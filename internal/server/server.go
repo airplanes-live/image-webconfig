@@ -1,34 +1,89 @@
-// Package server wires the airplanes-webconfig HTTP routes. PR-1 only
-// implements the plumbing-test endpoints: GET / (embedded UI placeholder)
-// and GET /health (200 ok). Auth, config, status, and write paths land in
-// later PRs.
+// Package server wires the airplanes-webconfig HTTP routes and middleware.
 package server
 
 import (
 	"io/fs"
 	"net/http"
 
+	"github.com/airplanes-live/image/webconfig/internal/auth"
 	webassets "github.com/airplanes-live/image/webconfig/web"
 )
 
-// New returns the top-level HTTP handler. version is embedded at build time
-// and surfaced via /health so plumbing tests can confirm which build is
-// running behind the lighttpd reverse-proxy.
-func New(version string) http.Handler {
+// Server holds the runtime auth components. Constructed in cmd/webconfig.
+type Server struct {
+	version      string
+	store        *auth.PasswordStore
+	sessions     *auth.Sessions
+	lockout      *auth.Lockout
+	guard        *auth.HashGuard
+	argon2Params auth.Params
+}
+
+// Deps is the injection bundle main passes to NewServer.
+type Deps struct {
+	Version      string
+	Store        *auth.PasswordStore
+	Sessions     *auth.Sessions
+	Lockout      *auth.Lockout
+	Guard        *auth.HashGuard
+	Argon2Params auth.Params
+}
+
+// New returns the top-level HTTP handler.
+func New(d Deps) http.Handler {
+	s := &Server{
+		version:      d.Version,
+		store:        d.Store,
+		sessions:     d.Sessions,
+		lockout:      d.Lockout,
+		guard:        d.Guard,
+		argon2Params: d.Argon2Params,
+	}
+
 	mux := http.NewServeMux()
 
-	mux.HandleFunc("GET /health", func(w http.ResponseWriter, _ *http.Request) {
-		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-		w.Header().Set("Cache-Control", "no-store")
-		_, _ = w.Write([]byte("ok " + version + "\n"))
-	})
+	// Public endpoints (no auth required).
+	mux.HandleFunc("GET /health", s.handleHealth)
+	mux.HandleFunc("GET /api/state", s.handleState)
+	mux.HandleFunc("POST /api/setup", s.handleSetup)
+	mux.HandleFunc("POST /api/auth/login", s.handleLogin)
 
-	assets, err := fs.Sub(webassets.FS, "assets")
+	// Authed endpoints.
+	mux.HandleFunc("POST /api/auth/logout", s.requireSession(s.handleLogout))
+	mux.HandleFunc("POST /api/auth/password", s.requireSession(s.handleChangePassword))
+	mux.HandleFunc("GET /api/auth/whoami", s.requireSession(s.handleWhoami))
+
+	// Static assets at /static/*; the SPA shell is served by the GET /
+	// handler below.
+	staticFS, err := fs.Sub(webassets.FS, "assets")
 	if err != nil {
-		// Compile-time guarantee — embed.FS always has the declared subdir.
-		panic(err)
+		panic(err) // compile-time guarantee — embed.FS always has this dir
 	}
-	mux.Handle("GET /", http.FileServer(http.FS(assets)))
+	mux.Handle("GET /static/", http.StripPrefix("/static/", http.FileServer(http.FS(staticFS))))
 
-	return mux
+	// SPA shell: serve index.html on the root and reject anything else that
+	// fell through to /-prefix matching.
+	mux.HandleFunc("GET /{$}", s.handleIndex)
+
+	// Compose middleware: security headers on every response; Origin/Host
+	// check on every mutating method.
+	return securityHeaders(requireOriginMatchesHost(mux))
+}
+
+func (s *Server) handleHealth(w http.ResponseWriter, _ *http.Request) {
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-store")
+	_, _ = w.Write([]byte("ok " + s.version + "\n"))
+}
+
+func (s *Server) handleIndex(w http.ResponseWriter, r *http.Request) {
+	staticFS, _ := fs.Sub(webassets.FS, "assets")
+	body, err := fs.ReadFile(staticFS, "index.html")
+	if err != nil {
+		http.NotFound(w, r)
+		return
+	}
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-store")
+	_, _ = w.Write(body)
 }

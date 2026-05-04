@@ -1,6 +1,4 @@
-// Package web exposes the embedded HTML/CSS/JS asset tree. The actual SPA
-// chrome lands in PR-2 (auth + dashboard); PR-1 ships a placeholder index
-// that proves the lighttpd reverse-proxy reaches this binary.
+// Package web exposes the embedded HTML/CSS/JS asset tree.
 package web
 
 import "embed"
