@@ -83,6 +83,7 @@ func main() {
 			FeedEnv:      feedenv.New(),
 			Status:       status.NewReader(version, status.DefaultPaths(), nil),
 			Logs:         logs.NewStreamer(nil),
+			Privileged:   server.DefaultPrivilegedArgv(),
 		}),
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       15 * time.Second,

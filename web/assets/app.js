@@ -151,6 +151,34 @@
             onclick: () => dashboard(),
         }, "Refresh");
 
+        const updateBtn = el("button", {
+            class: "secondary",
+            onclick: async () => {
+                updateBtn.disabled = true;
+                const r = await postJSON("/api/update", {});
+                updateBtn.disabled = false;
+                if (!r.ok) {
+                    alert(r.payload.error || "update failed");
+                    return;
+                }
+                logViewer("update");
+            },
+        }, "Run update");
+
+        const rebootBtn = el("button", {
+            class: "secondary",
+            onclick: async () => {
+                if (!confirm("Reboot the feeder now?")) return;
+                rebootBtn.disabled = true;
+                rebootBtn.textContent = "Rebooting…";
+                await postJSON("/api/reboot", {});
+                render(el("div", { class: "panel" },
+                    el("h2", {}, "Rebooting…"),
+                    el("p", {}, "The feeder is restarting. This page will go offline for ~30 seconds."),
+                ));
+            },
+        }, "Reboot");
+
         render(
             el("div", { class: "dashboard-grid" },
                 el("div", { class: "dashboard-card" },
@@ -169,7 +197,7 @@
                     el("h2", {}, "Live logs"),
                     el("p", { class: "muted" }, "Tail journalctl output for any unit:"),
                     el("div", { class: "actions" },
-                        ...["feed", "mlat", "readsb", "dump978", "uat", "claim"].map(slug =>
+                        ...["feed", "mlat", "readsb", "dump978", "uat", "claim", "update"].map(slug =>
                             el("button", {
                                 class: "secondary",
                                 onclick: () => logViewer(slug),
@@ -178,7 +206,7 @@
                     ),
                 ),
             ),
-            el("div", { class: "actions" }, refresh, change, logout),
+            el("div", { class: "actions" }, refresh, updateBtn, change, rebootBtn, logout),
         );
 
         const [identity, status, config] = await Promise.all([
@@ -258,17 +286,88 @@
             return;
         }
         const values = resp.payload.values || {};
-        const keys = Object.keys(values).sort();
-        if (keys.length === 0) {
-            parent.appendChild(el("p", { class: "muted" }, "feed.env is empty."));
-            return;
+        const inputs = {};
+        const field = (key, label, attrs) => {
+            const input = el("input", { name: key, value: values[key] || "", ...(attrs || {}) });
+            inputs[key] = input;
+            return el("div", { class: "field" },
+                el("label", {}, label, " ", el("code", {}, key)),
+                input,
+            );
+        };
+        const dump978On = (values["UAT_INPUT"] || "") !== "";
+        const uat = el("input", {
+            type: "checkbox",
+            name: "UAT_INPUT",
+            ...(dump978On ? { checked: "" } : {}),
+        });
+        inputs["UAT_INPUT"] = uat;
+
+        const err = errorEl();
+        const submit = el("button", { type: "submit" }, "Save & restart");
+
+        const form = el("form", {
+            class: "config-form",
+            onsubmit: async (e) => {
+                e.preventDefault();
+                err.textContent = "";
+                submit.disabled = true;
+                submit.textContent = "Saving…";
+                const updates = {
+                    LATITUDE: inputs.LATITUDE.value.trim(),
+                    LONGITUDE: inputs.LONGITUDE.value.trim(),
+                    ALTITUDE: inputs.ALTITUDE.value.trim(),
+                    USER: inputs.USER.value.trim(),
+                    GAIN: inputs.GAIN.value.trim(),
+                    UAT_INPUT: uat.checked ? "127.0.0.1:30978" : "",
+                };
+                // Drop empty strings except UAT_INPUT (empty is meaningful for
+                // disabling 978).
+                for (const k of Object.keys(updates)) {
+                    if (k !== "UAT_INPUT" && updates[k] === "") {
+                        delete updates[k];
+                    }
+                }
+                const r = await postJSON("/api/config", { updates });
+                submit.disabled = false;
+                submit.textContent = "Save & restart";
+                if (!r.ok) {
+                    err.textContent = r.payload.error || "save failed";
+                    return;
+                }
+                await dashboard();
+            },
+        },
+            field("LATITUDE", "Latitude", { type: "text", inputmode: "decimal", placeholder: "51.5" }),
+            field("LONGITUDE", "Longitude", { type: "text", inputmode: "decimal", placeholder: "-0.1" }),
+            field("ALTITUDE", "Altitude", { type: "text", placeholder: "120m" }),
+            field("USER", "MLAT name", { type: "text", placeholder: "alice" }),
+            field("GAIN", "Gain", { type: "text", placeholder: "auto" }),
+            el("div", { class: "field" },
+                el("label", {},
+                    uat, " Enable 978 UAT", " ", el("code", {}, "UAT_INPUT"),
+                ),
+            ),
+            submit,
+            err,
+        );
+        parent.appendChild(form);
+
+        // Read-only keys (set by feed/install.sh, not editable here).
+        const readOnly = Object.keys(values).filter(k =>
+            !["LATITUDE", "LONGITUDE", "ALTITUDE", "USER", "GAIN", "UAT_INPUT"].includes(k)
+        ).sort();
+        if (readOnly.length > 0) {
+            const tbl = el("dl", { class: "config-list" });
+            for (const k of readOnly) {
+                tbl.appendChild(el("dt", {}, k));
+                tbl.appendChild(el("dd", {}, values[k] === "" ? "(empty)" : values[k]));
+            }
+            parent.appendChild(el("details", {},
+                el("summary", { class: "muted" }, "Advanced (read-only)"),
+                tbl,
+            ));
         }
-        const tbl = el("dl", { class: "config-list" });
-        for (const k of keys) {
-            tbl.appendChild(el("dt", {}, k));
-            tbl.appendChild(el("dd", {}, values[k] === "" ? "(empty)" : values[k]));
-        }
-        parent.appendChild(tbl);
     }
 
     function logViewer(slug) {
