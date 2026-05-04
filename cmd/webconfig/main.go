@@ -15,7 +15,11 @@ import (
 	"time"
 
 	"github.com/airplanes-live/image/webconfig/internal/auth"
+	"github.com/airplanes-live/image/webconfig/internal/feedenv"
+	"github.com/airplanes-live/image/webconfig/internal/identity"
+	"github.com/airplanes-live/image/webconfig/internal/logs"
 	"github.com/airplanes-live/image/webconfig/internal/server"
+	"github.com/airplanes-live/image/webconfig/internal/status"
 )
 
 // version is overridden via -ldflags "-X main.version=<sha>".
@@ -75,6 +79,10 @@ func main() {
 			Lockout:      auth.NewLockout(*lockoutThreshold, *lockoutWindow, *lockoutDuration),
 			Guard:        guard,
 			Argon2Params: params,
+			Identity:     identity.NewReader(identity.DefaultPaths(), nil),
+			FeedEnv:      feedenv.New(),
+			Status:       status.NewReader(version, status.DefaultPaths(), nil),
+			Logs:         logs.NewStreamer(nil),
 		}),
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       15 * time.Second,

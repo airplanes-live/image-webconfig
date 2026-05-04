@@ -131,5 +131,56 @@ button.secondary:hover { background: var(--border); }
 .dashboard-card h2 { margin: 0 0 0.5rem; font-size: 1rem; }
 .dashboard-card p { margin: 0; color: var(--muted); font-size: 0.9rem; }
 
-.actions { display: flex; gap: 0.75rem; }
-.actions button { flex: 1; }
+.actions { display: flex; flex-wrap: wrap; gap: 0.5rem; }
+.actions button { flex: 1; min-width: 6rem; }
+
+.service-list { list-style: none; padding: 0; margin: 0; font-size: 0.9rem; }
+.service-list li { padding: 0.2rem 0; }
+.service-state {
+  display: inline-block;
+  min-width: 4.5rem;
+  padding: 0.05rem 0.5rem;
+  border-radius: 999px;
+  font-size: 0.75rem;
+  text-align: center;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  background: var(--border);
+  color: var(--fg);
+}
+.service-state.state-active { background: var(--success); color: var(--accent-fg); }
+.service-state.state-inactive { background: var(--border); color: var(--muted); }
+.service-state.state-failed { background: var(--error); color: var(--accent-fg); }
+.service-state.state-unknown { background: var(--border); color: var(--muted); font-style: italic; }
+
+.config-list {
+  display: grid;
+  grid-template-columns: max-content 1fr;
+  gap: 0.25rem 0.75rem;
+  margin: 0;
+  font-size: 0.9rem;
+}
+.config-list dt { font-weight: 500; color: var(--muted); }
+.config-list dd { margin: 0; word-break: break-all; font-family: ui-monospace, "SF Mono", Menlo, monospace; }
+
+.log-output {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 0.75rem;
+  margin: 0.5rem 0;
+  max-height: 24rem;
+  overflow: auto;
+  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+  font-size: 0.8rem;
+  white-space: pre-wrap;
+  word-break: break-all;
+}
+
+code {
+  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+  background: var(--border);
+  padding: 0.05rem 0.3rem;
+  border-radius: 3px;
+  font-size: 0.85em;
+}

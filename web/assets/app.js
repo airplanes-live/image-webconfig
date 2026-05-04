@@ -132,29 +132,167 @@
         pw.focus();
     }
 
-    function dashboard() {
+    async function dashboard() {
+        // Skeleton with placeholder cards; populate as endpoints respond.
+        const statusBody = el("p", { class: "muted" }, "loading…");
+        const identityBody = el("div", {}, el("p", { class: "muted" }, "loading…"));
+        const configBody = el("div", {}, el("p", { class: "muted" }, "loading…"));
+
         const logout = el("button", {
             class: "secondary",
-            onclick: async () => {
-                await postJSON("/api/auth/logout", {});
-                await boot();
-            },
+            onclick: async () => { await postJSON("/api/auth/logout", {}); await boot(); },
         }, "Log out");
-
         const change = el("button", {
             class: "secondary",
             onclick: () => changePasswordPanel(),
         }, "Change password");
+        const refresh = el("button", {
+            class: "secondary",
+            onclick: () => dashboard(),
+        }, "Refresh");
 
         render(
             el("div", { class: "dashboard-grid" },
                 el("div", { class: "dashboard-card" },
+                    el("h2", {}, "Identity"),
+                    identityBody,
+                ),
+                el("div", { class: "dashboard-card" },
                     el("h2", {}, "Status"),
-                    el("p", {}, "Signed in."),
+                    statusBody,
+                ),
+                el("div", { class: "dashboard-card" },
+                    el("h2", {}, "Configuration"),
+                    configBody,
+                ),
+                el("div", { class: "dashboard-card" },
+                    el("h2", {}, "Live logs"),
+                    el("p", { class: "muted" }, "Tail journalctl output for any unit:"),
+                    el("div", { class: "actions" },
+                        ...["feed", "mlat", "readsb", "dump978", "uat", "claim"].map(slug =>
+                            el("button", {
+                                class: "secondary",
+                                onclick: () => logViewer(slug),
+                            }, slug),
+                        ),
+                    ),
                 ),
             ),
-            el("div", { class: "actions" }, change, logout),
+            el("div", { class: "actions" }, refresh, change, logout),
         );
+
+        const [identity, status, config] = await Promise.all([
+            getJSON("/api/identity"),
+            getJSON("/api/status"),
+            getJSON("/api/config"),
+        ]);
+        renderIdentityCard(identityBody, identity);
+        renderStatusCard(statusBody, status);
+        renderConfigCard(configBody, config);
+    }
+
+    function renderIdentityCard(parent, resp) {
+        parent.replaceChildren();
+        if (!resp.ok) {
+            parent.appendChild(el("p", { class: "error" }, resp.payload.error || "could not load identity"));
+            return;
+        }
+        const id = resp.payload || {};
+        if (!id.feeder_id) {
+            parent.appendChild(el("p", { class: "muted" }, "Feeder ID will be assigned on first run."));
+            return;
+        }
+        parent.appendChild(el("p", {}, el("strong", {}, "Feeder ID: "), id.feeder_id));
+        if (!id.claim_secret_present) {
+            parent.appendChild(el("p", { class: "muted" }, "No claim secret yet — apl-feed claim register will create one."));
+            return;
+        }
+        const reveal = el("button", {
+            class: "secondary",
+            onclick: async () => {
+                reveal.disabled = true;
+                const r = await postJSON("/api/identity/secret", {});
+                reveal.disabled = false;
+                if (!r.ok) {
+                    parent.replaceChildren(el("p", { class: "error" }, r.payload.error || "reveal failed"));
+                    return;
+                }
+                parent.replaceChildren(
+                    el("p", {}, el("strong", {}, "Feeder ID: "), r.payload.feeder_id),
+                    el("p", {}, el("strong", {}, "Claim secret: "), el("code", {}, r.payload.claim_secret)),
+                    el("p", {}, el("a", { href: r.payload.claim_page, target: "_blank", rel: "noopener noreferrer" }, "Claim this feeder")),
+                );
+            },
+        }, "Show claim secret");
+        parent.appendChild(reveal);
+    }
+
+    function renderStatusCard(parent, resp) {
+        parent.replaceChildren();
+        if (!resp.ok) {
+            parent.appendChild(el("p", { class: "error" }, resp.payload.error || "could not load status"));
+            return;
+        }
+        const services = resp.payload.services || {};
+        const list = el("ul", { class: "service-list" });
+        for (const [unit, state] of Object.entries(services).sort()) {
+            list.appendChild(el("li", {},
+                el("span", { class: "service-state state-" + state }, state),
+                " ",
+                el("code", {}, unit.replace(/\.service$/, "")),
+            ));
+        }
+        parent.appendChild(list);
+        const feed = resp.payload.feed;
+        if (feed) {
+            parent.appendChild(el("p", { class: "muted" },
+                feed.aircraft_count + " aircraft, " + feed.messages_counter + " messages decoded",
+            ));
+        }
+    }
+
+    function renderConfigCard(parent, resp) {
+        parent.replaceChildren();
+        if (!resp.ok) {
+            parent.appendChild(el("p", { class: "error" }, resp.payload.error || "could not load config"));
+            return;
+        }
+        const values = resp.payload.values || {};
+        const keys = Object.keys(values).sort();
+        if (keys.length === 0) {
+            parent.appendChild(el("p", { class: "muted" }, "feed.env is empty."));
+            return;
+        }
+        const tbl = el("dl", { class: "config-list" });
+        for (const k of keys) {
+            tbl.appendChild(el("dt", {}, k));
+            tbl.appendChild(el("dd", {}, values[k] === "" ? "(empty)" : values[k]));
+        }
+        parent.appendChild(tbl);
+    }
+
+    function logViewer(slug) {
+        const pre = el("pre", { class: "log-output" });
+        const back = el("button", { class: "secondary", onclick: () => dashboard() }, "Back");
+        render(
+            el("div", { class: "panel" },
+                el("h2", {}, "journalctl -u " + slug),
+                el("p", { class: "muted" }, "Streaming live; close this view to disconnect."),
+                pre,
+                back,
+            ),
+        );
+        const es = new EventSource("/api/log/" + encodeURIComponent(slug));
+        es.onmessage = (ev) => {
+            pre.appendChild(document.createTextNode(ev.data + "\n"));
+            pre.scrollTop = pre.scrollHeight;
+        };
+        es.onerror = () => {
+            pre.appendChild(document.createTextNode("[stream closed]\n"));
+            es.close();
+        };
+        // Close the EventSource when navigating away from this view.
+        back.addEventListener("click", () => es.close(), { once: true });
     }
 
     function changePasswordPanel() {

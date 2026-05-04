@@ -2,18 +2,25 @@ package server
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"io"
 	"net/http"
 	"net/http/cookiejar"
 	"net/http/httptest"
 	"net/url"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/airplanes-live/image/webconfig/internal/auth"
+	wexec "github.com/airplanes-live/image/webconfig/internal/exec"
+	"github.com/airplanes-live/image/webconfig/internal/feedenv"
+	"github.com/airplanes-live/image/webconfig/internal/identity"
+	"github.com/airplanes-live/image/webconfig/internal/logs"
+	"github.com/airplanes-live/image/webconfig/internal/status"
 )
 
 const testPassword = "correct horse battery staple"
@@ -22,8 +29,8 @@ const testPassword = "correct horse battery staple"
 var fastTestParams = auth.Params{TimeCost: 1, MemoryKB: 8, Threads: 1, KeyLen: 32, SaltLen: 16}
 
 // newTestServer wires server.Deps with in-memory components and a tempfile-
-// backed PasswordStore. Returns the httptest.Server and the underlying Deps
-// for tests that need to peek at session/lockout state.
+// backed PasswordStore. Read-side deps (identity / feedenv / status / logs)
+// are stubbed with deterministic fixtures.
 func newTestServer(t *testing.T) (*httptest.Server, *Server) {
 	t.Helper()
 	dir := t.TempDir()
@@ -32,6 +39,42 @@ func newTestServer(t *testing.T) (*httptest.Server, *Server) {
 	if err != nil {
 		t.Fatal(err)
 	}
+
+	idPaths := identity.Paths{
+		FeederIDFile:    filepath.Join(dir, "feeder-id"),
+		ClaimSecretFile: filepath.Join(dir, "feeder-claim-secret"),
+		APLFeedSudoArgv: []string{"/bin/echo", "stub"},
+	}
+	_ = os.WriteFile(idPaths.FeederIDFile, []byte("test-feeder-id"), 0o644)
+	_ = os.WriteFile(idPaths.ClaimSecretFile, []byte("ABCDEFGHIJKLMNOP"), 0o600)
+	idStubRunner := func(_ context.Context, _ []string) (wexec.Result, error) {
+		return wexec.Result{Stdout: []byte(
+			"Feeder ID: test-feeder-id\n" +
+				"Claim secret: ABCD-EFGH-IJKL-MNOP\n" +
+				"Claim page: https://airplanes.live/feeder/claim\n",
+		)}, nil
+	}
+
+	feedEnvPath := filepath.Join(dir, "feed.env")
+	_ = os.WriteFile(feedEnvPath,
+		[]byte(`LATITUDE=51.5`+"\n"+`LONGITUDE=-0.1`+"\n"+`USER=tester`+"\n"),
+		0o644,
+	)
+
+	statusPaths := status.Paths{
+		ManifestFile:     filepath.Join(dir, "build-manifest.json"),
+		AircraftJSONFile: filepath.Join(dir, "aircraft.json"),
+		SystemctlBinary:  "/usr/bin/systemctl",
+		IsActiveTimeout:  time.Second,
+	}
+	statusRunner := func(_ context.Context, _ []string) (wexec.Result, error) {
+		return wexec.Result{Stdout: []byte("active\n")}, nil
+	}
+	logsRunner := func(_ context.Context, w io.Writer, _ []string) error {
+		_, _ = w.Write([]byte("test-log-line\n"))
+		return nil
+	}
+
 	deps := Deps{
 		Version:      "test-sha",
 		Store:        auth.NewPasswordStore(hashPath),
@@ -39,14 +82,15 @@ func newTestServer(t *testing.T) (*httptest.Server, *Server) {
 		Lockout:      auth.NewLockout(5, time.Minute, 15*time.Minute),
 		Guard:        guard,
 		Argon2Params: fastTestParams,
+		Identity:     identity.NewReader(idPaths, idStubRunner),
+		FeedEnv:      &feedenv.Reader{Path: feedEnvPath},
+		Status:       status.NewReader("test-sha", statusPaths, statusRunner),
+		Logs:         logs.NewStreamer(logsRunner),
 	}
 	handler := New(deps)
 	ts := httptest.NewServer(handler)
 	t.Cleanup(ts.Close)
 
-	// Reach into the unexported Server through a fresh constructor: New()
-	// returned a wrapped middleware chain but for tests we want the raw
-	// state. Build a parallel Server with the same deps.
 	s := &Server{
 		version: deps.Version, store: deps.Store, sessions: deps.Sessions,
 		lockout: deps.Lockout, guard: deps.Guard, argon2Params: deps.Argon2Params,
@@ -499,4 +543,181 @@ func mustDo(t *testing.T, req *http.Request) *http.Response {
 		t.Fatalf("Do %s %s: %v", req.Method, req.URL, err)
 	}
 	return resp
+}
+
+// authedClient returns a client whose CookieJar holds a valid session,
+// established by running setup against the freshly-provisioned tempfile
+// password store.
+func authedClient(t *testing.T, ts *httptest.Server) *http.Client {
+	t.Helper()
+	c := httpClient(t)
+	r := postJSON(t, c, ts.URL+"/api/setup", map[string]string{"password": testPassword})
+	r.Body.Close()
+	if r.StatusCode != http.StatusOK {
+		t.Fatalf("setup status = %d, want 200", r.StatusCode)
+	}
+	return c
+}
+
+// --- read endpoint tests ---
+
+func TestIdentity_RequiresAuth(t *testing.T) {
+	t.Parallel()
+	ts, _ := newTestServer(t)
+	resp := mustGetDefault(t, ts.URL+"/api/identity")
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want 401", resp.StatusCode)
+	}
+}
+
+func TestIdentity_AuthedReturnsFeederID(t *testing.T) {
+	t.Parallel()
+	ts, _ := newTestServer(t)
+	c := authedClient(t, ts)
+	resp := mustGet(t, c, ts.URL+"/api/identity")
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d", resp.StatusCode)
+	}
+	var got map[string]any
+	_ = json.NewDecoder(resp.Body).Decode(&got)
+	if got["feeder_id"] != "test-feeder-id" {
+		t.Errorf("feeder_id = %v, want test-feeder-id", got["feeder_id"])
+	}
+	if got["claim_secret_present"] != true {
+		t.Errorf("claim_secret_present = %v, want true", got["claim_secret_present"])
+	}
+}
+
+func TestIdentitySecret_RequiresAuth(t *testing.T) {
+	t.Parallel()
+	ts, _ := newTestServer(t)
+	c := httpClient(t)
+	r := postJSON(t, c, ts.URL+"/api/identity/secret", map[string]any{})
+	defer r.Body.Close()
+	if r.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want 401", r.StatusCode)
+	}
+}
+
+func TestIdentitySecret_AuthedReturnsSecret(t *testing.T) {
+	t.Parallel()
+	ts, _ := newTestServer(t)
+	c := authedClient(t, ts)
+	r := postJSON(t, c, ts.URL+"/api/identity/secret", map[string]any{})
+	defer r.Body.Close()
+	if r.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d", r.StatusCode)
+	}
+	var got map[string]any
+	_ = json.NewDecoder(r.Body).Decode(&got)
+	if got["claim_secret"] != "ABCD-EFGH-IJKL-MNOP" {
+		t.Errorf("claim_secret = %v", got["claim_secret"])
+	}
+	if got["feeder_id"] != "test-feeder-id" {
+		t.Errorf("feeder_id = %v", got["feeder_id"])
+	}
+}
+
+func TestConfigGet_RequiresAuth(t *testing.T) {
+	t.Parallel()
+	ts, _ := newTestServer(t)
+	resp := mustGetDefault(t, ts.URL+"/api/config")
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want 401", resp.StatusCode)
+	}
+}
+
+func TestConfigGet_AuthedReturnsValues(t *testing.T) {
+	t.Parallel()
+	ts, _ := newTestServer(t)
+	c := authedClient(t, ts)
+	resp := mustGet(t, c, ts.URL+"/api/config")
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d", resp.StatusCode)
+	}
+	var got struct {
+		Values map[string]string `json:"values"`
+	}
+	_ = json.NewDecoder(resp.Body).Decode(&got)
+	if got.Values["LATITUDE"] != "51.5" {
+		t.Errorf("LATITUDE = %q, want 51.5", got.Values["LATITUDE"])
+	}
+	if got.Values["USER"] != "tester" {
+		t.Errorf("USER = %q, want tester", got.Values["USER"])
+	}
+}
+
+func TestStatus_RequiresAuth(t *testing.T) {
+	t.Parallel()
+	ts, _ := newTestServer(t)
+	resp := mustGetDefault(t, ts.URL+"/api/status")
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want 401", resp.StatusCode)
+	}
+}
+
+func TestStatus_AuthedReturnsServiceStates(t *testing.T) {
+	t.Parallel()
+	ts, _ := newTestServer(t)
+	c := authedClient(t, ts)
+	resp := mustGet(t, c, ts.URL+"/api/status")
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d", resp.StatusCode)
+	}
+	var got struct {
+		Version  string            `json:"webconfig_version"`
+		Services map[string]string `json:"services"`
+	}
+	_ = json.NewDecoder(resp.Body).Decode(&got)
+	if got.Version != "test-sha" {
+		t.Errorf("version = %q, want test-sha", got.Version)
+	}
+	if got.Services["airplanes-feed.service"] != "active" {
+		t.Errorf("airplanes-feed = %q, want active", got.Services["airplanes-feed.service"])
+	}
+}
+
+func TestLog_RequiresAuth(t *testing.T) {
+	t.Parallel()
+	ts, _ := newTestServer(t)
+	resp := mustGetDefault(t, ts.URL+"/api/log/feed")
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want 401", resp.StatusCode)
+	}
+}
+
+func TestLog_UnknownUnit(t *testing.T) {
+	t.Parallel()
+	ts, _ := newTestServer(t)
+	c := authedClient(t, ts)
+	resp := mustGet(t, c, ts.URL+"/api/log/no-such-unit")
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404", resp.StatusCode)
+	}
+}
+
+func TestLog_KnownUnitStreamsSSE(t *testing.T) {
+	t.Parallel()
+	ts, _ := newTestServer(t)
+	c := authedClient(t, ts)
+	resp := mustGet(t, c, ts.URL+"/api/log/feed")
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d", resp.StatusCode)
+	}
+	if got, want := resp.Header.Get("Content-Type"), "text/event-stream"; got != want {
+		t.Errorf("Content-Type = %q, want %q", got, want)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	if !strings.Contains(string(body), "data: test-log-line") {
+		t.Errorf("SSE body missing test-log-line: %q", body)
+	}
 }
