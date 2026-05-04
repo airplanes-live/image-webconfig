@@ -8,6 +8,8 @@ import (
 	"strings"
 
 	"github.com/airplanes-live/image/webconfig/internal/auth"
+	"github.com/airplanes-live/image/webconfig/internal/identity"
+	"github.com/airplanes-live/image/webconfig/internal/logs"
 )
 
 // MinPasswordLen is the minimum length we accept for setup / change-password.
@@ -277,4 +279,71 @@ func (s *Server) handleChangePassword(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleWhoami(w http.ResponseWriter, _ *http.Request) {
 	// requireSession middleware has already validated the session.
 	writeJSON(w, http.StatusOK, map[string]string{"username": "admin"})
+}
+
+// /api/identity (GET): redacted view — feeder ID + claim_secret_present flag.
+func (s *Server) handleIdentity(w http.ResponseWriter, _ *http.Request) {
+	id, err := s.identity.Read()
+	if err != nil {
+		if errors.Is(err, identity.ErrNoFeederID) {
+			writeJSON(w, http.StatusOK, identity.Identity{}) // empty struct: feeder not yet first-run
+			return
+		}
+		log.Printf("identity read: %v", err)
+		writeJSONError(w, http.StatusInternalServerError, "identity read failed")
+		return
+	}
+	writeJSON(w, http.StatusOK, id)
+}
+
+// /api/identity/secret (POST): full claim secret reveal. POST so it can't
+// be cached or logged in browser history; Cache-Control: no-store via
+// writeJSON.
+func (s *Server) handleIdentitySecret(w http.ResponseWriter, r *http.Request) {
+	got, err := s.identity.Reveal(r.Context())
+	if err != nil {
+		if errors.Is(err, identity.ErrNoClaimSecret) {
+			writeJSONError(w, http.StatusNotFound, "no claim secret yet — register first")
+			return
+		}
+		log.Printf("identity reveal: %v", err)
+		writeJSONError(w, http.StatusInternalServerError, "identity reveal failed")
+		return
+	}
+	writeJSON(w, http.StatusOK, got)
+}
+
+// /api/config (GET): whitelisted feed.env keys.
+func (s *Server) handleConfigGet(w http.ResponseWriter, _ *http.Request) {
+	values, err := s.feedEnv.ReadAll()
+	if err != nil {
+		log.Printf("feedenv read: %v", err)
+		writeJSONError(w, http.StatusInternalServerError, "feed.env read failed")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"values": values})
+}
+
+// /api/status (GET): service states + manifest + feed snapshot.
+func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
+	st, err := s.status.Read(r.Context())
+	if err != nil {
+		log.Printf("status read: %v", err)
+		writeJSONError(w, http.StatusInternalServerError, "status read failed")
+		return
+	}
+	writeJSON(w, http.StatusOK, st)
+}
+
+// /api/log/{unit} (GET): SSE-stream journalctl output for the unit.
+func (s *Server) handleLog(w http.ResponseWriter, r *http.Request) {
+	slug := r.PathValue("unit")
+	if err := s.logs.ServeSSE(r.Context(), w, slug); err != nil {
+		if errors.Is(err, logs.ErrUnknownUnit) {
+			writeJSONError(w, http.StatusNotFound, "unit not in webconfig log allowlist")
+			return
+		}
+		log.Printf("log stream %s: %v", slug, err)
+		// Headers may already be sent (SSE); no point writing JSON now.
+	}
 }

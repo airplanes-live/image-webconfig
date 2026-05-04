@@ -6,6 +6,10 @@ import (
 	"net/http"
 
 	"github.com/airplanes-live/image/webconfig/internal/auth"
+	"github.com/airplanes-live/image/webconfig/internal/feedenv"
+	"github.com/airplanes-live/image/webconfig/internal/identity"
+	"github.com/airplanes-live/image/webconfig/internal/logs"
+	"github.com/airplanes-live/image/webconfig/internal/status"
 	webassets "github.com/airplanes-live/image/webconfig/web"
 )
 
@@ -17,6 +21,10 @@ type Server struct {
 	lockout      *auth.Lockout
 	guard        *auth.HashGuard
 	argon2Params auth.Params
+	identity     *identity.Reader
+	feedEnv      *feedenv.Reader
+	status       *status.Reader
+	logs         *logs.Streamer
 }
 
 // Deps is the injection bundle main passes to NewServer.
@@ -27,6 +35,10 @@ type Deps struct {
 	Lockout      *auth.Lockout
 	Guard        *auth.HashGuard
 	Argon2Params auth.Params
+	Identity     *identity.Reader
+	FeedEnv      *feedenv.Reader
+	Status       *status.Reader
+	Logs         *logs.Streamer
 }
 
 // New returns the top-level HTTP handler.
@@ -38,6 +50,10 @@ func New(d Deps) http.Handler {
 		lockout:      d.Lockout,
 		guard:        d.Guard,
 		argon2Params: d.Argon2Params,
+		identity:     d.Identity,
+		feedEnv:      d.FeedEnv,
+		status:       d.Status,
+		logs:         d.Logs,
 	}
 
 	mux := http.NewServeMux()
@@ -52,6 +68,11 @@ func New(d Deps) http.Handler {
 	mux.HandleFunc("POST /api/auth/logout", s.requireSession(s.handleLogout))
 	mux.HandleFunc("POST /api/auth/password", s.requireSession(s.handleChangePassword))
 	mux.HandleFunc("GET /api/auth/whoami", s.requireSession(s.handleWhoami))
+	mux.HandleFunc("GET /api/identity", s.requireSession(s.handleIdentity))
+	mux.HandleFunc("POST /api/identity/secret", s.requireSession(s.handleIdentitySecret))
+	mux.HandleFunc("GET /api/config", s.requireSession(s.handleConfigGet))
+	mux.HandleFunc("GET /api/status", s.requireSession(s.handleStatus))
+	mux.HandleFunc("GET /api/log/{unit}", s.requireSession(s.handleLog))
 
 	// Static assets at /static/*; the SPA shell is served by the GET /
 	// handler below.
