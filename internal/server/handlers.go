@@ -1,13 +1,20 @@
 package server
 
 import (
+	"bytes"
+	"context"
+	"encoding/json"
 	"errors"
+	"fmt"
 	"io/fs"
 	"log"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/airplanes-live/image/webconfig/internal/auth"
+	"github.com/airplanes-live/image/webconfig/internal/configspec"
+	wexec "github.com/airplanes-live/image/webconfig/internal/exec"
 	"github.com/airplanes-live/image/webconfig/internal/identity"
 	"github.com/airplanes-live/image/webconfig/internal/logs"
 )
@@ -346,4 +353,200 @@ func (s *Server) handleLog(w http.ResponseWriter, r *http.Request) {
 		log.Printf("log stream %s: %v", slug, err)
 		// Headers may already be sent (SSE); no point writing JSON now.
 	}
+}
+
+// configRequest is the POST /api/config payload.
+type configRequest struct {
+	Updates map[string]string `json:"updates"`
+}
+
+const (
+	// applyConfigTimeout caps the helper's wall time. The helper itself
+	// has a 5s lock-acquisition timeout; total budget is generous.
+	applyConfigTimeout = 10 * time.Second
+	// systemctlTimeout caps each per-unit systemctl call.
+	systemctlTimeout = 10 * time.Second
+)
+
+// /api/config (POST): atomic feed.env write through the apply-config helper,
+// followed by service restart and 978 reconcile. The whole transaction is
+// serialized by an in-process mutex so concurrent posts can't leave
+// feed.env and 978-unit state inconsistent.
+func (s *Server) handleConfigPost(w http.ResponseWriter, r *http.Request) {
+	var req configRequest
+	if err := readJSON(w, r, &req); err != nil {
+		writeJSONError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	// Daemon-side validation. The helper re-validates against the same
+	// configspec — keep both layers; drift is exactly what the shared
+	// package prevents.
+	for k, v := range req.Updates {
+		if err := configspec.Validate(k, v); err != nil {
+			writeJSONError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+	}
+
+	s.configMu.Lock()
+	defer s.configMu.Unlock()
+
+	// Compute the desired final UAT_INPUT to drive the 978 reconcile after
+	// the helper writes. If the request didn't touch UAT_INPUT, reconcile
+	// matches whatever feed.env already has.
+	currentValues, err := s.feedEnv.ReadAll()
+	if err != nil {
+		log.Printf("config-post: read feed.env: %v", err)
+		writeJSONError(w, http.StatusInternalServerError, "feed.env read failed")
+		return
+	}
+	finalUAT := currentValues["UAT_INPUT"]
+	if v, ok := req.Updates["UAT_INPUT"]; ok {
+		finalUAT = v
+	}
+
+	if err := s.invokeApplyConfig(r.Context(), req.Updates); err != nil {
+		var ce *configError
+		if errors.As(err, &ce) {
+			writeJSONError(w, ce.status, ce.message)
+			return
+		}
+		log.Printf("config-post: helper: %v", err)
+		writeJSONError(w, http.StatusInternalServerError, "config write failed")
+		return
+	}
+
+	// Service restart for feed + mlat. Failures here log loudly but do not
+	// roll back feed.env — that would require a transaction we don't have.
+	for _, argv := range [][]string{s.priv.RestartFeed, s.priv.RestartMLAT} {
+		if err := s.runSudo(r.Context(), argv, systemctlTimeout); err != nil {
+			log.Printf("config-post: %v", err)
+		}
+	}
+
+	// 978 reconcile from final UAT_INPUT (idempotent: enable on enabled is
+	// a no-op; start on running is a no-op; same for stop+disable).
+	if finalUAT == "" {
+		s.reconcile978Off(r.Context())
+	} else {
+		s.reconcile978On(r.Context())
+	}
+
+	writeJSON(w, http.StatusOK, map[string]string{"status": "applied"})
+}
+
+// configError carries an HTTP status + safe-to-surface message.
+type configError struct {
+	status  int
+	message string
+}
+
+func (e *configError) Error() string { return e.message }
+
+// invokeApplyConfig pipes the JSON body to the helper via fixed-argv sudo.
+// Helper exit codes 10/11/12 (validation/parse/oversize) → 400; 20
+// (filesystem) → 500. Stderr is logged server-side; the response carries
+// only a stable message to avoid leaking internals.
+func (s *Server) invokeApplyConfig(ctx context.Context, updates map[string]string) error {
+	body, err := json.Marshal(map[string]any{"updates": updates})
+	if err != nil {
+		return err
+	}
+	cctx, cancel := context.WithTimeout(ctx, applyConfigTimeout)
+	defer cancel()
+
+	res, err := s.stdinRunner(cctx, s.priv.ApplyConfig, bytes.NewReader(body))
+	if err == nil {
+		return nil
+	}
+	exit := res.ExitCode
+	logHelper(exit, res, err)
+	switch exit {
+	case 10, 11, 12, 30:
+		return &configError{status: http.StatusBadRequest, message: "config rejected by helper"}
+	default:
+		return fmt.Errorf("helper exit %d: %w", exit, err)
+	}
+}
+
+func logHelper(exit int, res wexec.Result, err error) {
+	log.Printf("apply-config exit=%d err=%v stderr=%q",
+		exit, err, strings.TrimSpace(string(res.Stderr)))
+}
+
+// runSudo runs argv with a per-call timeout and logs on failure.
+func (s *Server) runSudo(ctx context.Context, argv []string, timeout time.Duration) error {
+	cctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	res, err := s.runner(cctx, argv)
+	if err != nil {
+		return fmt.Errorf("sudo %v: %w (stderr=%q)", argv, err, strings.TrimSpace(string(res.Stderr)))
+	}
+	return nil
+}
+
+func (s *Server) reconcile978On(ctx context.Context) {
+	for _, argv := range [][]string{
+		s.priv.EnableDump978, s.priv.EnableUAT,
+		s.priv.StartDump978, s.priv.StartUAT,
+	} {
+		if err := s.runSudo(ctx, argv, systemctlTimeout); err != nil {
+			log.Printf("978-on reconcile: %v", err)
+		}
+	}
+}
+
+func (s *Server) reconcile978Off(ctx context.Context) {
+	for _, argv := range [][]string{
+		s.priv.StopUAT, s.priv.StopDump978,
+		s.priv.DisableUAT, s.priv.DisableDump978,
+	} {
+		if err := s.runSudo(ctx, argv, systemctlTimeout); err != nil {
+			log.Printf("978-off reconcile: %v", err)
+		}
+	}
+}
+
+// /api/update (POST): kicks off a transient airplanes-update.service via
+// systemd-run. Returns 202 + the unit name so the SPA can stream
+// /api/log/update for live output. systemd-run exits with non-zero on
+// "unit already exists" — we map that to 409.
+func (s *Server) handleUpdate(w http.ResponseWriter, r *http.Request) {
+	cctx, cancel := context.WithTimeout(r.Context(), systemctlTimeout)
+	defer cancel()
+	res, err := s.runner(cctx, s.priv.StartUpdate)
+	if err != nil {
+		stderr := strings.TrimSpace(string(res.Stderr))
+		log.Printf("update: %v stderr=%q", err, stderr)
+		if strings.Contains(stderr, "already exists") || strings.Contains(stderr, "already running") {
+			writeJSONError(w, http.StatusConflict, "update is already in progress")
+			return
+		}
+		writeJSONError(w, http.StatusInternalServerError, "update start failed")
+		return
+	}
+	writeJSON(w, http.StatusAccepted, map[string]string{
+		"status":     "running",
+		"unit":       "airplanes-update.service",
+		"started_at": time.Now().UTC().Format(time.RFC3339),
+	})
+}
+
+// /api/reboot (POST): writes 202 + flushes, then triggers reboot from a
+// goroutine after a brief delay so the response actually leaves the wire
+// before init starts tearing things down.
+func (s *Server) handleReboot(w http.ResponseWriter, _ *http.Request) {
+	writeJSON(w, http.StatusAccepted, map[string]string{"status": "rebooting"})
+	if f, ok := w.(http.Flusher); ok {
+		f.Flush()
+	}
+	go func() {
+		time.Sleep(250 * time.Millisecond)
+		ctx, cancel := context.WithTimeout(context.Background(), systemctlTimeout)
+		defer cancel()
+		res, err := s.runner(ctx, s.priv.Reboot)
+		if err != nil {
+			log.Printf("reboot: %v stderr=%q", err, strings.TrimSpace(string(res.Stderr)))
+		}
+	}()
 }

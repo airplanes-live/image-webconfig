@@ -4,8 +4,10 @@ package server
 import (
 	"io/fs"
 	"net/http"
+	"sync"
 
 	"github.com/airplanes-live/image/webconfig/internal/auth"
+	wexec "github.com/airplanes-live/image/webconfig/internal/exec"
 	"github.com/airplanes-live/image/webconfig/internal/feedenv"
 	"github.com/airplanes-live/image/webconfig/internal/identity"
 	"github.com/airplanes-live/image/webconfig/internal/logs"
@@ -25,24 +27,86 @@ type Server struct {
 	feedEnv      *feedenv.Reader
 	status       *status.Reader
 	logs         *logs.Streamer
+	runner       wexec.CommandRunner
+	stdinRunner  wexec.CommandRunnerStdin
+	priv         PrivilegedArgv
+	configMu     sync.Mutex // serializes POST /api/config transactions
+}
+
+// PrivilegedArgv carries the exact sudoers-allowed argv shapes for every
+// command webconfig elevates. Each slice is invoked verbatim — no
+// concatenation, no shell.
+type PrivilegedArgv struct {
+	ApplyConfig         []string // sudo -n /usr/local/lib/airplanes-webconfig/apply-config
+	RestartFeed         []string
+	RestartMLAT         []string
+	StartDump978        []string
+	StartUAT            []string
+	StopDump978         []string
+	StopUAT             []string
+	EnableDump978       []string
+	EnableUAT           []string
+	DisableDump978      []string
+	DisableUAT          []string
+	Reboot              []string
+	StartUpdate         []string // sudo systemd-run --unit=airplanes-update ...
+}
+
+// DefaultPrivilegedArgv returns the production argv shapes for the
+// airplanes-webconfig sudoers entry. Override per-test via Deps.
+func DefaultPrivilegedArgv() PrivilegedArgv {
+	sudo := func(args ...string) []string {
+		return append([]string{"/usr/bin/sudo", "-n"}, args...)
+	}
+	return PrivilegedArgv{
+		ApplyConfig:    sudo("/usr/local/lib/airplanes-webconfig/apply-config"),
+		RestartFeed:    sudo("/usr/bin/systemctl", "restart", "airplanes-feed.service"),
+		RestartMLAT:    sudo("/usr/bin/systemctl", "restart", "airplanes-mlat.service"),
+		StartDump978:   sudo("/usr/bin/systemctl", "start", "dump978-fa.service"),
+		StartUAT:       sudo("/usr/bin/systemctl", "start", "airplanes-978.service"),
+		StopDump978:    sudo("/usr/bin/systemctl", "stop", "dump978-fa.service"),
+		StopUAT:        sudo("/usr/bin/systemctl", "stop", "airplanes-978.service"),
+		EnableDump978:  sudo("/usr/bin/systemctl", "enable", "dump978-fa.service"),
+		EnableUAT:      sudo("/usr/bin/systemctl", "enable", "airplanes-978.service"),
+		DisableDump978: sudo("/usr/bin/systemctl", "disable", "dump978-fa.service"),
+		DisableUAT:     sudo("/usr/bin/systemctl", "disable", "airplanes-978.service"),
+		Reboot:         sudo("/usr/bin/systemctl", "reboot"),
+		StartUpdate: sudo(
+			"/usr/bin/systemd-run",
+			"--unit=airplanes-update",
+			"--collect",
+			"/usr/local/share/airplanes/update.sh",
+		),
+	}
 }
 
 // Deps is the injection bundle main passes to NewServer.
 type Deps struct {
-	Version      string
-	Store        *auth.PasswordStore
-	Sessions     *auth.Sessions
-	Lockout      *auth.Lockout
-	Guard        *auth.HashGuard
-	Argon2Params auth.Params
-	Identity     *identity.Reader
-	FeedEnv      *feedenv.Reader
-	Status       *status.Reader
-	Logs         *logs.Streamer
+	Version       string
+	Store         *auth.PasswordStore
+	Sessions      *auth.Sessions
+	Lockout       *auth.Lockout
+	Guard         *auth.HashGuard
+	Argon2Params  auth.Params
+	Identity      *identity.Reader
+	FeedEnv       *feedenv.Reader
+	Status        *status.Reader
+	Logs          *logs.Streamer
+	Runner        wexec.CommandRunner      // override for tests; nil → exec.RealRunner
+	StdinRunner   wexec.CommandRunnerStdin // ditto; for apply-config (JSON piped via stdin)
+	Privileged    PrivilegedArgv
 }
 
 // New returns the top-level HTTP handler.
 func New(d Deps) http.Handler {
+	runner := d.Runner
+	if runner == nil {
+		runner = wexec.RealRunner
+	}
+	stdinRunner := d.StdinRunner
+	if stdinRunner == nil {
+		stdinRunner = wexec.RealRunnerStdin
+	}
 	s := &Server{
 		version:      d.Version,
 		store:        d.Store,
@@ -54,6 +118,9 @@ func New(d Deps) http.Handler {
 		feedEnv:      d.FeedEnv,
 		status:       d.Status,
 		logs:         d.Logs,
+		runner:       runner,
+		stdinRunner:  stdinRunner,
+		priv:         d.Privileged,
 	}
 
 	mux := http.NewServeMux()
@@ -73,6 +140,9 @@ func New(d Deps) http.Handler {
 	mux.HandleFunc("GET /api/config", s.requireSession(s.handleConfigGet))
 	mux.HandleFunc("GET /api/status", s.requireSession(s.handleStatus))
 	mux.HandleFunc("GET /api/log/{unit}", s.requireSession(s.handleLog))
+	mux.HandleFunc("POST /api/config", s.requireSession(s.handleConfigPost))
+	mux.HandleFunc("POST /api/update", s.requireSession(s.handleUpdate))
+	mux.HandleFunc("POST /api/reboot", s.requireSession(s.handleReboot))
 
 	// Static assets at /static/*; the SPA shell is served by the GET /
 	// handler below.

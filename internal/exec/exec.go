@@ -28,6 +28,10 @@ type Result struct {
 // CommandRunner is the function-type interface every shell-out goes through.
 type CommandRunner func(ctx context.Context, argv []string) (Result, error)
 
+// CommandRunnerStdin is the variant for shell-outs that need to pipe data to
+// the child's stdin (e.g. apply-config receiving its JSON input).
+type CommandRunnerStdin func(ctx context.Context, argv []string, stdin io.Reader) (Result, error)
+
 // StreamRunner is the streaming variant used by /api/<unit>/log SSE.
 // Until ctx is canceled, lines from the child's stdout are written to w as
 // they arrive. Returns nil on clean ctx cancel; non-nil on process error.
@@ -35,10 +39,19 @@ type StreamRunner func(ctx context.Context, w io.Writer, argv []string) error
 
 // RealRunner runs argv via os/exec.CommandContext. argv must be non-empty.
 func RealRunner(ctx context.Context, argv []string) (Result, error) {
+	return RealRunnerStdin(ctx, argv, nil)
+}
+
+// RealRunnerStdin is RealRunner with an attached stdin. Used by the
+// apply-config invocation path (JSON piped through sudo to the helper).
+func RealRunnerStdin(ctx context.Context, argv []string, stdin io.Reader) (Result, error) {
 	if len(argv) == 0 {
 		return Result{}, errors.New("exec: empty argv")
 	}
 	cmd := exec.CommandContext(ctx, argv[0], argv[1:]...)
+	if stdin != nil {
+		cmd.Stdin = stdin
+	}
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr

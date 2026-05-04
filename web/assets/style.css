@@ -184,3 +184,19 @@ code {
   border-radius: 3px;
   font-size: 0.85em;
 }
+
+.config-form .field { margin-bottom: 0.75rem; }
+.config-form input[type=text] {
+  width: 100%;
+  padding: 0.5rem 0.6rem;
+  font-size: 0.95rem;
+  background: var(--bg);
+  color: var(--fg);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+}
+.config-form label code { font-size: 0.75em; color: var(--muted); }
+.config-form button[type=submit] { width: 100%; margin-top: 0.5rem; }
+details { margin-top: 1rem; }
+details summary { cursor: pointer; }
