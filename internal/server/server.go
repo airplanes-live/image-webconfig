@@ -145,12 +145,14 @@ func New(d Deps) http.Handler {
 	mux.HandleFunc("POST /api/reboot", s.requireSession(s.handleReboot))
 
 	// Static assets at /static/*; the SPA shell is served by the GET /
-	// handler below.
+	// handler below. no-store cache policy: assets are embedded in the
+	// binary and a binary update is the only way they change, so a stale
+	// cached copy after rollout would mask the new UI.
 	staticFS, err := fs.Sub(webassets.FS, "assets")
 	if err != nil {
 		panic(err) // compile-time guarantee — embed.FS always has this dir
 	}
-	mux.Handle("GET /static/", http.StripPrefix("/static/", http.FileServer(http.FS(staticFS))))
+	mux.Handle("GET /static/", http.StripPrefix("/static/", noStore(http.FileServer(http.FS(staticFS)))))
 
 	// SPA shell: serve index.html on the root and reject anything else that
 	// fell through to /-prefix matching.
@@ -159,6 +161,13 @@ func New(d Deps) http.Handler {
 	// Compose middleware: security headers on every response; Origin/Host
 	// check on every mutating method.
 	return securityHeaders(requireOriginMatchesHost(mux))
+}
+
+func noStore(h http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Cache-Control", "no-store")
+		h.ServeHTTP(w, r)
+	})
 }
 
 func (s *Server) handleHealth(w http.ResponseWriter, _ *http.Request) {
