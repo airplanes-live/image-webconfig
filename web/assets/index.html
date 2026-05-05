@@ -3,14 +3,32 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>airplanes.live webconfig</title>
+<title>airplanes.live feeder</title>
+<link rel="icon" type="image/svg+xml" href="/static/icon.svg">
 <link rel="stylesheet" href="/static/style.css">
 </head>
 <body>
-<header>
-<h1>airplanes.live <span class="muted">webconfig</span></h1>
+<header class="wc-header">
+  <div class="wc-header__inner">
+    <a class="wc-brand" href="/" aria-label="Airplanes.live Feeder dashboard">
+      <img class="wc-brand__mark" src="/static/icon.svg" alt="" width="32" height="32">
+      <span class="wc-brand__text">
+        <span class="wc-brand__name">Airplanes.live Feeder</span>
+        <span class="wc-brand__meta">Web Config</span>
+      </span>
+    </a>
+    <span class="wc-header__title" id="wc-header-title"></span>
+    <div class="wc-header__actions">
+      <button type="button" class="wc-btn-ghost" id="wc-back-btn" hidden>← Dashboard</button>
+      <button type="button" class="wc-btn-icon" id="wc-theme-btn" aria-label="Toggle theme" title="Toggle theme">
+        <svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true">
+          <path d="M8 15A7 7 0 1 1 8 1v14zm0 1A8 8 0 1 0 8 0a8 8 0 0 0 0 16z"/>
+        </svg>
+      </button>
+    </div>
+  </div>
 </header>
-<main id="app" aria-live="polite">
+<main id="app">
 <p class="muted">Loading…</p>
 </main>
 <script src="/static/app.js" defer></script>

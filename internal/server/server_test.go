@@ -880,6 +880,9 @@ func TestStatic_Serves(t *testing.T) {
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("status = %d, want 200", resp.StatusCode)
 	}
+	if got := resp.Header.Get("Cache-Control"); got != "no-store" {
+		t.Fatalf("Cache-Control = %q, want %q", got, "no-store")
+	}
 }
 
 func TestLogin_RejectsUnknownFields(t *testing.T) {

@@ -1,120 +1,269 @@
+/* airplanes.live feeder webconfig — design system.
+   Tokens mirror the public website's palette (Nunito-Sans-equivalent
+   typographic stack since the device may be offline at first boot, so
+   no font CDN). Theme selectors:
+   - :root carries the light values.
+   - html[data-theme="dark"] / html[data-theme="light"] are JS-set
+     overrides (localStorage). Both fully redefine the palette so a
+     user-chosen light theme beats an OS-dark preference.
+   - @media (prefers-color-scheme: dark) applies only when JS has not
+     written data-theme, so a fresh visit honours the OS. */
+
 :root {
   color-scheme: light dark;
-  --bg: #fafafa;
-  --fg: #1a1a1a;
-  --muted: #666;
-  --border: #ddd;
-  --accent: #1f6feb;
-  --accent-fg: #fff;
-  --error: #b91c1c;
-  --success: #15803d;
-  --radius: 6px;
-  --space: 1rem;
+
+  --wc-font-sans: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui,
+                  Roboto, "Helvetica Neue", Arial, sans-serif;
+  --wc-font-mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+
+  /* Light (default) */
+  --wc-surface-0: #f7f4ec;
+  --wc-surface-1: #fbf8f2;
+  --wc-surface-2: #efe9dc;
+  --wc-surface-3: #ffffff;
+  --wc-ink-1: #142033;
+  --wc-ink-2: #4f5c6b;
+  --wc-ink-3: #6c7987;
+  --wc-line-soft: rgba(20, 32, 51, 0.12);
+  --wc-line-strong: rgba(20, 32, 51, 0.22);
+  --wc-accent: #0c6f9b;
+  --wc-accent-strong: #074b70;
+  --wc-warm: #ef8458;
+  --wc-warm-strong: #db6a3a;
+  --wc-danger: #b1442e;
+  --wc-danger-strong: #8e351f;
+  --wc-success: #15803d;
+  --wc-shell-backdrop: rgba(247, 244, 236, 0.92);
+
+  --wc-status-ok: var(--wc-success);
+  --wc-status-warn: var(--wc-warm);
+  --wc-status-err: var(--wc-danger);
+  --wc-status-na: var(--wc-ink-3);
+
+  --wc-radius: 8px;
+  --wc-radius-sm: 6px;
+  --wc-shadow-soft: 0 1px 2px rgba(20, 32, 51, 0.04);
 }
 
+/* User-chosen dark — overrides OS preference */
+html[data-theme="dark"] {
+  --wc-surface-0: #0d1520;
+  --wc-surface-1: #121f30;
+  --wc-surface-2: #121f30;
+  --wc-surface-3: #172538;
+  --wc-ink-1: #edf3f8;
+  --wc-ink-2: #b8c6d6;
+  --wc-ink-3: #8d9cae;
+  --wc-line-soft: rgba(237, 243, 248, 0.10);
+  --wc-line-strong: rgba(237, 243, 248, 0.22);
+  --wc-accent: #64b9df;
+  --wc-accent-strong: #91d4f0;
+  --wc-warm: #ff9b70;
+  --wc-warm-strong: #ffb489;
+  --wc-danger: #e87a5f;
+  --wc-danger-strong: #f08e74;
+  --wc-success: #3fb950;
+  --wc-shell-backdrop: rgba(13, 21, 32, 0.92);
+  --wc-shadow-soft: 0 1px 2px rgba(0, 0, 0, 0.35);
+}
+
+/* User-chosen light — explicit selector documents the override path. */
+html[data-theme="light"] {
+  /* :root already carries light values; nothing to redefine. */
+}
+
+/* OS preference applies only when no explicit override */
 @media (prefers-color-scheme: dark) {
-  :root {
-    --bg: #0d1117;
-    --fg: #e6edf3;
-    --muted: #8b949e;
-    --border: #30363d;
-    --accent: #2f81f7;
-    --accent-fg: #fff;
-    --error: #f85149;
-    --success: #3fb950;
+  html:not([data-theme]) {
+    --wc-surface-0: #0d1520;
+    --wc-surface-1: #121f30;
+    --wc-surface-2: #121f30;
+    --wc-surface-3: #172538;
+    --wc-ink-1: #edf3f8;
+    --wc-ink-2: #b8c6d6;
+    --wc-ink-3: #8d9cae;
+    --wc-line-soft: rgba(237, 243, 248, 0.10);
+    --wc-line-strong: rgba(237, 243, 248, 0.22);
+    --wc-accent: #64b9df;
+    --wc-accent-strong: #91d4f0;
+    --wc-warm: #ff9b70;
+    --wc-warm-strong: #ffb489;
+    --wc-danger: #e87a5f;
+    --wc-danger-strong: #f08e74;
+    --wc-success: #3fb950;
+    --wc-shell-backdrop: rgba(13, 21, 32, 0.92);
+    --wc-shadow-soft: 0 1px 2px rgba(0, 0, 0, 0.35);
   }
 }
 
 * { box-sizing: border-box; }
 html, body { margin: 0; padding: 0; }
+[hidden] { display: none !important; }
 
 body {
-  background: var(--bg);
-  color: var(--fg);
-  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, Roboto, "Helvetica Neue", Arial, sans-serif;
+  background: var(--wc-surface-0);
+  color: var(--wc-ink-1);
+  font-family: var(--wc-font-sans);
   font-size: 16px;
-  line-height: 1.5;
+  line-height: 1.55;
+  letter-spacing: -0.005em;
   min-height: 100vh;
 }
 
-header {
-  border-bottom: 1px solid var(--border);
-  padding: var(--space) 1.5rem;
+a { color: var(--wc-accent); text-decoration: none; }
+a:hover { color: var(--wc-accent-strong); text-decoration: underline; }
+
+h1, h2, h3 {
+  color: var(--wc-ink-1);
+  font-weight: 600;
+  letter-spacing: -0.01em;
+  margin: 0 0 0.75rem;
+}
+h1 { font-size: 1.25rem; }
+h2 { font-size: 1.1rem; }
+h3 { font-size: 1rem; }
+
+.muted { color: var(--wc-ink-3); font-weight: normal; }
+.error { color: var(--wc-danger); margin-top: 0.5rem; min-height: 1.5em; }
+
+code, pre, kbd, samp {
+  font-family: var(--wc-font-mono);
+  font-variant-numeric: tabular-nums;
 }
 
-h1 { font-size: 1.25rem; margin: 0; font-weight: 600; }
-h2 { font-size: 1.125rem; margin: 0 0 1rem; font-weight: 600; }
-
-.muted { color: var(--muted); font-weight: normal; }
-.error { color: var(--error); margin-top: 0.5rem; min-height: 1.5em; }
-
-main {
-  max-width: 28rem;
-  margin: 2.5rem auto;
-  padding: 0 1.5rem;
+code {
+  background: var(--wc-surface-2);
+  color: var(--wc-ink-1);
+  padding: 0.05rem 0.3rem;
+  border-radius: 3px;
+  font-size: 0.85em;
 }
 
-.panel {
-  background: transparent;
-  border: 1px solid var(--border);
-  border-radius: var(--radius);
-  padding: 1.5rem;
+/* ========== Sticky header ========== */
+
+.wc-header {
+  position: sticky;
+  top: 0;
+  z-index: 10;
+  background: var(--wc-shell-backdrop);
+  -webkit-backdrop-filter: blur(12px);
+  backdrop-filter: blur(12px);
+  border-bottom: 1px solid var(--wc-line-soft);
 }
 
-.panel p {
-  margin: 0 0 1.25rem;
-  color: var(--muted);
+.wc-header__inner {
+  max-width: 60rem;
+  margin: 0 auto;
+  display: flex;
+  align-items: center;
+  gap: 1rem;
+  min-height: 4rem;
+  padding: 0.5rem 1.25rem;
 }
 
-label {
-  display: block;
-  font-weight: 500;
-  margin-bottom: 0.4rem;
-  font-size: 0.9rem;
-}
-
-input[type=password] {
-  width: 100%;
-  padding: 0.6rem 0.75rem;
-  font-size: 1rem;
-  background: var(--bg);
-  color: var(--fg);
-  border: 1px solid var(--border);
-  border-radius: var(--radius);
-}
-
-input[type=password]:focus {
-  outline: 2px solid var(--accent);
-  outline-offset: 1px;
-  border-color: var(--accent);
-}
-
-.field { margin-bottom: 1rem; }
-
-button {
+.wc-brand {
   display: inline-flex;
   align-items: center;
-  justify-content: center;
-  width: 100%;
-  padding: 0.65rem 1rem;
-  font-size: 1rem;
+  gap: 0.75rem;
+  color: var(--wc-ink-1);
+  text-decoration: none;
+}
+.wc-brand:hover { color: var(--wc-ink-1); text-decoration: none; }
+
+.wc-brand__mark {
+  width: 32px;
+  height: 32px;
+  flex-shrink: 0;
+}
+
+.wc-brand__text {
+  display: flex;
+  flex-direction: column;
+  line-height: 1;
+}
+
+.wc-brand__name {
+  font-weight: 600;
+  font-size: 1.05rem;
+  color: var(--wc-ink-1);
+}
+
+.wc-brand__meta {
+  margin-top: 0.25rem;
+  color: var(--wc-ink-3);
+  font-size: 0.7rem;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+}
+
+.wc-header__title {
+  color: var(--wc-ink-2);
+  font-size: 0.95rem;
   font-weight: 500;
-  background: var(--accent);
-  color: var(--accent-fg);
-  border: none;
-  border-radius: var(--radius);
-  cursor: pointer;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
-button:hover { filter: brightness(1.1); }
-button:disabled { opacity: 0.5; cursor: not-allowed; }
-
-button.secondary {
-  background: transparent;
-  color: var(--fg);
-  border: 1px solid var(--border);
+.wc-header__actions {
+  margin-left: auto;
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
 }
-button.secondary:hover { background: var(--border); }
+
+@media (max-width: 480px) {
+  .wc-brand__meta { display: none; }
+  .wc-header__title { font-size: 0.85rem; }
+}
+
+/* ========== Layout shell ========== */
+
+.wc-shell {
+  max-width: 60rem;
+  margin: 1.5rem auto;
+  padding: 0 1.25rem 3rem;
+}
+
+main {
+  max-width: 60rem;
+  margin: 1.5rem auto;
+  padding: 0 1.25rem 3rem;
+}
+
+/* ========== Cards & panels ========== */
+
+.wc-card,
+.panel,
+.dashboard-card {
+  background: var(--wc-surface-1);
+  border: 1px solid var(--wc-line-soft);
+  border-radius: var(--wc-radius);
+  padding: 1.25rem 1.5rem;
+  box-shadow: var(--wc-shadow-soft);
+}
+
+/* No `.wc-card + .wc-card { margin-top }`: cards live inside grids
+   (.wc-split, .wc-grid--tiles) where adjacent siblings sit horizontally,
+   and a top margin on the second sibling forces it to render below
+   its row's natural y-origin. Vertical spacing comes from the grid gap
+   or from explicit margin on the container. */
+
+.wc-card h2,
+.panel h2,
+.dashboard-card h2 {
+  margin: 0 0 0.5rem;
+  font-size: 1rem;
+  font-weight: 600;
+}
+
+.wc-card p,
+.panel p,
+.dashboard-card p {
+  margin: 0 0 0.75rem;
+  color: var(--wc-ink-2);
+  font-size: 0.95rem;
+}
 
 .dashboard-grid {
   display: grid;
@@ -122,17 +271,167 @@ button.secondary:hover { background: var(--border); }
   margin-bottom: 1.5rem;
 }
 
-.dashboard-card {
-  border: 1px solid var(--border);
-  border-radius: var(--radius);
-  padding: 1rem 1.25rem;
+/* ========== Hero strip ========== */
+
+.wc-hero {
+  display: flex;
+  align-items: center;
+  gap: 1rem;
+  padding: 1.25rem 1.5rem;
+  margin-bottom: 1rem;
+  background: var(--wc-surface-1);
+  border: 1px solid var(--wc-line-soft);
+  border-radius: var(--wc-radius);
+  box-shadow: var(--wc-shadow-soft);
 }
 
-.dashboard-card h2 { margin: 0 0 0.5rem; font-size: 1rem; }
-.dashboard-card p { margin: 0; color: var(--muted); font-size: 0.9rem; }
+.wc-hero__body { flex: 1; min-width: 0; }
+.wc-hero__title {
+  font-size: 1.15rem;
+  font-weight: 600;
+  color: var(--wc-ink-1);
+  margin: 0 0 0.2rem;
+}
+.wc-hero__meta {
+  color: var(--wc-ink-2);
+  font-size: 0.9rem;
+  font-family: var(--wc-font-mono);
+  font-variant-numeric: tabular-nums;
+}
 
-.actions { display: flex; flex-wrap: wrap; gap: 0.5rem; }
-.actions button { flex: 1; min-width: 6rem; }
+.wc-hero__badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+  padding: 0.35rem 0.75rem;
+  border-radius: 999px;
+  border: 1px solid var(--wc-line-soft);
+  background: var(--wc-surface-3);
+  font-size: 0.78rem;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--wc-ink-2);
+  font-weight: 600;
+}
+
+/* ========== Service-tile grid ========== */
+
+.wc-grid--tiles {
+  display: grid;
+  gap: 0.75rem;
+  grid-template-columns: 1fr;
+  /* Lock every tile row to the same height so content-driven sub-pixel
+     drift doesn't make adjacent rows look uneven. */
+  grid-auto-rows: 4rem;
+  margin-bottom: 1.25rem;
+}
+@media (min-width: 576px) {
+  .wc-grid--tiles { grid-template-columns: repeat(2, 1fr); }
+}
+@media (min-width: 992px) {
+  .wc-grid--tiles { grid-template-columns: repeat(3, 1fr); }
+}
+
+.wc-tile {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  padding: 0.85rem 1rem;
+  height: 100%;
+  background: var(--wc-surface-1);
+  border: 1px solid var(--wc-line-soft);
+  border-radius: var(--wc-radius-sm);
+  color: var(--wc-ink-1);
+  text-decoration: none;
+  transition: transform 0.12s ease, border-color 0.12s ease, background 0.12s ease;
+}
+.wc-tile:hover,
+.wc-tile:focus-visible {
+  background: var(--wc-surface-3);
+  border-color: var(--wc-line-strong);
+  color: var(--wc-ink-1);
+  text-decoration: none;
+  transform: translateY(-1px);
+  outline: none;
+}
+
+.wc-tile__icon {
+  flex-shrink: 0;
+  width: 1.5rem;
+  height: 1.5rem;
+  color: var(--wc-accent);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.wc-tile__body {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  line-height: 1.25;
+}
+
+.wc-tile__title {
+  font-weight: 600;
+  font-size: 0.95rem;
+  color: var(--wc-ink-1);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.wc-tile__meta {
+  font-size: 0.8rem;
+  color: var(--wc-ink-3);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  font-family: var(--wc-font-mono);
+  font-variant-numeric: tabular-nums;
+  margin-top: 0.15rem;
+}
+
+.wc-tile__dot {
+  flex-shrink: 0;
+  width: 0.7rem;
+  height: 0.7rem;
+  border-radius: 999px;
+  background: var(--wc-status-na);
+  box-shadow: 0 0 0 2px var(--wc-surface-1);
+}
+.wc-tile:hover .wc-tile__dot,
+.wc-tile:focus-visible .wc-tile__dot {
+  box-shadow: 0 0 0 2px var(--wc-surface-3);
+}
+.wc-tile__dot--ok   { background: var(--wc-status-ok); }
+.wc-tile__dot--warn { background: var(--wc-status-warn); }
+.wc-tile__dot--err  { background: var(--wc-status-err); }
+.wc-tile__dot--na   { background: var(--wc-status-na); }
+
+/* External-link affordance for app tiles. The chevron is muted at rest
+   and pops to accent on hover. */
+.wc-tile__chev {
+  flex-shrink: 0;
+  color: var(--wc-ink-3);
+  font-size: 0.95rem;
+  line-height: 1;
+  margin: 0 0.1rem;
+}
+.wc-tile--app:hover .wc-tile__chev,
+.wc-tile--app:focus-visible .wc-tile__chev {
+  color: var(--wc-accent);
+}
+
+/* Stack of two tile grids (services + apps) on the dashboard. Inherit
+   the existing .wc-grid--tiles bottom margin between them; no extra
+   styling needed at the wrapper level. */
+.wc-tiles-stack { display: contents; }
+
+/* ========== Service-state legacy badge (kept for the intermediate
+   state where app.js still emits .service-list / .service-state). The
+   tile UI above replaces this once app.js is updated. ========== */
 
 .service-list { list-style: none; padding: 0; margin: 0; font-size: 0.9rem; }
 .service-list li { padding: 0.2rem 0; }
@@ -141,17 +440,193 @@ button.secondary:hover { background: var(--border); }
   min-width: 4.5rem;
   padding: 0.05rem 0.5rem;
   border-radius: 999px;
-  font-size: 0.75rem;
+  font-size: 0.72rem;
   text-align: center;
   text-transform: uppercase;
-  letter-spacing: 0.5px;
-  background: var(--border);
-  color: var(--fg);
+  letter-spacing: 0.05em;
+  background: var(--wc-surface-2);
+  color: var(--wc-ink-2);
+  font-weight: 600;
 }
-.service-state.state-active { background: var(--success); color: var(--accent-fg); }
-.service-state.state-inactive { background: var(--border); color: var(--muted); }
-.service-state.state-failed { background: var(--error); color: var(--accent-fg); }
-.service-state.state-unknown { background: var(--border); color: var(--muted); font-style: italic; }
+.service-state.state-active   { background: var(--wc-success); color: #fff; }
+.service-state.state-inactive { background: var(--wc-surface-2); color: var(--wc-ink-3); }
+.service-state.state-failed   { background: var(--wc-danger); color: #fff; }
+.service-state.state-unknown  { background: var(--wc-surface-2); color: var(--wc-ink-3); font-style: italic; }
+
+/* ========== Buttons ========== */
+
+button,
+.wc-btn-primary,
+.wc-btn-ghost,
+.wc-btn-danger {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.4rem;
+  width: 100%;
+  min-height: 2.75rem;
+  padding: 0.55rem 1rem;
+  font: inherit;
+  font-weight: 500;
+  font-size: 0.95rem;
+  background: var(--wc-accent);
+  color: #fff;
+  border: 1px solid var(--wc-accent);
+  border-radius: var(--wc-radius-sm);
+  cursor: pointer;
+  transition: transform 0.12s ease, background 0.12s ease, border-color 0.12s ease;
+}
+
+button:hover,
+.wc-btn-primary:hover,
+.wc-btn-ghost:hover,
+.wc-btn-danger:hover {
+  transform: translateY(-1px);
+}
+
+button:focus-visible {
+  outline: 2px solid var(--wc-accent);
+  outline-offset: 2px;
+}
+
+button:disabled,
+button[aria-disabled="true"] {
+  opacity: 0.55;
+  cursor: not-allowed;
+  transform: none;
+}
+
+button.secondary,
+.wc-btn-ghost {
+  background: var(--wc-surface-1);
+  color: var(--wc-ink-1);
+  border-color: var(--wc-line-strong);
+}
+button.secondary:hover,
+.wc-btn-ghost:hover {
+  background: var(--wc-surface-3);
+  border-color: var(--wc-line-strong);
+}
+
+.wc-btn-primary {
+  background: var(--wc-accent);
+  border-color: var(--wc-accent);
+  color: #fff;
+}
+.wc-btn-primary:hover {
+  background: var(--wc-accent-strong);
+  border-color: var(--wc-accent-strong);
+}
+
+.wc-btn-danger {
+  background: var(--wc-danger);
+  border-color: var(--wc-danger);
+  color: #fff;
+}
+.wc-btn-danger:hover {
+  background: var(--wc-danger-strong);
+  border-color: var(--wc-danger-strong);
+}
+
+.wc-btn-icon {
+  width: 2.75rem;
+  min-width: 2.75rem;
+  height: 2.75rem;
+  padding: 0;
+  background: transparent;
+  color: var(--wc-ink-1);
+  border: 1px solid var(--wc-line-soft);
+  border-radius: 999px;
+}
+.wc-btn-icon:hover {
+  background: var(--wc-surface-1);
+  border-color: var(--wc-line-strong);
+  transform: translateY(-1px);
+}
+
+/* The header back button visually matches an icon button when collapsed
+   on mobile but stretches with text on desktop — keep it as a normal
+   ghost button. */
+#wc-back-btn {
+  width: auto;
+  padding: 0.45rem 0.85rem;
+  min-height: 2.5rem;
+  font-size: 0.85rem;
+}
+
+.actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+}
+/* Buttons grow to share row space but never below their natural content
+   width, so labels stay on one line. The row wraps to a second line
+   when the row can't fit them all. width: auto undoes the global
+   button width: 100% — that rule is meant for full-width form submit
+   buttons. */
+.actions button {
+  flex: 1 1 auto;
+  width: auto;
+  min-width: max-content;
+  white-space: nowrap;
+}
+
+/* Top-level action rows that follow a card need separation; intra-card
+   .actions inherit the card's own padding so they don't get this. */
+.wc-card + .actions,
+.wc-grid--tiles + .actions,
+.wc-split + .actions {
+  margin-top: 1rem;
+}
+
+/* ========== Forms ========== */
+
+label {
+  display: block;
+  font-weight: 500;
+  margin-bottom: 0.35rem;
+  font-size: 0.9rem;
+  color: var(--wc-ink-2);
+}
+
+input[type="password"],
+input[type="text"],
+input[type="email"],
+input[type="number"],
+select,
+textarea {
+  width: 100%;
+  padding: 0.6rem 0.75rem;
+  font-size: 1rem;
+  background: var(--wc-surface-3);
+  color: var(--wc-ink-1);
+  border: 1px solid var(--wc-line-strong);
+  border-radius: var(--wc-radius-sm);
+  font-family: var(--wc-font-sans);
+}
+
+input[type="checkbox"] {
+  margin-right: 0.4rem;
+  accent-color: var(--wc-accent);
+}
+
+input:focus,
+select:focus,
+textarea:focus {
+  outline: 2px solid var(--wc-accent);
+  outline-offset: 1px;
+  border-color: var(--wc-accent);
+}
+
+.field { margin-bottom: 1rem; }
+
+.config-form .field { margin-bottom: 0.75rem; }
+.config-form input[type="text"] {
+  font-family: var(--wc-font-mono);
+  font-size: 0.95rem;
+}
+.config-form label code { font-size: 0.75em; color: var(--wc-ink-3); }
+.config-form button[type="submit"] { width: 100%; margin-top: 0.5rem; }
 
 .config-list {
   display: grid;
@@ -160,43 +635,70 @@ button.secondary:hover { background: var(--border); }
   margin: 0;
   font-size: 0.9rem;
 }
-.config-list dt { font-weight: 500; color: var(--muted); }
-.config-list dd { margin: 0; word-break: break-all; font-family: ui-monospace, "SF Mono", Menlo, monospace; }
+.config-list dt { font-weight: 500; color: var(--wc-ink-3); }
+.config-list dd {
+  margin: 0;
+  word-break: break-all;
+  font-family: var(--wc-font-mono);
+  color: var(--wc-ink-1);
+}
+
+/* ========== Logs ========== */
 
 .log-output {
-  background: var(--bg);
-  border: 1px solid var(--border);
-  border-radius: var(--radius);
+  background: var(--wc-surface-2);
+  color: var(--wc-ink-1);
+  border: 1px solid var(--wc-line-soft);
+  border-radius: var(--wc-radius-sm);
   padding: 0.75rem;
   margin: 0.5rem 0;
   max-height: 24rem;
   overflow: auto;
-  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+  font-family: var(--wc-font-mono);
   font-size: 0.8rem;
   white-space: pre-wrap;
   word-break: break-all;
 }
 
-code {
-  font-family: ui-monospace, "SF Mono", Menlo, monospace;
-  background: var(--border);
-  padding: 0.05rem 0.3rem;
-  border-radius: 3px;
-  font-size: 0.85em;
+details { margin-top: 1rem; }
+details summary {
+  cursor: pointer;
+  color: var(--wc-ink-2);
+  font-weight: 500;
 }
 
-.config-form .field { margin-bottom: 0.75rem; }
-.config-form input[type=text] {
-  width: 100%;
-  padding: 0.5rem 0.6rem;
-  font-size: 0.95rem;
-  background: var(--bg);
-  color: var(--fg);
-  border: 1px solid var(--border);
-  border-radius: var(--radius);
-  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+/* ========== Two-column responsive split (identity + config) ========== */
+
+.wc-split {
+  display: grid;
+  gap: 1rem;
+  margin-bottom: 1.25rem;
+  grid-template-columns: 1fr;
 }
-.config-form label code { font-size: 0.75em; color: var(--muted); }
-.config-form button[type=submit] { width: 100%; margin-top: 0.5rem; }
-details { margin-top: 1rem; }
-details summary { cursor: pointer; }
+@media (min-width: 768px) {
+  .wc-split { grid-template-columns: 1fr 1fr; }
+}
+
+/* ========== Reduced motion ========== */
+
+@media (prefers-reduced-motion: reduce) {
+  .wc-tile,
+  .wc-tile:hover,
+  button,
+  button:hover,
+  .wc-btn-primary,
+  .wc-btn-primary:hover,
+  .wc-btn-ghost,
+  .wc-btn-ghost:hover,
+  .wc-btn-danger,
+  .wc-btn-danger:hover,
+  .wc-btn-icon,
+  .wc-btn-icon:hover {
+    transition: none;
+    transform: none;
+  }
+  .wc-header {
+    -webkit-backdrop-filter: none;
+    backdrop-filter: none;
+  }
+}
