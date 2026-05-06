@@ -306,8 +306,8 @@ func (s *Server) handleIdentity(w http.ResponseWriter, _ *http.Request) {
 // /api/identity/secret (POST): full claim secret reveal. POST so it can't
 // be cached or logged in browser history; Cache-Control: no-store via
 // writeJSON.
-func (s *Server) handleIdentitySecret(w http.ResponseWriter, r *http.Request) {
-	got, err := s.identity.Reveal(r.Context())
+func (s *Server) handleIdentitySecret(w http.ResponseWriter, _ *http.Request) {
+	got, err := s.identity.Reveal()
 	if err != nil {
 		if errors.Is(err, identity.ErrNoClaimSecret) {
 			writeJSONError(w, http.StatusNotFound, "no claim secret yet — register first")

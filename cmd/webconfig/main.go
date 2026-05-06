@@ -79,7 +79,7 @@ func main() {
 			Lockout:      auth.NewLockout(*lockoutThreshold, *lockoutWindow, *lockoutDuration),
 			Guard:        guard,
 			Argon2Params: params,
-			Identity:     identity.NewReader(identity.DefaultPaths(), nil),
+			Identity:     identity.NewReader(identity.DefaultPaths()),
 			FeedEnv:      feedenv.New(),
 			Status:       status.NewReader(version, status.DefaultPaths(), nil),
 			Logs:         logs.NewStreamer(nil),
