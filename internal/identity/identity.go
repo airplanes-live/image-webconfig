@@ -2,70 +2,68 @@
 //
 // /api/identity (GET) returns just the UUID + a present/absent flag for the
 // secret; the file is at /etc/airplanes/feeder-id and readable by any user,
-// so no shell-out is needed.
+// so no privilege bump is needed.
 //
 // /api/identity/secret (POST, authed) returns the full claim secret. The
-// secret file is /etc/airplanes/feeder-claim-secret, mode 0600 — webconfig
-// (running as airplanes-webconfig) can't read it directly. Reveal goes
-// through `sudo -n -u airplanes-feed /usr/local/bin/apl-feed claim show`
-// whose argv is pinned in /etc/sudoers.d.
+// secret file is /etc/airplanes/feeder-claim-secret, mode 0640 group=
+// airplanes-feed (set by feed/scripts/apl-feed/common.sh:write_secret_file).
+// airplanes-webconfig is a member of the airplanes-feed group (added in
+// stage-airplanes/05-install-webconfig/01-run-chroot.sh), so we read the
+// file directly via group permissions — no sudo, no apl-feed CLI shell-out.
 package identity
 
 import (
-	"bufio"
-	"context"
 	"errors"
+	"fmt"
 	"io/fs"
 	"os"
+	"regexp"
 	"strings"
-
-	wexec "github.com/airplanes-live/image/webconfig/internal/exec"
 )
 
-// Paths webconfig reads / shells out to. Override per-test.
+// Paths webconfig reads. Override per-test.
 type Paths struct {
-	FeederIDFile     string // /etc/airplanes/feeder-id
-	ClaimSecretFile  string // /etc/airplanes/feeder-claim-secret
-	APLFeedSudoArgv  []string
+	FeederIDFile    string // /etc/airplanes/feeder-id
+	ClaimSecretFile string // /etc/airplanes/feeder-claim-secret
+	ClaimPageURL    string // https://airplanes.live/feeder/claim
 }
 
-// DefaultPaths returns production paths and the sudo argv shape that the
-// shipped sudoers entry permits.
+const defaultClaimPageURL = "https://airplanes.live/feeder/claim"
+
+// DefaultPaths returns production paths.
 func DefaultPaths() Paths {
 	return Paths{
 		FeederIDFile:    "/etc/airplanes/feeder-id",
 		ClaimSecretFile: "/etc/airplanes/feeder-claim-secret",
-		APLFeedSudoArgv: []string{
-			"/usr/bin/sudo", "-n", "-u", "airplanes-feed",
-			"/usr/local/bin/apl-feed", "claim", "show",
-		},
+		ClaimPageURL:    defaultClaimPageURL,
 	}
 }
 
-// Reader exposes the methods the HTTP handlers call. Tests substitute the
-// CommandRunner for canned `apl-feed claim show` output.
+// Reader exposes the methods the HTTP handlers call. Tests can substitute
+// Paths to point at fixture files.
 type Reader struct {
-	paths   Paths
-	runner  wexec.CommandRunner
+	paths Paths
 }
 
-func NewReader(p Paths, r wexec.CommandRunner) *Reader {
-	if r == nil {
-		r = wexec.RealRunner
+// NewReader builds a Reader. Empty ClaimPageURL falls back to the
+// production default so callers don't have to specify it.
+func NewReader(p Paths) *Reader {
+	if p.ClaimPageURL == "" {
+		p.ClaimPageURL = defaultClaimPageURL
 	}
-	return &Reader{paths: p, runner: r}
+	return &Reader{paths: p}
 }
 
 // Identity is the GET /api/identity payload.
 type Identity struct {
-	FeederID            string `json:"feeder_id"`
-	ClaimSecretPresent  bool   `json:"claim_secret_present"`
+	FeederID           string `json:"feeder_id"`
+	ClaimSecretPresent bool   `json:"claim_secret_present"`
 }
 
 // IdentityWithSecret is the POST /api/identity/secret payload.
 type IdentityWithSecret struct {
 	FeederID    string `json:"feeder_id"`
-	ClaimSecret string `json:"claim_secret"`  // formatted XXXX-XXXX-XXXX-XXXX
+	ClaimSecret string `json:"claim_secret"` // formatted XXXX-XXXX-XXXX-XXXX
 	ClaimPage   string `json:"claim_page"`
 }
 
@@ -75,8 +73,14 @@ var ErrNoFeederID = errors.New("identity: feeder-id missing")
 // ErrNoClaimSecret is returned when no claim secret has been generated yet.
 var ErrNoClaimSecret = errors.New("identity: claim secret missing")
 
+// canonicalSecret matches feed/scripts/apl-feed/common.sh:validate_secret —
+// 16 chars of A-Z / 0-9 after canonicalization (whitespace + hyphens
+// stripped, uppercased). Drift here would silently reject secrets that
+// apl-feed would accept (or vice versa).
+var canonicalSecret = regexp.MustCompile(`^[A-Z0-9]{16}$`)
+
 // Read returns the redacted identity. The feeder-id file is plain-text and
-// readable by anyone; the claim-secret file is mode 0600 and we only stat it.
+// readable by anyone; the claim-secret file we only stat for presence.
 func (r *Reader) Read() (Identity, error) {
 	feederID, err := readSingleLine(r.paths.FeederIDFile)
 	if err != nil {
@@ -98,50 +102,77 @@ func (r *Reader) Read() (Identity, error) {
 	}, nil
 }
 
-// Reveal returns the full claim secret via the pinned-argv `apl-feed claim
-// show` shell-out.
-func (r *Reader) Reveal(ctx context.Context) (IdentityWithSecret, error) {
-	res, err := r.runner(ctx, r.paths.APLFeedSudoArgv)
+// Reveal returns the full claim secret. Reads /etc/airplanes/feeder-claim-secret
+// directly via group permissions — no sudo, no shell-out.
+//
+// "File missing" is the only condition that maps to ErrNoClaimSecret (the
+// 404 "register first" UX). An existing file whose first line doesn't
+// canonicalize to a valid 16-char A-Z 0-9 secret is treated as malformed,
+// not absent — surfacing real corruption instead of telling the operator
+// to register a secret they already have.
+func (r *Reader) Reveal() (IdentityWithSecret, error) {
+	feederID, err := readSingleLine(r.paths.FeederIDFile)
 	if err != nil {
-		// Pass through stderr if any so /var/log/journal shows the cause.
-		return IdentityWithSecret{}, errors.New("identity reveal: " + err.Error())
-	}
-	parsed, err := parseClaimShow(string(res.Stdout))
-	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return IdentityWithSecret{}, ErrNoFeederID
+		}
 		return IdentityWithSecret{}, err
 	}
-	if parsed.FeederID == "" || parsed.ClaimSecret == "" {
-		return IdentityWithSecret{}, ErrNoClaimSecret
+	if feederID == "" {
+		return IdentityWithSecret{}, ErrNoFeederID
 	}
-	return parsed, nil
+
+	raw, err := os.ReadFile(r.paths.ClaimSecretFile)
+	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return IdentityWithSecret{}, ErrNoClaimSecret
+		}
+		// EISDIR, permission-denied, anything else: surface as a genuine
+		// read failure rather than masquerading as "no claim secret".
+		return IdentityWithSecret{}, fmt.Errorf("read claim secret: %w", err)
+	}
+	// First line only — no TrimSpace before canonicalize. canonicalize
+	// already strips ASCII whitespace and hyphens, so a CRLF-terminated
+	// secret normalizes correctly without TrimSpace's broader Unicode
+	// behavior diverging from feed's `tr -d '[:space:]-'` posture.
+	firstLine, _, _ := strings.Cut(string(raw), "\n")
+	canonical := canonicalize(firstLine)
+	if !canonicalSecret.MatchString(canonical) {
+		return IdentityWithSecret{}, errors.New("identity: claim secret on disk is not canonical")
+	}
+
+	return IdentityWithSecret{
+		FeederID:    feederID,
+		ClaimSecret: format4x4(canonical),
+		ClaimPage:   r.paths.ClaimPageURL,
+	}, nil
 }
 
-// parseClaimShow accepts the `apl-feed claim show` output:
-//
-//	Feeder ID: <uuid>
-//	Claim secret: XXXX-XXXX-XXXX-XXXX
-//	Claim page: https://...
-//	Version: <n>     (optional)
-//
-// Lines beyond these are ignored.
-func parseClaimShow(out string) (IdentityWithSecret, error) {
-	var got IdentityWithSecret
-	scanner := bufio.NewScanner(strings.NewReader(out))
-	for scanner.Scan() {
-		line := scanner.Text()
+// canonicalize mirrors feed's canonicalize_secret: strip whitespace and
+// hyphens, uppercase the rest. Robust against drift in how the secret was
+// originally written (e.g. lowercase, hyphenated).
+func canonicalize(s string) string {
+	var b strings.Builder
+	b.Grow(len(s))
+	for _, ch := range s {
 		switch {
-		case strings.HasPrefix(line, "Feeder ID:"):
-			got.FeederID = strings.TrimSpace(strings.TrimPrefix(line, "Feeder ID:"))
-		case strings.HasPrefix(line, "Claim secret:"):
-			got.ClaimSecret = strings.TrimSpace(strings.TrimPrefix(line, "Claim secret:"))
-		case strings.HasPrefix(line, "Claim page:"):
-			got.ClaimPage = strings.TrimSpace(strings.TrimPrefix(line, "Claim page:"))
+		case ch == '-':
+			continue
+		case ch == ' ' || ch == '\t' || ch == '\r' || ch == '\n':
+			continue
+		case ch >= 'a' && ch <= 'z':
+			b.WriteRune(ch - 'a' + 'A')
+		default:
+			b.WriteRune(ch)
 		}
 	}
-	if err := scanner.Err(); err != nil {
-		return IdentityWithSecret{}, err
-	}
-	return got, nil
+	return b.String()
+}
+
+// format4x4 formats a 16-char canonical secret as XXXX-XXXX-XXXX-XXXX.
+// Caller must validate length first.
+func format4x4(canonical string) string {
+	return canonical[0:4] + "-" + canonical[4:8] + "-" + canonical[8:12] + "-" + canonical[12:16]
 }
 
 func readSingleLine(path string) (string, error) {

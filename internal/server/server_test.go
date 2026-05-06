@@ -45,17 +45,10 @@ func newTestServer(t *testing.T) (*httptest.Server, *Server) {
 	idPaths := identity.Paths{
 		FeederIDFile:    filepath.Join(dir, "feeder-id"),
 		ClaimSecretFile: filepath.Join(dir, "feeder-claim-secret"),
-		APLFeedSudoArgv: []string{"/bin/echo", "stub"},
+		ClaimPageURL:    "https://airplanes.live/feeder/claim",
 	}
 	_ = os.WriteFile(idPaths.FeederIDFile, []byte("test-feeder-id"), 0o644)
-	_ = os.WriteFile(idPaths.ClaimSecretFile, []byte("ABCDEFGHIJKLMNOP"), 0o600)
-	idStubRunner := func(_ context.Context, _ []string) (wexec.Result, error) {
-		return wexec.Result{Stdout: []byte(
-			"Feeder ID: test-feeder-id\n" +
-				"Claim secret: ABCD-EFGH-IJKL-MNOP\n" +
-				"Claim page: https://airplanes.live/feeder/claim\n",
-		)}, nil
-	}
+	_ = os.WriteFile(idPaths.ClaimSecretFile, []byte("ABCDEFGHIJKLMNOP"), 0o640)
 
 	feedEnvPath := filepath.Join(dir, "feed.env")
 	_ = os.WriteFile(feedEnvPath,
@@ -121,7 +114,7 @@ func newTestServer(t *testing.T) (*httptest.Server, *Server) {
 		Lockout:      auth.NewLockout(5, time.Minute, 15*time.Minute),
 		Guard:        guard,
 		Argon2Params: fastTestParams,
-		Identity:     identity.NewReader(idPaths, idStubRunner),
+		Identity:     identity.NewReader(idPaths),
 		FeedEnv:      &feedenv.Reader{Path: feedEnvPath},
 		Status:       status.NewReader("test-sha", statusPaths, statusRunner),
 		Logs:         logs.NewStreamer(logsRunner),
@@ -225,7 +218,7 @@ func newWriteHarness(t *testing.T) *writeHarness {
 		Lockout:      auth.NewLockout(5, time.Minute, 15*time.Minute),
 		Guard:        guard,
 		Argon2Params: fastTestParams,
-		Identity:     identity.NewReader(identity.Paths{FeederIDFile: filepath.Join(dir, "feeder-id")}, nil),
+		Identity:     identity.NewReader(identity.Paths{FeederIDFile: filepath.Join(dir, "feeder-id")}),
 		FeedEnv:      &feedenv.Reader{Path: feedEnvPath},
 		Status: status.NewReader("test-sha", status.Paths{
 			SystemctlBinary: "/bin/true", IsActiveTimeout: time.Second,
