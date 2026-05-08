@@ -225,6 +225,12 @@ func mergeAndValidate(existing, updates map[string]string) (map[string]string, e
 			return nil, bail(exitValidation, "preserved value: %v", err)
 		}
 	}
+	// Cross-key consistency: a single-key POST that toggles MLAT_ENABLED=true
+	// without supplying MLAT_USER must fail here, otherwise the merged config
+	// would write an inconsistent feed.env that strict-fails the daemon.
+	if err := configspec.ValidateConsistency(merged); err != nil {
+		return nil, bail(exitValidation, "%v", err)
+	}
 	return merged, nil
 }
 

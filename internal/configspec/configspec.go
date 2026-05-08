@@ -124,6 +124,27 @@ func Validate(key, value string) error {
 	}
 }
 
+// ValidateConsistency enforces cross-key rules on the final merged config
+// after each individual key has passed Validate. Today the only cross-key
+// rule is the MLAT pair: MLAT_ENABLED=true requires a non-empty MLAT_USER
+// (otherwise airplanes-mlat.sh strict-fails with exit 64 and the user sees
+// the unit failed without an obvious cause).
+//
+// Apply-config and server both call this before persisting a merged config
+// so an inconsistent state never reaches disk.
+func ValidateConsistency(merged map[string]string) error {
+	mlatEnabled, hasEnabled := merged["MLAT_ENABLED"]
+	mlatUser, hasUser := merged["MLAT_USER"]
+	if hasEnabled && mlatEnabled == "true" {
+		// MLAT_USER missing or empty + MLAT_ENABLED=true is the inconsistent
+		// shape that strict-fails the daemon.
+		if !hasUser || mlatUser == "" {
+			return validationError("MLAT_USER", "must be non-empty when MLAT_ENABLED=true")
+		}
+	}
+	return nil
+}
+
 // Canonicalize returns the normalized on-disk form of a value (e.g. ALTITUDE
 // always carries the explicit `m` suffix). Validate must succeed first.
 func Canonicalize(key, value string) string {
