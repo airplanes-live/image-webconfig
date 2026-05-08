@@ -20,7 +20,8 @@ var WriteKeys = []string{
 	"LATITUDE",
 	"LONGITUDE",
 	"ALTITUDE",
-	"USER",
+	"MLAT_USER",
+	"MLAT_ENABLED",
 	"GAIN",
 	"UAT_INPUT",
 }
@@ -33,7 +34,8 @@ var AllReadKeys = []string{
 	"LATITUDE",
 	"LONGITUDE",
 	"ALTITUDE",
-	"USER",
+	"MLAT_USER",
+	"MLAT_ENABLED",
 	"INPUT",
 	"INPUT_TYPE",
 	"NET_OPTIONS",
@@ -88,8 +90,11 @@ func CheckUniversal(key, value string) error {
 // Validate enforces the per-key shape (and universal-reject). Returns nil
 // if value is acceptable for the given write-whitelist key.
 //
-// Empty string is accepted only where it has a defined semantic (currently
-// just UAT_INPUT="" → 978 disabled). Other keys reject empty.
+// Empty string is accepted only where it has a defined semantic:
+//   - UAT_INPUT="" → 978 disabled
+//   - MLAT_USER="" → MLAT name unset (must be paired with MLAT_ENABLED=false)
+//
+// Other keys reject empty.
 func Validate(key, value string) error {
 	if !isWriteKey(key) {
 		return validationError(key, "not in write whitelist")
@@ -104,8 +109,10 @@ func Validate(key, value string) error {
 		return validateLongitude(value)
 	case "ALTITUDE":
 		return validateAltitude(value)
-	case "USER":
-		return validateUser(value)
+	case "MLAT_USER":
+		return validateMlatUser(value)
+	case "MLAT_ENABLED":
+		return validateMlatEnabled(value)
 	case "GAIN":
 		return validateGain(value)
 	case "UAT_INPUT":
@@ -115,6 +122,27 @@ func Validate(key, value string) error {
 		// switch exhaustive in case WriteKeys grows.
 		return validationError(key, "no validator")
 	}
+}
+
+// ValidateConsistency enforces cross-key rules on the final merged config
+// after each individual key has passed Validate. Today the only cross-key
+// rule is the MLAT pair: MLAT_ENABLED=true requires a non-empty MLAT_USER
+// (otherwise airplanes-mlat.sh strict-fails with exit 64 and the user sees
+// the unit failed without an obvious cause).
+//
+// Apply-config and server both call this before persisting a merged config
+// so an inconsistent state never reaches disk.
+func ValidateConsistency(merged map[string]string) error {
+	mlatEnabled, hasEnabled := merged["MLAT_ENABLED"]
+	mlatUser, hasUser := merged["MLAT_USER"]
+	if hasEnabled && mlatEnabled == "true" {
+		// MLAT_USER missing or empty + MLAT_ENABLED=true is the inconsistent
+		// shape that strict-fails the daemon.
+		if !hasUser || mlatUser == "" {
+			return validationError("MLAT_USER", "must be non-empty when MLAT_ENABLED=true")
+		}
+	}
+	return nil
 }
 
 // Canonicalize returns the normalized on-disk form of a value (e.g. ALTITUDE
@@ -181,13 +209,34 @@ func validateAltitude(v string) error {
 	return nil
 }
 
-var userRE = regexp.MustCompile(`^[A-Za-z0-9_-]{1,64}$`)
+var mlatUserRE = regexp.MustCompile(`^[A-Za-z0-9_-]{1,64}$`)
 
-func validateUser(v string) error {
-	if !userRE.MatchString(v) {
-		return validationError("USER", `must match [A-Za-z0-9_-]{1,64}`)
+// validateMlatUser accepts an empty string (MLAT name explicitly cleared,
+// must be paired with MLAT_ENABLED=false) or a sanitized identifier of
+// 1-64 chars in [A-Za-z0-9_-]. Pairing is enforced at the apply-config
+// layer, not here, so a single-key POST can clear the name independently
+// of toggling the boolean.
+func validateMlatUser(v string) error {
+	if v == "" {
+		return nil
+	}
+	if !mlatUserRE.MatchString(v) {
+		return validationError("MLAT_USER", `must match [A-Za-z0-9_-]{1,64} or be empty`)
 	}
 	return nil
+}
+
+// validateMlatEnabled accepts only the literal strings "true" and "false".
+// MLAT_ENABLED is a boolean toggle on disk: airplanes-mlat.sh and
+// apl-feed/status.sh both check the predicate `MLAT_ENABLED == "true"`,
+// so any other value (yes/no/1/0/empty) would fall through to disabled.
+// Reject those at write time to keep the schema unambiguous.
+func validateMlatEnabled(v string) error {
+	switch v {
+	case "true", "false":
+		return nil
+	}
+	return validationError("MLAT_ENABLED", `must be "true" or "false"`)
 }
 
 func validateGain(v string) error {

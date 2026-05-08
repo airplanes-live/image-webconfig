@@ -387,6 +387,27 @@ func (s *Server) handleConfigPost(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	// Cross-key consistency precheck: reject the inconsistent
+	// MLAT_ENABLED=true + empty/absent MLAT_USER POST early so the user gets
+	// a clear 400 from the dashboard rather than a silently-failing daemon
+	// after the helper has already written the bad state. We compute the
+	// projection of (existing ∪ updates) for the MLAT pair only — full merge
+	// happens in apply-config.
+	{
+		preview, err := s.feedEnv.ReadAll()
+		if err != nil {
+			log.Printf("config-post: read feed.env for consistency check: %v", err)
+			writeJSONError(w, http.StatusInternalServerError, "feed.env read failed")
+			return
+		}
+		for k, v := range req.Updates {
+			preview[k] = v
+		}
+		if err := configspec.ValidateConsistency(preview); err != nil {
+			writeJSONError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+	}
 
 	s.configMu.Lock()
 	defer s.configMu.Unlock()

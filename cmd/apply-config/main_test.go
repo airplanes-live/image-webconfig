@@ -113,8 +113,8 @@ func TestMergeAndValidate_CanonicalizesAltitude(t *testing.T) {
 
 func TestRenderFeedEnv_DeterministicAlphabetical(t *testing.T) {
 	t.Parallel()
-	a := renderFeedEnv(map[string]string{"USER": "alice", "LATITUDE": "0", "ALTITUDE": "0m"})
-	b := renderFeedEnv(map[string]string{"ALTITUDE": "0m", "LATITUDE": "0", "USER": "alice"})
+	a := renderFeedEnv(map[string]string{"MLAT_USER": "alice", "LATITUDE": "0", "ALTITUDE": "0m"})
+	b := renderFeedEnv(map[string]string{"ALTITUDE": "0m", "LATITUDE": "0", "MLAT_USER": "alice"})
 	if string(a) != string(b) {
 		t.Fatalf("non-deterministic render:\n%s---\n%s", a, b)
 	}
@@ -128,7 +128,8 @@ func TestReadExisting_ParsesQuotedAndUnquoted(t *testing.T) {
 	tmp := t.TempDir() + "/feed.env"
 	body := `# header
 LATITUDE="51.5"
-USER=alice
+MLAT_USER=alice
+MLAT_ENABLED=true
 
 # comment
 NET_OPTIONS="--quiet --verbose"
@@ -143,8 +144,11 @@ NET_OPTIONS="--quiet --verbose"
 	if got["LATITUDE"] != "51.5" {
 		t.Errorf("LATITUDE = %q, want 51.5", got["LATITUDE"])
 	}
-	if got["USER"] != "alice" {
-		t.Errorf("USER = %q, want alice", got["USER"])
+	if got["MLAT_USER"] != "alice" {
+		t.Errorf("MLAT_USER = %q, want alice", got["MLAT_USER"])
+	}
+	if got["MLAT_ENABLED"] != "true" {
+		t.Errorf("MLAT_ENABLED = %q, want true", got["MLAT_ENABLED"])
 	}
 	if got["NET_OPTIONS"] != "--quiet --verbose" {
 		t.Errorf("NET_OPTIONS = %q", got["NET_OPTIONS"])

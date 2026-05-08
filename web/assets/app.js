@@ -261,6 +261,12 @@
         return parseFloat(lat) !== 0 || parseFloat(lon) !== 0;
     }
 
+    function isMlatExplicitlyDisabled(values) {
+        // Mirror the predicate in airplanes-mlat.sh: MLAT_ENABLED=false is
+        // the user's explicit "off" toggle, distinct from "lat/lon not set".
+        return (values.MLAT_ENABLED || "").trim() === "false";
+    }
+
     function classifyService(unit, state, feed, configValues) {
         // Default falls through unknowns.
         const base = { dot: "warn", meta: state || "unknown" };
@@ -279,6 +285,7 @@
             case "airplanes-mlat.service": {
                 if (state === "active") return { dot: "ok", meta: "mlat running" };
                 if (state === "failed") return { dot: "err", meta: "failed" };
+                if (isMlatExplicitlyDisabled(configValues)) return { dot: "na", meta: "disabled — MLAT off in config" };
                 if (!isLatLonSet(configValues)) return { dot: "na", meta: "disabled — set lat/lon" };
                 return { dot: "err", meta: "mlat down" };
             }
@@ -348,7 +355,7 @@
             const u2 = get("airplanes-978.service");
             if (u1 !== "active" || u2 !== "active") return { dot: "warn", label: "partial" };
         }
-        if (isLatLonSet(configValues) && get("airplanes-mlat.service") !== "active") {
+        if (isLatLonSet(configValues) && !isMlatExplicitlyDisabled(configValues) && get("airplanes-mlat.service") !== "active") {
             return { dot: "warn", label: "partial" };
         }
         return { dot: "ok", label: "healthy" };
@@ -620,6 +627,17 @@
         });
         inputs["UAT_INPUT"] = uat;
 
+        // MLAT_ENABLED is a separate boolean toggle in the new schema. Default
+        // to "true" when the key is absent (e.g. on a fresh feed.env that
+        // hasn't been written yet) to match the daemon's MLAT_ENABLED:-true.
+        const mlatOn = (values["MLAT_ENABLED"] || "true") === "true";
+        const mlat = el("input", {
+            type: "checkbox",
+            name: "MLAT_ENABLED",
+            checked: mlatOn ? "" : null,
+        });
+        inputs["MLAT_ENABLED"] = mlat;
+
         const err = errorEl();
         const submit = el("button", { type: "submit", class: "wc-btn-primary" }, "Save & restart");
 
@@ -634,12 +652,17 @@
                     LATITUDE: inputs.LATITUDE.value.trim(),
                     LONGITUDE: inputs.LONGITUDE.value.trim(),
                     ALTITUDE: inputs.ALTITUDE.value.trim(),
-                    USER: inputs.USER.value.trim(),
+                    MLAT_USER: inputs.MLAT_USER.value.trim(),
+                    MLAT_ENABLED: mlat.checked ? "true" : "false",
                     GAIN: inputs.GAIN.value.trim(),
                     UAT_INPUT: uat.checked ? "127.0.0.1:30978" : "",
                 };
+                // Always send MLAT_ENABLED and UAT_INPUT — they're explicit
+                // toggles whose "" form is meaningful. Strip other keys when
+                // empty so the user can leave a field unchanged from the
+                // current value rather than blanking it.
                 for (const k of Object.keys(updates)) {
-                    if (k !== "UAT_INPUT" && updates[k] === "") delete updates[k];
+                    if (k !== "UAT_INPUT" && k !== "MLAT_ENABLED" && k !== "MLAT_USER" && updates[k] === "") delete updates[k];
                 }
                 const r = await postJSON("/api/config", { updates });
                 submit.disabled = false;
@@ -656,7 +679,10 @@
             field("LATITUDE", "Latitude", { inputmode: "decimal", placeholder: "51.5" }),
             field("LONGITUDE", "Longitude", { inputmode: "decimal", placeholder: "-0.1" }),
             field("ALTITUDE", "Altitude", { placeholder: "120m" }),
-            field("USER", "MLAT name", { placeholder: "alice" }),
+            field("MLAT_USER", "MLAT name", { placeholder: "alice" }),
+            el("div", { class: "field" },
+                el("label", {}, mlat, " Enable MLAT", " ", el("code", {}, "MLAT_ENABLED")),
+            ),
             field("GAIN", "Gain", { placeholder: "auto" }),
             el("div", { class: "field" },
                 el("label", {}, uat, " Enable 978 UAT", " ", el("code", {}, "UAT_INPUT")),
@@ -667,7 +693,7 @@
         parent.appendChild(form);
 
         const readOnly = Object.keys(values).filter(k =>
-            !["LATITUDE", "LONGITUDE", "ALTITUDE", "USER", "GAIN", "UAT_INPUT"].includes(k)
+            !["LATITUDE", "LONGITUDE", "ALTITUDE", "MLAT_USER", "MLAT_ENABLED", "GAIN", "UAT_INPUT"].includes(k)
         ).sort();
         if (readOnly.length > 0) {
             const tbl = el("dl", { class: "config-list" });

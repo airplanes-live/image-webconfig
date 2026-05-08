@@ -52,7 +52,7 @@ func newTestServer(t *testing.T) (*httptest.Server, *Server) {
 
 	feedEnvPath := filepath.Join(dir, "feed.env")
 	_ = os.WriteFile(feedEnvPath,
-		[]byte(`LATITUDE=51.5`+"\n"+`LONGITUDE=-0.1`+"\n"+`USER=tester`+"\n"),
+		[]byte(`LATITUDE=51.5`+"\n"+`LONGITUDE=-0.1`+"\n"+`MLAT_USER=tester`+"\n"+`MLAT_ENABLED=true`+"\n"),
 		0o644,
 	)
 
@@ -272,7 +272,7 @@ func TestConfigPost_ValidatedRequestRunsHelperThenRestarts(t *testing.T) {
 	t.Parallel()
 	h := newWriteHarness(t)
 	r := postJSON(t, h.client, h.ts.URL+"/api/config", map[string]any{
-		"updates": map[string]string{"LATITUDE": "51.5", "USER": "alice"},
+		"updates": map[string]string{"LATITUDE": "51.5", "MLAT_USER": "alice"},
 	})
 	defer r.Body.Close()
 	if r.StatusCode != http.StatusOK {
@@ -291,7 +291,7 @@ func TestConfigPost_ValidatedRequestRunsHelperThenRestarts(t *testing.T) {
 	if err := json.Unmarshal(stdinCalls[0].stdin, &body); err != nil {
 		t.Fatal(err)
 	}
-	if body.Updates["LATITUDE"] != "51.5" || body.Updates["USER"] != "alice" {
+	if body.Updates["LATITUDE"] != "51.5" || body.Updates["MLAT_USER"] != "alice" {
 		t.Errorf("apply-config stdin = %v", body.Updates)
 	}
 	calls := h.callsCopy()
@@ -1032,8 +1032,8 @@ func TestConfigGet_AuthedReturnsValues(t *testing.T) {
 	if got.Values["LATITUDE"] != "51.5" {
 		t.Errorf("LATITUDE = %q, want 51.5", got.Values["LATITUDE"])
 	}
-	if got.Values["USER"] != "tester" {
-		t.Errorf("USER = %q, want tester", got.Values["USER"])
+	if got.Values["MLAT_USER"] != "tester" {
+		t.Errorf("MLAT_USER = %q, want tester", got.Values["MLAT_USER"])
 	}
 }
 
