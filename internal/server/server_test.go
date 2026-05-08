@@ -152,13 +152,14 @@ type stdinCall struct {
 type writeHarness struct {
 	ts          *httptest.Server
 	client      *http.Client
-	feedEnvPath string
-	mu          sync.Mutex
-	calls       [][]string
-	stdinCalls  []stdinCall
-	runnerErr   error // returned by captureRunner; tests override
-	stdinErr    error
-	stdinResult wexec.Result
+	feedEnvPath  string
+	mu           sync.Mutex
+	calls        [][]string
+	stdinCalls   []stdinCall
+	runnerErr    error                 // returned by captureRunner; tests override
+	runnerErrFor func(argv []string) error // optional: per-argv error; falls back to runnerErr when nil
+	stdinErr     error
+	stdinResult  wexec.Result
 }
 
 func newWriteHarness(t *testing.T) *writeHarness {
@@ -181,7 +182,12 @@ func newWriteHarness(t *testing.T) *writeHarness {
 	captureRunner := func(_ context.Context, argv []string) (wexec.Result, error) {
 		h.mu.Lock()
 		h.calls = append(h.calls, append([]string(nil), argv...))
-		err := h.runnerErr
+		var err error
+		if h.runnerErrFor != nil {
+			err = h.runnerErrFor(argv)
+		} else {
+			err = h.runnerErr
+		}
 		h.mu.Unlock()
 		return wexec.Result{}, err
 	}
@@ -1105,5 +1111,113 @@ func TestLog_KnownUnitStreamsSSE(t *testing.T) {
 	body, _ := io.ReadAll(resp.Body)
 	if !strings.Contains(string(body), "data: test-log-line") {
 		t.Errorf("SSE body missing test-log-line: %q", body)
+	}
+}
+
+// --- pending_restart surfacing (PR 3) ---
+
+func TestConfigPost_PendingRestartOmittedWhenAllSucceed(t *testing.T) {
+	t.Parallel()
+	h := newWriteHarness(t)
+	r := postJSON(t, h.client, h.ts.URL+"/api/config", map[string]any{
+		"updates": map[string]string{"LATITUDE": "51.5", "MLAT_USER": "alice"},
+	})
+	defer r.Body.Close()
+	if r.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d", r.StatusCode)
+	}
+	var body struct {
+		Status         string   `json:"status"`
+		PendingRestart []string `json:"pending_restart"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if body.Status != "applied" {
+		t.Errorf("status = %q, want applied", body.Status)
+	}
+	if len(body.PendingRestart) != 0 {
+		t.Errorf("PendingRestart = %v, want empty (all restarts succeeded)", body.PendingRestart)
+	}
+}
+
+func TestConfigPost_PendingRestartIncludesMLATWhenOnlyMLATFails(t *testing.T) {
+	t.Parallel()
+	h := newWriteHarness(t)
+	// Only fail RestartMLAT (argv[1]=="restart" && argv[2]=="mlat").
+	h.mu.Lock()
+	h.runnerErrFor = func(argv []string) error {
+		if len(argv) >= 3 && argv[1] == "restart" && argv[2] == "mlat" {
+			return errors.New("simulated mlat restart failure")
+		}
+		return nil
+	}
+	h.mu.Unlock()
+
+	r := postJSON(t, h.client, h.ts.URL+"/api/config", map[string]any{
+		"updates": map[string]string{"LATITUDE": "51.5", "MLAT_USER": "alice"},
+	})
+	defer r.Body.Close()
+	if r.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d (err=%q)", r.StatusCode, decodeError(t, r.Body))
+	}
+	var body struct {
+		Status         string   `json:"status"`
+		PendingRestart []string `json:"pending_restart"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if body.Status != "applied" {
+		t.Errorf("status = %q, want applied", body.Status)
+	}
+	if len(body.PendingRestart) != 1 || body.PendingRestart[0] != "airplanes-mlat.service" {
+		t.Errorf("PendingRestart = %v, want [airplanes-mlat.service]", body.PendingRestart)
+	}
+}
+
+func TestConfigPost_PendingRestartIncludesBothWhenBothFail(t *testing.T) {
+	t.Parallel()
+	h := newWriteHarness(t)
+	h.mu.Lock()
+	h.runnerErrFor = func(argv []string) error {
+		if len(argv) >= 3 && argv[1] == "restart" {
+			return errors.New("simulated restart failure")
+		}
+		return nil
+	}
+	h.mu.Unlock()
+
+	r := postJSON(t, h.client, h.ts.URL+"/api/config", map[string]any{
+		"updates": map[string]string{"LATITUDE": "51.5", "MLAT_USER": "alice"},
+	})
+	defer r.Body.Close()
+	if r.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d", r.StatusCode)
+	}
+	var body struct {
+		Status         string   `json:"status"`
+		PendingRestart []string `json:"pending_restart"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(body.PendingRestart) != 2 {
+		t.Fatalf("PendingRestart len = %d, want 2", len(body.PendingRestart))
+	}
+	wantAny := map[string]bool{
+		"airplanes-feed.service": false,
+		"airplanes-mlat.service": false,
+	}
+	for _, u := range body.PendingRestart {
+		if _, ok := wantAny[u]; !ok {
+			t.Errorf("PendingRestart contains unexpected unit %q", u)
+		}
+		wantAny[u] = true
+	}
+	for u, seen := range wantAny {
+		if !seen {
+			t.Errorf("PendingRestart missing %q", u)
+		}
 	}
 }

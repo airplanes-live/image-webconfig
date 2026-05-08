@@ -114,11 +114,30 @@
 
     // ===== Navigation (one cleanup point) =====
 
+    // pendingFlash: one-shot banner consumed by the next panel that
+    // calls consumePendingFlash(). Survives the navigate() teardown so
+    // a "saved, but restart failed" message reaches the dashboard panel
+    // even though navigate() resets dashboardCtx.
+    let pendingFlash = null;
+
+    function consumePendingFlash() {
+        const f = pendingFlash;
+        pendingFlash = null;
+        return f;
+    }
+
+    function buildFlashNode(flash) {
+        if (!flash || !flash.text) return null;
+        const cls = flash.level === "warn" ? "wc-flash wc-flash--warn" : "wc-flash";
+        return el("div", { class: cls, role: "status", "aria-live": "polite" }, flash.text);
+    }
+
     function navigate(panelFn, opts) {
         if (activeStream) { try { activeStream.close(); } catch (_) {} activeStream = null; }
         if (statusTimer) { clearInterval(statusTimer); statusTimer = null; }
         if (activeAbort) { try { activeAbort.abort(); } catch (_) {} activeAbort = null; }
         dashboardCtx = null;
+        if (opts && opts.flash) pendingFlash = opts.flash;
         setHeader(opts);
         panelFn();
     }
@@ -254,20 +273,64 @@
         return null;
     }
 
-    function isLatLonSet(values) {
-        const lat = (values.LATITUDE || "").trim();
-        const lon = (values.LONGITUDE || "").trim();
-        if (!lat || !lon) return false;
-        return parseFloat(lat) !== 0 || parseFloat(lon) !== 0;
+    // previewLatLonSet — projection of unsaved form values onto the
+    // daemon's "would MLAT be enabled?" rule. Used ONLY for the form-time
+    // preview path and for the legacy fallback in classifyService when
+    // the daemon's mlat_decision isn't available. The running daemon's
+    // authoritative answer comes from payload.mlat_decision.
+    //
+    // Daemon disables MLAT if EITHER coordinate is zero; this used to
+    // wrongly OR the comparisons (treating "lat=52, lon=0" as set).
+    // Treat NaN (unparseable) as unset.
+    function previewLatLonSet(values) {
+        const lat = parseFloat((values.LATITUDE || "").trim());
+        const lon = parseFloat((values.LONGITUDE || "").trim());
+        if (Number.isNaN(lat) || Number.isNaN(lon)) return false;
+        return lat !== 0 && lon !== 0;
     }
 
-    function isMlatExplicitlyDisabled(values) {
-        // Mirror the predicate in airplanes-mlat.sh: MLAT_ENABLED=false is
-        // the user's explicit "off" toggle, distinct from "lat/lon not set".
+    // previewMlatDisabled — same projection semantics: read MLAT_ENABLED
+    // from the unsaved form values. The running daemon's truth comes from
+    // payload.mlat_decision.
+    function previewMlatDisabled(values) {
         return (values.MLAT_ENABLED || "").trim() === "false";
     }
 
-    function classifyService(unit, state, feed, configValues) {
+    function mlatDisabledReason(reason) {
+        switch (reason) {
+            case "mlat_enabled_false": return "MLAT_ENABLED=false";
+            case "latitude_zero":      return "LATITUDE=0";
+            case "longitude_zero":     return "LONGITUDE=0";
+            default:                   return reason || "config";
+        }
+    }
+
+    function mlatMisconfigReason(reason) {
+        switch (reason) {
+            case "mlat_user_empty": return "MLAT_USER empty — set name or set MLAT_ENABLED=false";
+            default:                return "misconfigured (" + (reason || "unknown") + ")";
+        }
+    }
+
+    function classifyMlatFromDecision(decision, serviceState) {
+        if (decision.state === "disabled") {
+            return { dot: "na", meta: "disabled — " + mlatDisabledReason(decision.reason) };
+        }
+        if (decision.state === "misconfigured") {
+            return { dot: "err", meta: mlatMisconfigReason(decision.reason) };
+        }
+        // decision.state === "enabled"
+        if (serviceState === "active") return { dot: "ok", meta: "mlat running" };
+        if (serviceState === "failed") return { dot: "err", meta: "failed" };
+        if (serviceState === "activating" || serviceState === "reloading") {
+            return { dot: "warn", meta: "starting" };
+        }
+        return { dot: "err", meta: "mlat down" };
+    }
+
+    function classifyService(unit, state, payload) {
+        const feed = payload.feed || null;
+        const configValues = payload.values || {};
         // Default falls through unknowns.
         const base = { dot: "warn", meta: state || "unknown" };
 
@@ -283,10 +346,19 @@
                 return { dot: "err", meta: "not feeding" };
             }
             case "airplanes-mlat.service": {
+                // Decision-first: an "active" daemon may be sleeping in
+                // disabled-by-config mode. Consult the daemon's published
+                // state file BEFORE the active-state shortcut.
+                const mlatDecision = payload.mlat_decision || null;
+                if (mlatDecision) {
+                    return classifyMlatFromDecision(mlatDecision, state);
+                }
+                // Legacy fallback: pre-PR-1 daemon without a state file,
+                // or transient server-side parse failure.
                 if (state === "active") return { dot: "ok", meta: "mlat running" };
                 if (state === "failed") return { dot: "err", meta: "failed" };
-                if (isMlatExplicitlyDisabled(configValues)) return { dot: "na", meta: "disabled — MLAT off in config" };
-                if (!isLatLonSet(configValues)) return { dot: "na", meta: "disabled — set lat/lon" };
+                if (previewMlatDisabled(configValues)) return { dot: "na", meta: "disabled — MLAT off in config" };
+                if (!previewLatLonSet(configValues)) return { dot: "na", meta: "disabled — set lat/lon" };
                 return { dot: "err", meta: "mlat down" };
             }
             case "readsb.service": {
@@ -334,7 +406,9 @@
         return { dot: "warn", meta: "unknown — observability gap" };
     }
 
-    function classifyOverall(services, feed, configValues) {
+    function classifyOverall(payload) {
+        const services = payload.services || {};
+        const configValues = payload.values || {};
         const get = (u) => services[u] || "unknown";
         const feedState = get("airplanes-feed.service");
         const readsbState = get("readsb.service");
@@ -355,7 +429,16 @@
             const u2 = get("airplanes-978.service");
             if (u1 !== "active" || u2 !== "active") return { dot: "warn", label: "partial" };
         }
-        if (isLatLonSet(configValues) && !isMlatExplicitlyDisabled(configValues) && get("airplanes-mlat.service") !== "active") {
+        // MLAT contributes to overall health when it's the daemon's intent
+        // to run (decision.state === "enabled"). If the daemon decided
+        // disabled or misconfigured, MLAT being non-active is the user's
+        // intended state and shouldn't demote the hero. Falls back to
+        // form-projected previewMlat* helpers if no decision is published.
+        const mlatDecision = payload.mlat_decision || null;
+        const mlatIntendedRunning = mlatDecision
+            ? mlatDecision.state === "enabled"
+            : (previewLatLonSet(configValues) && !previewMlatDisabled(configValues));
+        if (mlatIntendedRunning && get("airplanes-mlat.service") !== "active") {
             return { dot: "warn", label: "partial" };
         }
         return { dot: "ok", label: "healthy" };
@@ -378,10 +461,15 @@
 
     function updateHero(heroEl, status, configValues) {
         const payload = (status && status.payload) || {};
+        // configValues from the form is what the user has typed; fold it
+        // into the payload's "values" so the classifier sees the merged
+        // state (form values override server-snapshot values for cases
+        // where the user has unsaved edits).
+        payload.values = Object.assign({}, payload.values || {}, configValues || {});
         const services = payload.services || {};
         const feed = payload.feed || null;
 
-        const overall = classifyOverall(services, feed, configValues);
+        const overall = classifyOverall(payload);
         heroEl.dotEl.className = "wc-tile__dot wc-tile__dot--" + overall.dot;
         heroEl.labelEl.textContent = overall.label;
 
@@ -436,9 +524,10 @@
         return { root, titleEl, metaEl, dotEl };
     }
 
-    function updateTile(tile, unit, services, feed, configValues) {
+    function updateTile(tile, unit, payload) {
+        const services = payload.services || {};
         const state = services[unit] || "unknown";
-        const c = classifyService(unit, state, feed, configValues);
+        const c = classifyService(unit, state, payload);
         tile.dotEl.className = "wc-tile__dot wc-tile__dot--" + c.dot;
         tile.metaEl.textContent = c.meta;
         tile.root.setAttribute("data-state", state);
@@ -524,12 +613,15 @@
     }
 
     function updateTiles(grid, status, configValues) {
-        const payload = (status && status.payload) || {};
-        const services = payload.services || {};
-        const feed = payload.feed || null;
+        const payload = Object.assign({}, (status && status.payload) || {});
+        // Form-time configValues override the snapshot's values (the user
+        // may have unsaved edits). Each tile classifier reads from
+        // payload.values and payload.mlat_decision; merging here keeps
+        // the call sites simple.
+        payload.values = Object.assign({}, payload.values || {}, configValues || {});
         for (const unit of MONITORED_SERVICES) {
             const tile = grid.tiles[unit];
-            if (tile) updateTile(tile, unit, services, feed, configValues);
+            if (tile) updateTile(tile, unit, payload);
         }
     }
 
@@ -673,7 +765,21 @@
                     return;
                 }
                 // Reload the dashboard so the new values + restart show up.
-                navigate(dashboard, { title: null, showBack: false });
+                // If the server reported a restart failure, pass a one-shot
+                // flash through navigate options — without this, the warning
+                // would clear immediately when navigate() rerenders.
+                const pending = (r.payload && r.payload.pending_restart) || [];
+                const opts = { title: null, showBack: false };
+                if (pending.length > 0) {
+                    opts.flash = {
+                        level: "warn",
+                        text: "Saved, but service restart failed: " + pending.join(", ")
+                            + ". The dashboard reflects the previously running service "
+                            + "until you restart manually: sudo systemctl restart "
+                            + pending.join(" "),
+                    };
+                }
+                navigate(dashboard, opts);
             },
         },
             field("LATITUDE", "Latitude", { inputmode: "decimal", placeholder: "51.5" }),
@@ -774,12 +880,16 @@
         const identityCard = el("section", { class: "wc-card" }, el("h2", {}, "Identity"), identityBody);
         const configCard = el("section", { class: "wc-card" }, el("h2", {}, "Configuration"), configBody);
 
-        render(
+        const flashNode = buildFlashNode(consumePendingFlash());
+        const renderArgs = [];
+        if (flashNode) renderArgs.push(flashNode);
+        renderArgs.push(
             heroEl.root,
             tileGrid.root,
             el("div", { class: "wc-split" }, identityCard, configCard),
             buildActionsRow(),
         );
+        render.apply(null, renderArgs);
 
         const ctx = {
             heroEl, tileGrid, identityBody, configBody,
