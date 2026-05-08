@@ -20,7 +20,8 @@ var WriteKeys = []string{
 	"LATITUDE",
 	"LONGITUDE",
 	"ALTITUDE",
-	"USER",
+	"MLAT_USER",
+	"MLAT_ENABLED",
 	"GAIN",
 	"UAT_INPUT",
 }
@@ -33,7 +34,8 @@ var AllReadKeys = []string{
 	"LATITUDE",
 	"LONGITUDE",
 	"ALTITUDE",
-	"USER",
+	"MLAT_USER",
+	"MLAT_ENABLED",
 	"INPUT",
 	"INPUT_TYPE",
 	"NET_OPTIONS",
@@ -88,8 +90,11 @@ func CheckUniversal(key, value string) error {
 // Validate enforces the per-key shape (and universal-reject). Returns nil
 // if value is acceptable for the given write-whitelist key.
 //
-// Empty string is accepted only where it has a defined semantic (currently
-// just UAT_INPUT="" → 978 disabled). Other keys reject empty.
+// Empty string is accepted only where it has a defined semantic:
+//   - UAT_INPUT="" → 978 disabled
+//   - MLAT_USER="" → MLAT name unset (must be paired with MLAT_ENABLED=false)
+//
+// Other keys reject empty.
 func Validate(key, value string) error {
 	if !isWriteKey(key) {
 		return validationError(key, "not in write whitelist")
@@ -104,8 +109,10 @@ func Validate(key, value string) error {
 		return validateLongitude(value)
 	case "ALTITUDE":
 		return validateAltitude(value)
-	case "USER":
-		return validateUser(value)
+	case "MLAT_USER":
+		return validateMlatUser(value)
+	case "MLAT_ENABLED":
+		return validateMlatEnabled(value)
 	case "GAIN":
 		return validateGain(value)
 	case "UAT_INPUT":
@@ -181,13 +188,34 @@ func validateAltitude(v string) error {
 	return nil
 }
 
-var userRE = regexp.MustCompile(`^[A-Za-z0-9_-]{1,64}$`)
+var mlatUserRE = regexp.MustCompile(`^[A-Za-z0-9_-]{1,64}$`)
 
-func validateUser(v string) error {
-	if !userRE.MatchString(v) {
-		return validationError("USER", `must match [A-Za-z0-9_-]{1,64}`)
+// validateMlatUser accepts an empty string (MLAT name explicitly cleared,
+// must be paired with MLAT_ENABLED=false) or a sanitized identifier of
+// 1-64 chars in [A-Za-z0-9_-]. Pairing is enforced at the apply-config
+// layer, not here, so a single-key POST can clear the name independently
+// of toggling the boolean.
+func validateMlatUser(v string) error {
+	if v == "" {
+		return nil
+	}
+	if !mlatUserRE.MatchString(v) {
+		return validationError("MLAT_USER", `must match [A-Za-z0-9_-]{1,64} or be empty`)
 	}
 	return nil
+}
+
+// validateMlatEnabled accepts only the literal strings "true" and "false".
+// MLAT_ENABLED is a boolean toggle on disk: airplanes-mlat.sh and
+// apl-feed/status.sh both check the predicate `MLAT_ENABLED == "true"`,
+// so any other value (yes/no/1/0/empty) would fall through to disabled.
+// Reject those at write time to keep the schema unambiguous.
+func validateMlatEnabled(v string) error {
+	switch v {
+	case "true", "false":
+		return nil
+	}
+	return validationError("MLAT_ENABLED", `must be "true" or "false"`)
 }
 
 func validateGain(v string) error {

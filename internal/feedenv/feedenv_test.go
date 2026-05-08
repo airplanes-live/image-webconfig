@@ -34,7 +34,8 @@ func TestReadAll_QuotedAndUnquoted(t *testing.T) {
 	r := &Reader{Path: writeEnv(t,
 		`LATITUDE="51.5"`+"\n"+
 			`LONGITUDE=-0.1`+"\n"+
-			`USER="Dave Display"`+"\n"+ // quoted with space
+			`MLAT_USER="Dave Display"`+"\n"+ // quoted with space
+			`MLAT_ENABLED=true`+"\n"+
 			`GAIN=auto`+"\n",
 	)}
 	got, err := r.ReadAll()
@@ -42,10 +43,11 @@ func TestReadAll_QuotedAndUnquoted(t *testing.T) {
 		t.Fatal(err)
 	}
 	want := map[string]string{
-		"LATITUDE":  "51.5",
-		"LONGITUDE": "-0.1",
-		"USER":      "Dave Display",
-		"GAIN":      "auto",
+		"LATITUDE":     "51.5",
+		"LONGITUDE":    "-0.1",
+		"MLAT_USER":    "Dave Display",
+		"MLAT_ENABLED": "true",
+		"GAIN":         "auto",
 	}
 	if !mapsEqual(got, want) {
 		t.Errorf("got %v, want %v", got, want)
@@ -57,13 +59,17 @@ func TestReadAll_FiltersToWhitelist(t *testing.T) {
 	r := &Reader{Path: writeEnv(t,
 		`LATITUDE=51.5`+"\n"+
 			`MYSTERY_KEY=should-be-ignored`+"\n"+
-			`USER=alice`+"\n",
+			`USER=legacy-not-whitelisted`+"\n"+
+			`MLAT_USER=alice`+"\n",
 	)}
 	got, _ := r.ReadAll()
 	if _, ok := got["MYSTERY_KEY"]; ok {
 		t.Error("non-whitelisted key leaked into output")
 	}
-	if got["LATITUDE"] != "51.5" || got["USER"] != "alice" {
+	if _, ok := got["USER"]; ok {
+		t.Error("legacy USER key leaked into output (should be excluded post-split)")
+	}
+	if got["LATITUDE"] != "51.5" || got["MLAT_USER"] != "alice" {
 		t.Errorf("missing whitelisted values: %v", got)
 	}
 }
