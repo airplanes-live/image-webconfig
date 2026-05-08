@@ -437,23 +437,51 @@ func (s *Server) handleConfigPost(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Service restart for feed + mlat. Failures here log loudly but do not
-	// roll back feed.env — that would require a transaction we don't have.
-	for _, argv := range [][]string{s.priv.RestartFeed, s.priv.RestartMLAT} {
-		if err := s.runSudo(r.Context(), argv, systemctlTimeout); err != nil {
-			log.Printf("config-post: %v", err)
+	// Service restart for feed + mlat. Failures here log loudly AND get
+	// surfaced to the client as `pending_restart` so the dashboard can
+	// alert the user that their saved config isn't actually running yet.
+	// Restarting the daemon is what makes the new config take effect; if
+	// it doesn't happen, /api/status will continue to reflect the previous
+	// running config — making this a real foot-gun if silently swallowed.
+	var pendingRestart []string
+	for _, namedArgv := range []struct {
+		unit string
+		argv []string
+	}{
+		{"airplanes-feed.service", s.priv.RestartFeed},
+		{"airplanes-mlat.service", s.priv.RestartMLAT},
+	} {
+		if err := s.runSudo(r.Context(), namedArgv.argv, systemctlTimeout); err != nil {
+			log.Printf("config-post: %s restart: %v", namedArgv.unit, err)
+			pendingRestart = append(pendingRestart, namedArgv.unit)
 		}
 	}
 
 	// 978 reconcile from final UAT_INPUT (idempotent: enable on enabled is
 	// a no-op; start on running is a no-op; same for stop+disable).
+	// PR 4 will surface 978 reconcile failures via the same pending-shape;
+	// for PR 3 they remain log-and-continue.
 	if finalUAT == "" {
 		s.reconcile978Off(r.Context())
 	} else {
 		s.reconcile978On(r.Context())
 	}
 
-	writeJSON(w, http.StatusOK, map[string]string{"status": "applied"})
+	writeJSON(w, http.StatusOK, configApplyResponse{
+		Status:         "applied",
+		PendingRestart: pendingRestart,
+	})
+}
+
+// configApplyResponse is the body returned by POST /api/config. The
+// PendingRestart field is omitempty so the legacy {"status":"applied"}
+// shape is preserved when all restarts succeed; new clients check for
+// pending_restart and surface a "saved, but restart failed" banner.
+// Unit names are full ("airplanes-mlat.service") so clients don't have
+// to append .service.
+type configApplyResponse struct {
+	Status         string   `json:"status"`
+	PendingRestart []string `json:"pending_restart,omitempty"`
 }
 
 // configError carries an HTTP status + safe-to-surface message.

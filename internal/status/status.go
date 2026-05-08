@@ -16,6 +16,7 @@ import (
 	"time"
 
 	wexec "github.com/airplanes-live/image/webconfig/internal/exec"
+	"github.com/airplanes-live/image/webconfig/internal/runtimestate"
 )
 
 // MonitoredServices is the static list every /api/status query reports on.
@@ -34,6 +35,8 @@ var MonitoredServices = []string{
 type Paths struct {
 	ManifestFile        string // /etc/airplanes/build-manifest.json
 	AircraftJSONFile    string // /run/readsb/aircraft.json
+	MlatStateFile       string // /run/airplanes-mlat/state
+	FeedStateFile       string // /run/airplanes-feed/state
 	SystemctlSudoArgv0  []string // [sudo, -n, ...] OR [systemctl] (no sudo: is-active is read-only)
 	SystemctlBinary     string   // /usr/bin/systemctl
 	IsActiveTimeout     time.Duration
@@ -43,6 +46,8 @@ func DefaultPaths() Paths {
 	return Paths{
 		ManifestFile:     "/etc/airplanes/build-manifest.json",
 		AircraftJSONFile: "/run/readsb/aircraft.json",
+		MlatStateFile:    "/run/airplanes-mlat/state",
+		FeedStateFile:    "/run/airplanes-feed/state",
 		SystemctlBinary:  "/usr/bin/systemctl",
 		IsActiveTimeout:  2 * time.Second,
 	}
@@ -70,6 +75,22 @@ type Status struct {
 	Services map[string]string  `json:"services"` // unit → "active" / "inactive" / "unknown"
 	Manifest json.RawMessage    `json:"manifest,omitempty"`
 	Feed     *FeedStats         `json:"feed,omitempty"`
+	// Decisions are the daemons' published config-classifications, read
+	// from /run/<service>/state. omitempty so an old daemon (pre PR 1
+	// in feed) without a state file doesn't break the JSON shape —
+	// clients fall back to the service active-state classification.
+	MlatDecision *Decision `json:"mlat_decision,omitempty"`
+	FeedDecision *Decision `json:"feed_decision,omitempty"`
+}
+
+// Decision is the daemon's last-published runtime decision.
+// State is one of "enabled" | "disabled" | "misconfigured" (from
+// runtimestate.AllowedDecisions; unknown tokens are filtered out).
+// Reason is a stable token specific to the state; UI text is the
+// consumer's responsibility.
+type Decision struct {
+	State  string `json:"state"`
+	Reason string `json:"reason"`
 }
 
 // FeedStats summarizes /run/readsb/aircraft.json.
@@ -121,7 +142,74 @@ func (r *Reader) Read(ctx context.Context) (Status, error) {
 		out.Feed = fs
 	}
 
+	out.MlatDecision = r.readMlatDecision(ctx, out.Services["airplanes-mlat.service"])
+	out.FeedDecision = r.readFeedDecision(out.Services["airplanes-feed.service"])
+
 	return out, nil
+}
+
+// readMlatDecision reads the airplanes-mlat daemon's published decision.
+// Consulted when the unit is active|activating|reloading (state file is
+// fresh) OR failed with ExecMainStatus=64 (the strict misconfig fail; the
+// state file persists across the failed terminal state via
+// RuntimeDirectoryPreserve=yes per feed PR 1+2). Returns nil for any
+// other state (consumer falls back to systemd-only classification).
+func (r *Reader) readMlatDecision(ctx context.Context, svcState string) *Decision {
+	consult := false
+	switch svcState {
+	case "active", "activating", "reloading":
+		consult = true
+	case "failed":
+		if r.execMainStatus(ctx, "airplanes-mlat.service") == "64" {
+			consult = true
+		}
+	}
+	if !consult {
+		return nil
+	}
+	return decisionFromFile(r.paths.MlatStateFile)
+}
+
+// readFeedDecision: simpler than mlat; no exit-64 special case (feed
+// daemon has no strict-misconfig path). Only consulted for active /
+// transitioning states.
+func (r *Reader) readFeedDecision(svcState string) *Decision {
+	switch svcState {
+	case "active", "activating", "reloading":
+		return decisionFromFile(r.paths.FeedStateFile)
+	}
+	return nil
+}
+
+func decisionFromFile(path string) *Decision {
+	rs, err := runtimestate.Read(path)
+	if err != nil {
+		return nil
+	}
+	state := rs.Values["state"]
+	if !runtimestate.AllowedDecisions[state] {
+		return nil
+	}
+	return &Decision{State: state, Reason: rs.Values["reason"]}
+}
+
+// execMainStatus runs `systemctl show --property=ExecMainStatus --value <unit>`
+// and returns the trimmed value, or empty string on any error / timeout.
+// Bounded by IsActiveTimeout to match the existing per-call budget.
+func (r *Reader) execMainStatus(ctx context.Context, unit string) string {
+	cctx, cancel := context.WithTimeout(ctx, r.paths.IsActiveTimeout)
+	defer cancel()
+	res, err := r.runner(cctx, []string{
+		r.paths.SystemctlBinary,
+		"show",
+		"--property=ExecMainStatus",
+		"--value",
+		unit,
+	})
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(res.Stdout))
 }
 
 func (r *Reader) isActive(ctx context.Context, unit string) string {
