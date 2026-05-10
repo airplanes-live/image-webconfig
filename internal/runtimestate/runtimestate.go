@@ -41,6 +41,34 @@ var AllowedDecisions = map[string]bool{
 	"misconfigured": true,
 }
 
+// Reason vocabularies are owner-specific so a malformed state file from
+// one daemon cannot pass through with another daemon's reason token.
+// Callers select the right map per the daemon they're reading. Adding a
+// new reason in the bash wrappers requires adding it here in the same
+// PR.
+
+// AllowedReasonsMLAT mirrors airplanes-mlat.sh's _mlat_classify output.
+var AllowedReasonsMLAT = map[string]bool{
+	"ok":                 true,
+	"mlat_enabled_false": true,
+	"latitude_zero":      true,
+	"longitude_zero":     true,
+	"mlat_user_empty":    true,
+}
+
+// AllowedReasonsFeed mirrors airplanes-feed.sh — currently only "ok"
+// (the daemon has no disable/misconfig path).
+var AllowedReasonsFeed = map[string]bool{
+	"ok": true,
+}
+
+// AllowedReasons978 mirrors airplanes-978.sh's _978_classify output.
+var AllowedReasons978 = map[string]bool{
+	"ok":                true,
+	"uat_disabled":      true,
+	"uat_input_invalid": true,
+}
+
 // Read parses a runtime state file. Returns ErrUnknownSchema if the
 // schema_version line is missing or not "1". Returns os.ErrNotExist
 // (wrapped) for a missing file. Other errors propagate as-is.

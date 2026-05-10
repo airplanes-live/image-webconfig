@@ -237,6 +237,7 @@ func newDecisionTestPaths(t *testing.T) Paths {
 		AircraftJSONFile: filepath.Join(dir, "aircraft.json"),
 		MlatStateFile:    filepath.Join(dir, "run", "airplanes-mlat", "state"),
 		FeedStateFile:    filepath.Join(dir, "run", "airplanes-feed", "state"),
+		UAT978StateFile:  filepath.Join(dir, "run", "airplanes-978", "state"),
 		SystemctlBinary:  "systemctl",
 		IsActiveTimeout:  2 * time.Second,
 	}
@@ -375,5 +376,118 @@ func TestRead_FeedDecisionNilOnFailed(t *testing.T) {
 	got, _ := r.Read(context.Background())
 	if got.FeedDecision != nil {
 		t.Errorf("FeedDecision = %+v, want nil for failed feed unit", got.FeedDecision)
+	}
+}
+
+// ---- UAT decision (PR 4) — mirrors MLAT shape on airplanes-978.service ----
+
+func TestRead_UATDecisionPopulatedWhenActive(t *testing.T) {
+	t.Parallel()
+	p := newDecisionTestPaths(t)
+	writeStateFile(t, p.UAT978StateFile, "schema_version=1\nservice=airplanes-978\nstate=enabled\nreason=ok\n")
+	r := NewReader("v", p, perArgvRunner(map[string]func(unit string) (string, error){
+		"is-active:default": func(_ string) (string, error) { return "active", nil },
+	}))
+	got, err := r.Read(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.UATDecision == nil {
+		t.Fatalf("UATDecision = nil, want non-nil")
+	}
+	if got.UATDecision.State != "enabled" {
+		t.Errorf("UATDecision.State = %q, want enabled", got.UATDecision.State)
+	}
+	if got.UATDecision.Reason != "ok" {
+		t.Errorf("UATDecision.Reason = %q, want ok", got.UATDecision.Reason)
+	}
+}
+
+func TestRead_UATDecisionPopulatedOnFailedExit64(t *testing.T) {
+	t.Parallel()
+	p := newDecisionTestPaths(t)
+	writeStateFile(t, p.UAT978StateFile, "schema_version=1\nstate=disabled\nreason=uat_disabled\n")
+	r := NewReader("v", p, perArgvRunner(map[string]func(unit string) (string, error){
+		"is-active:airplanes-978.service":             func(_ string) (string, error) { return "failed", errors.New("exit 3") },
+		"is-active:default":                           func(_ string) (string, error) { return "active", nil },
+		"show-exec-main-status:airplanes-978.service": func(_ string) (string, error) { return "64", nil },
+	}))
+	got, _ := r.Read(context.Background())
+	if got.UATDecision == nil {
+		t.Fatalf("UATDecision = nil, want non-nil for failed+exit-64")
+	}
+	if got.UATDecision.State != "disabled" {
+		t.Errorf("UATDecision.State = %q, want disabled", got.UATDecision.State)
+	}
+	if got.UATDecision.Reason != "uat_disabled" {
+		t.Errorf("UATDecision.Reason = %q, want uat_disabled", got.UATDecision.Reason)
+	}
+}
+
+func TestRead_UATDecisionMisconfigOnFailedExit64(t *testing.T) {
+	t.Parallel()
+	p := newDecisionTestPaths(t)
+	writeStateFile(t, p.UAT978StateFile, "schema_version=1\nstate=misconfigured\nreason=uat_input_invalid\n")
+	r := NewReader("v", p, perArgvRunner(map[string]func(unit string) (string, error){
+		"is-active:airplanes-978.service":             func(_ string) (string, error) { return "failed", errors.New("exit 3") },
+		"is-active:default":                           func(_ string) (string, error) { return "active", nil },
+		"show-exec-main-status:airplanes-978.service": func(_ string) (string, error) { return "64", nil },
+	}))
+	got, _ := r.Read(context.Background())
+	if got.UATDecision == nil {
+		t.Fatalf("UATDecision = nil, want non-nil for failed+exit-64 misconfig")
+	}
+	if got.UATDecision.State != "misconfigured" {
+		t.Errorf("UATDecision.State = %q", got.UATDecision.State)
+	}
+	if got.UATDecision.Reason != "uat_input_invalid" {
+		t.Errorf("UATDecision.Reason = %q", got.UATDecision.Reason)
+	}
+}
+
+func TestRead_UATDecisionNilOnFailedExitNon64(t *testing.T) {
+	t.Parallel()
+	p := newDecisionTestPaths(t)
+	writeStateFile(t, p.UAT978StateFile, "schema_version=1\nstate=enabled\nreason=ok\n")
+	r := NewReader("v", p, perArgvRunner(map[string]func(unit string) (string, error){
+		"is-active:airplanes-978.service":             func(_ string) (string, error) { return "failed", errors.New("exit 3") },
+		"is-active:default":                           func(_ string) (string, error) { return "active", nil },
+		"show-exec-main-status:airplanes-978.service": func(_ string) (string, error) { return "1", nil },
+	}))
+	got, _ := r.Read(context.Background())
+	if got.UATDecision != nil {
+		t.Errorf("UATDecision = %+v, want nil for failed+exit-1 (real failure, not strict misconfig)", got.UATDecision)
+	}
+}
+
+func TestRead_UATDecisionNilOnInactive(t *testing.T) {
+	t.Parallel()
+	p := newDecisionTestPaths(t)
+	// Inactive 978 unit (e.g., never started yet). Even with a stale state
+	// file lying around, the reader should NOT consult it.
+	writeStateFile(t, p.UAT978StateFile, "schema_version=1\nstate=enabled\nreason=ok\n")
+	r := NewReader("v", p, perArgvRunner(map[string]func(unit string) (string, error){
+		"is-active:airplanes-978.service": func(_ string) (string, error) { return "inactive", errors.New("exit 3") },
+		"is-active:default":                func(_ string) (string, error) { return "active", nil },
+	}))
+	got, _ := r.Read(context.Background())
+	if got.UATDecision != nil {
+		t.Errorf("UATDecision = %+v, want nil for inactive 978 unit", got.UATDecision)
+	}
+}
+
+// Cross-owner reason rejection: a 978 state file claiming an MLAT-only reason
+// (e.g. `mlat_user_empty`) is dropped by the owner-aware reason whitelist —
+// AllowedReasons978 doesn't include it.
+func TestRead_UATDecisionRejectsCrossOwnerReason(t *testing.T) {
+	t.Parallel()
+	p := newDecisionTestPaths(t)
+	writeStateFile(t, p.UAT978StateFile, "schema_version=1\nstate=misconfigured\nreason=mlat_user_empty\n")
+	r := NewReader("v", p, perArgvRunner(map[string]func(unit string) (string, error){
+		"is-active:default": func(_ string) (string, error) { return "active", nil },
+	}))
+	got, _ := r.Read(context.Background())
+	if got.UATDecision != nil {
+		t.Errorf("UATDecision = %+v, want nil (mlat_user_empty is not a valid 978 reason)", got.UATDecision)
 	}
 }

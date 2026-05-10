@@ -33,13 +33,14 @@ var MonitoredServices = []string{
 // Paths configures file lookups; defaults match the rootfs layout. Override
 // in tests.
 type Paths struct {
-	ManifestFile        string // /etc/airplanes/build-manifest.json
-	AircraftJSONFile    string // /run/readsb/aircraft.json
-	MlatStateFile       string // /run/airplanes-mlat/state
-	FeedStateFile       string // /run/airplanes-feed/state
-	SystemctlSudoArgv0  []string // [sudo, -n, ...] OR [systemctl] (no sudo: is-active is read-only)
-	SystemctlBinary     string   // /usr/bin/systemctl
-	IsActiveTimeout     time.Duration
+	ManifestFile       string // /etc/airplanes/build-manifest.json
+	AircraftJSONFile   string // /run/readsb/aircraft.json
+	MlatStateFile      string // /run/airplanes-mlat/state
+	FeedStateFile      string // /run/airplanes-feed/state
+	UAT978StateFile    string // /run/airplanes-978/state
+	SystemctlSudoArgv0 []string // [sudo, -n, ...] OR [systemctl] (no sudo: is-active is read-only)
+	SystemctlBinary    string   // /usr/bin/systemctl
+	IsActiveTimeout    time.Duration
 }
 
 func DefaultPaths() Paths {
@@ -48,6 +49,7 @@ func DefaultPaths() Paths {
 		AircraftJSONFile: "/run/readsb/aircraft.json",
 		MlatStateFile:    "/run/airplanes-mlat/state",
 		FeedStateFile:    "/run/airplanes-feed/state",
+		UAT978StateFile:  "/run/airplanes-978/state",
 		SystemctlBinary:  "/usr/bin/systemctl",
 		IsActiveTimeout:  2 * time.Second,
 	}
@@ -71,16 +73,22 @@ func NewReader(version string, p Paths, r wexec.CommandRunner) *Reader {
 
 // Status is the GET /api/status payload.
 type Status struct {
-	Version  string             `json:"webconfig_version"`
-	Services map[string]string  `json:"services"` // unit → "active" / "inactive" / "unknown"
-	Manifest json.RawMessage    `json:"manifest,omitempty"`
-	Feed     *FeedStats         `json:"feed,omitempty"`
+	Version  string            `json:"webconfig_version"`
+	Services map[string]string `json:"services"` // unit → "active" / "inactive" / "unknown"
+	Manifest json.RawMessage   `json:"manifest,omitempty"`
+	Feed     *FeedStats        `json:"feed,omitempty"`
 	// Decisions are the daemons' published config-classifications, read
 	// from /run/<service>/state. omitempty so an old daemon (pre PR 1
-	// in feed) without a state file doesn't break the JSON shape —
-	// clients fall back to the service active-state classification.
+	// in feed, pre PR 4 in image for UAT) without a state file doesn't
+	// break the JSON shape — clients fall back to the service active-state
+	// classification (or, for UAT, to UAT_INPUT-truthy from /api/config).
+	//
+	// UATDecision applies to BOTH 978 services (dump978-fa, airplanes-978):
+	// they share a single state file written by airplanes-978.sh from the
+	// same UAT_INPUT input.
 	MlatDecision *Decision `json:"mlat_decision,omitempty"`
 	FeedDecision *Decision `json:"feed_decision,omitempty"`
+	UATDecision  *Decision `json:"uat_decision,omitempty"`
 }
 
 // Decision is the daemon's last-published runtime decision.
@@ -144,6 +152,7 @@ func (r *Reader) Read(ctx context.Context) (Status, error) {
 
 	out.MlatDecision = r.readMlatDecision(ctx, out.Services["airplanes-mlat.service"])
 	out.FeedDecision = r.readFeedDecision(out.Services["airplanes-feed.service"])
+	out.UATDecision = r.readUATDecision(ctx, out.Services["airplanes-978.service"])
 
 	return out, nil
 }
@@ -167,7 +176,7 @@ func (r *Reader) readMlatDecision(ctx context.Context, svcState string) *Decisio
 	if !consult {
 		return nil
 	}
-	return decisionFromFile(r.paths.MlatStateFile)
+	return decisionFromFile(r.paths.MlatStateFile, runtimestate.AllowedReasonsMLAT)
 }
 
 // readFeedDecision: simpler than mlat; no exit-64 special case (feed
@@ -176,12 +185,39 @@ func (r *Reader) readMlatDecision(ctx context.Context, svcState string) *Decisio
 func (r *Reader) readFeedDecision(svcState string) *Decision {
 	switch svcState {
 	case "active", "activating", "reloading":
-		return decisionFromFile(r.paths.FeedStateFile)
+		return decisionFromFile(r.paths.FeedStateFile, runtimestate.AllowedReasonsFeed)
 	}
 	return nil
 }
 
-func decisionFromFile(path string) *Decision {
+// readUATDecision reads the airplanes-978 daemon's published decision.
+// Same consultation rule as MLAT (active|activating|reloading OR failed
+// with ExecMainStatus=64): when UAT_INPUT is empty/invalid, the wrapper
+// writes state=disabled or state=misconfigured then exits 64, and
+// RuntimeDirectoryPreserve=yes keeps the file across the failed terminal
+// state. Returns nil otherwise so consumers fall back to UAT_INPUT-truthy
+// classification (the prior behavior).
+func (r *Reader) readUATDecision(ctx context.Context, svcState string) *Decision {
+	consult := false
+	switch svcState {
+	case "active", "activating", "reloading":
+		consult = true
+	case "failed":
+		if r.execMainStatus(ctx, "airplanes-978.service") == "64" {
+			consult = true
+		}
+	}
+	if !consult {
+		return nil
+	}
+	return decisionFromFile(r.paths.UAT978StateFile, runtimestate.AllowedReasons978)
+}
+
+// decisionFromFile reads, validates, and returns the Decision encoded in a
+// runtime state file. allowedReasons gates the reason vocabulary per
+// daemon-owner so a malformed 978 file claiming an MLAT-only reason is
+// dropped rather than passed through.
+func decisionFromFile(path string, allowedReasons map[string]bool) *Decision {
 	rs, err := runtimestate.Read(path)
 	if err != nil {
 		return nil
@@ -190,7 +226,11 @@ func decisionFromFile(path string) *Decision {
 	if !runtimestate.AllowedDecisions[state] {
 		return nil
 	}
-	return &Decision{State: state, Reason: rs.Values["reason"]}
+	reason := rs.Values["reason"]
+	if !allowedReasons[reason] {
+		return nil
+	}
+	return &Decision{State: state, Reason: reason}
 }
 
 // execMainStatus runs `systemctl show --property=ExecMainStatus --value <unit>`

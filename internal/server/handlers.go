@@ -369,9 +369,11 @@ const (
 )
 
 // /api/config (POST): atomic feed.env write through the apply-config helper,
-// followed by service restart and 978 reconcile. The whole transaction is
-// serialized by an in-process mutex so concurrent posts can't leave
-// feed.env and 978-unit state inconsistent.
+// followed by per-unit restart for feed/mlat/dump978-fa/airplanes-978. The
+// whole transaction is serialized by an in-process mutex so concurrent posts
+// can't interleave feed.env writes and unit restarts. The 978 daemons
+// self-decide on UAT_INPUT (mlat-style: exit 64 when not requested), so the
+// server only needs to kick a restart — no more enable/disable reconcile.
 func (s *Server) handleConfigPost(w http.ResponseWriter, r *http.Request) {
 	var req configRequest
 	if err := readJSON(w, r, &req); err != nil {
@@ -412,20 +414,6 @@ func (s *Server) handleConfigPost(w http.ResponseWriter, r *http.Request) {
 	s.configMu.Lock()
 	defer s.configMu.Unlock()
 
-	// Compute the desired final UAT_INPUT to drive the 978 reconcile after
-	// the helper writes. If the request didn't touch UAT_INPUT, reconcile
-	// matches whatever feed.env already has.
-	currentValues, err := s.feedEnv.ReadAll()
-	if err != nil {
-		log.Printf("config-post: read feed.env: %v", err)
-		writeJSONError(w, http.StatusInternalServerError, "feed.env read failed")
-		return
-	}
-	finalUAT := currentValues["UAT_INPUT"]
-	if v, ok := req.Updates["UAT_INPUT"]; ok {
-		finalUAT = v
-	}
-
 	if err := s.invokeApplyConfig(r.Context(), req.Updates); err != nil {
 		var ce *configError
 		if errors.As(err, &ce) {
@@ -437,12 +425,20 @@ func (s *Server) handleConfigPost(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Service restart for feed + mlat. Failures here log loudly AND get
-	// surfaced to the client as `pending_restart` so the dashboard can
-	// alert the user that their saved config isn't actually running yet.
-	// Restarting the daemon is what makes the new config take effect; if
-	// it doesn't happen, /api/status will continue to reflect the previous
-	// running config — making this a real foot-gun if silently swallowed.
+	// Service restart for feed + mlat + dump978-fa + airplanes-978. Failures
+	// here log loudly AND get surfaced to the client as `pending_restart` so
+	// the dashboard can alert the user that their saved config isn't actually
+	// running yet. Restarting the daemon is what makes the new config take
+	// effect; if it doesn't happen, /api/status will continue to reflect the
+	// previous running config — making this a real foot-gun if silently
+	// swallowed.
+	//
+	// `systemctl restart` returns 0 once the unit's start job has been
+	// dispatched, regardless of whether the wrapper later exits 64 (the
+	// self-disable path used by mlat and the 978 daemons when their config
+	// says "off"). So restarting on "UAT_INPUT cleared by user" does NOT
+	// generate a spurious pending_restart entry — the daemon is intentionally
+	// failed-terminal, not "couldn't be restarted".
 	var pendingRestart []string
 	for _, namedArgv := range []struct {
 		unit string
@@ -450,21 +446,13 @@ func (s *Server) handleConfigPost(w http.ResponseWriter, r *http.Request) {
 	}{
 		{"airplanes-feed.service", s.priv.RestartFeed},
 		{"airplanes-mlat.service", s.priv.RestartMLAT},
+		{"dump978-fa.service", s.priv.RestartDump978},
+		{"airplanes-978.service", s.priv.RestartUAT},
 	} {
 		if err := s.runSudo(r.Context(), namedArgv.argv, systemctlTimeout); err != nil {
 			log.Printf("config-post: %s restart: %v", namedArgv.unit, err)
 			pendingRestart = append(pendingRestart, namedArgv.unit)
 		}
-	}
-
-	// 978 reconcile from final UAT_INPUT (idempotent: enable on enabled is
-	// a no-op; start on running is a no-op; same for stop+disable).
-	// PR 4 will surface 978 reconcile failures via the same pending-shape;
-	// for PR 3 they remain log-and-continue.
-	if finalUAT == "" {
-		s.reconcile978Off(r.Context())
-	} else {
-		s.reconcile978On(r.Context())
 	}
 
 	writeJSON(w, http.StatusOK, configApplyResponse{
@@ -532,28 +520,6 @@ func (s *Server) runSudo(ctx context.Context, argv []string, timeout time.Durati
 		return fmt.Errorf("sudo %v: %w (stderr=%q)", argv, err, strings.TrimSpace(string(res.Stderr)))
 	}
 	return nil
-}
-
-func (s *Server) reconcile978On(ctx context.Context) {
-	for _, argv := range [][]string{
-		s.priv.EnableDump978, s.priv.EnableUAT,
-		s.priv.StartDump978, s.priv.StartUAT,
-	} {
-		if err := s.runSudo(ctx, argv, systemctlTimeout); err != nil {
-			log.Printf("978-on reconcile: %v", err)
-		}
-	}
-}
-
-func (s *Server) reconcile978Off(ctx context.Context) {
-	for _, argv := range [][]string{
-		s.priv.StopUAT, s.priv.StopDump978,
-		s.priv.DisableUAT, s.priv.DisableDump978,
-	} {
-		if err := s.runSudo(ctx, argv, systemctlTimeout); err != nil {
-			log.Printf("978-off reconcile: %v", err)
-		}
-	}
 }
 
 // /api/update (POST): kicks off a transient airplanes-update.service via

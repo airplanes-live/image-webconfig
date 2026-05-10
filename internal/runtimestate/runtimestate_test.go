@@ -209,3 +209,81 @@ longitude=13.405
 		}
 	}
 }
+
+// AllowedReasons*: owner-aware reason whitelists. PR 4 added these so a
+// malformed state file cannot pass through with a cross-owner reason.
+func TestAllowedReasonsMLAT(t *testing.T) {
+	for _, tok := range []string{
+		"ok", "mlat_enabled_false", "latitude_zero", "longitude_zero", "mlat_user_empty",
+	} {
+		if !AllowedReasonsMLAT[tok] {
+			t.Errorf("AllowedReasonsMLAT[%q] = false, want true", tok)
+		}
+	}
+	for _, tok := range []string{"uat_disabled", "uat_input_invalid", "future_token", ""} {
+		if AllowedReasonsMLAT[tok] {
+			t.Errorf("AllowedReasonsMLAT[%q] = true, want false (cross-owner or unknown)", tok)
+		}
+	}
+}
+
+func TestAllowedReasonsFeed(t *testing.T) {
+	if !AllowedReasonsFeed["ok"] {
+		t.Errorf("AllowedReasonsFeed[ok] = false, want true")
+	}
+	for _, tok := range []string{"uat_disabled", "mlat_enabled_false", ""} {
+		if AllowedReasonsFeed[tok] {
+			t.Errorf("AllowedReasonsFeed[%q] = true, want false", tok)
+		}
+	}
+}
+
+func TestAllowedReasons978(t *testing.T) {
+	for _, tok := range []string{"ok", "uat_disabled", "uat_input_invalid"} {
+		if !AllowedReasons978[tok] {
+			t.Errorf("AllowedReasons978[%q] = false, want true", tok)
+		}
+	}
+	for _, tok := range []string{"mlat_user_empty", "latitude_zero", "future_token", ""} {
+		if AllowedReasons978[tok] {
+			t.Errorf("AllowedReasons978[%q] = true, want false (cross-owner or unknown)", tok)
+		}
+	}
+}
+
+// Round-trip with the 978 wrapper's output shape.
+func TestRead_RoundTripWith978WriterShape(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "state")
+	writeFile(t, path, `schema_version=1
+service=airplanes-978
+state=enabled
+reason=ok
+decided_at=2026-05-08T11:42:13Z
+uat_input=127.0.0.1:30978
+`)
+	s, err := Read(path)
+	if err != nil {
+		t.Fatalf("Read: %v", err)
+	}
+	want := map[string]string{
+		"service":    "airplanes-978",
+		"state":      "enabled",
+		"reason":     "ok",
+		"decided_at": "2026-05-08T11:42:13Z",
+		"uat_input":  "127.0.0.1:30978",
+	}
+	for k, v := range want {
+		if got := s.Values[k]; got != v {
+			t.Errorf("Values[%q] = %q, want %q", k, got, v)
+		}
+	}
+	// Reason is in the 978 whitelist but NOT the MLAT whitelist —
+	// owner-aware filtering is the consumer's responsibility.
+	if !AllowedReasons978[s.Values["reason"]] {
+		t.Errorf("AllowedReasons978[%q] = false, want true", s.Values["reason"])
+	}
+	if AllowedReasonsMLAT[s.Values["reason"]] {
+		t.Errorf("AllowedReasonsMLAT[%q] = true; the 978 reason should not be in MLAT set", s.Values["reason"])
+	}
+}
