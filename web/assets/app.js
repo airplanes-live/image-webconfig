@@ -328,6 +328,35 @@
         return { dot: "err", meta: "mlat down" };
     }
 
+    function uatMisconfigReason(reason) {
+        switch (reason) {
+            case "uat_input_invalid": return "UAT_INPUT invalid — set to '127.0.0.1:30978' or clear";
+            default:                   return "misconfigured (" + (reason || "unknown") + ")";
+        }
+    }
+
+    // classify978FromDecision mirrors classifyMlatFromDecision: the daemon's
+    // published decision drives the tile state, with the unit's systemd
+    // active state only consulted in the "enabled" branch (where transient
+    // failures or starting-up states are user-visible). Used for both the
+    // dump978-fa and airplanes-978 tiles — they share the same UAT_INPUT
+    // decision (only airplanes-978.sh writes the file).
+    function classify978FromDecision(decision, serviceState, activeLabel) {
+        if (decision.state === "disabled") {
+            return { dot: "na", meta: "disabled — UAT off in config" };
+        }
+        if (decision.state === "misconfigured") {
+            return { dot: "err", meta: uatMisconfigReason(decision.reason) };
+        }
+        // decision.state === "enabled"
+        if (serviceState === "active") return { dot: "ok", meta: activeLabel };
+        if (serviceState === "failed") return { dot: "err", meta: "failed" };
+        if (serviceState === "activating" || serviceState === "reloading") {
+            return { dot: "warn", meta: "starting" };
+        }
+        return { dot: "err", meta: "enabled but not running" };
+    }
+
     function classifyService(unit, state, payload) {
         const feed = payload.feed || null;
         const configValues = payload.values || {};
@@ -375,12 +404,22 @@
                 return { dot: "err", meta: "decoder down" };
             }
             case "dump978-fa.service": {
+                const uatDecision = payload.uat_decision || null;
+                if (uatDecision) {
+                    return classify978FromDecision(uatDecision, state, "decoding 978");
+                }
+                // Legacy fallback: pre-PR-4 webconfig binary or daemon
+                // without a state file.
                 const enabled = !!(configValues.UAT_INPUT && configValues.UAT_INPUT.trim());
-                return classify978(state, enabled, "decoding 978");
+                return classify978Fallback(state, enabled, "decoding 978");
             }
             case "airplanes-978.service": {
+                const uatDecision = payload.uat_decision || null;
+                if (uatDecision) {
+                    return classify978FromDecision(uatDecision, state, "relaying UAT");
+                }
                 const enabled = !!(configValues.UAT_INPUT && configValues.UAT_INPUT.trim());
-                return classify978(state, enabled, "relaying UAT");
+                return classify978Fallback(state, enabled, "relaying UAT");
             }
             case "lighttpd.service": {
                 if (state === "active") return { dot: "ok", meta: "serving on :80" };
@@ -397,7 +436,10 @@
         return base;
     }
 
-    function classify978(state, enabled, activeLabel) {
+    // classify978Fallback is the pre-PR-4 UAT_INPUT-truthy classifier;
+    // used only when the server didn't publish a uat_decision (older
+    // webconfig binary, missing state file, schema violation).
+    function classify978Fallback(state, enabled, activeLabel) {
         if (state === "active" && enabled) return { dot: "ok", meta: activeLabel };
         if (state === "active" && !enabled) return { dot: "warn", meta: "active but config disabled (drift)" };
         if (state === "inactive" && enabled) return { dot: "err", meta: "enabled but not running" };
@@ -422,9 +464,15 @@
         }
 
         // Both core services active. Optional services (978, mlat) only
-        // demote us to "partial" if the user has opted into them.
-        const uatEnabled = !!(configValues.UAT_INPUT && configValues.UAT_INPUT.trim());
-        if (uatEnabled) {
+        // demote us to "partial" if the user has opted into them. Decision-
+        // first: the daemon's own answer to "is UAT expected?" wins over
+        // the form-projected UAT_INPUT-truthy preview, which only kicks in
+        // when no decision has been published.
+        const uatDecision = payload.uat_decision || null;
+        const uatIntendedRunning = uatDecision
+            ? uatDecision.state === "enabled"
+            : !!(configValues.UAT_INPUT && configValues.UAT_INPUT.trim());
+        if (uatIntendedRunning) {
             const u1 = get("dump978-fa.service");
             const u2 = get("airplanes-978.service");
             if (u1 !== "active" || u2 !== "active") return { dot: "warn", label: "partial" };

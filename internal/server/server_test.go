@@ -95,14 +95,8 @@ func newTestServer(t *testing.T) (*httptest.Server, *Server) {
 		ApplyConfig:    []string{"sudo-stub", "apply-config"},
 		RestartFeed:    []string{"sudo-stub", "restart", "feed"},
 		RestartMLAT:    []string{"sudo-stub", "restart", "mlat"},
-		StartDump978:   []string{"sudo-stub", "start", "dump978"},
-		StartUAT:       []string{"sudo-stub", "start", "uat"},
-		StopDump978:    []string{"sudo-stub", "stop", "dump978"},
-		StopUAT:        []string{"sudo-stub", "stop", "uat"},
-		EnableDump978:  []string{"sudo-stub", "enable", "dump978"},
-		EnableUAT:      []string{"sudo-stub", "enable", "uat"},
-		DisableDump978: []string{"sudo-stub", "disable", "dump978"},
-		DisableUAT:     []string{"sudo-stub", "disable", "uat"},
+		RestartDump978: []string{"sudo-stub", "restart", "dump978"},
+		RestartUAT:     []string{"sudo-stub", "restart", "uat"},
 		Reboot:         []string{"sudo-stub", "reboot"},
 		StartUpdate:    []string{"sudo-stub", "update"},
 	}
@@ -205,14 +199,8 @@ func newWriteHarness(t *testing.T) *writeHarness {
 		ApplyConfig:    []string{"sudo-stub", "apply-config"},
 		RestartFeed:    []string{"sudo-stub", "restart", "feed"},
 		RestartMLAT:    []string{"sudo-stub", "restart", "mlat"},
-		StartDump978:   []string{"sudo-stub", "start", "dump978"},
-		StartUAT:       []string{"sudo-stub", "start", "uat"},
-		StopDump978:    []string{"sudo-stub", "stop", "dump978"},
-		StopUAT:        []string{"sudo-stub", "stop", "uat"},
-		EnableDump978:  []string{"sudo-stub", "enable", "dump978"},
-		EnableUAT:      []string{"sudo-stub", "enable", "uat"},
-		DisableDump978: []string{"sudo-stub", "disable", "dump978"},
-		DisableUAT:     []string{"sudo-stub", "disable", "uat"},
+		RestartDump978: []string{"sudo-stub", "restart", "dump978"},
+		RestartUAT:     []string{"sudo-stub", "restart", "uat"},
 		Reboot:         []string{"sudo-stub", "reboot"},
 		StartUpdate:    []string{"sudo-stub", "update"},
 	}
@@ -335,9 +323,80 @@ func TestConfigPost_RejectsBadValueWithKeyName(t *testing.T) {
 	}
 }
 
-func TestConfigPost_978OnReconciles(t *testing.T) {
+// PR 4 retired reconcile978On/Off. Both 978 services now restart on every
+// /api/config POST, regardless of UAT_INPUT direction; the daemons self-decide
+// from UAT_INPUT and exit 64 (intentional failed-terminal) when not requested.
+// systemctl restart returns 0 once the start job is dispatched, so the
+// pending_restart payload stays empty on the disable transition.
+func TestConfigPost_978UnitsRestartedRegardless(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name string
+		body map[string]any
+		seed string
+	}{
+		{
+			name: "uat_on",
+			body: map[string]any{"updates": map[string]string{"UAT_INPUT": "127.0.0.1:30978"}},
+			seed: `UAT_INPUT=""` + "\n",
+		},
+		{
+			name: "uat_off",
+			body: map[string]any{"updates": map[string]string{"UAT_INPUT": ""}},
+			seed: `UAT_INPUT="127.0.0.1:30978"` + "\n",
+		},
+		{
+			name: "no_uat_change_still_restarts",
+			body: map[string]any{"updates": map[string]string{"LATITUDE": "51.5"}},
+			seed: `UAT_INPUT="127.0.0.1:30978"` + "\n" + `LATITUDE="0"` + "\n",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h := newWriteHarness(t)
+			if err := os.WriteFile(h.feedEnvPath, []byte(tc.seed), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			r := postJSON(t, h.client, h.ts.URL+"/api/config", tc.body)
+			defer r.Body.Close()
+			if r.StatusCode != http.StatusOK {
+				t.Fatalf("status = %d", r.StatusCode)
+			}
+			calls := h.callsCopy()
+			sawDump978, sawUAT := false, false
+			for _, c := range calls {
+				if len(c) >= 3 && c[1] == "restart" {
+					if c[2] == "dump978" {
+						sawDump978 = true
+					}
+					if c[2] == "uat" {
+						sawUAT = true
+					}
+				}
+			}
+			if !sawDump978 {
+				t.Errorf("missing restart of dump978; calls=%v", calls)
+			}
+			if !sawUAT {
+				t.Errorf("missing restart of uat; calls=%v", calls)
+			}
+		})
+	}
+}
+
+// pending_restart surfaces 978 unit failures alongside feed/mlat. Confirms
+// that both 978 entries land in the response when their restart fails.
+func TestConfigPost_PendingRestartIncludes978(t *testing.T) {
 	t.Parallel()
 	h := newWriteHarness(t)
+	h.mu.Lock()
+	h.runnerErrFor = func(argv []string) error {
+		if len(argv) >= 3 && argv[1] == "restart" && (argv[2] == "dump978" || argv[2] == "uat") {
+			return errors.New("synthetic restart failure")
+		}
+		return nil
+	}
+	h.mu.Unlock()
+
 	r := postJSON(t, h.client, h.ts.URL+"/api/config", map[string]any{
 		"updates": map[string]string{"UAT_INPUT": "127.0.0.1:30978"},
 	})
@@ -345,49 +404,22 @@ func TestConfigPost_978OnReconciles(t *testing.T) {
 	if r.StatusCode != http.StatusOK {
 		t.Fatalf("status = %d", r.StatusCode)
 	}
-	calls := h.callsCopy()
-	wantVerbs := map[string]bool{"enable": false, "start": false}
-	for _, c := range calls {
-		if len(c) >= 3 && (c[2] == "dump978" || c[2] == "uat") {
-			wantVerbs[c[1]] = true
-		}
+	var body struct {
+		Status         string   `json:"status"`
+		PendingRestart []string `json:"pending_restart"`
 	}
-	for verb, saw := range wantVerbs {
-		if !saw {
-			t.Errorf("missing %s verb on 978 units; calls=%v", verb, calls)
-		}
-	}
-}
-
-func TestConfigPost_978OffReconciles(t *testing.T) {
-	t.Parallel()
-	h := newWriteHarness(t)
-	// Pre-existing UAT_INPUT set on disk — UAT_INPUT="" in updates is the
-	// disable transition.
-	if err := os.WriteFile(h.feedEnvPath,
-		[]byte(`UAT_INPUT="127.0.0.1:30978"`+"\n"),
-		0o644,
-	); err != nil {
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		t.Fatal(err)
 	}
-	r := postJSON(t, h.client, h.ts.URL+"/api/config", map[string]any{
-		"updates": map[string]string{"UAT_INPUT": ""},
-	})
-	defer r.Body.Close()
-	if r.StatusCode != http.StatusOK {
-		t.Fatalf("status = %d", r.StatusCode)
+	want := map[string]bool{
+		"dump978-fa.service":    true,
+		"airplanes-978.service": true,
 	}
-	calls := h.callsCopy()
-	wantVerbs := map[string]bool{"stop": false, "disable": false}
-	for _, c := range calls {
-		if len(c) >= 3 && (c[2] == "dump978" || c[2] == "uat") {
-			wantVerbs[c[1]] = true
-		}
+	for _, u := range body.PendingRestart {
+		delete(want, u)
 	}
-	for verb, saw := range wantVerbs {
-		if !saw {
-			t.Errorf("missing %s verb on 978 units; calls=%v", verb, calls)
-		}
+	if len(want) != 0 {
+		t.Errorf("missing units in pending_restart=%v: %v", body.PendingRestart, want)
 	}
 }
 
@@ -1176,7 +1208,7 @@ func TestConfigPost_PendingRestartIncludesMLATWhenOnlyMLATFails(t *testing.T) {
 	}
 }
 
-func TestConfigPost_PendingRestartIncludesBothWhenBothFail(t *testing.T) {
+func TestConfigPost_PendingRestartIncludesAllWhenAllFail(t *testing.T) {
 	t.Parallel()
 	h := newWriteHarness(t)
 	h.mu.Lock()
@@ -1202,12 +1234,16 @@ func TestConfigPost_PendingRestartIncludesBothWhenBothFail(t *testing.T) {
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		t.Fatalf("decode: %v", err)
 	}
-	if len(body.PendingRestart) != 2 {
-		t.Fatalf("PendingRestart len = %d, want 2", len(body.PendingRestart))
+	// PR 4: 978 units join the restart loop. When ALL restarts fail, all four
+	// units land in pending_restart.
+	if len(body.PendingRestart) != 4 {
+		t.Fatalf("PendingRestart len = %d, want 4 (feed+mlat+dump978+uat)", len(body.PendingRestart))
 	}
 	wantAny := map[string]bool{
 		"airplanes-feed.service": false,
 		"airplanes-mlat.service": false,
+		"dump978-fa.service":     false,
+		"airplanes-978.service":  false,
 	}
 	for _, u := range body.PendingRestart {
 		if _, ok := wantAny[u]; !ok {

@@ -37,19 +37,13 @@ type Server struct {
 // command webconfig elevates. Each slice is invoked verbatim — no
 // concatenation, no shell.
 type PrivilegedArgv struct {
-	ApplyConfig         []string // sudo -n /usr/local/lib/airplanes-webconfig/apply-config
-	RestartFeed         []string
-	RestartMLAT         []string
-	StartDump978        []string
-	StartUAT            []string
-	StopDump978         []string
-	StopUAT             []string
-	EnableDump978       []string
-	EnableUAT           []string
-	DisableDump978      []string
-	DisableUAT          []string
-	Reboot              []string
-	StartUpdate         []string // sudo systemd-run --unit=airplanes-update ...
+	ApplyConfig    []string // sudo -n /usr/local/lib/airplanes-webconfig/apply-config
+	RestartFeed    []string
+	RestartMLAT    []string
+	RestartDump978 []string
+	RestartUAT     []string
+	Reboot         []string
+	StartUpdate    []string // sudo systemd-run --unit=airplanes-update ...
 }
 
 // DefaultPrivilegedArgv returns the production argv shapes for the
@@ -62,14 +56,8 @@ func DefaultPrivilegedArgv() PrivilegedArgv {
 		ApplyConfig:    sudo("/usr/local/lib/airplanes-webconfig/apply-config"),
 		RestartFeed:    sudo("/usr/bin/systemctl", "restart", "airplanes-feed.service"),
 		RestartMLAT:    sudo("/usr/bin/systemctl", "restart", "airplanes-mlat.service"),
-		StartDump978:   sudo("/usr/bin/systemctl", "start", "dump978-fa.service"),
-		StartUAT:       sudo("/usr/bin/systemctl", "start", "airplanes-978.service"),
-		StopDump978:    sudo("/usr/bin/systemctl", "stop", "dump978-fa.service"),
-		StopUAT:        sudo("/usr/bin/systemctl", "stop", "airplanes-978.service"),
-		EnableDump978:  sudo("/usr/bin/systemctl", "enable", "dump978-fa.service"),
-		EnableUAT:      sudo("/usr/bin/systemctl", "enable", "airplanes-978.service"),
-		DisableDump978: sudo("/usr/bin/systemctl", "disable", "dump978-fa.service"),
-		DisableUAT:     sudo("/usr/bin/systemctl", "disable", "airplanes-978.service"),
+		RestartDump978: sudo("/usr/bin/systemctl", "restart", "dump978-fa.service"),
+		RestartUAT:     sudo("/usr/bin/systemctl", "restart", "airplanes-978.service"),
 		Reboot:         sudo("/usr/bin/systemctl", "reboot"),
 		StartUpdate: sudo(
 			"/usr/bin/systemd-run",
