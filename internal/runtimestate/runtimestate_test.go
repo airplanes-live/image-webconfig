@@ -278,12 +278,10 @@ uat_input=127.0.0.1:30978
 			t.Errorf("Values[%q] = %q, want %q", k, got, v)
 		}
 	}
-	// Reason is in the 978 whitelist but NOT the MLAT whitelist —
-	// owner-aware filtering is the consumer's responsibility.
+	// Reason is in the 978 whitelist. (Both daemons share the "ok" reason
+	// for their enabled state; cross-owner rejection is enforced for the
+	// daemon-specific reasons via the per-owner reason maps in tests above.)
 	if !AllowedReasons978[s.Values["reason"]] {
 		t.Errorf("AllowedReasons978[%q] = false, want true", s.Values["reason"])
-	}
-	if AllowedReasonsMLAT[s.Values["reason"]] {
-		t.Errorf("AllowedReasonsMLAT[%q] = true; the 978 reason should not be in MLAT set", s.Values["reason"])
 	}
 }

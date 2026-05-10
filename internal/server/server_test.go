@@ -1208,7 +1208,7 @@ func TestConfigPost_PendingRestartIncludesMLATWhenOnlyMLATFails(t *testing.T) {
 	}
 }
 
-func TestConfigPost_PendingRestartIncludesBothWhenBothFail(t *testing.T) {
+func TestConfigPost_PendingRestartIncludesAllWhenAllFail(t *testing.T) {
 	t.Parallel()
 	h := newWriteHarness(t)
 	h.mu.Lock()
@@ -1234,12 +1234,16 @@ func TestConfigPost_PendingRestartIncludesBothWhenBothFail(t *testing.T) {
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		t.Fatalf("decode: %v", err)
 	}
-	if len(body.PendingRestart) != 2 {
-		t.Fatalf("PendingRestart len = %d, want 2", len(body.PendingRestart))
+	// PR 4: 978 units join the restart loop. When ALL restarts fail, all four
+	// units land in pending_restart.
+	if len(body.PendingRestart) != 4 {
+		t.Fatalf("PendingRestart len = %d, want 4 (feed+mlat+dump978+uat)", len(body.PendingRestart))
 	}
 	wantAny := map[string]bool{
 		"airplanes-feed.service": false,
 		"airplanes-mlat.service": false,
+		"dump978-fa.service":     false,
+		"airplanes-978.service":  false,
 	}
 	for _, u := range body.PendingRestart {
 		if _, ok := wantAny[u]; !ok {
