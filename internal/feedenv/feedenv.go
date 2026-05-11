@@ -15,7 +15,14 @@ import (
 // DefaultPath is the rootfs location.
 const DefaultPath = "/etc/airplanes/feed.env"
 
-// ReadKeys is the GET /api/config whitelist.
+// ReadKeys is the GET /api/config whitelist. Brand endpoints
+// (MLATSERVER, TARGET), readsb tuning (NET_OPTIONS, JSON_OPTIONS,
+// REDUCE_INTERVAL), and the mlat-client result-output bundle (RESULTS,
+// RESULTS2-4) live as daemon-script defaults — feed.env holds operator
+// data only. If an operator hand-edits feed.env to override one of
+// those daemon defaults, the API still won't expose the override;
+// that's intentional — those are advanced knobs, not part of the v1
+// UI surface.
 var ReadKeys = []string{
 	"LATITUDE",
 	"LONGITUDE",
@@ -24,13 +31,7 @@ var ReadKeys = []string{
 	"MLAT_ENABLED",
 	"INPUT",
 	"INPUT_TYPE",
-	"NET_OPTIONS",
-	"JSON_OPTIONS",
-	"MLATSERVER",
-	"TARGET",
-	"REDUCE_INTERVAL",
 	"GAIN",
-	"RESULTS",
 	"UAT_INPUT",
 }
 
