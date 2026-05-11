@@ -216,6 +216,32 @@ func mergeAndValidate(existing, updates map[string]string) (map[string]string, e
 	for k, v := range updates {
 		merged[k] = configspec.Canonicalize(k, v)
 	}
+	// Auto-derive GEO_CONFIGURED when the update touched coords without
+	// setting the flag explicitly. Frontends that submit lat/lon don't
+	// need to know about GEO_CONFIGURED; we infer "user is configuring
+	// geo" from the presence of a coord key in the update. The derivation
+	// uses the same numerically-zero heuristic as configure.sh and the
+	// feed-side migration so writers agree on what counts as the (0,0)
+	// placeholder pair vs a real equator/prime-meridian coordinate.
+	//
+	// Only fires when BOTH LATITUDE and LONGITUDE are present in the
+	// merged config — a single-axis update doesn't have enough info to
+	// set the flag correctly, and the consistency check would reject
+	// GEO_CONFIGURED=true with a missing coord anyway.
+	if _, explicit := updates["GEO_CONFIGURED"]; !explicit {
+		touchedGeo := false
+		for _, k := range []string{"LATITUDE", "LONGITUDE", "ALTITUDE"} {
+			if _, ok := updates[k]; ok {
+				touchedGeo = true
+				break
+			}
+		}
+		_, hasLat := merged["LATITUDE"]
+		_, hasLon := merged["LONGITUDE"]
+		if touchedGeo && hasLat && hasLon {
+			merged["GEO_CONFIGURED"] = configspec.DeriveGeoConfigured(merged["LATITUDE"], merged["LONGITUDE"])
+		}
+	}
 	// Defense in depth: every preserved value (not just the ones we wrote)
 	// must pass the universal-reject scan. If the existing feed.env was
 	// hand-edited and contains shell-sensitive characters, we fail closed

@@ -111,6 +111,105 @@ func TestMergeAndValidate_CanonicalizesAltitude(t *testing.T) {
 	}
 }
 
+func TestMergeAndValidate_AutoSetsGeoConfiguredTrueWhenCoordsSubmitted(t *testing.T) {
+	t.Parallel()
+	// Frontend submits lat/lon without GEO_CONFIGURED; the helper infers
+	// "user is configuring geo" and writes true. MLAT_USER is required by
+	// the consistency check for MLAT_ENABLED=true scenarios; here MLAT is
+	// untouched so the cross-key rule doesn't fire.
+	got, err := mergeAndValidate(
+		map[string]string{"MLAT_USER": "alice"},
+		map[string]string{"LATITUDE": "51.5", "LONGITUDE": "-0.1"},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got["GEO_CONFIGURED"] != "true" {
+		t.Errorf("GEO_CONFIGURED = %q, want true", got["GEO_CONFIGURED"])
+	}
+}
+
+func TestMergeAndValidate_AutoSetsGeoConfiguredFalseForZeroPair(t *testing.T) {
+	t.Parallel()
+	// Caller submits a (0,0) placeholder pair (image freeze, reset to
+	// defaults, etc.); auto-derive infers unconfigured even though the
+	// caller didn't say so explicitly.
+	got, err := mergeAndValidate(
+		map[string]string{"MLAT_USER": "alice"},
+		map[string]string{"LATITUDE": "0", "LONGITUDE": "0"},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got["GEO_CONFIGURED"] != "false" {
+		t.Errorf("GEO_CONFIGURED = %q, want false", got["GEO_CONFIGURED"])
+	}
+}
+
+func TestMergeAndValidate_AutoSetsGeoConfiguredTrueForEquator(t *testing.T) {
+	t.Parallel()
+	// Real equator coordinate (lat=0, lon=13). Must NOT be classified as
+	// the placeholder pair.
+	got, err := mergeAndValidate(
+		map[string]string{"MLAT_USER": "alice"},
+		map[string]string{"LATITUDE": "0", "LONGITUDE": "13"},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got["GEO_CONFIGURED"] != "true" {
+		t.Errorf("GEO_CONFIGURED = %q, want true (equator is configured)", got["GEO_CONFIGURED"])
+	}
+}
+
+func TestMergeAndValidate_ExplicitGeoConfiguredWinsOverAutoDerive(t *testing.T) {
+	t.Parallel()
+	// Caller explicitly sets GEO_CONFIGURED=false while also submitting
+	// real coords (rare but possible, e.g., "save these values but mark
+	// as not-yet-configured"). The explicit value wins.
+	got, err := mergeAndValidate(
+		map[string]string{"MLAT_USER": "alice"},
+		map[string]string{"LATITUDE": "51.5", "LONGITUDE": "-0.1", "GEO_CONFIGURED": "false"},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got["GEO_CONFIGURED"] != "false" {
+		t.Errorf("GEO_CONFIGURED = %q, want false (explicit wins)", got["GEO_CONFIGURED"])
+	}
+}
+
+func TestMergeAndValidate_NoAutoSetWhenCoordsUntouched(t *testing.T) {
+	t.Parallel()
+	// Caller updates an unrelated key (MLAT_ENABLED). GEO_CONFIGURED must
+	// not be invented from existing values; the rule fires only when the
+	// caller submits coords.
+	got, err := mergeAndValidate(
+		map[string]string{"MLAT_USER": "alice", "LATITUDE": "51.5", "LONGITUDE": "-0.1"},
+		map[string]string{"MLAT_ENABLED": "false"},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := got["GEO_CONFIGURED"]; ok {
+		t.Errorf("GEO_CONFIGURED was set when coords weren't touched: %q", got["GEO_CONFIGURED"])
+	}
+}
+
+func TestMergeAndValidate_RejectsGeoConfiguredTrueWithoutLatitude(t *testing.T) {
+	t.Parallel()
+	// Cross-key consistency: explicit GEO_CONFIGURED=true requires
+	// LATITUDE and LONGITUDE both present so the daemon doesn't strict-
+	// fail downstream.
+	_, err := mergeAndValidate(
+		map[string]string{},
+		map[string]string{"GEO_CONFIGURED": "true", "LONGITUDE": "13"},
+	)
+	if err == nil {
+		t.Fatal("expected consistency error for GEO_CONFIGURED=true without LATITUDE")
+	}
+}
+
 func TestRenderFeedEnv_DeterministicAlphabetical(t *testing.T) {
 	t.Parallel()
 	a := renderFeedEnv(map[string]string{"MLAT_USER": "alice", "LATITUDE": "0", "ALTITUDE": "0m"})

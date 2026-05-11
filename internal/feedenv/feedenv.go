@@ -27,6 +27,7 @@ var ReadKeys = []string{
 	"LATITUDE",
 	"LONGITUDE",
 	"ALTITUDE",
+	"GEO_CONFIGURED",
 	"MLAT_USER",
 	"MLAT_ENABLED",
 	"INPUT",

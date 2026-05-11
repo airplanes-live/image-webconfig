@@ -20,6 +20,7 @@ var WriteKeys = []string{
 	"LATITUDE",
 	"LONGITUDE",
 	"ALTITUDE",
+	"GEO_CONFIGURED",
 	"MLAT_USER",
 	"MLAT_ENABLED",
 	"GAIN",
@@ -34,6 +35,7 @@ var AllReadKeys = []string{
 	"LATITUDE",
 	"LONGITUDE",
 	"ALTITUDE",
+	"GEO_CONFIGURED",
 	"MLAT_USER",
 	"MLAT_ENABLED",
 	"INPUT",
@@ -103,6 +105,8 @@ func Validate(key, value string) error {
 		return validateLongitude(value)
 	case "ALTITUDE":
 		return validateAltitude(value)
+	case "GEO_CONFIGURED":
+		return validateGeoConfigured(value)
 	case "MLAT_USER":
 		return validateMlatUser(value)
 	case "MLAT_ENABLED":
@@ -136,7 +140,46 @@ func ValidateConsistency(merged map[string]string) error {
 			return validationError("MLAT_USER", "must be non-empty when MLAT_ENABLED=true")
 		}
 	}
+	// GEO_CONFIGURED=true asserts the operator has provided real coordinates.
+	// Both LATITUDE and LONGITUDE must be present in the merged config for
+	// the daemon to pass them to mlat-client. (A single zero axis is fine —
+	// that's a real equator or prime-meridian feeder.)
+	if geo, hasGeo := merged["GEO_CONFIGURED"]; hasGeo && geo == "true" {
+		if lat, ok := merged["LATITUDE"]; !ok || lat == "" {
+			return validationError("LATITUDE", "must be non-empty when GEO_CONFIGURED=true")
+		}
+		if lon, ok := merged["LONGITUDE"]; !ok || lon == "" {
+			return validationError("LONGITUDE", "must be non-empty when GEO_CONFIGURED=true")
+		}
+	}
 	return nil
+}
+
+// numericZero matches the same set of strings the feed-side bash helpers
+// treat as numerically zero: empty, "0", "-0", "+0", "0.0", "0.00000",
+// etc. Used by DeriveGeoConfigured to keep the auto-set heuristic aligned
+// with configure.sh / airplanes-mlat.sh / migrate_geo_to_configured_flag.
+var numericZero = regexp.MustCompile(`^[+-]?0+(\.0+)?$`)
+
+// IsNumericallyZero reports whether v is the empty string or a numeric
+// representation of zero (signed or decimal zero forms included).
+func IsNumericallyZero(v string) bool {
+	if v == "" {
+		return true
+	}
+	return numericZero.MatchString(v)
+}
+
+// DeriveGeoConfigured returns "true" or "false" using the same heuristic
+// applied by configure.sh and migrate_geo_to_configured_flag: both axes
+// numerically zero (or empty) means the placeholder pair and the result
+// is "false"; anything else (including a single zero axis at equator or
+// prime meridian) is "true".
+func DeriveGeoConfigured(latitude, longitude string) string {
+	if IsNumericallyZero(latitude) && IsNumericallyZero(longitude) {
+		return "false"
+	}
+	return "true"
 }
 
 // Canonicalize returns the normalized on-disk form of a value (e.g. ALTITUDE
@@ -218,6 +261,18 @@ func validateMlatUser(v string) error {
 		return validationError("MLAT_USER", `must match [A-Za-z0-9_-]{1,64} or be empty`)
 	}
 	return nil
+}
+
+// validateGeoConfigured accepts only the literal strings "true" and "false".
+// Same shape as MLAT_ENABLED: the daemon checks `GEO_CONFIGURED == "true"`
+// and any other value (yes/no/1/0/empty) falls through to disabled. Reject
+// at write time to keep the schema unambiguous.
+func validateGeoConfigured(v string) error {
+	switch v {
+	case "true", "false":
+		return nil
+	}
+	return validationError("GEO_CONFIGURED", `must be "true" or "false"`)
 }
 
 // validateMlatEnabled accepts only the literal strings "true" and "false".
