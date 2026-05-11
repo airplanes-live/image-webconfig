@@ -28,8 +28,8 @@ var WriteKeys = []string{
 
 // AllReadKeys mirrors feedenv.ReadKeys; duplicated here so apply-config
 // doesn't need to depend on the feedenv package (which has the file IO
-// surface). Keep the two lists in sync via the cross-package test in
-// internal/feedenv.
+// surface). Keep this list manually in sync with feedenv.ReadKeys; add
+// a cross-package drift test before changing either list.
 var AllReadKeys = []string{
 	"LATITUDE",
 	"LONGITUDE",
@@ -38,13 +38,7 @@ var AllReadKeys = []string{
 	"MLAT_ENABLED",
 	"INPUT",
 	"INPUT_TYPE",
-	"NET_OPTIONS",
-	"JSON_OPTIONS",
-	"MLATSERVER",
-	"TARGET",
-	"REDUCE_INTERVAL",
 	"GAIN",
-	"RESULTS",
 	"UAT_INPUT",
 }
 
