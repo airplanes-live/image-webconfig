@@ -226,6 +226,11 @@
     function render(...nodes) { clear(); for (const n of nodes) app.appendChild(n); }
     function errorEl() { return el("div", { class: "error", role: "alert" }); }
 
+    // Hidden username so password managers can save credentials against the implicit "admin" account.
+    function hiddenUsernameField() {
+        return el("input", { type: "text", name: "username", value: "admin", autocomplete: "username", readonly: true, hidden: true, "aria-hidden": "true", tabindex: "-1" });
+    }
+
     function svgIcon(pathD, size) {
         const ns = "http://www.w3.org/2000/svg";
         const svg = document.createElementNS(ns, "svg");
@@ -1001,8 +1006,9 @@
 
     function setupPanel() {
         const err = errorEl();
-        const pw = el("input", { type: "password", autocomplete: "new-password", required: true, minlength: "12" });
-        const confirmInput = el("input", { type: "password", autocomplete: "new-password", required: true, minlength: "12" });
+        const username = hiddenUsernameField();
+        const pw = el("input", { id: "setup-pw", name: "new-password", type: "password", autocomplete: "new-password", required: true, minlength: "12" });
+        const confirmInput = el("input", { id: "setup-pw-confirm", name: "confirm-password", type: "password", autocomplete: "new-password", required: true, minlength: "12" });
         const submit = el("button", { type: "submit", class: "wc-btn-primary" }, "Set password");
 
         const form = el("form", {
@@ -1032,8 +1038,9 @@
         },
             el("h2", {}, "Set webconfig password"),
             el("p", {}, "Choose the password used to administer this feeder. Minimum 12 characters."),
-            el("div", { class: "field" }, el("label", {}, "Password"), pw),
-            el("div", { class: "field" }, el("label", {}, "Confirm password"), confirmInput),
+            username,
+            el("div", { class: "field" }, el("label", { for: "setup-pw" }, "Password"), pw),
+            el("div", { class: "field" }, el("label", { for: "setup-pw-confirm" }, "Confirm password"), confirmInput),
             submit,
             err,
         );
@@ -1044,7 +1051,8 @@
     function loginPanel(initialError) {
         const err = errorEl();
         if (initialError) err.textContent = initialError;
-        const pw = el("input", { type: "password", autocomplete: "current-password", required: true });
+        const username = hiddenUsernameField();
+        const pw = el("input", { id: "login-pw", name: "current-password", type: "password", autocomplete: "current-password", required: true });
         const submit = el("button", { type: "submit", class: "wc-btn-primary" }, "Log in");
 
         const form = el("form", {
@@ -1069,7 +1077,8 @@
             },
         },
             el("h2", {}, "Log in"),
-            el("div", { class: "field" }, el("label", {}, "Password"), pw),
+            username,
+            el("div", { class: "field" }, el("label", { for: "login-pw" }, "Password"), pw),
             submit,
             err,
         );
@@ -1079,9 +1088,10 @@
 
     function changePasswordPanel() {
         const err = errorEl();
-        const oldPw = el("input", { type: "password", autocomplete: "current-password", required: true });
-        const newPw = el("input", { type: "password", autocomplete: "new-password", required: true, minlength: "12" });
-        const confirmInput = el("input", { type: "password", autocomplete: "new-password", required: true, minlength: "12" });
+        const username = hiddenUsernameField();
+        const oldPw = el("input", { id: "change-pw-old", name: "current-password", type: "password", autocomplete: "current-password", required: true });
+        const newPw = el("input", { id: "change-pw-new", name: "new-password", type: "password", autocomplete: "new-password", required: true, minlength: "12" });
+        const confirmInput = el("input", { id: "change-pw-confirm", name: "confirm-password", type: "password", autocomplete: "new-password", required: true, minlength: "12" });
         const submit = el("button", { type: "submit", class: "wc-btn-primary" }, "Change password");
         const cancel = el("button", {
             type: "button", class: "wc-btn-ghost",
@@ -1114,9 +1124,10 @@
             },
         },
             el("h2", {}, "Change webconfig password"),
-            el("div", { class: "field" }, el("label", {}, "Current password"), oldPw),
-            el("div", { class: "field" }, el("label", {}, "New password"), newPw),
-            el("div", { class: "field" }, el("label", {}, "Confirm new password"), confirmInput),
+            username,
+            el("div", { class: "field" }, el("label", { for: "change-pw-old" }, "Current password"), oldPw),
+            el("div", { class: "field" }, el("label", { for: "change-pw-new" }, "New password"), newPw),
+            el("div", { class: "field" }, el("label", { for: "change-pw-confirm" }, "Confirm new password"), confirmInput),
             el("div", { class: "actions" }, cancel, submit),
             err,
         );
