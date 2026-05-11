@@ -196,6 +196,67 @@ func TestMergeAndValidate_NoAutoSetWhenCoordsUntouched(t *testing.T) {
 	}
 }
 
+func TestMergeAndValidate_AltitudeOnlyUpdatePreservesExistingGeoConfigured(t *testing.T) {
+	t.Parallel()
+	// Operator already configured location with GEO_CONFIGURED=false
+	// (e.g., they're saving values but haven't confirmed real coords yet).
+	// An altitude-only update must NOT auto-flip the flag to true.
+	got, err := mergeAndValidate(
+		map[string]string{
+			"MLAT_USER":      "alice",
+			"LATITUDE":       "51.5",
+			"LONGITUDE":      "-0.1",
+			"GEO_CONFIGURED": "false",
+		},
+		map[string]string{"ALTITUDE": "120"},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got["GEO_CONFIGURED"] != "false" {
+		t.Errorf("GEO_CONFIGURED = %q, want false (altitude-only must preserve existing flag)", got["GEO_CONFIGURED"])
+	}
+}
+
+func TestMergeAndValidate_AltitudeOnlyUpdateAtZeroPairPreservesTrue(t *testing.T) {
+	t.Parallel()
+	// Inverse: existing config has GEO_CONFIGURED=true with (0,0) coords
+	// (legitimately the Atlantic, or a deliberate hand-edit). An altitude-
+	// only update must NOT auto-flip to false based on the (0,0) heuristic.
+	got, err := mergeAndValidate(
+		map[string]string{
+			"MLAT_USER":      "alice",
+			"LATITUDE":       "0",
+			"LONGITUDE":      "0",
+			"GEO_CONFIGURED": "true",
+		},
+		map[string]string{"ALTITUDE": "120"},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got["GEO_CONFIGURED"] != "true" {
+		t.Errorf("GEO_CONFIGURED = %q, want true (altitude-only must preserve explicit true)", got["GEO_CONFIGURED"])
+	}
+}
+
+func TestMergeAndValidate_NoAutoSetWhenCounterpartCoordEmpty(t *testing.T) {
+	t.Parallel()
+	// Existing config has empty LONGITUDE (partial earlier write or
+	// hand-edit). Updating LATITUDE alone must NOT auto-derive — both
+	// axes must be non-empty in the merged config for the heuristic to
+	// have valid inputs.
+	_, err := mergeAndValidate(
+		map[string]string{"MLAT_USER": "alice", "LATITUDE": "0", "LONGITUDE": ""},
+		map[string]string{"LATITUDE": "51.5"},
+	)
+	// Auto-derive should be skipped; no consistency error fires because
+	// GEO_CONFIGURED stays absent.
+	if err != nil {
+		t.Fatalf("unexpected error from single-axis update with empty counterpart: %v", err)
+	}
+}
+
 func TestMergeAndValidate_RejectsGeoConfiguredTrueWithoutLatitude(t *testing.T) {
 	t.Parallel()
 	// Cross-key consistency: explicit GEO_CONFIGURED=true requires
