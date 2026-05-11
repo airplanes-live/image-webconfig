@@ -31,15 +31,21 @@
         { id: "graphs1090", label: "graphs1090", meta: "history graphs",    href: "/graphs1090/" },
     ];
 
-    // Service unit → log slug for journalctl. Services without a slug
-    // are not click-through to a log stream.
-    const UNIT_TO_LOG_SLUG = {
-        "airplanes-feed.service": "feed",
-        "airplanes-mlat.service": "mlat",
-        "readsb.service": "readsb",
-        "dump978-fa.service": "dump978",
-        "airplanes-978.service": "uat",
+    // Slug ↔ systemd unit. Mirrors the server-side whitelist in
+    // internal/logs/logs.go; keep them in sync.
+    const LOG_SLUG_TO_UNIT = {
+        "feed":      "airplanes-feed.service",
+        "mlat":      "airplanes-mlat.service",
+        "readsb":    "readsb.service",
+        "dump978":   "dump978-fa.service",
+        "uat":       "airplanes-978.service",
+        "claim":     "airplanes-claim.service",
+        "webconfig": "airplanes-webconfig.service",
+        "update":    "airplanes-update.service",
     };
+    const UNIT_TO_LOG_SLUG = Object.fromEntries(
+        Object.entries(LOG_SLUG_TO_UNIT).map(([s, u]) => [u, s])
+    );
 
     // App tile icons (also Bootstrap-icons style).
     const APP_ICONS = {
@@ -1126,9 +1132,10 @@
 
     function logViewer(slug) {
         const pre = el("pre", { class: "log-output" });
+        const unit = LOG_SLUG_TO_UNIT[slug] || slug;
         render(
             el("section", { class: "wc-card" },
-                el("h2", {}, "journalctl -u " + slug),
+                el("h2", {}, "journalctl -u " + unit),
                 el("p", { class: "muted" }, "Streaming live; close this view (use the Dashboard button above) to disconnect."),
                 pre,
             ),
