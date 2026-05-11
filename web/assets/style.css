@@ -290,14 +290,19 @@ main {
   font-size: 1.15rem;
   font-weight: 600;
   color: var(--wc-ink-1);
-  margin: 0 0 0.2rem;
+  margin: 0;
 }
 .wc-hero__meta {
   color: var(--wc-ink-2);
   font-size: 0.9rem;
   font-family: var(--wc-font-mono);
   font-variant-numeric: tabular-nums;
+  margin: 0;
 }
+/* Gap between title and meta only when the meta line has content;
+   without this an empty meta inflates the body height and pushes the
+   visible title above the hero card's vertical centerline. */
+.wc-hero__meta:not(:empty) { margin-top: 0.2rem; }
 
 .wc-hero__badge {
   display: inline-flex;
@@ -319,17 +324,22 @@ main {
 .wc-grid--tiles {
   display: grid;
   gap: 0.75rem;
-  grid-template-columns: 1fr;
+  /* minmax(0, 1fr) ignores the items' intrinsic min-content widths so
+     each track is exactly (container − gap) / N. Two adjacent tile
+     grids (services + apps) with different tile contents otherwise
+     resolve `1fr` to slightly different widths, and the apps row
+     visibly drifts off the columns above it. */
+  grid-template-columns: minmax(0, 1fr);
   /* Lock every tile row to the same height so content-driven sub-pixel
      drift doesn't make adjacent rows look uneven. */
   grid-auto-rows: 4rem;
   margin-bottom: 1.25rem;
 }
 @media (min-width: 576px) {
-  .wc-grid--tiles { grid-template-columns: repeat(2, 1fr); }
+  .wc-grid--tiles { grid-template-columns: repeat(2, minmax(0, 1fr)); }
 }
 @media (min-width: 992px) {
-  .wc-grid--tiles { grid-template-columns: repeat(3, 1fr); }
+  .wc-grid--tiles { grid-template-columns: repeat(3, minmax(0, 1fr)); }
 }
 
 .wc-tile {
@@ -338,6 +348,7 @@ main {
   gap: 0.75rem;
   padding: 0.85rem 1rem;
   height: 100%;
+  min-width: 0;
   background: var(--wc-surface-1);
   border: 1px solid var(--wc-line-soft);
   border-radius: var(--wc-radius-sm);
