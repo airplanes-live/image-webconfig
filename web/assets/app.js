@@ -798,6 +798,20 @@
         });
         inputs["MLAT_ENABLED"] = mlat;
 
+        // MLAT_PRIVATE hides the feed name on the public MLAT map. Default
+        // false (name shown) when absent, matching airplanes-mlat.sh's
+        // MLAT_PRIVATE:-false. Position is never shown precisely regardless
+        // of the toggle.
+        const mlatPrivateOn = (values["MLAT_PRIVATE"] || "false") === "true";
+        const mlatPrivateId = fieldId("MLAT_PRIVATE");
+        const mlatPrivate = el("input", {
+            id: mlatPrivateId,
+            type: "checkbox",
+            name: "MLAT_PRIVATE",
+            checked: mlatPrivateOn ? "" : null,
+        });
+        inputs["MLAT_PRIVATE"] = mlatPrivate;
+
         const err = errorEl();
         const submit = el("button", { type: "submit", class: "wc-btn-primary" }, "Save & restart");
 
@@ -814,15 +828,17 @@
                     ALTITUDE: inputs.ALTITUDE.value.trim(),
                     MLAT_USER: inputs.MLAT_USER.value.trim(),
                     MLAT_ENABLED: mlat.checked ? "true" : "false",
+                    MLAT_PRIVATE: mlatPrivate.checked ? "true" : "false",
                     GAIN: inputs.GAIN.value.trim(),
                     UAT_INPUT: uat.checked ? "127.0.0.1:30978" : "",
                 };
-                // Always send MLAT_ENABLED and UAT_INPUT — they're explicit
-                // toggles whose "" form is meaningful. Strip other keys when
-                // empty so the user can leave a field unchanged from the
-                // current value rather than blanking it.
+                // Always send MLAT_ENABLED, MLAT_PRIVATE, and UAT_INPUT —
+                // they're explicit toggles whose "false"/"" form is
+                // meaningful. Strip other keys when empty so the user can
+                // leave a field unchanged from the current value rather
+                // than blanking it.
                 for (const k of Object.keys(updates)) {
-                    if (k !== "UAT_INPUT" && k !== "MLAT_ENABLED" && k !== "MLAT_USER" && updates[k] === "") delete updates[k];
+                    if (k !== "UAT_INPUT" && k !== "MLAT_ENABLED" && k !== "MLAT_PRIVATE" && k !== "MLAT_USER" && updates[k] === "") delete updates[k];
                 }
                 const r = await postJSON("/api/config", { updates });
                 submit.disabled = false;
@@ -857,6 +873,9 @@
             el("div", { class: "field" },
                 el("label", { for: mlatId }, mlat, " Enable MLAT", " ", el("code", {}, "MLAT_ENABLED")),
             ),
+            el("div", { class: "field" },
+                el("label", { for: mlatPrivateId }, mlatPrivate, " Hide MLAT name on public map", " ", el("code", {}, "MLAT_PRIVATE")),
+            ),
             field("GAIN", "Gain", { placeholder: "auto" }),
             el("div", { class: "field" },
                 el("label", { for: uatId }, uat, " Enable 978 UAT", " ", el("code", {}, "UAT_INPUT")),
@@ -867,7 +886,7 @@
         parent.appendChild(form);
 
         const readOnly = Object.keys(values).filter(k =>
-            !["LATITUDE", "LONGITUDE", "ALTITUDE", "MLAT_USER", "MLAT_ENABLED", "GAIN", "UAT_INPUT"].includes(k)
+            !["LATITUDE", "LONGITUDE", "ALTITUDE", "MLAT_USER", "MLAT_ENABLED", "MLAT_PRIVATE", "GAIN", "UAT_INPUT"].includes(k)
         ).sort();
         if (readOnly.length > 0) {
             const tbl = el("dl", { class: "config-list" });

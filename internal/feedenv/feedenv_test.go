@@ -4,8 +4,23 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"reflect"
 	"testing"
+
+	"github.com/airplanes-live/image/webconfig/internal/configspec"
 )
+
+// TestReadKeysMatchConfigspecAllReadKeys enforces the comment-block invariant
+// in configspec.go that feedenv.ReadKeys and configspec.AllReadKeys stay
+// aligned. The duplicate exists so apply-config can validate-preserve keys
+// without depending on feedenv's file-IO surface; the price is hand-syncing
+// two lists, and this test makes drift a build break instead of a silent bug.
+func TestReadKeysMatchConfigspecAllReadKeys(t *testing.T) {
+	t.Parallel()
+	if !reflect.DeepEqual(ReadKeys, configspec.AllReadKeys) {
+		t.Errorf("feedenv.ReadKeys and configspec.AllReadKeys diverged.\nReadKeys: %v\nAllReadKeys: %v", ReadKeys, configspec.AllReadKeys)
+	}
+}
 
 func writeEnv(t *testing.T, content string) string {
 	t.Helper()

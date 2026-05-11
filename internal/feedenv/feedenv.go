@@ -30,6 +30,7 @@ var ReadKeys = []string{
 	"GEO_CONFIGURED",
 	"MLAT_USER",
 	"MLAT_ENABLED",
+	"MLAT_PRIVATE",
 	"INPUT",
 	"INPUT_TYPE",
 	"GAIN",

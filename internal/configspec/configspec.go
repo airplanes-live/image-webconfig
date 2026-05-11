@@ -23,14 +23,16 @@ var WriteKeys = []string{
 	"GEO_CONFIGURED",
 	"MLAT_USER",
 	"MLAT_ENABLED",
+	"MLAT_PRIVATE",
 	"GAIN",
 	"UAT_INPUT",
 }
 
 // AllReadKeys mirrors feedenv.ReadKeys; duplicated here so apply-config
 // doesn't need to depend on the feedenv package (which has the file IO
-// surface). Keep this list manually in sync with feedenv.ReadKeys; add
-// a cross-package drift test before changing either list.
+// surface). Keep this list in lockstep with feedenv.ReadKeys —
+// internal/feedenv has a drift test that fails the build if they
+// diverge.
 var AllReadKeys = []string{
 	"LATITUDE",
 	"LONGITUDE",
@@ -38,6 +40,7 @@ var AllReadKeys = []string{
 	"GEO_CONFIGURED",
 	"MLAT_USER",
 	"MLAT_ENABLED",
+	"MLAT_PRIVATE",
 	"INPUT",
 	"INPUT_TYPE",
 	"GAIN",
@@ -111,6 +114,8 @@ func Validate(key, value string) error {
 		return validateMlatUser(value)
 	case "MLAT_ENABLED":
 		return validateMlatEnabled(value)
+	case "MLAT_PRIVATE":
+		return validateMlatPrivate(value)
 	case "GAIN":
 		return validateGain(value)
 	case "UAT_INPUT":
@@ -286,6 +291,19 @@ func validateMlatEnabled(v string) error {
 		return nil
 	}
 	return validationError("MLAT_ENABLED", `must be "true" or "false"`)
+}
+
+// validateMlatPrivate accepts only "true" or "false". MLAT_PRIVATE on disk
+// is the canonical boolean — airplanes-mlat.sh's classifier strict-fails
+// on any other value (mlat_private_invalid → exit 64). Reject anything
+// outside that pair at write time so the daemon's strict-fail path is
+// unreachable through the API.
+func validateMlatPrivate(v string) error {
+	switch v {
+	case "true", "false":
+		return nil
+	}
+	return validationError("MLAT_PRIVATE", `must be "true" or "false"`)
 }
 
 func validateGain(v string) error {
