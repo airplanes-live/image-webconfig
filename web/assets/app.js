@@ -749,18 +749,23 @@
         const values = resp.payload.values || {};
         const inputs = {};
 
+        const fieldId = (key) => "config-" + key.toLowerCase().replace(/_/g, "-");
+
         const field = (key, label, attrs) => {
-            const a = Object.assign({ name: key, value: values[key] || "", type: "text" }, attrs || {});
+            const id = fieldId(key);
+            const a = Object.assign({ id, name: key, value: values[key] || "", type: "text" }, attrs || {});
             const input = el("input", a);
             inputs[key] = input;
             return el("div", { class: "field" },
-                el("label", {}, label, " ", el("code", {}, key)),
+                el("label", { for: id }, label, " ", el("code", {}, key)),
                 input,
             );
         };
 
         const dump978On = (values["UAT_INPUT"] || "") !== "";
+        const uatId = fieldId("UAT_INPUT");
         const uat = el("input", {
+            id: uatId,
             type: "checkbox",
             name: "UAT_INPUT",
             checked: dump978On ? "" : null,
@@ -771,7 +776,9 @@
         // to "true" when the key is absent (e.g. on a fresh feed.env that
         // hasn't been written yet) to match the daemon's MLAT_ENABLED:-true.
         const mlatOn = (values["MLAT_ENABLED"] || "true") === "true";
+        const mlatId = fieldId("MLAT_ENABLED");
         const mlat = el("input", {
+            id: mlatId,
             type: "checkbox",
             name: "MLAT_ENABLED",
             checked: mlatOn ? "" : null,
@@ -835,11 +842,11 @@
             field("ALTITUDE", "Altitude", { placeholder: "120m" }),
             field("MLAT_USER", "MLAT name", { placeholder: "alice" }),
             el("div", { class: "field" },
-                el("label", {}, mlat, " Enable MLAT", " ", el("code", {}, "MLAT_ENABLED")),
+                el("label", { for: mlatId }, mlat, " Enable MLAT", " ", el("code", {}, "MLAT_ENABLED")),
             ),
             field("GAIN", "Gain", { placeholder: "auto" }),
             el("div", { class: "field" },
-                el("label", {}, uat, " Enable 978 UAT", " ", el("code", {}, "UAT_INPUT")),
+                el("label", { for: uatId }, uat, " Enable 978 UAT", " ", el("code", {}, "UAT_INPUT")),
             ),
             submit,
             err,
