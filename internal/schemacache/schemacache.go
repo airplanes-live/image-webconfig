@@ -27,9 +27,9 @@ import (
 // versions add fields. Unknown future versions cause Load to fail loud
 // so we don't silently lose schema info.
 type schemaJSON struct {
-	Version       int      `json:"version"`
-	WritableKeys  []string `json:"writable_keys"`
-	ReadableKeys  []string `json:"readable_keys"`
+	Version      int      `json:"version"`
+	WritableKeys []string `json:"writable_keys"`
+	ReadableKeys []string `json:"readable_keys"`
 }
 
 // Cache is goroutine-safe; a single instance is shared across handlers.

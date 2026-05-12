@@ -22,7 +22,8 @@ import (
 //   - HTML: src=, href=
 //   - CSS:  url(...), @import
 //   - JS:   no scan; new fetches go through getJSON/postJSON which use
-//           same-origin paths by construction.
+//     same-origin paths by construction.
+//
 // XML namespace URIs (xmlns="http://www.w3.org/2000/svg" etc.) are
 // explicitly allowed — the browser does not fetch them.
 func TestAssetsHaveNoExternalFetch(t *testing.T) {

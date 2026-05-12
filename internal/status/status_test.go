@@ -469,7 +469,7 @@ func TestRead_UATDecisionNilOnInactive(t *testing.T) {
 	writeStateFile(t, p.UAT978StateFile, "schema_version=1\nstate=enabled\nreason=ok\n")
 	r := NewReader("v", p, perArgvRunner(map[string]func(unit string) (string, error){
 		"is-active:airplanes-978.service": func(_ string) (string, error) { return "inactive", errors.New("exit 3") },
-		"is-active:default":                func(_ string) (string, error) { return "active", nil },
+		"is-active:default":               func(_ string) (string, error) { return "active", nil },
 	}))
 	got, _ := r.Read(context.Background())
 	if got.UATDecision != nil {
@@ -490,6 +490,39 @@ func TestRead_UATDecisionRejectsCrossOwnerReason(t *testing.T) {
 	got, _ := r.Read(context.Background())
 	if got.UATDecision != nil {
 		t.Errorf("UATDecision = %+v, want nil (mlat_enabled_false is not a valid 978 reason)", got.UATDecision)
+	}
+}
+
+func TestRead_RebootRequiredFlag(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name   string
+		create bool
+		want   bool
+	}{
+		{"present", true, true},
+		{"absent", false, false},
+	}
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			p, dir := newTestPaths(t)
+			p.RebootRequiredFile = filepath.Join(dir, "reboot-required")
+			if tc.create {
+				if err := os.WriteFile(p.RebootRequiredFile, nil, 0o644); err != nil {
+					t.Fatal(err)
+				}
+			}
+			r := NewReader("v", p, fixedRunner("active", nil))
+			got, err := r.Read(context.Background())
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got.RebootRequired != tc.want {
+				t.Errorf("RebootRequired = %v, want %v", got.RebootRequired, tc.want)
+			}
+		})
 	}
 }
 

@@ -102,9 +102,9 @@ func main() {
 					nil, // RealRunner
 					nil, // statfs-backed DiskProber
 				))),
-			Logs:         logs.NewStreamer(nil),
-			Schema:       cache,
-			Privileged:   priv,
+			Logs:       logs.NewStreamer(nil),
+			Schema:     cache,
+			Privileged: priv,
 		}),
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       15 * time.Second,
