@@ -119,3 +119,47 @@ func TestServeSSE_UnknownUnit(t *testing.T) {
 		t.Fatalf("err = %v, want ErrUnknownUnit", err)
 	}
 }
+
+// deadlineRecordingRW implements http.Flusher + SetWriteDeadline so we can
+// observe the per-write deadlines the handler applies. Production
+// hijackable writers always support SetWriteDeadline; the existing
+// httptest.NewRecorder path in TestServeSSE_StreamsLines exercises the
+// ErrNotSupported fallback (it has no SetWriteDeadline method).
+type deadlineRecordingRW struct {
+	header    http.Header
+	deadlines []time.Time
+}
+
+func (r *deadlineRecordingRW) Header() http.Header                  { return r.header }
+func (r *deadlineRecordingRW) Write(p []byte) (int, error)          { return len(p), nil }
+func (r *deadlineRecordingRW) WriteHeader(int)                      {}
+func (r *deadlineRecordingRW) Flush()                               {}
+func (r *deadlineRecordingRW) SetWriteDeadline(t time.Time) error {
+	r.deadlines = append(r.deadlines, t)
+	return nil
+}
+
+func TestServeSSE_SetsPerWriteDeadline(t *testing.T) {
+	t.Parallel()
+	s := NewStreamer(fakeStreamer([]string{"line one", "line two"}, 20*time.Millisecond))
+
+	w := &deadlineRecordingRW{header: http.Header{}}
+	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+	defer cancel()
+	if err := s.ServeSSE(ctx, w, "feed"); err != nil {
+		t.Fatal(err)
+	}
+
+	if len(w.deadlines) < 2 {
+		t.Fatalf("expected at least 2 SetWriteDeadline calls (one per line), got %d", len(w.deadlines))
+	}
+	for i, d := range w.deadlines {
+		delta := time.Until(d)
+		if delta <= 0 {
+			t.Errorf("deadline #%d already in the past (delta=%v); want a future deadline", i, delta)
+		}
+		if delta > perWriteTimeout {
+			t.Errorf("deadline #%d delta = %v; want at most perWriteTimeout=%v", i, delta, perWriteTimeout)
+		}
+	}
+}
