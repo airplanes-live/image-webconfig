@@ -320,6 +320,33 @@
         const f = Number(m[1]);
         return Number.isFinite(f) && f >= -1000 && f <= 10000;
     }
+
+    // Wi-Fi validators — bash twin lives at
+    // /usr/local/lib/airplanes/wifi-validators.sh (apl_wifi_valid_*). Pinned
+    // by the same parity fixture. CRUCIAL: no trim. WPA passphrases and
+    // SSIDs can legitimately carry leading/trailing whitespace, so pass the
+    // value through verbatim — the form must not normalize.
+    const wifiSSIDControlsRE = /[\x00-\x1f\x7f]/;
+    function isValidWifiSSID(v) {
+        const s = String(v == null ? "" : v);
+        if (wifiSSIDControlsRE.test(s)) return false;
+        const bytes = new TextEncoder().encode(s).length;
+        return bytes >= 1 && bytes <= 32;
+    }
+    const wifiPSKHexRE = /^[A-Fa-f0-9]{64}$/;
+    const wifiPSKASCIIRE = /^[\x20-\x7e]{8,63}$/;
+    function isValidWifiPSK(v) {
+        const s = String(v == null ? "" : v);
+        if (wifiPSKHexRE.test(s)) return true;
+        return wifiPSKASCIIRE.test(s);
+    }
+    function isValidWifiCountry(v) {
+        return /^[A-Z]{2}$/.test(String(v == null ? "" : v));
+    }
+    const wifiPriorityRE = /^(0|[1-9][0-9]{0,2})$/;
+    function isValidWifiPriority(v) {
+        return wifiPriorityRE.test(String(v == null ? "" : v));
+    }
     /* @validator-parity end */
 
     // previewLatLonSet — projection of unsaved form values onto the

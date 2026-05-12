@@ -43,11 +43,24 @@ type Server struct {
 // the feed scripts (canonical writer + schema endpoint). The feed CLI
 // owns feed.env validation, restart fan-out, and the on-disk schema —
 // webconfig is a thin HTTP shell around its JSON interface.
+//
+// Wifi* target the apl-wifi binary installed by stage-airplanes/05. One
+// entry per subcommand keeps the sudoers grant pinned to a single verb;
+// a compromised webconfig cannot drift between the read-only (list /
+// status) and mutating (add / update / delete / test / activate) surfaces
+// via the same grant.
 type PrivilegedArgv struct {
-	ApplyFeed   []string // sudo -n /usr/local/bin/apl-feed apply --json
-	SchemaFeed  []string // /usr/local/bin/apl-feed schema --json (no sudo: read-only)
-	Reboot      []string
-	StartUpdate []string // sudo systemd-run --unit=airplanes-update ...
+	ApplyFeed    []string // sudo -n /usr/local/bin/apl-feed apply --json
+	SchemaFeed   []string // /usr/local/bin/apl-feed schema --json (no sudo: read-only)
+	Reboot       []string
+	StartUpdate  []string // sudo systemd-run --unit=airplanes-update ...
+	WifiList     []string
+	WifiAdd      []string
+	WifiUpdate   []string
+	WifiDelete   []string
+	WifiTest     []string
+	WifiActivate []string
+	WifiStatus   []string
 }
 
 // DefaultPrivilegedArgv returns the production argv shapes for the
@@ -67,6 +80,13 @@ func DefaultPrivilegedArgv() PrivilegedArgv {
 			"--property=ExecStopPost=/usr/bin/systemctl kill -s HUP airplanes-webconfig.service",
 			"/usr/local/share/airplanes/update.sh",
 		),
+		WifiList:     sudo("/usr/local/bin/apl-wifi", "list", "--json"),
+		WifiAdd:      sudo("/usr/local/bin/apl-wifi", "add", "--json"),
+		WifiUpdate:   sudo("/usr/local/bin/apl-wifi", "update", "--json"),
+		WifiDelete:   sudo("/usr/local/bin/apl-wifi", "delete", "--json"),
+		WifiTest:     sudo("/usr/local/bin/apl-wifi", "test", "--json"),
+		WifiActivate: sudo("/usr/local/bin/apl-wifi", "activate", "--json"),
+		WifiStatus:   sudo("/usr/local/bin/apl-wifi", "status", "--json"),
 	}
 }
 
@@ -135,6 +155,19 @@ func New(d Deps) http.Handler {
 	mux.HandleFunc("POST /api/config", s.requireSession(s.handleConfigPost))
 	mux.HandleFunc("POST /api/update", s.requireSession(s.handleUpdate))
 	mux.HandleFunc("POST /api/reboot", s.requireSession(s.handleReboot))
+
+	// Wi-Fi network management — privileged subcommands of /usr/local/bin/apl-wifi.
+	// No `s.wifiMu` mutex: the helper's flock at /run/airplanes/wifi.lock is
+	// the cross-process serialization point; a Go mutex would queue concurrent
+	// requests behind a 30s-test instead of letting the helper return a fast
+	// 503 lock_timeout to the second caller.
+	mux.HandleFunc("GET /api/wifi", s.requireSession(s.handleWifiList))
+	mux.HandleFunc("GET /api/wifi/status", s.requireSession(s.handleWifiStatus))
+	mux.HandleFunc("POST /api/wifi", s.requireSession(s.handleWifiAdd))
+	mux.HandleFunc("POST /api/wifi/test", s.requireSession(s.handleWifiTest))
+	mux.HandleFunc("PUT /api/wifi/{id}", s.requireSession(s.handleWifiUpdate))
+	mux.HandleFunc("DELETE /api/wifi/{id}", s.requireSession(s.handleWifiDelete))
+	mux.HandleFunc("POST /api/wifi/{id}/activate", s.requireSession(s.handleWifiActivate))
 
 	// Static assets at /static/*; the SPA shell is served by the GET /
 	// handler below. no-store cache policy: assets are embedded in the

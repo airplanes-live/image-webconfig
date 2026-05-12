@@ -93,10 +93,17 @@ func newTestServer(t *testing.T) (*httptest.Server, *Server) {
 	}
 
 	priv := PrivilegedArgv{
-		ApplyFeed:   []string{"sudo-stub", "apl-feed", "apply", "--json"},
-		SchemaFeed:  []string{"apl-feed", "schema", "--json"},
-		Reboot:      []string{"sudo-stub", "reboot"},
-		StartUpdate: []string{"sudo-stub", "update"},
+		ApplyFeed:    []string{"sudo-stub", "apl-feed", "apply", "--json"},
+		SchemaFeed:   []string{"apl-feed", "schema", "--json"},
+		Reboot:       []string{"sudo-stub", "reboot"},
+		StartUpdate:  []string{"sudo-stub", "update"},
+		WifiList:     []string{"sudo-stub", "apl-wifi", "list", "--json"},
+		WifiAdd:      []string{"sudo-stub", "apl-wifi", "add", "--json"},
+		WifiUpdate:   []string{"sudo-stub", "apl-wifi", "update", "--json"},
+		WifiDelete:   []string{"sudo-stub", "apl-wifi", "delete", "--json"},
+		WifiTest:     []string{"sudo-stub", "apl-wifi", "test", "--json"},
+		WifiActivate: []string{"sudo-stub", "apl-wifi", "activate", "--json"},
+		WifiStatus:   []string{"sudo-stub", "apl-wifi", "status", "--json"},
 	}
 
 	deps := Deps{
@@ -205,10 +212,17 @@ func newWriteHarness(t *testing.T) *writeHarness {
 	}
 
 	priv := PrivilegedArgv{
-		ApplyFeed:   []string{"sudo-stub", "apl-feed", "apply", "--json"},
-		SchemaFeed:  []string{"apl-feed", "schema", "--json"},
-		Reboot:      []string{"sudo-stub", "reboot"},
-		StartUpdate: []string{"sudo-stub", "update"},
+		ApplyFeed:    []string{"sudo-stub", "apl-feed", "apply", "--json"},
+		SchemaFeed:   []string{"apl-feed", "schema", "--json"},
+		Reboot:       []string{"sudo-stub", "reboot"},
+		StartUpdate:  []string{"sudo-stub", "update"},
+		WifiList:     []string{"sudo-stub", "apl-wifi", "list", "--json"},
+		WifiAdd:      []string{"sudo-stub", "apl-wifi", "add", "--json"},
+		WifiUpdate:   []string{"sudo-stub", "apl-wifi", "update", "--json"},
+		WifiDelete:   []string{"sudo-stub", "apl-wifi", "delete", "--json"},
+		WifiTest:     []string{"sudo-stub", "apl-wifi", "test", "--json"},
+		WifiActivate: []string{"sudo-stub", "apl-wifi", "activate", "--json"},
+		WifiStatus:   []string{"sudo-stub", "apl-wifi", "status", "--json"},
 	}
 
 	deps := Deps{
