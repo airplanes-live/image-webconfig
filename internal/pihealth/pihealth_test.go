@@ -130,12 +130,15 @@ func TestIsRaspberryPi(t *testing.T) {
 // === Probe integration tests ===
 
 // canned wires a CommandRunner that returns the given stdout for argv[0]
-// matching one of the bins; any other argv returns the supplied default.
+// matching one of the bins. vcgencmd dispatches on the first sub-arg so
+// `get_throttled` and `get_config psu_max_current` mock independently.
 type canned struct {
-	vcgencmd    string
-	vcgencmdErr error
-	timedatectl string
-	timeErr     error
+	vcgencmd       string // get_throttled
+	vcgencmdErr    error
+	vcgencmdPSU    string // get_config psu_max_current
+	vcgencmdPSUErr error
+	timedatectl    string
+	timeErr        error
 }
 
 func (c canned) runner() wexec.CommandRunner {
@@ -146,6 +149,9 @@ func (c canned) runner() wexec.CommandRunner {
 		base := filepath.Base(argv[0])
 		switch base {
 		case "vcgencmd":
+			if len(argv) >= 3 && argv[1] == "get_config" && argv[2] == "psu_max_current" {
+				return wexec.Result{Stdout: []byte(c.vcgencmdPSU)}, c.vcgencmdPSUErr
+			}
 			return wexec.Result{Stdout: []byte(c.vcgencmd)}, c.vcgencmdErr
 		case "timedatectl":
 			return wexec.Result{Stdout: []byte(c.timedatectl)}, c.timeErr
@@ -615,5 +621,212 @@ func TestNewReader_NilRunnerDefaultsToReal(t *testing.T) {
 	}
 	if r.paths.ProbeTimeout <= 0 {
 		t.Error("zero ProbeTimeout should default to non-zero")
+	}
+}
+
+// === PSU probe + undervoltage enrichment ===
+
+func TestParsePSUMaxCurrent(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		in    string
+		want  int
+		wantOK bool
+	}{
+		{"psu_max_current=5000\n", 5000, true},
+		{"psu_max_current=3000", 3000, true},
+		{"  psu_max_current=5000  \n", 5000, true},
+		{"psu_max_current=0\n", 0, false},          // 0 is "not probed", not "0A"
+		{"psu_max_current=\n", 0, false},
+		{"psu_max_current=garbage\n", 0, false},
+		{"some_other_key=5000\n", 0, false},
+		{"", 0, false},
+	}
+	for _, c := range cases {
+		got, ok := parsePSUMaxCurrent(c.in)
+		if ok != c.wantOK || got != c.want {
+			t.Errorf("parsePSUMaxCurrent(%q) = (%d, %v), want (%d, %v)",
+				c.in, got, ok, c.want, c.wantOK)
+		}
+	}
+}
+
+func TestExpectedPSUMaxCurrentMA(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		model string
+		want  int
+	}{
+		{"Raspberry Pi 5 Model B Rev 1.0\x00", 5000},
+		{"Raspberry Pi 5\x00", 5000},
+		{"Raspberry Pi Compute Module 5 Rev 1.0\x00", 5000},
+		{"Raspberry Pi 4 Model B Rev 1.4\x00", 3000},
+		{"Raspberry Pi Compute Module 4\x00", 3000},
+		{"Raspberry Pi 3 Model B+\x00", 2500},
+		{"Raspberry Pi Zero 2 W Rev 1.0\x00", 2500},
+		{"Raspberry Pi 2 Model B\x00", 0}, // pre-Pi-3 / Zero 2: unknown
+		{"Some other SBC\x00", 0},
+		{"", 0},
+	}
+	for _, c := range cases {
+		if got := expectedPSUMaxCurrentMA([]byte(c.model)); got != c.want {
+			t.Errorf("expectedPSUMaxCurrentMA(%q) = %d, want %d", c.model, got, c.want)
+		}
+	}
+}
+
+func TestUndervoltedNowBlurb(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name string
+		in   *PiHealth
+		want string
+	}{
+		{
+			name: "PSU not probed → plain blurb",
+			in:   &PiHealth{},
+			want: "undervolted now",
+		},
+		{
+			name: "PSU probed but expected unknown (pre-Pi-3) → plain blurb",
+			in:   &PiHealth{PSUProbed: true, PSUMaxCurrentMA: 1500, PSUExpectedMA: 0},
+			want: "undervolted now",
+		},
+		{
+			name: "PSU rating matches expectation → plain blurb",
+			in:   &PiHealth{PSUProbed: true, PSUMaxCurrentMA: 5000, PSUExpectedMA: 5000},
+			want: "undervolted now",
+		},
+		{
+			name: "PSU rating exceeds expectation → plain blurb",
+			in:   &PiHealth{PSUProbed: true, PSUMaxCurrentMA: 5500, PSUExpectedMA: 5000},
+			want: "undervolted now",
+		},
+		{
+			name: "Pi 5 with 3A PSU → enriched",
+			in:   &PiHealth{PSUProbed: true, PSUMaxCurrentMA: 3000, PSUExpectedMA: 5000},
+			want: "undervolted now (PSU 3A, needs 5A)",
+		},
+		{
+			name: "Non-integer rating uses %g (4.5A not 4.50A)",
+			in:   &PiHealth{PSUProbed: true, PSUMaxCurrentMA: 4500, PSUExpectedMA: 5000},
+			want: "undervolted now (PSU 4.5A, needs 5A)",
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := undervoltedNowBlurb(c.in); got != c.want {
+				t.Errorf("undervoltedNowBlurb = %q, want %q", got, c.want)
+			}
+		})
+	}
+}
+
+func TestProbe_PSU_Pi5With3APSU_UndervoltageEnriched(t *testing.T) {
+	t.Parallel()
+	f := &fixture{
+		t:       t,
+		model:   "Raspberry Pi 5 Model B Rev 1.0\x00",
+		thermal: "60000\n",
+		meminfo: "MemTotal: 8000000 kB\nMemAvailable: 6000000 kB\n",
+		uptime:  "12345.67\n",
+		canned: canned{
+			vcgencmd:    "throttled=0x10001\n", // undervolt now + ever
+			timedatectl: "NTPSynchronized=yes\n",
+			vcgencmdPSU: "psu_max_current=3000\n",
+		},
+		disk: fixedDiskProber(40),
+	}
+	got := f.reader().Probe(context.Background())
+	if !got.PSUProbed || got.PSUMaxCurrentMA != 3000 {
+		t.Errorf("PSU probe wrong: probed=%v ma=%d", got.PSUProbed, got.PSUMaxCurrentMA)
+	}
+	if got.PSUExpectedMA != 5000 {
+		t.Errorf("PSUExpectedMA = %d, want 5000", got.PSUExpectedMA)
+	}
+	if got.Severity != "err" {
+		t.Errorf("severity = %q, want err", got.Severity)
+	}
+	wantLead := "undervolted now (PSU 3A, needs 5A)"
+	if !strings.HasPrefix(got.Summary, wantLead) {
+		t.Errorf("summary = %q, want prefix %q", got.Summary, wantLead)
+	}
+}
+
+func TestProbe_PSU_Pi5With5APSU_NoEnrichment(t *testing.T) {
+	t.Parallel()
+	f := &fixture{
+		t:       t,
+		model:   "Raspberry Pi 5 Model B Rev 1.0\x00",
+		thermal: "60000\n",
+		meminfo: "MemTotal: 8000000 kB\nMemAvailable: 6000000 kB\n",
+		uptime:  "12345.67\n",
+		canned: canned{
+			vcgencmd:    "throttled=0x10001\n",
+			timedatectl: "NTPSynchronized=yes\n",
+			vcgencmdPSU: "psu_max_current=5000\n",
+		},
+		disk: fixedDiskProber(40),
+	}
+	got := f.reader().Probe(context.Background())
+	if got.PSUMaxCurrentMA != 5000 {
+		t.Errorf("PSUMaxCurrentMA = %d, want 5000", got.PSUMaxCurrentMA)
+	}
+	// 5A meets the 5A expectation — no enrichment.
+	if !strings.HasPrefix(got.Summary, "undervolted now") || strings.Contains(got.Summary, "PSU") {
+		t.Errorf("summary should be plain 'undervolted now', got %q", got.Summary)
+	}
+}
+
+func TestProbe_PSU_Pi4NoVcgencmdReport_NoEnrichment(t *testing.T) {
+	t.Parallel()
+	f := &fixture{
+		t:       t,
+		model:   "Raspberry Pi 4 Model B Rev 1.4\x00",
+		thermal: "60000\n",
+		meminfo: "MemTotal: 4000000 kB\nMemAvailable: 2000000 kB\n",
+		uptime:  "12345.67\n",
+		canned: canned{
+			vcgencmd:    "throttled=0x10001\n",
+			timedatectl: "NTPSynchronized=yes\n",
+			// Pi 4 firmware doesn't expose psu_max_current — empty stdout.
+			vcgencmdPSU: "",
+		},
+		disk: fixedDiskProber(40),
+	}
+	got := f.reader().Probe(context.Background())
+	if got.PSUProbed {
+		t.Error("PSUProbed should be false on Pi 4 (no firmware report)")
+	}
+	if got.PSUExpectedMA != 3000 {
+		t.Errorf("PSUExpectedMA = %d, want 3000 (Pi 4)", got.PSUExpectedMA)
+	}
+	if strings.Contains(got.Summary, "PSU") {
+		t.Errorf("summary should not mention PSU when not probed, got %q", got.Summary)
+	}
+}
+
+func TestProbe_PSU_NonPi_NoEnrichment(t *testing.T) {
+	t.Parallel()
+	// No model file → not a Pi → PSUExpectedMA=0 → no enrichment even
+	// if vcgencmd were somehow to return a value.
+	f := &fixture{
+		t:       t,
+		thermal: "60000\n",
+		meminfo: "MemTotal: 16000000 kB\nMemAvailable: 8000000 kB\n",
+		uptime:  "12345.67\n",
+		canned: canned{
+			vcgencmd:    "throttled=0x10001\n",
+			timedatectl: "NTPSynchronized=yes\n",
+			vcgencmdPSU: "psu_max_current=3000\n",
+		},
+		disk: fixedDiskProber(40),
+	}
+	got := f.reader().Probe(context.Background())
+	if got.PSUExpectedMA != 0 {
+		t.Errorf("PSUExpectedMA = %d, want 0 (non-Pi)", got.PSUExpectedMA)
+	}
+	if strings.Contains(got.Summary, "PSU") {
+		t.Errorf("summary should not mention PSU on non-Pi, got %q", got.Summary)
 	}
 }

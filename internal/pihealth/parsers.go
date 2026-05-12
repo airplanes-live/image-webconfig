@@ -127,3 +127,54 @@ func isRaspberryPi(modelFileContents []byte) bool {
 	trimmed := bytes.TrimRight(modelFileContents, "\x00\n\r\t ")
 	return bytes.HasPrefix(trimmed, []byte("Raspberry Pi"))
 }
+
+// parsePSUMaxCurrent extracts the milliamp rating from `vcgencmd
+// get_config psu_max_current` output. Pi 5 firmware reports the
+// USB-PD-negotiated capability (e.g. `psu_max_current=5000`); earlier
+// Pis don't expose this key and `vcgencmd` either returns nothing or a
+// zero value — both are treated as "not probed" via ok=false.
+func parsePSUMaxCurrent(stdout string) (int, bool) {
+	s := strings.TrimSpace(stdout)
+	const prefix = "psu_max_current="
+	idx := strings.Index(s, prefix)
+	if idx < 0 {
+		return 0, false
+	}
+	value := s[idx+len(prefix):]
+	if cut := strings.IndexAny(value, " \t\r\n"); cut >= 0 {
+		value = value[:cut]
+	}
+	v, err := strconv.Atoi(value)
+	if err != nil || v <= 0 {
+		return 0, false
+	}
+	return v, true
+}
+
+// expectedPSUMaxCurrentMA returns the manufacturer-recommended PSU
+// rating in milliamps for the Pi family detected from the device-tree
+// model string. Returns 0 when the family is unknown or the model is
+// too old to have a documented expectation.
+//
+// Values track the official "minimum power supply" guidance:
+//   - Pi 5:    5000 mA (for full peripheral budget; 3000 mA boots in
+//              USB-current-limited mode)
+//   - Pi 4 /
+//     CM4:    3000 mA
+//   - Pi 3 /
+//     Zero 2: 2500 mA
+func expectedPSUMaxCurrentMA(modelFileContents []byte) int {
+	trimmed := strings.TrimRight(string(modelFileContents), "\x00\n\r\t ")
+	switch {
+	case strings.HasPrefix(trimmed, "Raspberry Pi 5"),
+		strings.HasPrefix(trimmed, "Raspberry Pi Compute Module 5"):
+		return 5000
+	case strings.HasPrefix(trimmed, "Raspberry Pi 4"),
+		strings.HasPrefix(trimmed, "Raspberry Pi Compute Module 4"):
+		return 3000
+	case strings.HasPrefix(trimmed, "Raspberry Pi 3"),
+		strings.HasPrefix(trimmed, "Raspberry Pi Zero 2"):
+		return 2500
+	}
+	return 0
+}

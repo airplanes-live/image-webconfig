@@ -115,6 +115,7 @@ type PiHealth struct {
 	TimeProbed     bool `json:"time_probed"`
 	MemProbed      bool `json:"mem_probed"`
 	DiskProbed     bool `json:"disk_probed"`
+	PSUProbed      bool `json:"psu_probed"`
 
 	UndervoltageNow   bool `json:"undervoltage_now"`
 	UndervoltageEver  bool `json:"undervoltage_ever"`
@@ -130,6 +131,15 @@ type PiHealth struct {
 	UptimeSeconds   float64 `json:"uptime_s,omitempty"`
 	MemoryAvailPct  float64 `json:"mem_avail_pct,omitempty"`
 	DiskFreePct     float64 `json:"disk_free_pct,omitempty"`
+
+	// PSU max-current capability reported by `vcgencmd get_config
+	// psu_max_current`. Pi 5 / CM5 firmware reports the USB-PD-negotiated
+	// rating; older Pis don't expose this key so PSUProbed stays false on
+	// them. PSUExpectedMA is the manufacturer-recommended rating for the
+	// detected family (5000 mA for Pi 5, 3000 mA for Pi 4, etc.); 0 when
+	// the family is unknown.
+	PSUMaxCurrentMA int `json:"psu_max_current_ma,omitempty"`
+	PSUExpectedMA   int `json:"psu_expected_ma,omitempty"`
 }
 
 // Probe runs every sub-probe and returns the aggregated PiHealth. Never
@@ -138,7 +148,11 @@ type PiHealth struct {
 func (r *Reader) Probe(ctx context.Context) *PiHealth {
 	out := &PiHealth{}
 
-	if model, err := os.ReadFile(r.paths.DeviceTreeModel); err == nil {
+	// The model file is consumed by two probes: IsRaspberryPi detection
+	// and the PSU family-expectation lookup. Read once and pass through.
+	var model []byte
+	if b, err := os.ReadFile(r.paths.DeviceTreeModel); err == nil {
+		model = b
 		out.IsRaspberryPi = isRaspberryPi(model)
 	}
 
@@ -147,6 +161,7 @@ func (r *Reader) Probe(ctx context.Context) *PiHealth {
 	r.probeTime(ctx, out)
 	r.probeMem(out)
 	r.probeDisk(out)
+	r.probePSU(ctx, out, model)
 
 	classify(out, r.thresholds)
 	return out
@@ -172,6 +187,29 @@ func (r *Reader) probeThrottle(ctx context.Context, out *PiHealth) {
 	out.ThrottlingEver = bits&bitThrottlingEver != 0
 	out.SoftTempLimitNow = bits&bitSoftTempLimitNow != 0
 	out.SoftTempLimitEver = bits&bitSoftTempLimitEver != 0
+}
+
+// probePSU runs `vcgencmd get_config psu_max_current` to discover the
+// PSU rating the firmware negotiated (Pi 5 / CM5 only — older boards
+// don't expose this key and vcgencmd either errors or returns no value,
+// in which case PSUProbed stays false). PSUExpectedMA is filled from
+// the device-tree model regardless of the vcgencmd outcome so the
+// classifier can still note "Pi 4 family expects 3A" if a future
+// downstream wants that even without a reported current.
+func (r *Reader) probePSU(ctx context.Context, out *PiHealth, model []byte) {
+	out.PSUExpectedMA = expectedPSUMaxCurrentMA(model)
+	cctx, cancel := context.WithTimeout(ctx, r.paths.ProbeTimeout)
+	defer cancel()
+	res, err := r.runner(cctx, []string{r.paths.VcgencmdBinary, "get_config", "psu_max_current"})
+	if err != nil {
+		return
+	}
+	mA, ok := parsePSUMaxCurrent(string(res.Stdout))
+	if !ok {
+		return
+	}
+	out.PSUProbed = true
+	out.PSUMaxCurrentMA = mA
 }
 
 func (r *Reader) probeTemp(out *PiHealth) {
@@ -256,6 +294,27 @@ type blurb struct {
 	text     string
 }
 
+// undervoltedNowBlurb returns the user-facing "undervolted now" text,
+// optionally enriched with the negotiated PSU rating vs the family
+// expectation when the firmware reports an under-spec supply. The
+// enrichment only fires when the probe succeeded AND the rating is
+// strictly below the documented expectation — a 5A PSU on a Pi 5
+// renders as plain "undervolted now" (PSU isn't the obvious culprit).
+//
+// Format example: "undervolted now (PSU 3A, needs 5A)" — uses %g to
+// strip noise zeros so 4500 mA reads "4.5A", not "4.50A".
+func undervoltedNowBlurb(p *PiHealth) string {
+	if !p.PSUProbed || p.PSUExpectedMA <= 0 {
+		return "undervolted now"
+	}
+	if p.PSUMaxCurrentMA >= p.PSUExpectedMA {
+		return "undervolted now"
+	}
+	return fmt.Sprintf("undervolted now (PSU %gA, needs %gA)",
+		float64(p.PSUMaxCurrentMA)/1000,
+		float64(p.PSUExpectedMA)/1000)
+}
+
 // classify fills out.Severity + out.Summary based on probed sub-checks.
 // The ordering of the priority cases here matches the plan's summary-
 // ordering table.
@@ -267,7 +326,7 @@ func classify(out *PiHealth, t Thresholds) {
 
 	if out.ThrottleProbed {
 		if out.UndervoltageNow {
-			add(1, sevErr, "undervolted now")
+			add(1, sevErr, undervoltedNowBlurb(out))
 		}
 		if out.ThrottlingNow {
 			add(2, sevErr, "throttling now")

@@ -112,6 +112,20 @@ func TestFormatCLILine(t *testing.T) {
 			want: "err\tundervolted now * throttling now * arm freq capped now",
 		},
 		{
+			name: "err with PSU-enriched undervoltage (already ASCII, no transform)",
+			in: &pihealth.PiHealth{
+				Severity:        "err",
+				Summary:         "undervolted now (PSU 3A, needs 5A) · throttling now",
+				ThrottleProbed:  true,
+				UndervoltageNow: true,
+				ThrottlingNow:   true,
+				PSUProbed:       true,
+				PSUMaxCurrentMA: 3000,
+				PSUExpectedMA:   5000,
+			},
+			want: "err\tundervolted now (PSU 3A, needs 5A) * throttling now",
+		},
+		{
 			name: "na probe failed",
 			in: &pihealth.PiHealth{
 				Severity: "na",
