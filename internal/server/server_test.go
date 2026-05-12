@@ -335,6 +335,24 @@ func TestConfigPost_LockTimeoutReturns503(t *testing.T) {
 	}
 }
 
+func TestConfigPost_PreservesHelperSuppliedError(t *testing.T) {
+	// If apl-feed (or a future helper) emits a flat error field directly,
+	// synthesizeError must not overwrite it with the joined errors or
+	// the generic last-resort string.
+	h := newWriteHarness(t)
+	h.stdinResult = wexec.Result{
+		Stdout: []byte(`{"status":"rejected","error":"helper-supplied summary","errors":{"LATITUDE":"x"}}`),
+	}
+	r := postJSON(t, h.client, h.ts.URL+"/api/config",
+		map[string]any{"updates": map[string]string{"LATITUDE": "bad"}})
+	defer r.Body.Close()
+	var body applyFeedResponse
+	_ = json.NewDecoder(r.Body).Decode(&body)
+	if body.Error != "helper-supplied summary" {
+		t.Errorf("body.Error = %q, want helper-supplied summary preserved", body.Error)
+	}
+}
+
 func TestConfigPost_RejectedErrorIsSorted(t *testing.T) {
 	// Map iteration order is randomised in Go, so the synthesized error
 	// string must sort keys for stable rendering.
@@ -347,7 +365,7 @@ func TestConfigPost_RejectedErrorIsSorted(t *testing.T) {
 	defer r.Body.Close()
 	var body applyFeedResponse
 	_ = json.NewDecoder(r.Body).Decode(&body)
-	want := "ALTITUDE: y\nLATITUDE: z\nLONGITUDE: x"
+	want := "ALTITUDE: y; LATITUDE: z; LONGITUDE: x"
 	if body.Error != want {
 		t.Errorf("body.Error = %q, want %q (sorted)", body.Error, want)
 	}

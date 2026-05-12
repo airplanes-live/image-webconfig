@@ -458,10 +458,16 @@ type applyFeedResponse struct {
 // non-success paths; success envelopes leave Error empty.
 //
 // rejected envelopes carry per-key reasons in Errors. The form renders
-// a single string today, so we join "KEY: reason" pairs with newlines.
+// resp.Error via textContent, which collapses newlines visually — so we
+// join "KEY: reason" pairs with "; " for a readable one-line message.
 // Sorted to keep the output stable across runs (Go map iteration is
 // randomised, and the renderer would otherwise re-order on every save).
+// If apl-feed (or a future helper) already populated resp.Error, leave
+// it alone — that flat field is authoritative when present.
 func synthesizeError(resp *applyFeedResponse) {
+	if resp.Error != "" {
+		return
+	}
 	if len(resp.Errors) > 0 {
 		keys := make([]string, 0, len(resp.Errors))
 		for k := range resp.Errors {
@@ -472,7 +478,7 @@ func synthesizeError(resp *applyFeedResponse) {
 		for _, k := range keys {
 			parts = append(parts, k+": "+resp.Errors[k])
 		}
-		resp.Error = strings.Join(parts, "\n")
+		resp.Error = strings.Join(parts, "; ")
 		return
 	}
 	if resp.Message != "" {
