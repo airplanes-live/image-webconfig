@@ -351,17 +351,38 @@
     // classify978FromDecision mirrors classifyMlatFromDecision: the daemon's
     // published decision drives the tile state, with the unit's systemd
     // active state only consulted in the "enabled" branch (where transient
-    // failures or starting-up states are user-visible). Used for both the
-    // dump978-fa and airplanes-978 tiles — they share the same UAT_INPUT
-    // decision (only airplanes-978.sh writes the file).
+    // failures or starting-up states are user-visible).
+    //
+    // Used by both 978 tiles, but reads from different decision objects:
+    //   - dump978-fa.service tile  → dump978fa_decision (the producer)
+    //   - airplanes-978.service tile → uat_decision    (the consumer)
+    //
+    // Reason vocabularies differ across producer/consumer (no_hardware on
+    // the producer, peer_no_hardware on the consumer); both render the
+    // same family of "warn — no SDR" tiles so the user sees a coherent
+    // story even though the underlying signals come from different files.
     function classify978FromDecision(decision, serviceState, activeLabel) {
         if (decision.state === "disabled") {
+            // no_hardware is the dump978-fa hardware-probe self-disable;
+            // render as warn (not the na/grey that uat_disabled gets) so
+            // the user notices the SDR is missing rather than mistaking it
+            // for an intentional config-off.
+            if (decision.reason === "no_hardware") {
+                return { dot: "warn", meta: "no 978 SDR detected" };
+            }
             return { dot: "na", meta: "disabled — UAT off in config" };
         }
         if (decision.state === "misconfigured") {
             return { dot: "err", meta: uatMisconfigReason(decision.reason) };
         }
         // decision.state === "enabled"
+        // peer_no_hardware: airplanes-978 is up but dump978-fa stood down
+        // because no 978 SDR is present. The relay has no input — render
+        // an honest idle tile instead of the green "relaying UAT" that
+        // would mislead.
+        if (decision.reason === "peer_no_hardware") {
+            return { dot: "warn", meta: "idle — no 978 SDR detected" };
+        }
         if (serviceState === "active") return { dot: "ok", meta: activeLabel };
         if (serviceState === "failed") return { dot: "err", meta: "failed" };
         if (serviceState === "activating" || serviceState === "reloading") {
@@ -417,9 +438,14 @@
                 return { dot: "err", meta: "decoder down" };
             }
             case "dump978-fa.service": {
-                const uatDecision = payload.uat_decision || null;
-                if (uatDecision) {
-                    return classify978FromDecision(uatDecision, state, "decoding 978");
+                // Producer side: read dump978-fa's own decision (which
+                // includes the new no_hardware reason from its USB-serial
+                // probe). Falls back to the consumer's uat_decision if the
+                // server didn't publish a separate producer decision (older
+                // webconfig binary, missing state file).
+                const dump978Decision = payload.dump978fa_decision || payload.uat_decision || null;
+                if (dump978Decision) {
+                    return classify978FromDecision(dump978Decision, state, "decoding 978");
                 }
                 // Legacy fallback: pre-PR-4 webconfig binary or daemon
                 // without a state file.
@@ -785,6 +811,30 @@
         });
         inputs["UAT_INPUT"] = uat;
 
+        // 978 dependent fields. Defaults mirror dump978-fa.sh's wrapper
+        // fallback ("978" / "42.1") so the form pre-renders the same value
+        // the daemon would use if the user simply toggles UAT on.
+        const sdrSerialId = fieldId("DUMP978_SDR_SERIAL");
+        const dump978Serial = el("input", {
+            id: sdrSerialId,
+            type: "text",
+            name: "DUMP978_SDR_SERIAL",
+            value: values["DUMP978_SDR_SERIAL"] || "978",
+            placeholder: "978",
+        });
+        inputs["DUMP978_SDR_SERIAL"] = dump978Serial;
+
+        const gainId = fieldId("DUMP978_GAIN");
+        const dump978Gain = el("input", {
+            id: gainId,
+            type: "text",
+            name: "DUMP978_GAIN",
+            value: values["DUMP978_GAIN"] || "42.1",
+            placeholder: "42.1",
+            inputmode: "decimal",
+        });
+        inputs["DUMP978_GAIN"] = dump978Gain;
+
         // MLAT_ENABLED is a separate boolean toggle in the new schema. Default
         // to "true" when the key is absent (e.g. on a fresh feed.env that
         // hasn't been written yet) to match the daemon's MLAT_ENABLED:-true.
@@ -831,7 +881,18 @@
                     MLAT_PRIVATE: mlatPrivate.checked ? "true" : "false",
                     GAIN: inputs.GAIN.value.trim(),
                     UAT_INPUT: uat.checked ? "127.0.0.1:30978" : "",
+                    DUMP978_SDR_SERIAL: dump978Serial.value.trim(),
+                    DUMP978_GAIN: dump978Gain.value.trim(),
                 };
+                // Don't write DUMP978_* keys when UAT is toggled off — they
+                // would be no-ops the daemon never reads, and writing them
+                // anyway would let a stale serial/gain accumulate in feed.env
+                // even after the user disabled 978. The wrapper falls back
+                // to compiled-in defaults (978 / 42.1) on next enable.
+                if (!uat.checked) {
+                    delete updates.DUMP978_SDR_SERIAL;
+                    delete updates.DUMP978_GAIN;
+                }
                 // Always send MLAT_ENABLED, MLAT_PRIVATE, and UAT_INPUT —
                 // they're explicit toggles whose "false"/"" form is
                 // meaningful. Strip other keys when empty so the user can
@@ -880,13 +941,21 @@
             el("div", { class: "field" },
                 el("label", { for: uatId }, uat, " Enable 978 UAT", " ", el("code", {}, "UAT_INPUT")),
             ),
+            el("div", { class: "field" },
+                el("label", { for: sdrSerialId }, "978 SDR serial", " ", el("code", {}, "DUMP978_SDR_SERIAL")),
+                dump978Serial,
+            ),
+            el("div", { class: "field" },
+                el("label", { for: gainId }, "978 gain", " ", el("code", {}, "DUMP978_GAIN")),
+                dump978Gain,
+            ),
             submit,
             err,
         );
         parent.appendChild(form);
 
         const readOnly = Object.keys(values).filter(k =>
-            !["LATITUDE", "LONGITUDE", "ALTITUDE", "MLAT_USER", "MLAT_ENABLED", "MLAT_PRIVATE", "GAIN", "UAT_INPUT"].includes(k)
+            !["LATITUDE", "LONGITUDE", "ALTITUDE", "MLAT_USER", "MLAT_ENABLED", "MLAT_PRIVATE", "GAIN", "UAT_INPUT", "DUMP978_SDR_SERIAL", "DUMP978_GAIN"].includes(k)
         ).sort();
         if (readOnly.length > 0) {
             const tbl = el("dl", { class: "config-list" });

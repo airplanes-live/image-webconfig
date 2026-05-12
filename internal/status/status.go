@@ -33,25 +33,27 @@ var MonitoredServices = []string{
 // Paths configures file lookups; defaults match the rootfs layout. Override
 // in tests.
 type Paths struct {
-	ManifestFile       string // /etc/airplanes/build-manifest.json
-	AircraftJSONFile   string // /run/readsb/aircraft.json
-	MlatStateFile      string // /run/airplanes-mlat/state
-	FeedStateFile      string // /run/airplanes-feed/state
-	UAT978StateFile    string // /run/airplanes-978/state
-	SystemctlSudoArgv0 []string // [sudo, -n, ...] OR [systemctl] (no sudo: is-active is read-only)
-	SystemctlBinary    string   // /usr/bin/systemctl
-	IsActiveTimeout    time.Duration
+	ManifestFile        string // /etc/airplanes/build-manifest.json
+	AircraftJSONFile    string // /run/readsb/aircraft.json
+	MlatStateFile       string // /run/airplanes-mlat/state
+	FeedStateFile       string // /run/airplanes-feed/state
+	UAT978StateFile     string // /run/airplanes-978/state
+	Dump978FAStateFile  string // /run/dump978-fa/state
+	SystemctlSudoArgv0  []string // [sudo, -n, ...] OR [systemctl] (no sudo: is-active is read-only)
+	SystemctlBinary     string   // /usr/bin/systemctl
+	IsActiveTimeout     time.Duration
 }
 
 func DefaultPaths() Paths {
 	return Paths{
-		ManifestFile:     "/etc/airplanes/build-manifest.json",
-		AircraftJSONFile: "/run/readsb/aircraft.json",
-		MlatStateFile:    "/run/airplanes-mlat/state",
-		FeedStateFile:    "/run/airplanes-feed/state",
-		UAT978StateFile:  "/run/airplanes-978/state",
-		SystemctlBinary:  "/usr/bin/systemctl",
-		IsActiveTimeout:  2 * time.Second,
+		ManifestFile:       "/etc/airplanes/build-manifest.json",
+		AircraftJSONFile:   "/run/readsb/aircraft.json",
+		MlatStateFile:      "/run/airplanes-mlat/state",
+		FeedStateFile:      "/run/airplanes-feed/state",
+		UAT978StateFile:    "/run/airplanes-978/state",
+		Dump978FAStateFile: "/run/dump978-fa/state",
+		SystemctlBinary:    "/usr/bin/systemctl",
+		IsActiveTimeout:    2 * time.Second,
 	}
 }
 
@@ -83,12 +85,17 @@ type Status struct {
 	// break the JSON shape — clients fall back to the service active-state
 	// classification (or, for UAT, to UAT_INPUT-truthy from /api/config).
 	//
-	// UATDecision applies to BOTH 978 services (dump978-fa, airplanes-978):
-	// they share a single state file written by airplanes-978.sh from the
-	// same UAT_INPUT input.
-	MlatDecision *Decision `json:"mlat_decision,omitempty"`
-	FeedDecision *Decision `json:"feed_decision,omitempty"`
-	UATDecision  *Decision `json:"uat_decision,omitempty"`
+	// UATDecision is airplanes-978.sh's publication (the consumer side of
+	// the 978 family). Dump978FADecision is dump978-fa.sh's publication
+	// (the producer side, now hardware-aware via its USB-serial probe).
+	// Frontend consumers render the tiles independently; the producer's
+	// no_hardware decision propagates into UATDecision.Reason as
+	// peer_no_hardware so the airplanes-978 tile can render an "idle relay"
+	// state without polling two endpoints.
+	MlatDecision     *Decision `json:"mlat_decision,omitempty"`
+	FeedDecision     *Decision `json:"feed_decision,omitempty"`
+	UATDecision      *Decision `json:"uat_decision,omitempty"`
+	Dump978FADecision *Decision `json:"dump978fa_decision,omitempty"`
 }
 
 // Decision is the daemon's last-published runtime decision.
@@ -153,6 +160,7 @@ func (r *Reader) Read(ctx context.Context) (Status, error) {
 	out.MlatDecision = r.readMlatDecision(ctx, out.Services["airplanes-mlat.service"])
 	out.FeedDecision = r.readFeedDecision(out.Services["airplanes-feed.service"])
 	out.UATDecision = r.readUATDecision(ctx, out.Services["airplanes-978.service"])
+	out.Dump978FADecision = r.readDump978FADecision(ctx, out.Services["dump978-fa.service"])
 
 	return out, nil
 }
@@ -211,6 +219,27 @@ func (r *Reader) readUATDecision(ctx context.Context, svcState string) *Decision
 		return nil
 	}
 	return decisionFromFile(r.paths.UAT978StateFile, runtimestate.AllowedReasons978)
+}
+
+// readDump978FADecision reads dump978-fa.sh's published decision. Same
+// consult rule as the other 64-exit self-disable wrappers. The
+// no_hardware reason is the new state-machine entry from the wrapper's
+// USB-serial probe — dashboards should render it as an "SDR absent" tile
+// rather than a generic failure.
+func (r *Reader) readDump978FADecision(ctx context.Context, svcState string) *Decision {
+	consult := false
+	switch svcState {
+	case "active", "activating", "reloading":
+		consult = true
+	case "failed":
+		if r.execMainStatus(ctx, "dump978-fa.service") == "64" {
+			consult = true
+		}
+	}
+	if !consult {
+		return nil
+	}
+	return decisionFromFile(r.paths.Dump978FAStateFile, runtimestate.AllowedReasonsDump978FA)
 }
 
 // decisionFromFile reads, validates, and returns the Decision encoded in a

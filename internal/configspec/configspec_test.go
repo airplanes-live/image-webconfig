@@ -38,6 +38,14 @@ func TestValidate_HappyPaths(t *testing.T) {
 		{"GAIN", "60"},
 		{"UAT_INPUT", ""},
 		{"UAT_INPUT", "127.0.0.1:30978"},
+		{"DUMP978_SDR_SERIAL", ""},
+		{"DUMP978_SDR_SERIAL", "978"},
+		{"DUMP978_SDR_SERIAL", "00000978"},
+		{"DUMP978_SDR_SERIAL", "custom-serial_42"},
+		{"DUMP978_SDR_SERIAL", strings.Repeat("a", 32)},
+		{"DUMP978_GAIN", "0"},
+		{"DUMP978_GAIN", "42.1"},
+		{"DUMP978_GAIN", "60"},
 	}
 	for _, c := range cases {
 		t.Run(c.key+"/"+c.value, func(t *testing.T) {
@@ -60,6 +68,8 @@ func TestValidate_RejectsOutOfRange(t *testing.T) {
 		{"ALTITUDE", "-2000"},
 		{"GAIN", "61"},
 		{"GAIN", "-1"},
+		{"DUMP978_GAIN", "61"},
+		{"DUMP978_GAIN", "-1"},
 	}
 	for _, c := range cases {
 		t.Run(c.key+"/"+c.value, func(t *testing.T) {
@@ -107,6 +117,14 @@ func TestValidate_RejectsBadShapes(t *testing.T) {
 		{"UAT_INPUT", "127.0.0.1:30979", "wrong-port"},
 		{"UAT_INPUT", "10.0.0.5:30978", "remote-host"},
 		{"UAT_INPUT", "any-other-string", "free-form"},
+		{"DUMP978_SDR_SERIAL", strings.Repeat("a", 33), "too-long"},
+		{"DUMP978_SDR_SERIAL", "with space", "space"},
+		{"DUMP978_SDR_SERIAL", "name@home", "at-sign"},
+		{"DUMP978_GAIN", "", "empty"},
+		{"DUMP978_GAIN", "auto", "string-not-numeric"},
+		{"DUMP978_GAIN", "min", "string-not-numeric"},
+		{"DUMP978_GAIN", "max", "string-not-numeric"},
+		{"DUMP978_GAIN", "abc", "non-numeric"},
 	}
 	for _, c := range cases {
 		t.Run(c.key+"/"+c.why, func(t *testing.T) {

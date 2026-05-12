@@ -64,11 +64,23 @@ var AllowedReasonsFeed = map[string]bool{
 	"ok": true,
 }
 
-// AllowedReasons978 mirrors airplanes-978.sh's _978_classify output.
+// AllowedReasons978 mirrors airplanes-978.sh's classifier (including the
+// peer-refined enabled-branch reasons).
 var AllowedReasons978 = map[string]bool{
 	"ok":                true,
 	"uat_disabled":      true,
 	"uat_input_invalid": true,
+	"peer_no_hardware":  true,
+}
+
+// AllowedReasonsDump978FA mirrors dump978-fa.sh's classifier. dump978-fa
+// has its own state file at /run/dump978-fa/state; the additional
+// no_hardware reason captures the wrapper's hardware-probe self-disable.
+var AllowedReasonsDump978FA = map[string]bool{
+	"ok":                true,
+	"uat_disabled":      true,
+	"uat_input_invalid": true,
+	"no_hardware":       true,
 }
 
 // Read parses a runtime state file. Returns ErrUnknownSchema if the

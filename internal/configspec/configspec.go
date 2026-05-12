@@ -26,6 +26,8 @@ var WriteKeys = []string{
 	"MLAT_PRIVATE",
 	"GAIN",
 	"UAT_INPUT",
+	"DUMP978_SDR_SERIAL",
+	"DUMP978_GAIN",
 }
 
 // AllReadKeys mirrors feedenv.ReadKeys; duplicated here so apply-config
@@ -45,6 +47,8 @@ var AllReadKeys = []string{
 	"INPUT_TYPE",
 	"GAIN",
 	"UAT_INPUT",
+	"DUMP978_SDR_SERIAL",
+	"DUMP978_GAIN",
 }
 
 // universalReject contains every byte that is unsafe to emit unescaped into
@@ -120,6 +124,10 @@ func Validate(key, value string) error {
 		return validateGain(value)
 	case "UAT_INPUT":
 		return validateUATInput(value)
+	case "DUMP978_SDR_SERIAL":
+		return validateDump978SdrSerial(value)
+	case "DUMP978_GAIN":
+		return validateDump978Gain(value)
 	default:
 		// Unreachable given the isWriteKey guard above, but keep the
 		// switch exhaustive in case WriteKeys grows.
@@ -328,6 +336,39 @@ func validateUATInput(v string) error {
 		return nil
 	}
 	return validationError("UAT_INPUT", `must be "" or "127.0.0.1:30978"`)
+}
+
+var dump978SerialRE = regexp.MustCompile(`^[0-9A-Za-z_-]{1,32}$`)
+
+// validateDump978SdrSerial accepts an empty string (USB serial unset → wrappers
+// fall back to the conventional "978") or a 1-32 char identifier in
+// [0-9A-Za-z_-]. The serial is matched against the on-device USB EEPROM serial
+// for the 978-receiver dongle; the character class mirrors what librtlsdr's
+// device-by-serial selector accepts. CheckUniversal already strips shell
+// metachars (defense-in-depth).
+func validateDump978SdrSerial(v string) error {
+	if v == "" {
+		return nil
+	}
+	if !dump978SerialRE.MatchString(v) {
+		return validationError("DUMP978_SDR_SERIAL", `must match [0-9A-Za-z_-]{1,32} or be empty`)
+	}
+	return nil
+}
+
+// validateDump978Gain accepts only a finite numeric in [0, 60]. dump978-fa's
+// --sdr-gain takes a numeric dB value; the readsb-flavoured `auto` / `min` /
+// `max` strings are not accepted by FA's binary, so we reject them here even
+// though the readsb-side GAIN validator allows them.
+func validateDump978Gain(v string) error {
+	f, err := parseFiniteFloat(v)
+	if err != nil {
+		return validationError("DUMP978_GAIN", err.Error())
+	}
+	if f < 0 || f > 60 {
+		return validationError("DUMP978_GAIN", "must be in [0, 60]")
+	}
+	return nil
 }
 
 // parseFiniteFloat rejects empty input, NaN, and ±Inf — strconv.ParseFloat

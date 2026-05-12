@@ -35,6 +35,8 @@ var ReadKeys = []string{
 	"INPUT_TYPE",
 	"GAIN",
 	"UAT_INPUT",
+	"DUMP978_SDR_SERIAL",
+	"DUMP978_GAIN",
 }
 
 // keyLine matches `KEY=` or `KEY=value` or `KEY="value"` (with quoted
