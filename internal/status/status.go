@@ -18,6 +18,7 @@ import (
 	wexec "github.com/airplanes-live/image/webconfig/internal/exec"
 	"github.com/airplanes-live/image/webconfig/internal/pihealth"
 	"github.com/airplanes-live/image/webconfig/internal/runtimestate"
+	"github.com/airplanes-live/image/webconfig/internal/wifi"
 )
 
 // PiHealthProbe is the interface status.Reader uses to fetch a hardware
@@ -25,6 +26,13 @@ import (
 // stub.
 type PiHealthProbe interface {
 	Probe(ctx context.Context) *pihealth.PiHealth
+}
+
+// WifiProbe is the interface status.Reader uses to fetch WiFi signal
+// state. Concrete production type is *wifi.SignalReader; tests inject a
+// stub.
+type WifiProbe interface {
+	Probe(ctx context.Context) *wifi.Signal
 }
 
 // Option configures optional Reader behavior. Keeps NewReader's 3-arg
@@ -36,6 +44,14 @@ type Option func(*Reader)
 // result as Status.PiHealth.
 func WithPiHealth(p PiHealthProbe) Option {
 	return func(r *Reader) { r.pihealth = p }
+}
+
+// WithWifi wires a WifiProbe into the Reader. When set, Read() runs the
+// probe in parallel with the other goroutines and embeds the result as
+// Status.Wifi. A nil probe result yields an omitted field (the frontend
+// hides its tile entirely).
+func WithWifi(p WifiProbe) Option {
+	return func(r *Reader) { r.wifi = p }
 }
 
 // MonitoredServices is the static list every /api/status query reports on.
@@ -86,6 +102,7 @@ type Reader struct {
 	runner   wexec.CommandRunner
 	version  string
 	pihealth PiHealthProbe
+	wifi     WifiProbe
 }
 
 func NewReader(version string, p Paths, r wexec.CommandRunner, opts ...Option) *Reader {
@@ -127,6 +144,11 @@ type Status struct {
 	// configured without WithPiHealth (e.g. server tests that don't care)
 	// keeps the JSON shape compatible.
 	PiHealth *pihealth.PiHealth `json:"pi_health,omitempty"`
+
+	// Wifi is the live signal snapshot. omitempty when there is no WiFi
+	// hardware (or the probe wasn't configured) so the frontend can hide
+	// its tile rather than show a misleading "—".
+	Wifi *wifi.Signal `json:"wifi,omitempty"`
 
 	// RebootRequired is true when /var/run/reboot-required exists, which
 	// needrestart writes after a kernel or libc upgrade. The dashboard
@@ -189,6 +211,19 @@ func (r *Reader) Read(ctx context.Context) (Status, error) {
 		}()
 	}
 
+	// WiFi signal probe runs alongside the others. Internal timeouts in
+	// the wifi package bound wall-clock; nil result is the normal case
+	// (no hardware) and just means the field is omitted from the payload.
+	var wifiWG sync.WaitGroup
+	var wifiResult *wifi.Signal
+	if r.wifi != nil {
+		wifiWG.Add(1)
+		go func() {
+			defer wifiWG.Done()
+			wifiResult = r.wifi.Probe(ctx)
+		}()
+	}
+
 	wg.Wait()
 	close(ch)
 	for s := range ch {
@@ -197,6 +232,9 @@ func (r *Reader) Read(ctx context.Context) (Status, error) {
 
 	phWG.Wait()
 	out.PiHealth = phResult
+
+	wifiWG.Wait()
+	out.Wifi = wifiResult
 
 	if m, err := os.ReadFile(r.paths.ManifestFile); err == nil {
 		// Validate JSON shape so we never embed garbage in the response.

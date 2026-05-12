@@ -23,6 +23,7 @@ import (
 	"github.com/airplanes-live/image/webconfig/internal/schemacache"
 	"github.com/airplanes-live/image/webconfig/internal/server"
 	"github.com/airplanes-live/image/webconfig/internal/status"
+	"github.com/airplanes-live/image/webconfig/internal/wifi"
 )
 
 // version is overridden via -ldflags "-X main.version=<sha>".
@@ -110,7 +111,9 @@ func main() {
 					pihealth.DefaultThresholds(),
 					nil, // RealRunner
 					nil, // statfs-backed DiskProber
-				))),
+				)),
+				status.WithWifi(wifi.NewSignalReader("/usr/bin/nmcli", nil)),
+			),
 			Logs:       logs.NewStreamer(nil),
 			Schema:     cache,
 			Privileged: priv,
