@@ -389,11 +389,15 @@ func classify(out *PiHealth, t Thresholds) {
 		}
 	}
 
-	// Partial-failure marker: Pi confirmed but throttle probe couldn't
-	// answer. Distinct from "not a Pi" (where we wouldn't expect
-	// vcgencmd at all).
+	// Partial-probe marker: Pi confirmed but throttle probe couldn't
+	// answer. Distinct from "not a Pi" (where we wouldn't expect vcgencmd
+	// at all). Emitted at sevOK so the tile stays green when every other
+	// probe is happy — vcgencmd missing alone means we lack throttling
+	// telemetry, not that the device is in trouble. The summary builder
+	// composes "healthy · <temp> · vcgencmd unavailable" so the operator
+	// still sees the partial-probe note.
 	if out.IsRaspberryPi && !out.ThrottleProbed {
-		add(13, sevWarn, "vcgencmd unavailable")
+		add(13, sevOK, "vcgencmd unavailable")
 	}
 
 	// All-probes-failed: nothing to say. severity=na, summary="probe failed".
@@ -403,7 +407,9 @@ func classify(out *PiHealth, t Thresholds) {
 		return
 	}
 
-	// Aggregate severity and pick the top 3 blurbs by priority.
+	// Aggregate severity. Blurbs may include sevOK entries (currently just
+	// the vcgencmd-unavailable note); those don't promote severity above
+	// "ok" but do contribute to the summary text.
 	maxSev := sevOK
 	for _, x := range b {
 		if x.severity > maxSev {
@@ -434,7 +440,19 @@ func classify(out *PiHealth, t Thresholds) {
 			break
 		}
 	}
-	summary := strings.Join(parts, " · ")
+	// When the worst signal is still sevOK (e.g. only "vcgencmd unavailable"
+	// fired), prepend the healthy+temp prefix so the tile doesn't read as
+	// a one-note warning.
+	var summary string
+	if maxSev == sevOK {
+		summary = "healthy"
+		if out.TempProbed {
+			summary += fmt.Sprintf(" · %.0f°C", out.CPUTempCelsius)
+		}
+		summary += " · " + strings.Join(parts, " · ")
+	} else {
+		summary = strings.Join(parts, " · ")
+	}
 	if !out.IsRaspberryPi {
 		summary = "generic Linux · " + summary
 	}

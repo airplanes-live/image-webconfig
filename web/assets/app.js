@@ -734,6 +734,10 @@
         const c = classifyService(unit, state, payload);
         tile.dotEl.className = "wc-tile__dot wc-tile__dot--" + c.dot;
         tile.metaEl.textContent = c.meta;
+        // title= recovers the full meta string when CSS ellipsis truncates
+        // the tile (the fixed-row grid means long reasons clip on narrow
+        // viewports). Hover / long-press surfaces the full text.
+        tile.root.title = c.meta || "";
         tile.root.setAttribute("data-state", state);
     }
 
@@ -755,12 +759,15 @@
         if (!ph) {
             tile.dotEl.className = "wc-tile__dot wc-tile__dot--na";
             tile.metaEl.textContent = "—";
+            tile.root.title = "";
             tile.root.setAttribute("data-state", "unknown");
             return;
         }
         const sev = ph.severity || "na";
+        const summary = ph.summary || "—";
         tile.dotEl.className = "wc-tile__dot wc-tile__dot--" + sev;
-        tile.metaEl.textContent = ph.summary || "—";
+        tile.metaEl.textContent = summary;
+        tile.root.title = summary;
         tile.root.setAttribute("data-state", sev);
     }
 
@@ -818,6 +825,7 @@
         tile.root.hidden = false;
         tile.dotEl.className = "wc-tile__dot wc-tile__dot--" + c.dot;
         tile.metaEl.textContent = c.meta;
+        tile.root.title = c.meta || "";
         tile.root.setAttribute("data-state", c.dot);
     }
 
@@ -902,8 +910,10 @@
             const tile = grid.appTiles[a.id];
             if (!tile) return;
             const ok = results[i];
+            const meta = ok ? a.meta : (a.meta + " · unreachable");
             tile.dotEl.className = "wc-tile__dot wc-tile__dot--" + (ok ? "ok" : "err");
-            tile.metaEl.textContent = ok ? a.meta : (a.meta + " · unreachable");
+            tile.metaEl.textContent = meta;
+            tile.root.title = meta || "";
             tile.root.setAttribute("data-state", ok ? "active" : "inactive");
         });
     }
@@ -1980,6 +1990,15 @@
     function logViewer(slug) {
         const pre = el("pre", { class: "log-output" });
         const unit = LOG_SLUG_TO_UNIT[slug] || slug;
+        // Placeholder shown until the first event arrives (or the stream
+        // closes without one) — without it the <pre> is just an empty box,
+        // which looks broken on services that haven't run yet (e.g. the
+        // update log on a freshly booted feeder).
+        const placeholder = el("span", { class: "muted" }, "(no log entries yet)");
+        pre.appendChild(placeholder);
+        const clearPlaceholder = () => {
+            if (placeholder.parentNode === pre) pre.removeChild(placeholder);
+        };
         render(
             el("section", { class: "wc-card" },
                 el("h2", {}, "journalctl -u " + unit),
@@ -1990,10 +2009,12 @@
         const es = new EventSource("/api/log/" + encodeURIComponent(slug));
         activeStream = es;
         es.onmessage = (ev) => {
+            clearPlaceholder();
             pre.appendChild(document.createTextNode(ev.data + "\n"));
             pre.scrollTop = pre.scrollHeight;
         };
         es.onerror = () => {
+            clearPlaceholder();
             pre.appendChild(document.createTextNode("[stream closed]\n"));
             try { es.close(); } catch (_) {}
             if (activeStream === es) activeStream = null;

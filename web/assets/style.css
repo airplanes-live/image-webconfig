@@ -190,7 +190,10 @@ code {
 
 .wc-brand__meta {
   margin-top: 0.25rem;
-  color: var(--wc-ink-3);
+  /* ink-2, not ink-3 — at 0.7rem the lighter value falls below WCAG AA in
+     light mode (~3.85:1 on --wc-surface-0). ink-2 lands at ~5.7:1 while
+     still sitting clearly below the brand name in the hierarchy. */
+  color: var(--wc-ink-2);
   font-size: 0.7rem;
   letter-spacing: 0.12em;
   text-transform: uppercase;

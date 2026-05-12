@@ -320,11 +320,17 @@ func TestProbe_PiButVcgencmdMissing(t *testing.T) {
 	if got.ThrottleProbed {
 		t.Error("ThrottleProbed should be false")
 	}
-	if got.Severity != "warn" {
-		t.Errorf("severity = %q, want warn (partial failure)", got.Severity)
+	// Missing vcgencmd alone (with every other probe happy) stays sevOK
+	// so the dashboard tile doesn't paint amber over a feeder that is
+	// otherwise fine; the summary still mentions the partial probe.
+	if got.Severity != "ok" {
+		t.Errorf("severity = %q, want ok (partial probe alone shouldn't warn)", got.Severity)
+	}
+	if !strings.Contains(got.Summary, "healthy") {
+		t.Errorf("summary = %q, expected to mention \"healthy\"", got.Summary)
 	}
 	if !strings.Contains(got.Summary, "vcgencmd unavailable") {
-		t.Errorf("summary = %q, expected to mention vcgencmd unavailable", got.Summary)
+		t.Errorf("summary = %q, expected to mention \"vcgencmd unavailable\"", got.Summary)
 	}
 }
 
