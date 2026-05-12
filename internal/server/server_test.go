@@ -13,6 +13,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
@@ -94,17 +95,19 @@ func newTestServer(t *testing.T) (*httptest.Server, *Server) {
 	}
 
 	priv := PrivilegedArgv{
-		ApplyFeed:    []string{"sudo-stub", "apl-feed", "apply", "--json", "--lock-timeout", "5"},
-		SchemaFeed:   []string{"apl-feed", "schema", "--json"},
-		Reboot:       []string{"sudo-stub", "reboot"},
-		StartUpdate:  []string{"sudo-stub", "update"},
-		WifiList:     []string{"sudo-stub", "apl-wifi", "list", "--json"},
-		WifiAdd:      []string{"sudo-stub", "apl-wifi", "add", "--json"},
-		WifiUpdate:   []string{"sudo-stub", "apl-wifi", "update", "--json"},
-		WifiDelete:   []string{"sudo-stub", "apl-wifi", "delete", "--json"},
-		WifiTest:     []string{"sudo-stub", "apl-wifi", "test", "--json"},
-		WifiActivate: []string{"sudo-stub", "apl-wifi", "activate", "--json"},
-		WifiStatus:   []string{"sudo-stub", "apl-wifi", "status", "--json"},
+		ApplyFeed:     []string{"sudo-stub", "apl-feed", "apply", "--json", "--lock-timeout", "5"},
+		SchemaFeed:    []string{"apl-feed", "schema", "--json"},
+		Reboot:        []string{"sudo-stub", "reboot"},
+		Poweroff:      []string{"sudo-stub", "poweroff"},
+		StartUpdate:   []string{"sudo-stub", "update"},
+		RegisterClaim: []string{"sudo-stub", "systemctl", "start", "--no-block", "airplanes-claim.service"},
+		WifiList:      []string{"sudo-stub", "apl-wifi", "list", "--json"},
+		WifiAdd:       []string{"sudo-stub", "apl-wifi", "add", "--json"},
+		WifiUpdate:    []string{"sudo-stub", "apl-wifi", "update", "--json"},
+		WifiDelete:    []string{"sudo-stub", "apl-wifi", "delete", "--json"},
+		WifiTest:      []string{"sudo-stub", "apl-wifi", "test", "--json"},
+		WifiActivate:  []string{"sudo-stub", "apl-wifi", "activate", "--json"},
+		WifiStatus:    []string{"sudo-stub", "apl-wifi", "status", "--json"},
 	}
 
 	deps := Deps{
@@ -213,17 +216,19 @@ func newWriteHarness(t *testing.T) *writeHarness {
 	}
 
 	priv := PrivilegedArgv{
-		ApplyFeed:    []string{"sudo-stub", "apl-feed", "apply", "--json", "--lock-timeout", "5"},
-		SchemaFeed:   []string{"apl-feed", "schema", "--json"},
-		Reboot:       []string{"sudo-stub", "reboot"},
-		StartUpdate:  []string{"sudo-stub", "update"},
-		WifiList:     []string{"sudo-stub", "apl-wifi", "list", "--json"},
-		WifiAdd:      []string{"sudo-stub", "apl-wifi", "add", "--json"},
-		WifiUpdate:   []string{"sudo-stub", "apl-wifi", "update", "--json"},
-		WifiDelete:   []string{"sudo-stub", "apl-wifi", "delete", "--json"},
-		WifiTest:     []string{"sudo-stub", "apl-wifi", "test", "--json"},
-		WifiActivate: []string{"sudo-stub", "apl-wifi", "activate", "--json"},
-		WifiStatus:   []string{"sudo-stub", "apl-wifi", "status", "--json"},
+		ApplyFeed:     []string{"sudo-stub", "apl-feed", "apply", "--json", "--lock-timeout", "5"},
+		SchemaFeed:    []string{"apl-feed", "schema", "--json"},
+		Reboot:        []string{"sudo-stub", "reboot"},
+		Poweroff:      []string{"sudo-stub", "poweroff"},
+		StartUpdate:   []string{"sudo-stub", "update"},
+		RegisterClaim: []string{"sudo-stub", "systemctl", "start", "--no-block", "airplanes-claim.service"},
+		WifiList:      []string{"sudo-stub", "apl-wifi", "list", "--json"},
+		WifiAdd:       []string{"sudo-stub", "apl-wifi", "add", "--json"},
+		WifiUpdate:    []string{"sudo-stub", "apl-wifi", "update", "--json"},
+		WifiDelete:    []string{"sudo-stub", "apl-wifi", "delete", "--json"},
+		WifiTest:      []string{"sudo-stub", "apl-wifi", "test", "--json"},
+		WifiActivate:  []string{"sudo-stub", "apl-wifi", "activate", "--json"},
+		WifiStatus:    []string{"sudo-stub", "apl-wifi", "status", "--json"},
 	}
 
 	deps := Deps{
@@ -540,6 +545,110 @@ func TestReboot_AuthedReturns202(t *testing.T) {
 	}
 	if !saw {
 		t.Errorf("reboot argv not invoked; calls=%v", calls)
+	}
+}
+
+func TestPoweroff_RequiresAuth(t *testing.T) {
+	t.Parallel()
+	ts, _ := newTestServer(t)
+	c := httpClient(t)
+	r := postJSON(t, c, ts.URL+"/api/poweroff", map[string]any{})
+	defer r.Body.Close()
+	if r.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("status = %d", r.StatusCode)
+	}
+}
+
+func TestPoweroff_AuthedReturns202(t *testing.T) {
+	t.Parallel()
+	h := newWriteHarness(t)
+	r := postJSON(t, h.client, h.ts.URL+"/api/poweroff", map[string]any{})
+	defer r.Body.Close()
+	if r.StatusCode != http.StatusAccepted {
+		t.Fatalf("status = %d", r.StatusCode)
+	}
+	// Poweroff is fired async; give the goroutine a moment to record the call.
+	want := []string{"sudo-stub", "poweroff"}
+	for i := 0; i < 100; i++ {
+		if len(h.callsCopy()) > 0 {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	calls := h.callsCopy()
+	saw := false
+	for _, c := range calls {
+		if reflect.DeepEqual(c, want) {
+			saw = true
+		}
+	}
+	if !saw {
+		t.Errorf("poweroff argv not invoked; calls=%v", calls)
+	}
+}
+
+// TestDefaultPrivilegedArgv_Poweroff pins the production argv shape so the Go
+// default and the sudoers file in stage-airplanes/05-install-webconfig cannot
+// drift. overlay-smoke catches sudoers-side drift on the image; this catches
+// the Go-source side at unit-test time.
+func TestDefaultPrivilegedArgv_Poweroff(t *testing.T) {
+	t.Parallel()
+	want := []string{"/usr/bin/sudo", "-n", "/usr/bin/systemctl", "poweroff"}
+	got := DefaultPrivilegedArgv().Poweroff
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("Poweroff = %v, want %v", got, want)
+	}
+}
+
+func TestClaimRegister_RequiresAuth(t *testing.T) {
+	t.Parallel()
+	ts, _ := newTestServer(t)
+	c := httpClient(t)
+	r := postJSON(t, c, ts.URL+"/api/claim/register", map[string]any{})
+	defer r.Body.Close()
+	if r.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("status = %d", r.StatusCode)
+	}
+}
+
+func TestClaimRegister_AuthedReturns202(t *testing.T) {
+	t.Parallel()
+	h := newWriteHarness(t)
+	r := postJSON(t, h.client, h.ts.URL+"/api/claim/register", map[string]any{})
+	defer r.Body.Close()
+	if r.StatusCode != http.StatusAccepted {
+		t.Fatalf("status = %d", r.StatusCode)
+	}
+	var got map[string]string
+	_ = json.NewDecoder(r.Body).Decode(&got)
+	if got["unit"] != "airplanes-claim.service" {
+		t.Errorf("unit = %q", got["unit"])
+	}
+	// Compare the full argv: position-based checks let a regression in the
+	// sudo prefix (e.g. dropping -n or sudo) slip through silently.
+	want := []string{"sudo-stub", "systemctl", "start", "--no-block", "airplanes-claim.service"}
+	calls := h.callsCopy()
+	saw := false
+	for _, c := range calls {
+		if reflect.DeepEqual(c, want) {
+			saw = true
+		}
+	}
+	if !saw {
+		t.Errorf("claim-register argv %v not invoked; calls=%v", want, calls)
+	}
+}
+
+func TestClaimRegister_RunnerErrorReturns500(t *testing.T) {
+	t.Parallel()
+	h := newWriteHarness(t)
+	h.mu.Lock()
+	h.runnerErr = errors.New("Failed to start airplanes-claim.service")
+	h.mu.Unlock()
+	r := postJSON(t, h.client, h.ts.URL+"/api/claim/register", map[string]any{})
+	defer r.Body.Close()
+	if r.StatusCode != http.StatusInternalServerError {
+		t.Fatalf("status = %d", r.StatusCode)
 	}
 }
 

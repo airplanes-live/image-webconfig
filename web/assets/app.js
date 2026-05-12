@@ -85,6 +85,7 @@
     const headerTitleEl = document.getElementById("wc-header-title");
     const backBtn = document.getElementById("wc-back-btn");
     const themeBtn = document.getElementById("wc-theme-btn");
+    const refreshBtn = document.getElementById("wc-refresh-btn");
 
     let activeStream = null;       // current EventSource (log viewer)
     let statusTimer = null;        // setInterval handle for status poll
@@ -121,6 +122,7 @@
         const o = opts || {};
         if (headerTitleEl) headerTitleEl.textContent = o.title ? "/ " + o.title : "";
         if (backBtn) backBtn.hidden = !o.showBack;
+        if (refreshBtn) refreshBtn.hidden = !o.showRefresh;
     }
 
     // ===== Navigation (one cleanup point) =====
@@ -150,7 +152,16 @@
         dashboardCtx = null;
         if (opts && opts.flash) pendingFlash = opts.flash;
         setHeader(opts);
-        panelFn();
+        return panelFn();
+    }
+
+    // Dashboard returns funnel through one helper so showRefresh, title,
+    // and showBack stay consistent across every "back to dashboard" path.
+    // Returns the panel promise so the refresh handler can await the
+    // initial fetch and toggle the spinner around it.
+    function navigateDashboard(extraOpts) {
+        return navigate(dashboard, Object.assign(
+            { title: null, showBack: false, showRefresh: true }, extraOpts || {}));
     }
 
     // ===== HTTP helpers =====
@@ -385,6 +396,13 @@
         const lat = Number(String(values.LATITUDE || "").trim());
         const lon = Number(String(values.LONGITUDE || "").trim());
         return !(lat === 0 && lon === 0);
+    }
+
+    // locationSaved — drives the form cascade. previewLatLonSet covers the
+    // GEO_CONFIGURED-first check; altitude is separate because the daemon
+    // classifies altitude_empty as its own MLAT misconfig reason.
+    function locationSaved(values) {
+        return previewLatLonSet(values || {}) && isValidAltitude((values || {}).ALTITUDE || "");
     }
 
     // previewMlatDisabled — same projection semantics: read MLAT_ENABLED
@@ -859,7 +877,31 @@
         parent.appendChild(el("p", {}, el("strong", {}, "Feeder ID: "), id.feeder_id));
         if (!id.claim_secret_present) {
             parent.appendChild(el("p", { class: "muted" },
-                "No claim secret yet — apl-feed claim register will create one."));
+                "Claim secret not yet registered. The feeder retries every 5 minutes; click below to attempt now."));
+            const registerErr = errorEl();
+            const registerBtn = el("button", {
+                class: "wc-btn-primary",
+                type: "button",
+                onclick: async () => {
+                    registerBtn.disabled = true;
+                    registerErr.textContent = "";
+                    const r = await postJSON("/api/claim/register", {});
+                    if (handleAuthFailure(r)) return;
+                    if (!r.ok) {
+                        registerBtn.disabled = false;
+                        registerErr.textContent = (r.payload && r.payload.error) || "register failed";
+                        return;
+                    }
+                    navigate(() => logViewer("claim"), { title: "Claim activity", showBack: true });
+                },
+            }, "Register now");
+            const claimLog = el("button", {
+                class: "wc-btn-ghost",
+                type: "button",
+                onclick: () => navigate(() => logViewer("claim"), { title: "Claim activity", showBack: true }),
+            }, "Claim activity");
+            parent.appendChild(el("div", { class: "actions" }, registerBtn, claimLog));
+            parent.appendChild(registerErr);
             return;
         }
         const claimLog = el("button", {
@@ -913,20 +955,118 @@
         }
         const values = resp.payload.values || {};
         const inputs = {};
+        const loc = locationSaved(values);
 
         const fieldId = (key) => "config-" + key.toLowerCase().replace(/_/g, "-");
 
+        // field() builds a "Label" + input row. No env-key code: those env
+        // names belong on the wire / in feed.env, not in the user-facing UI.
         const field = (key, label, attrs) => {
             const id = fieldId(key);
             const a = Object.assign({ id, name: key, value: values[key] || "", type: "text" }, attrs || {});
             const input = el("input", a);
             inputs[key] = input;
             return el("div", { class: "field" },
-                el("label", { for: id }, label, " ", el("code", {}, key)),
+                el("label", { for: id }, label),
                 input,
             );
         };
 
+        // ===== Location: collapsed card when saved, inputs otherwise =====
+        const latRow = field("LATITUDE", "Latitude", { inputmode: "decimal", placeholder: "51.5" });
+        const lonRow = field("LONGITUDE", "Longitude", { inputmode: "decimal", placeholder: "-0.1" });
+        const altRow = field("ALTITUDE", "Altitude", { placeholder: "120m" });
+        const locationInputs = el("div", { class: "location-inputs" }, latRow, lonRow, altRow);
+
+        const editLocation = el("button", { type: "button", class: "wc-btn-ghost" }, "Edit");
+        const locationCard = el("div", { class: "location-card" },
+            el("div", { class: "location-summary" },
+                (values.LATITUDE || "?") + ", " + (values.LONGITUDE || "?") + ", " + (values.ALTITUDE || "?"),
+            ),
+            editLocation,
+        );
+        // Both subtrees always exist; toggle visibility via the hidden
+        // attribute so the global form submit always reads from inputs.
+        locationCard.hidden = !loc;
+        locationInputs.hidden = loc;
+        editLocation.addEventListener("click", () => {
+            locationCard.hidden = true;
+            locationInputs.hidden = false;
+        });
+
+        const locationFieldset = el("fieldset", { class: "config-fieldset" },
+            el("legend", {}, "Location"),
+            locationCard,
+            locationInputs,
+        );
+
+        // ===== MLAT: gated on locationSaved =====
+        // Force unchecked when !loc: a stale MLAT_ENABLED=true with no geo
+        // would otherwise be posted on save and apl-feed apply would reject
+        // the whole request via the MLAT-vs-geo consistency check.
+        const mlatOn = loc && ((values["MLAT_ENABLED"] || "true") === "true");
+        const mlatId = fieldId("MLAT_ENABLED");
+        const mlat = el("input", {
+            id: mlatId,
+            type: "checkbox",
+            name: "MLAT_ENABLED",
+            checked: mlatOn ? "" : null,
+            disabled: loc ? null : "",
+        });
+        inputs["MLAT_ENABLED"] = mlat;
+
+        const mlatPrivateOn = (values["MLAT_PRIVATE"] || "false") === "true";
+        const mlatPrivateId = fieldId("MLAT_PRIVATE");
+        const mlatPrivate = el("input", {
+            id: mlatPrivateId,
+            type: "checkbox",
+            name: "MLAT_PRIVATE",
+            checked: mlatPrivateOn ? "" : null,
+        });
+        inputs["MLAT_PRIVATE"] = mlatPrivate;
+
+        const mlatToggleRow = el("div", { class: "field" },
+            el("label", { for: mlatId }, mlat, " Enable MLAT"),
+        );
+        const mlatHelp = el("p", { class: "help" }, "Set your location first to enable MLAT.");
+        mlatHelp.hidden = loc;
+
+        const mlatUserRow = field("MLAT_USER", "MLAT name", { placeholder: "alice" });
+        const mlatPrivateRow = el("div", { class: "field" },
+            el("label", { for: mlatPrivateId }, mlatPrivate, " Hide MLAT name on public map"),
+        );
+        const mlatSubFields = el("div", { class: "mlat-sub" }, mlatUserRow, mlatPrivateRow);
+        mlatSubFields.hidden = !(loc && mlat.checked);
+        mlat.addEventListener("change", () => {
+            mlatSubFields.hidden = !(loc && mlat.checked);
+        });
+
+        const mlatFieldset = el("fieldset", { class: "config-fieldset" },
+            el("legend", {}, "MLAT"),
+            mlatToggleRow,
+            mlatHelp,
+            mlatSubFields,
+        );
+
+        // ===== Gain: own fieldset with description + external doc link =====
+        const gainRow = field("GAIN", "Gain", { placeholder: "auto" });
+        const gainFieldset = el("fieldset", { class: "config-fieldset" },
+            el("legend", {}, "Gain"),
+            el("p", { class: "help" },
+                "RTL-SDR gain in dB, or ",
+                el("code", {}, "auto"),
+                " for adaptive control. See ",
+                el("a", {
+                    href: "https://github.com/wiedehopf/adsb-wiki/wiki/Optimizing-gain",
+                    target: "_blank",
+                    rel: "noopener noreferrer",
+                }, "wiedehopf's gain guide"),
+                ".",
+            ),
+            gainRow,
+        );
+
+        // ===== 978 UAT: toggle + collapsed sub-fields =====
         const dump978On = (values["UAT_INPUT"] || "") !== "";
         const uatId = fieldId("UAT_INPUT");
         const uat = el("input", {
@@ -950,9 +1090,9 @@
         });
         inputs["DUMP978_SDR_SERIAL"] = dump978Serial;
 
-        const gainId = fieldId("DUMP978_GAIN");
+        const dump978GainId = fieldId("DUMP978_GAIN");
         const dump978Gain = el("input", {
-            id: gainId,
+            id: dump978GainId,
             type: "text",
             name: "DUMP978_GAIN",
             value: values["DUMP978_GAIN"] || "42.1",
@@ -961,35 +1101,32 @@
         });
         inputs["DUMP978_GAIN"] = dump978Gain;
 
-        // MLAT_ENABLED is a separate boolean toggle in the new schema. Default
-        // to "true" when the key is absent (e.g. on a fresh feed.env that
-        // hasn't been written yet) to match the daemon's MLAT_ENABLED:-true.
-        const mlatOn = (values["MLAT_ENABLED"] || "true") === "true";
-        const mlatId = fieldId("MLAT_ENABLED");
-        const mlat = el("input", {
-            id: mlatId,
-            type: "checkbox",
-            name: "MLAT_ENABLED",
-            checked: mlatOn ? "" : null,
+        const dump978Sub = el("div", { class: "dump978-sub" },
+            el("div", { class: "field" },
+                el("label", { for: sdrSerialId }, "978 SDR serial"),
+                dump978Serial,
+            ),
+            el("div", { class: "field" },
+                el("label", { for: dump978GainId }, "978 gain"),
+                dump978Gain,
+            ),
+        );
+        dump978Sub.hidden = !uat.checked;
+        uat.addEventListener("change", () => {
+            dump978Sub.hidden = !uat.checked;
         });
-        inputs["MLAT_ENABLED"] = mlat;
 
-        // MLAT_PRIVATE hides the feed name on the public MLAT map. Default
-        // false (name shown) when absent, matching airplanes-mlat.sh's
-        // MLAT_PRIVATE:-false. Position is never shown precisely regardless
-        // of the toggle.
-        const mlatPrivateOn = (values["MLAT_PRIVATE"] || "false") === "true";
-        const mlatPrivateId = fieldId("MLAT_PRIVATE");
-        const mlatPrivate = el("input", {
-            id: mlatPrivateId,
-            type: "checkbox",
-            name: "MLAT_PRIVATE",
-            checked: mlatPrivateOn ? "" : null,
-        });
-        inputs["MLAT_PRIVATE"] = mlatPrivate;
+        const uatFieldset = el("fieldset", { class: "config-fieldset" },
+            el("legend", {}, "978 UAT"),
+            el("div", { class: "field" },
+                el("label", { for: uatId }, uat, " Enable 978 UAT"),
+            ),
+            dump978Sub,
+        );
 
+        // ===== Submit + form =====
         const err = errorEl();
-        const submit = el("button", { type: "submit", class: "wc-btn-primary" }, "Save & restart");
+        const submit = el("button", { type: "submit", class: "wc-btn-primary" }, "Save & apply");
 
         // Gate Save on the same MLAT → geo requirement that
         // configspec.ValidateConsistency enforces server-side. Reading
@@ -1033,12 +1170,17 @@
                 err.textContent = "";
                 submit.disabled = true;
                 submit.textContent = "Saving…";
+                // When location isn't saved, force MLAT_ENABLED=false: the
+                // disabled checkbox would otherwise carry a stale "true" and
+                // apl-feed apply would reject every save (including a Gain-
+                // only edit) via the GEO_CONFIGURED consistency check.
+                const mlatEnabled = (loc && mlat.checked) ? "true" : "false";
                 const updates = {
                     LATITUDE: inputs.LATITUDE.value.trim(),
                     LONGITUDE: inputs.LONGITUDE.value.trim(),
                     ALTITUDE: inputs.ALTITUDE.value.trim(),
                     MLAT_USER: inputs.MLAT_USER.value.trim(),
-                    MLAT_ENABLED: mlat.checked ? "true" : "false",
+                    MLAT_ENABLED: mlatEnabled,
                     MLAT_PRIVATE: mlatPrivate.checked ? "true" : "false",
                     GAIN: inputs.GAIN.value.trim(),
                     UAT_INPUT: uat.checked ? "127.0.0.1:30978" : "",
@@ -1046,10 +1188,10 @@
                     DUMP978_GAIN: dump978Gain.value.trim(),
                 };
                 // Don't write DUMP978_* keys when UAT is toggled off — they
-                // would be no-ops the daemon never reads, and writing them
-                // anyway would let a stale serial/gain accumulate in feed.env
-                // even after the user disabled 978. The wrapper falls back
-                // to compiled-in defaults (978 / 42.1) on next enable.
+                // would be no-ops the daemon never reads. The wrapper falls
+                // back to compiled-in defaults (978 / 42.1) on next enable.
+                // Note: existing values already in feed.env are retained;
+                // toggling UAT off does not clear them.
                 if (!uat.checked) {
                     delete updates.DUMP978_SDR_SERIAL;
                     delete updates.DUMP978_GAIN;
@@ -1064,7 +1206,7 @@
                 }
                 const r = await postJSON("/api/config", { updates });
                 submit.disabled = false;
-                submit.textContent = "Save & restart";
+                submit.textContent = "Save & apply";
                 if (handleAuthFailure(r)) return;
                 if (!r.ok) {
                     err.textContent = (r.payload && r.payload.error) || "save failed";
@@ -1075,7 +1217,7 @@
                 // flash through navigate options — without this, the warning
                 // would clear immediately when navigate() rerenders.
                 const pending = (r.payload && r.payload.pending_restart) || [];
-                const opts = { title: null, showBack: false };
+                const opts = {};
                 if (pending.length > 0) {
                     opts.flash = {
                         level: "warn",
@@ -1085,37 +1227,13 @@
                             + pending.join(" "),
                     };
                 }
-                navigate(dashboard, opts);
+                navigateDashboard(opts);
             },
         },
-            el("fieldset", { class: "config-fieldset" },
-                el("legend", {}, "Location"),
-                field("LATITUDE", "Latitude", { inputmode: "decimal", placeholder: "51.5" }),
-                field("LONGITUDE", "Longitude", { inputmode: "decimal", placeholder: "-0.1" }),
-                field("ALTITUDE", "Altitude", { placeholder: "120m" }),
-            ),
-            el("fieldset", { class: "config-fieldset" },
-                el("legend", {}, "MLAT"),
-                field("MLAT_USER", "MLAT name", { placeholder: "alice" }),
-                el("div", { class: "field" },
-                    el("label", { for: mlatId }, mlat, " Enable MLAT", " ", el("code", {}, "MLAT_ENABLED")),
-                ),
-                el("div", { class: "field" },
-                    el("label", { for: mlatPrivateId }, mlatPrivate, " Hide MLAT name on public map", " ", el("code", {}, "MLAT_PRIVATE")),
-                ),
-            ),
-            field("GAIN", "Gain", { placeholder: "auto" }),
-            el("div", { class: "field" },
-                el("label", { for: uatId }, uat, " Enable 978 UAT", " ", el("code", {}, "UAT_INPUT")),
-            ),
-            el("div", { class: "field" },
-                el("label", { for: sdrSerialId }, "978 SDR serial", " ", el("code", {}, "DUMP978_SDR_SERIAL")),
-                dump978Serial,
-            ),
-            el("div", { class: "field" },
-                el("label", { for: gainId }, "978 gain", " ", el("code", {}, "DUMP978_GAIN")),
-                dump978Gain,
-            ),
+            locationFieldset,
+            mlatFieldset,
+            gainFieldset,
+            uatFieldset,
             submit,
             err,
         );
@@ -1128,31 +1246,11 @@
         inputs.ALTITUDE.addEventListener("input", recheck);
         mlat.addEventListener("change", recheck);
         recheck();
-
-        const readOnly = Object.keys(values).filter(k =>
-            !["LATITUDE", "LONGITUDE", "ALTITUDE", "MLAT_USER", "MLAT_ENABLED", "MLAT_PRIVATE", "GAIN", "UAT_INPUT", "DUMP978_SDR_SERIAL", "DUMP978_GAIN"].includes(k)
-        ).sort();
-        if (readOnly.length > 0) {
-            const tbl = el("dl", { class: "config-list" });
-            for (const k of readOnly) {
-                tbl.appendChild(el("dt", {}, k));
-                tbl.appendChild(el("dd", {}, values[k] === "" ? "(empty)" : values[k]));
-            }
-            parent.appendChild(el("details", {},
-                el("summary", { class: "muted" }, "Advanced (read-only)"),
-                tbl,
-            ));
-        }
     }
 
     // ===== Action row =====
 
     function buildActionsRow() {
-        const refresh = el("button", {
-            type: "button", class: "wc-btn-ghost",
-            onclick: () => navigate(dashboard, { title: null, showBack: false }),
-        }, "Refresh");
-
         const updateBtn = el("button", {
             type: "button", class: "wc-btn-ghost",
             onclick: async () => {
@@ -1192,6 +1290,11 @@
             },
         }, "Reboot");
 
+        const poweroffBtn = el("button", {
+            type: "button", class: "wc-btn-danger",
+            onclick: () => navigate(confirmPowerOffPanel, { title: "Power off", showBack: true }),
+        }, "Power off");
+
         const logout = el("button", {
             type: "button", class: "wc-btn-ghost",
             onclick: async () => { await postJSON("/api/auth/logout", {}); await boot(); },
@@ -1202,7 +1305,7 @@
             onclick: () => navigate(wifiPanel, { title: "Wi-Fi networks", showBack: true }),
         }, "Wi-Fi networks");
 
-        return el("div", { class: "actions" }, refresh, updateBtn, updateLog, wifiBtn, change, rebootBtn, logout);
+        return el("div", { class: "actions" }, updateBtn, updateLog, wifiBtn, change, rebootBtn, poweroffBtn, logout);
     }
 
     // ===== Wi-Fi panel =====
@@ -1486,6 +1589,7 @@
             heroEl, tileGrid, identityBody, configBody,
             configValues: {},
             lastIdentity: null,
+            configDirty: false,
         };
         dashboardCtx = ctx;
 
@@ -1506,6 +1610,14 @@
         updateHero(heroEl, status, ctx.configValues);
         updateTiles(tileGrid, status, ctx.configValues);
         updateAppTiles(tileGrid);
+
+        // Track unsaved config edits so the header refresh button can
+        // prompt before discarding them. Initial-render value attributes
+        // don't fire `input`, so this only flips on actual typing.
+        const configForm = configBody.querySelector("form.config-form");
+        if (configForm) {
+            configForm.addEventListener("input", () => { ctx.configDirty = true; });
+        }
 
         // Start partial-refresh poll. Hero + tiles + identity update;
         // config card stays put.
@@ -1633,7 +1745,7 @@
         const submit = el("button", { type: "submit", class: "wc-btn-primary" }, "Change password");
         const cancel = el("button", {
             type: "button", class: "wc-btn-ghost",
-            onclick: () => navigate(dashboard, { title: null, showBack: false }),
+            onclick: () => navigateDashboard(),
         }, "Cancel");
 
         const form = el("form", {
@@ -1658,7 +1770,7 @@
                     err.textContent = (r.payload && r.payload.error) || "Change failed.";
                     return;
                 }
-                navigate(dashboard, { title: null, showBack: false });
+                navigateDashboard();
             },
         },
             el("h2", {}, "Change webconfig password"),
@@ -1671,6 +1783,63 @@
         );
         render(form);
         oldPw.focus();
+    }
+
+    function confirmPowerOffPanel() {
+        const PHRASE = "power off";
+        const err = errorEl();
+        const input = el("input", {
+            id: "poweroff-confirm",
+            type: "text",
+            autocomplete: "off",
+            autocapitalize: "none",
+            autocorrect: "off",
+            spellcheck: "false",
+            required: true,
+        });
+        const submit = el("button", { type: "submit", class: "wc-btn-danger", disabled: true }, "Power off");
+        const cancel = el("button", {
+            type: "button", class: "wc-btn-ghost",
+            onclick: () => navigate(dashboard, { title: null, showBack: false }),
+        }, "Cancel");
+
+        const matches = () => input.value.trim().toLowerCase() === PHRASE;
+        input.addEventListener("input", () => { submit.disabled = !matches(); });
+
+        const form = el("form", {
+            class: "wc-card",
+            onsubmit: async (e) => {
+                e.preventDefault();
+                if (!matches()) return;
+                err.textContent = "";
+                submit.disabled = true;
+                cancel.disabled = true;
+                submit.textContent = "Powering off…";
+                const r = await postJSON("/api/poweroff", {});
+                if (handleAuthFailure(r)) return;
+                if (!r.ok) {
+                    submit.disabled = false;
+                    cancel.disabled = false;
+                    submit.textContent = "Power off";
+                    err.textContent = (r.payload && r.payload.error) || "Power off failed.";
+                    return;
+                }
+                navigate(() => render(el("div", { class: "wc-card" },
+                    el("h2", {}, "Powering off…"),
+                    el("p", {}, "The feeder is shutting down. You'll need to disconnect and reconnect power to turn it back on."),
+                )), { title: "Powering off", showBack: false });
+            },
+        },
+            el("h2", {}, "Power off the feeder?"),
+            el("p", {}, "Shuts the feeder down cleanly so graphs1090 stats and other in-memory data are flushed to disk — safer than pulling the power cord."),
+            el("p", { class: "error" }, "Once powered off, the feeder cannot be turned back on remotely. You'll need physical access to disconnect and reconnect power."),
+            el("p", {}, "Type ", el("code", {}, PHRASE), " below to confirm."),
+            el("div", { class: "field" }, el("label", { for: "poweroff-confirm" }, "Confirmation"), input),
+            el("div", { class: "actions" }, cancel, submit),
+            err,
+        );
+        render(form);
+        input.focus();
     }
 
     function logViewer(slug) {
@@ -1723,7 +1892,7 @@
         }
         const who = await getJSON("/api/auth/whoami");
         if (who.ok) {
-            navigate(dashboard, { title: null, showBack: false });
+            navigateDashboard();
         } else {
             navigate(loginPanel, { title: null, showBack: false });
         }
@@ -1732,7 +1901,22 @@
     // ===== Wire-up =====
 
     if (themeBtn) themeBtn.addEventListener("click", toggleTheme);
-    if (backBtn) backBtn.addEventListener("click", () => navigate(dashboard, { title: null, showBack: false }));
+    if (backBtn) backBtn.addEventListener("click", () => navigateDashboard());
+    if (refreshBtn) refreshBtn.addEventListener("click", async () => {
+        if (refreshBtn.disabled) return;
+        if (dashboardCtx && dashboardCtx.configDirty
+            && !confirm("Discard unsaved configuration changes?")) {
+            return;
+        }
+        refreshBtn.disabled = true;
+        refreshBtn.classList.add("wc-btn-icon--spinning");
+        try {
+            await navigateDashboard();
+        } finally {
+            refreshBtn.classList.remove("wc-btn-icon--spinning");
+            refreshBtn.disabled = false;
+        }
+    });
 
     boot().catch((e) => corruptPanel("Fatal error: " + (e && e.message || e)));
 })();

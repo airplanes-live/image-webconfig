@@ -50,17 +50,19 @@ type Server struct {
 // status) and mutating (add / update / delete / test / activate) surfaces
 // via the same grant.
 type PrivilegedArgv struct {
-	ApplyFeed    []string // sudo -n /usr/local/bin/apl-feed apply --json --lock-timeout 5
-	SchemaFeed   []string // /usr/local/bin/apl-feed schema --json (no sudo: read-only)
-	Reboot       []string
-	StartUpdate  []string // sudo systemd-run --unit=airplanes-update ...
-	WifiList     []string
-	WifiAdd      []string
-	WifiUpdate   []string
-	WifiDelete   []string
-	WifiTest     []string
-	WifiActivate []string
-	WifiStatus   []string
+	ApplyFeed     []string // sudo -n /usr/local/bin/apl-feed apply --json --lock-timeout 5
+	SchemaFeed    []string // /usr/local/bin/apl-feed schema --json (no sudo: read-only)
+	Reboot        []string // sudo -n /usr/bin/systemctl reboot
+	Poweroff      []string // sudo -n /usr/bin/systemctl poweroff
+	StartUpdate   []string // sudo systemd-run --unit=airplanes-update ...
+	RegisterClaim []string // sudo systemctl start --no-block airplanes-claim.service
+	WifiList      []string
+	WifiAdd       []string
+	WifiUpdate    []string
+	WifiDelete    []string
+	WifiTest      []string
+	WifiActivate  []string
+	WifiStatus    []string
 }
 
 // DefaultPrivilegedArgv returns the production argv shapes for the
@@ -79,6 +81,7 @@ func DefaultPrivilegedArgv() PrivilegedArgv {
 		ApplyFeed:  sudo("/usr/local/bin/apl-feed", "apply", "--json", "--lock-timeout", "5"),
 		SchemaFeed: []string{"/usr/local/bin/apl-feed", "schema", "--json"},
 		Reboot:     sudo("/usr/bin/systemctl", "reboot"),
+		Poweroff:   sudo("/usr/bin/systemctl", "poweroff"),
 		StartUpdate: sudo(
 			"/usr/bin/systemd-run",
 			"--unit=airplanes-update",
@@ -86,13 +89,19 @@ func DefaultPrivilegedArgv() PrivilegedArgv {
 			"--property=ExecStopPost=/usr/bin/systemctl kill -s HUP airplanes-webconfig.service",
 			"/usr/local/share/airplanes/update.sh",
 		),
-		WifiList:     sudo("/usr/local/bin/apl-wifi", "list", "--json"),
-		WifiAdd:      sudo("/usr/local/bin/apl-wifi", "add", "--json"),
-		WifiUpdate:   sudo("/usr/local/bin/apl-wifi", "update", "--json"),
-		WifiDelete:   sudo("/usr/local/bin/apl-wifi", "delete", "--json"),
-		WifiTest:     sudo("/usr/local/bin/apl-wifi", "test", "--json"),
-		WifiActivate: sudo("/usr/local/bin/apl-wifi", "activate", "--json"),
-		WifiStatus:   sudo("/usr/local/bin/apl-wifi", "status", "--json"),
+		// --no-block: the unit is Type=oneshot and apl-feed claim register
+		// retries on network failure for up to ~15s. A blocking start could
+		// exceed systemctlTimeout; --no-block enqueues the job and returns
+		// immediately. Progress and failures show up in the claim activity
+		// log via the SSE stream the SPA opens after this returns.
+		RegisterClaim: sudo("/usr/bin/systemctl", "start", "--no-block", "airplanes-claim.service"),
+		WifiList:      sudo("/usr/local/bin/apl-wifi", "list", "--json"),
+		WifiAdd:       sudo("/usr/local/bin/apl-wifi", "add", "--json"),
+		WifiUpdate:    sudo("/usr/local/bin/apl-wifi", "update", "--json"),
+		WifiDelete:    sudo("/usr/local/bin/apl-wifi", "delete", "--json"),
+		WifiTest:      sudo("/usr/local/bin/apl-wifi", "test", "--json"),
+		WifiActivate:  sudo("/usr/local/bin/apl-wifi", "activate", "--json"),
+		WifiStatus:    sudo("/usr/local/bin/apl-wifi", "status", "--json"),
 	}
 }
 
@@ -161,6 +170,8 @@ func New(d Deps) http.Handler {
 	mux.HandleFunc("POST /api/config", s.requireSession(s.handleConfigPost))
 	mux.HandleFunc("POST /api/update", s.requireSession(s.handleUpdate))
 	mux.HandleFunc("POST /api/reboot", s.requireSession(s.handleReboot))
+	mux.HandleFunc("POST /api/poweroff", s.requireSession(s.handlePoweroff))
+	mux.HandleFunc("POST /api/claim/register", s.requireSession(s.handleClaimRegister))
 
 	// Wi-Fi network management — privileged subcommands of /usr/local/bin/apl-wifi.
 	// No `s.wifiMu` mutex: the helper's flock at /run/airplanes/wifi.lock is
