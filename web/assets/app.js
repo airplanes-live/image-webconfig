@@ -288,7 +288,8 @@
     // apl-feed apply is the authoritative server-side gate; the JS preview
     // here only suppresses Save while the user is editing. A JS-vs-bash
     // mismatch surfaces as "looks valid in the form but save failed", so
-    // these regexes must match the bash side byte-for-byte. Pinned by
+    // these accept/reject the same inputs as the bash side. Different
+    // regex engines, semantically equivalent rules. Pinned by
     // test/test_validator_parity.sh.
     //
     // The /* @validator-parity */ markers delimit the block exported to
