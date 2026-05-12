@@ -214,7 +214,8 @@ longitude=13.405
 // malformed state file cannot pass through with a cross-owner reason.
 func TestAllowedReasonsMLAT(t *testing.T) {
 	for _, tok := range []string{
-		"ok", "mlat_enabled_false", "latitude_zero", "longitude_zero", "mlat_user_empty",
+		"ok", "mlat_enabled_false", "latitude_zero", "longitude_zero",
+		"altitude_empty", "mlat_user_empty", "mlat_private_invalid",
 	} {
 		if !AllowedReasonsMLAT[tok] {
 			t.Errorf("AllowedReasonsMLAT[%q] = false, want true", tok)

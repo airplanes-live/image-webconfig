@@ -318,8 +318,10 @@
 
     function mlatMisconfigReason(reason) {
         switch (reason) {
-            case "mlat_user_empty": return "MLAT_USER empty — set name or set MLAT_ENABLED=false";
-            default:                return "misconfigured (" + (reason || "unknown") + ")";
+            case "mlat_user_empty":       return "MLAT_USER empty — set name or set MLAT_ENABLED=false";
+            case "mlat_private_invalid":  return "MLAT_PRIVATE must be 'true' or 'false'";
+            case "altitude_empty":        return "ALTITUDE empty — set the antenna altitude";
+            default:                      return "misconfigured (" + (reason || "unknown") + ")";
         }
     }
 
