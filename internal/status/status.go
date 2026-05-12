@@ -58,7 +58,7 @@ type Paths struct {
 	FeedStateFile      string   // /run/airplanes-feed/state
 	UAT978StateFile    string   // /run/airplanes-978/state
 	Dump978FAStateFile string   // /run/dump978-fa/state
-	RebootRequiredFile string   // /var/run/reboot-required (written by update-notifier-common after kernel/libc upgrades)
+	RebootRequiredFile string   // /var/run/reboot-required (written by needrestart after kernel/libc upgrades)
 	SystemctlSudoArgv0 []string // [sudo, -n, ...] OR [systemctl] (no sudo: is-active is read-only)
 	SystemctlBinary    string   // /usr/bin/systemctl
 	IsActiveTimeout    time.Duration
@@ -129,8 +129,8 @@ type Status struct {
 	PiHealth *pihealth.PiHealth `json:"pi_health,omitempty"`
 
 	// RebootRequired is true when /var/run/reboot-required exists, which
-	// update-notifier-common writes after a kernel or libc upgrade. The
-	// dashboard renders a banner when this flips on.
+	// needrestart writes after a kernel or libc upgrade. The dashboard
+	// renders a banner when this flips on.
 	RebootRequired bool `json:"reboot_required"`
 }
 
