@@ -461,13 +461,15 @@ main {
   color: var(--wc-accent);
 }
 
-/* Hardware tile differentiator. Sits in the same .wc-grid--tiles as the
-   service tiles, but the left-border accent + muted icon tint reads as a
-   different category (hardware vs. services). */
-.wc-tile--hardware {
+/* Infrastructure tiles (hardware health, WiFi) share a visual register
+   that's distinct from service tiles. Same grid cell, but the left-
+   border accent + muted icon tint reads as a different category. */
+.wc-tile--hardware,
+.wc-tile--wifi {
   border-left: 3px solid var(--wc-accent);
 }
-.wc-tile--hardware .wc-tile__icon {
+.wc-tile--hardware .wc-tile__icon,
+.wc-tile--wifi .wc-tile__icon {
   color: var(--wc-ink-2);
 }
 

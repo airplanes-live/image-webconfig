@@ -80,6 +80,10 @@
     const PIHEALTH_ICON =
         "M5 0a.5.5 0 0 1 .5.5V2h1V.5a.5.5 0 0 1 1 0V2h1V.5a.5.5 0 0 1 1 0V2h1V.5a.5.5 0 0 1 1 0V2A2.5 2.5 0 0 1 14 4.5h1.5a.5.5 0 0 1 0 1H14v1h1.5a.5.5 0 0 1 0 1H14v1h1.5a.5.5 0 0 1 0 1H14v1h1.5a.5.5 0 0 1 0 1H14A2.5 2.5 0 0 1 11.5 14H10v1.5a.5.5 0 0 1-1 0V14H8v1.5a.5.5 0 0 1-1 0V14H6v1.5a.5.5 0 0 1-1 0V14H4.5A2.5 2.5 0 0 1 2 11.5H.5a.5.5 0 0 1 0-1H2v-1H.5a.5.5 0 0 1 0-1H2v-1H.5a.5.5 0 0 1 0-1H2v-1H.5a.5.5 0 0 1 0-1H2A2.5 2.5 0 0 1 4.5 2V.5A.5.5 0 0 1 5 0m-.5 3A1.5 1.5 0 0 0 3 4.5v7A1.5 1.5 0 0 0 4.5 13h7a1.5 1.5 0 0 0 1.5-1.5v-7A1.5 1.5 0 0 0 11.5 3z";
 
+    // Bootstrap-icons wifi glyph (16×16 viewBox).
+    const WIFI_ICON =
+        "M15.384 6.115a.485.485 0 0 0-.047-.736A12.44 12.44 0 0 0 8 3C5.259 3 2.723 3.882.663 5.379a.485.485 0 0 0-.048.736.518.518 0 0 0 .668.05A11.45 11.45 0 0 1 8 4c2.507 0 4.827.802 6.716 2.164.205.148.49.13.668-.049m-2.55 2.516a.482.482 0 0 0-.063-.745A8.46 8.46 0 0 0 8 7a8.46 8.46 0 0 0-4.77 1.886.482.482 0 0 0-.064.745.525.525 0 0 0 .654.065A7.46 7.46 0 0 1 8 8c1.71 0 3.29.578 4.18 1.696a.525.525 0 0 0 .654-.065zm-2.557 2.514a.483.483 0 0 0-.089-.745A4.47 4.47 0 0 0 8 10c-.83 0-1.605.247-2.188.4a.483.483 0 0 0-.089.745.525.525 0 0 0 .626.085A3.47 3.47 0 0 1 8 11c.488 0 .947.118 1.349.314a.525.525 0 0 0 .626-.085zM9.5 14.25a1.5 1.5 0 1 1-3 0 1.5 1.5 0 0 1 3 0z";
+
     // ===== Runtime state =====
 
     const app = document.getElementById("app");
@@ -760,6 +764,63 @@
         tile.root.setAttribute("data-state", sev);
     }
 
+    // classifyWifi projects the /api/status.wifi payload into a tile
+    // {dot, meta}. Returns null when there's no payload — the tile is
+    // hidden in that case (Ethernet-only hosts have no WiFi field at
+    // all). A connected interface with unparseable signal renders as
+    // warn with just the SSID (conservative — we know it's up but
+    // can't grade it).
+    function classifyWifi(w) {
+        if (!w) return null;
+        if (!w.connected) return { dot: "na", meta: "not connected" };
+        const displaySSID = (w.ssid && w.ssid.length) ? w.ssid : "(hidden)";
+        if (typeof w.signal_pct !== "number") {
+            return { dot: "warn", meta: displaySSID };
+        }
+        const pct = w.signal_pct;
+        let dot = "ok";
+        if (pct < 40) dot = "err";
+        else if (pct < 60) dot = "warn";
+        return { dot, meta: displaySSID + " · " + pct + "%" };
+    }
+
+    function buildWifiTile() {
+        const iconNode = el("span", { class: "wc-tile__icon" }, svgIcon(WIFI_ICON));
+        const titleEl  = el("span", { class: "wc-tile__title" }, "Wi-Fi");
+        const metaEl   = el("span", { class: "wc-tile__meta" }, "—");
+        const dotEl    = el("span", { class: "wc-tile__dot wc-tile__dot--na" });
+        // Hidden until the first payload arrives — avoids a flash on
+        // Ethernet-only hosts where the field is omitted entirely.
+        const root = el("a", {
+            class: "wc-tile wc-tile--wifi",
+            "data-state": "unknown",
+            href: "#",
+            role: "button",
+            hidden: true,
+            onclick: (e) => {
+                e.preventDefault();
+                navigate(wifiPanel, { title: "Wi-Fi networks", showBack: true });
+            },
+        },
+            iconNode,
+            el("span", { class: "wc-tile__body" }, titleEl, metaEl),
+            dotEl,
+        );
+        return { root, titleEl, metaEl, dotEl };
+    }
+
+    function updateWifiTile(tile, payload) {
+        const c = classifyWifi(payload && payload.wifi);
+        if (!c) {
+            tile.root.hidden = true;
+            return;
+        }
+        tile.root.hidden = false;
+        tile.dotEl.className = "wc-tile__dot wc-tile__dot--" + c.dot;
+        tile.metaEl.textContent = c.meta;
+        tile.root.setAttribute("data-state", c.dot);
+    }
+
     function buildTileGrid() {
         const services = el("div", { class: "wc-grid--tiles" });
         const apps = el("div", { class: "wc-grid--tiles" });
@@ -769,6 +830,10 @@
         // class differentiates it visually without needing a separate row.
         const piHealth = buildPiHealthTile();
         services.appendChild(piHealth.root);
+        // WiFi tile follows, hidden by default until /api/status confirms
+        // there is a WiFi adapter at all.
+        const wifi = buildWifiTile();
+        services.appendChild(wifi.root);
         for (const unit of MONITORED_SERVICES) {
             const t = buildTile(unit);
             tiles[unit] = t;
@@ -782,7 +847,7 @@
         // Wrap both grids in a fragment-like container so the dashboard
         // render() call gets a single root.
         const root = el("div", { class: "wc-tiles-stack" }, services, apps);
-        return { root, tiles, appTiles, piHealth };
+        return { root, tiles, appTiles, piHealth, wifi };
     }
 
     function buildAppTile(app) {
@@ -851,6 +916,7 @@
         // the call sites simple.
         payload.values = Object.assign({}, payload.values || {}, configValues || {});
         if (grid.piHealth) updatePiHealthTile(grid.piHealth, payload);
+        if (grid.wifi) updateWifiTile(grid.wifi, payload);
         for (const unit of MONITORED_SERVICES) {
             const tile = grid.tiles[unit];
             if (tile) updateTile(tile, unit, payload);
