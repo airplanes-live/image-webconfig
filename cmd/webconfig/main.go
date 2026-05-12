@@ -49,7 +49,16 @@ func main() {
 		"sliding window for failure counting")
 	lockoutDuration := flag.Duration("lockout-duration", 15*time.Minute,
 		"duration of an active lockout")
+	piHealthMode := flag.Bool("pi-health", false,
+		"emit a one-line pi-health summary and exit (for render-status / MOTD)")
+	piHealthTimeout := flag.Duration("pi-health-timeout", 2*time.Second,
+		"probe timeout for --pi-health (must be < the shell timeout wrapping the call)")
 	flag.Parse()
+
+	if *piHealthMode {
+		ph := pihealth.NewReader(pihealth.DefaultPaths(), pihealth.DefaultThresholds(), nil, nil)
+		os.Exit(runPiHealthCmd(os.Stdout, os.Stderr, ph.Probe, *piHealthTimeout))
+	}
 
 	if *argonThreads > 255 {
 		log.Fatalf("argon2-threads must be <= 255 (got %d)", *argonThreads)
