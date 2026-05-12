@@ -102,6 +102,13 @@ func newTestServer(t *testing.T) (*httptest.Server, *Server) {
 		StartUpdate:        []string{"sudo-stub", "update"},
 		StartSystemUpgrade: []string{"sudo-stub", "system-upgrade"},
 		RegisterClaim:      []string{"sudo-stub", "systemctl", "start", "--no-block", "airplanes-claim.service"},
+		WifiList:           []string{"sudo-stub", "apl-wifi", "list", "--json"},
+		WifiAdd:            []string{"sudo-stub", "apl-wifi", "add", "--json"},
+		WifiUpdate:         []string{"sudo-stub", "apl-wifi", "update", "--json"},
+		WifiDelete:         []string{"sudo-stub", "apl-wifi", "delete", "--json"},
+		WifiTest:           []string{"sudo-stub", "apl-wifi", "test", "--json"},
+		WifiActivate:       []string{"sudo-stub", "apl-wifi", "activate", "--json"},
+		WifiStatus:         []string{"sudo-stub", "apl-wifi", "status", "--json"},
 	}
 
 	deps := Deps{
@@ -222,6 +229,13 @@ func newWriteHarness(t *testing.T) *writeHarness {
 		StartUpdate:        []string{"sudo-stub", "update"},
 		StartSystemUpgrade: []string{"sudo-stub", "system-upgrade"},
 		RegisterClaim:      []string{"sudo-stub", "systemctl", "start", "--no-block", "airplanes-claim.service"},
+		WifiList:           []string{"sudo-stub", "apl-wifi", "list", "--json"},
+		WifiAdd:            []string{"sudo-stub", "apl-wifi", "add", "--json"},
+		WifiUpdate:         []string{"sudo-stub", "apl-wifi", "update", "--json"},
+		WifiDelete:         []string{"sudo-stub", "apl-wifi", "delete", "--json"},
+		WifiTest:           []string{"sudo-stub", "apl-wifi", "test", "--json"},
+		WifiActivate:       []string{"sudo-stub", "apl-wifi", "activate", "--json"},
+		WifiStatus:         []string{"sudo-stub", "apl-wifi", "status", "--json"},
 	}
 
 	deps := Deps{

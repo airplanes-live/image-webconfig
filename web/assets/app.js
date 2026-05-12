@@ -189,16 +189,29 @@
     }
 
     async function postJSON(path, body) {
+        return sendJSON("POST", path, body);
+    }
+
+    async function putJSON(path, body) {
+        return sendJSON("PUT", path, body);
+    }
+
+    async function deleteJSON(path, body) {
+        return sendJSON("DELETE", path, body);
+    }
+
+    async function sendJSON(method, path, body) {
         const ctrl = new AbortController();
         activeAbort = ctrl;
         try {
-            const resp = await fetch(path, {
-                method: "POST",
+            const init = {
+                method,
                 credentials: "same-origin",
                 headers: { "Content-Type": "application/json" },
-                body: JSON.stringify(body),
                 signal: ctrl.signal,
-            });
+            };
+            if (body !== undefined) init.body = JSON.stringify(body);
+            const resp = await fetch(path, init);
             let payload = null;
             try { payload = await resp.json(); } catch (_) {}
             return { ok: resp.ok, status: resp.status, payload: payload || {} };
@@ -336,6 +349,33 @@
         if (!m) return false;
         const f = Number(m[1]);
         return Number.isFinite(f) && f >= -1000 && f <= 10000;
+    }
+
+    // Wi-Fi validators — bash twin lives at
+    // /usr/local/lib/airplanes/wifi-validators.sh (apl_wifi_valid_*). Pinned
+    // by the same parity fixture. CRUCIAL: no trim. WPA passphrases and
+    // SSIDs can legitimately carry leading/trailing whitespace, so pass the
+    // value through verbatim — the form must not normalize.
+    const wifiSSIDControlsRE = /[\x00-\x1f\x7f]/;
+    function isValidWifiSSID(v) {
+        const s = String(v == null ? "" : v);
+        if (wifiSSIDControlsRE.test(s)) return false;
+        const bytes = new TextEncoder().encode(s).length;
+        return bytes >= 1 && bytes <= 32;
+    }
+    const wifiPSKHexRE = /^[A-Fa-f0-9]{64}$/;
+    const wifiPSKASCIIRE = /^[\x20-\x7e]{8,63}$/;
+    function isValidWifiPSK(v) {
+        const s = String(v == null ? "" : v);
+        if (wifiPSKHexRE.test(s)) return true;
+        return wifiPSKASCIIRE.test(s);
+    }
+    function isValidWifiCountry(v) {
+        return /^[A-Z]{2}$/.test(String(v == null ? "" : v));
+    }
+    const wifiPriorityRE = /^(0|[1-9][0-9]{0,2})$/;
+    function isValidWifiPriority(v) {
+        return wifiPriorityRE.test(String(v == null ? "" : v));
     }
     /* @validator-parity end */
 
@@ -1298,7 +1338,267 @@
             onclick: async () => { await postJSON("/api/auth/logout", {}); await boot(); },
         }, "Log out");
 
-        return el("div", { class: "actions" }, updateBtn, updateLog, sysUpgradeBtn, sysUpgradeLog, change, rebootBtn, poweroffBtn, logout);
+        const wifiBtn = el("button", {
+            type: "button", class: "wc-btn-ghost",
+            onclick: () => navigate(wifiPanel, { title: "Wi-Fi networks", showBack: true }),
+        }, "Wi-Fi networks");
+
+        return el("div", { class: "actions" }, updateBtn, updateLog, sysUpgradeBtn, sysUpgradeLog, wifiBtn, change, rebootBtn, poweroffBtn, logout);
+    }
+
+    // ===== Wi-Fi panel =====
+
+    async function wifiPanel() {
+        render(el("div", { class: "wc-card" }, el("p", { class: "muted" }, "loading Wi-Fi networks…")));
+
+        const [list, status] = await Promise.all([
+            getJSON("/api/wifi"),
+            getJSON("/api/wifi/status"),
+        ]);
+        if (handleAuthFailure(list) || handleAuthFailure(status)) return;
+
+        const listPayload = (list && list.payload) || {};
+        const statusPayload = (status && status.payload) || {};
+        const networks = listPayload.networks || [];
+        const nmAvailable = !!listPayload.networkmanager_available;
+        const activeConn = listPayload.active_connection || null;
+        const nonWifiUplinks = statusPayload.non_wifi_uplinks || [];
+        const hasEthernet = nonWifiUplinks.length > 0;
+        const managedNets = networks.filter(n => n.managed);
+
+        const flashEl = el("div", { class: "wifi-flash" });
+
+        function setFlash(msg, kind) {
+            flashEl.replaceChildren();
+            if (!msg) return;
+            flashEl.appendChild(el("div", { class: "wifi-flash-" + (kind || "ok"), role: "status" }, msg));
+        }
+        if (!nmAvailable) {
+            setFlash("NetworkManager is not available on this feeder — Wi-Fi changes won't take effect.", "warn");
+        }
+
+        const statusBanner = el("div", { class: "wifi-status" });
+        renderStatusBanner();
+        function renderStatusBanner() {
+            statusBanner.replaceChildren();
+            if (activeConn && activeConn.ssid) {
+                statusBanner.appendChild(el("p", {},
+                    el("span", { class: "wifi-dot-active" }, ""),
+                    " Connected to ",
+                    el("strong", {}, activeConn.ssid),
+                    activeConn.device ? el("span", { class: "muted" }, " on " + activeConn.device) : null,
+                ));
+            } else if (hasEthernet) {
+                const e = nonWifiUplinks[0];
+                statusBanner.appendChild(el("p", { class: "muted" },
+                    "Ethernet only — " + (e.device || "") + (e.ipv4 ? " (" + e.ipv4 + ")" : "")));
+            } else {
+                statusBanner.appendChild(el("p", { class: "muted" }, "No active uplink detected."));
+            }
+        }
+
+        const addBtn = el("button", { type: "button", class: "wc-btn-primary" }, "Add network");
+        const tableHost = el("div", {});
+        const formHost = el("div", {});
+
+        function renderTable() {
+            tableHost.replaceChildren();
+            if (networks.length === 0) {
+                tableHost.appendChild(el("p", { class: "muted" }, "No saved networks."));
+                return;
+            }
+            const rows = networks.map(n => {
+                const editBtn = el("button", {
+                    type: "button", class: "wc-btn-ghost",
+                    disabled: n.managed ? null : "",
+                    title: n.managed ? null : "Foreign keyfile — edit via SSH",
+                    onclick: () => showForm(n),
+                }, "Edit");
+                const activateBtn = el("button", {
+                    type: "button", class: "wc-btn-ghost",
+                    disabled: (!nmAvailable || n.active) ? "" : null,
+                    onclick: () => activateNetwork(n),
+                }, "Activate");
+                const deleteBtn = el("button", {
+                    type: "button", class: "wc-btn-danger",
+                    disabled: n.managed ? null : "",
+                    onclick: () => deleteNetwork(n),
+                }, "Delete");
+                return el("tr", {},
+                    el("td", {},
+                        n.active ? el("span", { class: "wifi-dot-active", title: "Active" }, "") : el("span", { class: "wifi-dot-idle" }, ""),
+                        " ",
+                        el("strong", {}, n.ssid || "(unknown)"),
+                        n.first_run_profile ? el("span", { class: "wifi-badge" }, "first-run") : null,
+                        n.managed ? null : el("span", { class: "wifi-badge wifi-badge-warn" }, "foreign"),
+                        n.hidden ? el("span", { class: "wifi-badge" }, "hidden") : null,
+                    ),
+                    el("td", { class: "wifi-priority" }, String(n.priority || 0)),
+                    el("td", { class: "wifi-actions" }, editBtn, activateBtn, deleteBtn),
+                );
+            });
+            const tbl = el("table", { class: "wifi-table" },
+                el("thead", {}, el("tr", {},
+                    el("th", {}, "Network"),
+                    el("th", {}, "Priority"),
+                    el("th", {}, "Actions"),
+                )),
+                el("tbody", {}, ...rows),
+            );
+            tableHost.appendChild(tbl);
+        }
+
+        // Soft + strong confirm for delete. Both can compose; we always send
+        // both force flags if needed (helper enforces server-side).
+        async function deleteNetwork(n) {
+            const remainingManaged = managedNets.filter(m => m.id !== n.id).length;
+            const needForceLast = remainingManaged === 0;
+            const needForceActive = n.active && !hasEthernet;
+
+            if (needForceActive) {
+                const typed = prompt(
+                    "Deleting the active Wi-Fi network and no Ethernet is plugged in.\n\n" +
+                    "After this the feeder will lose its uplink. To recover you'll need " +
+                    "physical access (SD card) or another network the feeder still knows.\n\n" +
+                    'Type DELETE to confirm:');
+                if (typed !== "DELETE") return;
+            } else if (needForceLast) {
+                if (!confirm("This is the last saved Wi-Fi network. Delete anyway?")) return;
+            } else {
+                if (!confirm("Delete Wi-Fi network \"" + (n.ssid || n.id) + "\"?")) return;
+            }
+
+            const r = await deleteJSON("/api/wifi/" + encodeURIComponent(n.id), {
+                force_last: needForceLast,
+                force_active_no_uplink: needForceActive,
+            });
+            if (handleAuthFailure(r)) return;
+            if (!r.ok) {
+                setFlash((r.payload && (r.payload.message || r.payload.reason || r.payload.error)) || "delete failed", "error");
+                return;
+            }
+            setFlash("Deleted " + (n.ssid || n.id), "ok");
+            await wifiPanel();
+        }
+
+        async function activateNetwork(n) {
+            const r = await postJSON("/api/wifi/" + encodeURIComponent(n.id) + "/activate", {});
+            if (handleAuthFailure(r)) return;
+            if (!r.ok) {
+                setFlash((r.payload && (r.payload.message || r.payload.reason || r.payload.nm_reason || r.payload.error)) || "activate failed", "error");
+                return;
+            }
+            setFlash("Activating " + (n.ssid || n.id) + "…", "ok");
+            await wifiPanel();
+        }
+
+        function showForm(existing) {
+            const isEdit = !!existing;
+            const ssid = el("input", { type: "text", required: true, value: existing ? (existing.ssid || "") : "" });
+            const psk = el("input", {
+                type: "password", autocomplete: "new-password",
+                placeholder: isEdit && existing.has_psk ? "(unchanged — leave blank to keep)" : "8-63 chars or 64-hex",
+            });
+            const hidden = el("input", { type: "checkbox" });
+            if (existing && existing.hidden) hidden.checked = true;
+            const priority = el("input", {
+                type: "number", min: "0", max: "999",
+                value: String(existing ? (existing.priority || 0) : 0),
+            });
+            const testBox = el("input", { type: "checkbox", checked: "" });
+            const submit = el("button", { type: "submit", class: "wc-btn-primary" }, isEdit ? "Save changes" : "Add network");
+            const cancel = el("button", { type: "button", class: "wc-btn-ghost" }, "Cancel");
+            cancel.onclick = () => { formHost.replaceChildren(); };
+            const inlineErr = el("p", { class: "error", role: "alert" });
+
+            const form = el("form", {
+                class: "wifi-form",
+                onsubmit: async (e) => {
+                    e.preventDefault();
+                    inlineErr.textContent = "";
+                    const ssidVal = ssid.value;
+                    const pskVal = psk.value;
+                    if (!isValidWifiSSID(ssidVal)) {
+                        inlineErr.textContent = "SSID must be 1-32 bytes, no control characters.";
+                        return;
+                    }
+                    if (pskVal !== "" && !isValidWifiPSK(pskVal)) {
+                        inlineErr.textContent = "Password must be 8-63 printable ASCII chars or 64 hex chars.";
+                        return;
+                    }
+                    const priVal = priority.value || "0";
+                    if (!isValidWifiPriority(priVal)) {
+                        inlineErr.textContent = "Priority must be an integer 0-999.";
+                        return;
+                    }
+                    const body = {
+                        ssid: ssidVal,
+                        hidden: hidden.checked,
+                        priority: parseInt(priVal, 10),
+                        test: testBox.checked,
+                    };
+                    // On edit: only include PSK when the user typed something.
+                    // Empty input means "leave existing PSK alone". The helper
+                    // honors explicit "" as "convert to open network" — guard
+                    // against that surprise by sending no key at all.
+                    if (!isEdit || pskVal !== "") body.psk = pskVal;
+
+                    submit.disabled = true;
+                    submit.textContent = testBox.checked ? "Testing (up to 30s)…" : "Saving…";
+                    const url = isEdit ? "/api/wifi/" + encodeURIComponent(existing.id) : "/api/wifi";
+                    const r = isEdit ? await putJSON(url, body) : await postJSON(url, body);
+                    submit.disabled = false;
+                    submit.textContent = isEdit ? "Save changes" : "Add network";
+                    if (handleAuthFailure(r)) return;
+                    if (!r.ok) {
+                        const p = r.payload || {};
+                        const errs = p.errors || {};
+                        const parts = Object.keys(errs).map(k => k + ": " + errs[k]);
+                        const reason = p.reason || p.message || p.error || "save failed";
+                        inlineErr.textContent = parts.length ? parts.join("; ") : reason;
+                        if (p.nm_reason) {
+                            inlineErr.textContent += " (" + p.nm_reason.split("\n")[0] + ")";
+                        }
+                        return;
+                    }
+                    setFlash(isEdit ? "Updated " + ssidVal : "Added " + ssidVal, "ok");
+                    await wifiPanel();
+                },
+            },
+                el("h3", {}, isEdit ? "Edit " + (existing.ssid || existing.id) : "Add network"),
+                el("div", { class: "field" }, el("label", {}, "SSID"), ssid),
+                el("div", { class: "field" }, el("label", {}, "Password"), psk),
+                el("div", { class: "field-row" },
+                    el("label", {}, hidden, " Hidden network"),
+                    el("label", {}, "Priority ", priority),
+                ),
+                el("div", { class: "field" },
+                    el("label", {}, testBox, " Test connection before saving"),
+                    el("p", { class: "muted" }, "Tries to join now; rolls back on failure. Connecting to a new network may briefly drop this page if the feeder is on Wi-Fi."),
+                ),
+                inlineErr,
+                el("div", { class: "actions" }, submit, cancel),
+            );
+            formHost.replaceChildren(form);
+            ssid.focus();
+        }
+
+        addBtn.onclick = () => showForm(null);
+
+        renderTable();
+
+        render(
+            el("section", { class: "wc-card" },
+                el("h2", {}, "Wi-Fi networks"),
+                statusBanner,
+                flashEl,
+                el("div", { class: "actions" }, addBtn),
+                tableHost,
+                formHost,
+                el("p", { class: "muted wifi-help" },
+                    "Add a second network before removing the one this feeder is on. The first-run network from airplanes-config.txt is shown as 'first-run'."),
+            ),
+        );
     }
 
     // buildRebootBannerSlot returns an empty container that the dashboard

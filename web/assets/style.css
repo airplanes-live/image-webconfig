@@ -743,6 +743,75 @@ textarea:focus {
   .wc-split { grid-template-columns: 1fr 1fr; }
 }
 
+/* ========== Wi-Fi panel ========== */
+
+.wifi-status p { margin: 0.25rem 0; }
+.wifi-dot-active,
+.wifi-dot-idle {
+  display: inline-block;
+  width: 0.6rem;
+  height: 0.6rem;
+  border-radius: 50%;
+  vertical-align: middle;
+  margin-right: 0.35rem;
+}
+.wifi-dot-active { background: #1f8a45; box-shadow: 0 0 0 2px rgba(31, 138, 69, 0.18); }
+.wifi-dot-idle   { background: var(--wc-line-strong); }
+
+.wifi-badge {
+  display: inline-block;
+  font-size: 0.75rem;
+  padding: 0 0.4rem;
+  border-radius: 0.75rem;
+  background: var(--wc-surface-2);
+  color: var(--wc-ink-2);
+  margin-left: 0.4rem;
+  vertical-align: middle;
+}
+.wifi-badge-warn { background: #fdecc8; color: #5e3a00; }
+
+.wifi-table {
+  width: 100%;
+  border-collapse: collapse;
+  margin: 0.5rem 0 0.75rem;
+}
+.wifi-table th,
+.wifi-table td {
+  text-align: left;
+  padding: 0.45rem 0.5rem;
+  border-bottom: 1px solid var(--wc-line-soft);
+  vertical-align: middle;
+}
+.wifi-priority { width: 5rem; }
+.wifi-actions  { width: auto; white-space: nowrap; }
+.wifi-actions button + button { margin-left: 0.35rem; }
+
+.wifi-form .field { margin: 0.5rem 0; }
+.wifi-form .field-row {
+  display: flex;
+  gap: 1.25rem;
+  align-items: center;
+  flex-wrap: wrap;
+  margin: 0.5rem 0;
+}
+.wifi-form input[type="number"] {
+  width: 5rem;
+  margin-left: 0.35rem;
+}
+.wifi-help { margin-top: 0.75rem; }
+
+.wifi-flash:empty { display: none; }
+.wifi-flash-ok,
+.wifi-flash-warn,
+.wifi-flash-error {
+  padding: 0.5rem 0.75rem;
+  border-radius: 0.4rem;
+  margin: 0.25rem 0 0.5rem;
+}
+.wifi-flash-ok    { background: #e3f1e6; color: #14441f; }
+.wifi-flash-warn  { background: #fdecc8; color: #5e3a00; }
+.wifi-flash-error { background: #fbdcdc; color: #6a1b1b; }
+
 /* ========== Reduced motion ========== */
 
 @media (prefers-reduced-motion: reduce) {
