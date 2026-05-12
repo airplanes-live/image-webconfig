@@ -435,6 +435,16 @@ main {
   color: var(--wc-accent);
 }
 
+/* Hardware tile differentiator. Sits in the same .wc-grid--tiles as the
+   service tiles, but the left-border accent + muted icon tint reads as a
+   different category (hardware vs. services). */
+.wc-tile--hardware {
+  border-left: 3px solid var(--wc-accent);
+}
+.wc-tile--hardware .wc-tile__icon {
+  color: var(--wc-ink-2);
+}
+
 /* Stack of two tile grids (services + apps) on the dashboard. Inherit
    the existing .wc-grid--tiles bottom margin between them; no extra
    styling needed at the wrapper level. */

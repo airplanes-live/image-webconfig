@@ -50,7 +50,7 @@ type Server struct {
 // status) and mutating (add / update / delete / test / activate) surfaces
 // via the same grant.
 type PrivilegedArgv struct {
-	ApplyFeed    []string // sudo -n /usr/local/bin/apl-feed apply --json
+	ApplyFeed    []string // sudo -n /usr/local/bin/apl-feed apply --json --lock-timeout 5
 	SchemaFeed   []string // /usr/local/bin/apl-feed schema --json (no sudo: read-only)
 	Reboot       []string
 	StartUpdate  []string // sudo systemd-run --unit=airplanes-update ...
@@ -65,12 +65,18 @@ type PrivilegedArgv struct {
 
 // DefaultPrivilegedArgv returns the production argv shapes for the
 // airplanes-webconfig sudoers entry. Override per-test via Deps.
+//
+// ApplyFeed pins --lock-timeout 5 so webconfig owns the wall-clock
+// budget end-to-end: apl-feed waits at most 5s for the feed.env flock,
+// then either succeeds or emits a structured lock_timeout envelope. The
+// applyConfigTimeout below (lockTimeout + post-lock budget) sets the
+// outer ceiling.
 func DefaultPrivilegedArgv() PrivilegedArgv {
 	sudo := func(args ...string) []string {
 		return append([]string{"/usr/bin/sudo", "-n"}, args...)
 	}
 	return PrivilegedArgv{
-		ApplyFeed:  sudo("/usr/local/bin/apl-feed", "apply", "--json"),
+		ApplyFeed:  sudo("/usr/local/bin/apl-feed", "apply", "--json", "--lock-timeout", "5"),
 		SchemaFeed: []string{"/usr/local/bin/apl-feed", "schema", "--json"},
 		Reboot:     sudo("/usr/bin/systemctl", "reboot"),
 		StartUpdate: sudo(
