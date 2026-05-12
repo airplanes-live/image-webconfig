@@ -10,9 +10,11 @@ package wifi
 //   1. `nmcli -t -f DEVICE,TYPE,STATE dev status` — find the wifi-type device
 //      and learn whether it's connected. If no wifi device exists, the
 //      probe returns nil so the dashboard hides the tile entirely.
-//   2. `nmcli --rescan no -t -f IN-USE,SIGNAL,SSID dev wifi list ifname <iface>`
+//   2. `nmcli -t -f IN-USE,SIGNAL,SSID dev wifi list ifname <iface> --rescan no`
 //      — only when the wifi device is connected. Parses the IN-USE='*'
-//      row and returns its SSID + signal %.
+//      row and returns its SSID + signal %. `--rescan no` must follow
+//      the `dev wifi list` subcommand; nmcli 1.52+ rejects it as a
+//      global flag with exit 2.
 //
 // Note: `nmcli dev wifi list` does NOT accept a DEVICE field, so the older
 // "one-call DEVICE,IN-USE,SIGNAL,SSID" shape was unworkable. Hence the
@@ -113,15 +115,20 @@ func (r *SignalReader) findWiFiInterface(ctx context.Context) (iface string, con
 	return "", false, false
 }
 
-// populateActiveRow runs `nmcli --rescan no -t -f IN-USE,SIGNAL,SSID dev
-// wifi list ifname <iface>` and fills SSID + SignalPct on out from the
+// populateActiveRow runs `nmcli -t -f IN-USE,SIGNAL,SSID dev wifi list
+// ifname <iface> --rescan no` and fills SSID + SignalPct on out from the
 // row whose IN-USE column is "*". On any failure (exec error, no in-use
 // row, malformed columns) out is left as-is (Connected stays true; we
 // don't fabricate disconnected).
+//
+// `--rescan no` MUST follow `dev wifi list` — nmcli 1.52+ rejects it as
+// a global flag with "Option '--rescan' is unknown" and exits 2. The
+// flag exists to suppress the implicit rescan nmcli would otherwise
+// trigger; without it nmcli's `--rescan auto` may stall the call.
 func (r *SignalReader) populateActiveRow(ctx context.Context, iface string, out *Signal) {
 	cctx, cancel := context.WithTimeout(ctx, r.timeout)
 	defer cancel()
-	res, err := r.runner(cctx, []string{r.nmcliBinary, "--rescan", "no", "-t", "-f", "IN-USE,SIGNAL,SSID", "dev", "wifi", "list", "ifname", iface})
+	res, err := r.runner(cctx, []string{r.nmcliBinary, "-t", "-f", "IN-USE,SIGNAL,SSID", "dev", "wifi", "list", "ifname", iface, "--rescan", "no"})
 	if err != nil {
 		return
 	}

@@ -3,6 +3,7 @@ package wifi
 import (
 	"context"
 	"errors"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -326,4 +327,71 @@ func itoa(n int) string {
 		buf[i] = '-'
 	}
 	return string(buf[i:])
+}
+
+// === Argv-shape regression ===
+
+// TestProbe_NMCLIArgvShape pins the exact argv slices Probe() sends to
+// nmcli. This catches the regression we hit in PR #120: `--rescan no`
+// was placed in the global-flag position (before the `dev wifi list`
+// subcommand), which nmcli 1.52+ rejects with `Option '--rescan' is
+// unknown` (exit 2). The shape below — `--rescan no` after `dev wifi
+// list ifname <iface>` — works on every nmcli we ship against.
+//
+// Earlier integration tests dispatched the mock runner on argv
+// substring matches, so they passed regardless of argv ordering. Pin
+// the exact slice here so any future reordering breaks the test
+// before it breaks the dashboard.
+func TestProbe_NMCLIArgvShape(t *testing.T) {
+	t.Parallel()
+	var calls [][]string
+	runner := func(_ context.Context, argv []string) (wexec.Result, error) {
+		// Defensive copy: the test inspects the slice after Probe()
+		// returns, and the runner's slice may be reused.
+		dup := append([]string(nil), argv...)
+		calls = append(calls, dup)
+		joined := strings.Join(argv[1:], " ")
+		switch {
+		case strings.HasSuffix(joined, "dev status"):
+			return wexec.Result{Stdout: []byte("wlan0:wifi:connected\n")}, nil
+		case strings.Contains(joined, "dev wifi list ifname"):
+			return wexec.Result{Stdout: []byte("*:78:Test\n")}, nil
+		}
+		return wexec.Result{}, errors.New("unexpected argv: " + joined)
+	}
+	r := &SignalReader{nmcliBinary: "/usr/bin/nmcli", runner: runner, timeout: time.Second}
+	got := r.Probe(context.Background())
+	if got == nil || !got.Connected {
+		t.Fatalf("probe failed: %+v", got)
+	}
+
+	if len(calls) != 2 {
+		t.Fatalf("expected 2 nmcli calls, got %d: %v", len(calls), calls)
+	}
+
+	wantStatus := []string{"/usr/bin/nmcli", "-t", "-f", "DEVICE,TYPE,STATE", "dev", "status"}
+	if !reflect.DeepEqual(calls[0], wantStatus) {
+		t.Errorf("dev status argv =\n  %q\nwant\n  %q", calls[0], wantStatus)
+	}
+
+	wantList := []string{"/usr/bin/nmcli", "-t", "-f", "IN-USE,SIGNAL,SSID", "dev", "wifi", "list", "ifname", "wlan0", "--rescan", "no"}
+	if !reflect.DeepEqual(calls[1], wantList) {
+		t.Errorf("dev wifi list argv =\n  %q\nwant\n  %q", calls[1], wantList)
+	}
+
+	// Belt-and-braces: even if the exact-shape check above is relaxed
+	// in the future, --rescan must come after `list` because nmcli
+	// only accepts it as a subcommand option.
+	rescanIdx, listIdx := -1, -1
+	for i, a := range calls[1] {
+		if a == "--rescan" {
+			rescanIdx = i
+		}
+		if a == "list" {
+			listIdx = i
+		}
+	}
+	if rescanIdx < 0 || listIdx < 0 || rescanIdx <= listIdx {
+		t.Errorf("--rescan must follow `list`; argv = %q", calls[1])
+	}
 }
