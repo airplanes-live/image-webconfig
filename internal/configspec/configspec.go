@@ -148,16 +148,39 @@ func Validate(key, value string) error {
 // MLAT_USER is a valid combination — the daemon picks a per-device name
 // rather than refusing to start.
 func ValidateConsistency(merged map[string]string) error {
-	// GEO_CONFIGURED=true asserts the operator has provided real coordinates.
-	// Both LATITUDE and LONGITUDE must be present in the merged config for
-	// the daemon to pass them to mlat-client. (A single zero axis is fine —
-	// that's a real equator or prime-meridian feeder.)
+	// GEO_CONFIGURED=true asserts the operator has provided real coordinates
+	// and an altitude. LATITUDE, LONGITUDE, ALTITUDE must all be non-empty
+	// for the daemon to pass them to mlat-client. A single zero axis is fine
+	// (a real equator or prime-meridian feeder); an empty ALTITUDE is not
+	// (airplanes-mlat.sh strict-fails with reason=altitude_empty).
 	if geo, hasGeo := merged["GEO_CONFIGURED"]; hasGeo && geo == "true" {
 		if lat, ok := merged["LATITUDE"]; !ok || lat == "" {
 			return validationError("LATITUDE", "must be non-empty when GEO_CONFIGURED=true")
 		}
 		if lon, ok := merged["LONGITUDE"]; !ok || lon == "" {
 			return validationError("LONGITUDE", "must be non-empty when GEO_CONFIGURED=true")
+		}
+		if alt, ok := merged["ALTITUDE"]; !ok || alt == "" {
+			return validationError("ALTITUDE", "must be non-empty when GEO_CONFIGURED=true")
+		}
+	}
+	// MLAT_ENABLED=true requires the full geo set up front. Mirrors the
+	// daemon classifier: airplanes-mlat.sh refuses to start when
+	// GEO_CONFIGURED!=true (reason=geo_not_configured) or ALTITUDE is empty
+	// (reason=altitude_empty). Catching it here gives the operator a clear
+	// per-field error at save time instead of "service failed; check logs".
+	if mlat, ok := merged["MLAT_ENABLED"]; ok && mlat == "true" {
+		if geo, ok := merged["GEO_CONFIGURED"]; !ok || geo != "true" {
+			return validationError("GEO_CONFIGURED", `must be "true" when MLAT_ENABLED=true (set LATITUDE/LONGITUDE first)`)
+		}
+		if lat, ok := merged["LATITUDE"]; !ok || lat == "" {
+			return validationError("LATITUDE", "must be non-empty when MLAT_ENABLED=true")
+		}
+		if lon, ok := merged["LONGITUDE"]; !ok || lon == "" {
+			return validationError("LONGITUDE", "must be non-empty when MLAT_ENABLED=true")
+		}
+		if alt, ok := merged["ALTITUDE"]; !ok || alt == "" {
+			return validationError("ALTITUDE", "must be non-empty when MLAT_ENABLED=true")
 		}
 	}
 	return nil

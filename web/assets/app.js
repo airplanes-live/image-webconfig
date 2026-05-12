@@ -284,20 +284,51 @@
         return null;
     }
 
+    // Strict full-string regexes mirroring configspec.go validators. Used
+    // by the form-time gate so a value the server would reject doesn't
+    // pass the client check. parseFloat is intentionally avoided —
+    // parseFloat("52abc") returns 52, which would let "52abc" sneak past.
+    const decimalRE = /^-?\d+(?:\.\d+)?$/;
+    const altitudeRE = /^(-?\d+(?:\.\d+)?)(m|ft)?$/;
+
+    function isValidLatitude(v) {
+        const s = (v || "").trim();
+        if (!decimalRE.test(s)) return false;
+        const f = Number(s);
+        return Number.isFinite(f) && f >= -90 && f <= 90;
+    }
+    function isValidLongitude(v) {
+        const s = (v || "").trim();
+        if (!decimalRE.test(s)) return false;
+        const f = Number(s);
+        return Number.isFinite(f) && f >= -180 && f <= 180;
+    }
+    function isValidAltitude(v) {
+        const s = (v || "").trim();
+        const m = altitudeRE.exec(s);
+        if (!m) return false;
+        const f = Number(m[1]);
+        return Number.isFinite(f) && f >= -1000 && f <= 10000;
+    }
+
     // previewLatLonSet — projection of unsaved form values onto the
     // daemon's "would MLAT be enabled?" rule. Used ONLY for the form-time
     // preview path and for the legacy fallback in classifyService when
     // the daemon's mlat_decision isn't available. The running daemon's
     // authoritative answer comes from payload.mlat_decision.
     //
-    // Daemon disables MLAT if EITHER coordinate is zero; this used to
-    // wrongly OR the comparisons (treating "lat=52, lon=0" as set).
-    // Treat NaN (unparseable) as unset.
+    // Prefer the explicit GEO_CONFIGURED flag when present in the form
+    // state — the form may be mid-edit with valid coords but GEO_CONFIGURED
+    // still pointing at the placeholder value. Fall back to the lat/lon
+    // derivation only when GEO_CONFIGURED is absent (legacy state-file).
     function previewLatLonSet(values) {
-        const lat = parseFloat((values.LATITUDE || "").trim());
-        const lon = parseFloat((values.LONGITUDE || "").trim());
-        if (Number.isNaN(lat) || Number.isNaN(lon)) return false;
-        return lat !== 0 && lon !== 0;
+        if (values && Object.prototype.hasOwnProperty.call(values, "GEO_CONFIGURED")) {
+            return (values.GEO_CONFIGURED || "").trim() === "true";
+        }
+        if (!isValidLatitude(values.LATITUDE) || !isValidLongitude(values.LONGITUDE)) return false;
+        const lat = Number(String(values.LATITUDE || "").trim());
+        const lon = Number(String(values.LONGITUDE || "").trim());
+        return !(lat === 0 && lon === 0);
     }
 
     // previewMlatDisabled — same projection semantics: read MLAT_ENABLED
@@ -865,6 +896,41 @@
         const err = errorEl();
         const submit = el("button", { type: "submit", class: "wc-btn-primary" }, "Save & restart");
 
+        // Gate Save on the same MLAT → geo requirement that
+        // configspec.ValidateConsistency enforces server-side. Reading
+        // the inputs directly (rather than capturing the saved values)
+        // means flipping the checkbox or editing a coord live-updates
+        // the inline error and the Save button.
+        const recheck = () => {
+            const lat = inputs.LATITUDE.value;
+            const lon = inputs.LONGITUDE.value;
+            const alt = inputs.ALTITUDE.value;
+            if (!mlat.checked) {
+                err.textContent = "";
+                submit.disabled = false;
+                return;
+            }
+            // mlat is on — every coord must parse to the same strict shape
+            // configspec.go requires AND not be the (0,0) placeholder pair.
+            const latOk = isValidLatitude(lat);
+            const lonOk = isValidLongitude(lon);
+            const altOk = isValidAltitude(alt);
+            const isPlaceholder = latOk && lonOk
+                && Number(lat.trim()) === 0 && Number(lon.trim()) === 0;
+            if (!latOk || !lonOk || !altOk || isPlaceholder) {
+                const missing = [];
+                if (!latOk) missing.push("latitude");
+                else if (!lonOk) missing.push("longitude");
+                else if (isPlaceholder) missing.push("non-(0,0) coordinates");
+                if (!altOk) missing.push("altitude");
+                err.textContent = "Set valid " + missing.join(", ") + " to enable MLAT.";
+                submit.disabled = true;
+            } else {
+                err.textContent = "";
+                submit.disabled = false;
+            }
+        };
+
         const form = el("form", {
             class: "config-form",
             onsubmit: async (e) => {
@@ -927,15 +993,21 @@
                 navigate(dashboard, opts);
             },
         },
-            field("LATITUDE", "Latitude", { inputmode: "decimal", placeholder: "51.5" }),
-            field("LONGITUDE", "Longitude", { inputmode: "decimal", placeholder: "-0.1" }),
-            field("ALTITUDE", "Altitude", { placeholder: "120m" }),
-            field("MLAT_USER", "MLAT name", { placeholder: "alice" }),
-            el("div", { class: "field" },
-                el("label", { for: mlatId }, mlat, " Enable MLAT", " ", el("code", {}, "MLAT_ENABLED")),
+            el("fieldset", { class: "config-fieldset" },
+                el("legend", {}, "Location"),
+                field("LATITUDE", "Latitude", { inputmode: "decimal", placeholder: "51.5" }),
+                field("LONGITUDE", "Longitude", { inputmode: "decimal", placeholder: "-0.1" }),
+                field("ALTITUDE", "Altitude", { placeholder: "120m" }),
             ),
-            el("div", { class: "field" },
-                el("label", { for: mlatPrivateId }, mlatPrivate, " Hide MLAT name on public map", " ", el("code", {}, "MLAT_PRIVATE")),
+            el("fieldset", { class: "config-fieldset" },
+                el("legend", {}, "MLAT"),
+                field("MLAT_USER", "MLAT name", { placeholder: "alice" }),
+                el("div", { class: "field" },
+                    el("label", { for: mlatId }, mlat, " Enable MLAT", " ", el("code", {}, "MLAT_ENABLED")),
+                ),
+                el("div", { class: "field" },
+                    el("label", { for: mlatPrivateId }, mlatPrivate, " Hide MLAT name on public map", " ", el("code", {}, "MLAT_PRIVATE")),
+                ),
             ),
             field("GAIN", "Gain", { placeholder: "auto" }),
             el("div", { class: "field" },
@@ -953,6 +1025,14 @@
             err,
         );
         parent.appendChild(form);
+
+        // Wire the gate listeners now that the form is in the DOM. Each
+        // input edit and the MLAT toggle re-run the same check.
+        inputs.LATITUDE.addEventListener("input", recheck);
+        inputs.LONGITUDE.addEventListener("input", recheck);
+        inputs.ALTITUDE.addEventListener("input", recheck);
+        mlat.addEventListener("change", recheck);
+        recheck();
 
         const readOnly = Object.keys(values).filter(k =>
             !["LATITUDE", "LONGITUDE", "ALTITUDE", "MLAT_USER", "MLAT_ENABLED", "MLAT_PRIVATE", "GAIN", "UAT_INPUT", "DUMP978_SDR_SERIAL", "DUMP978_GAIN"].includes(k)

@@ -113,12 +113,13 @@ func TestMergeAndValidate_CanonicalizesAltitude(t *testing.T) {
 
 func TestMergeAndValidate_AutoSetsGeoConfiguredTrueWhenCoordsSubmitted(t *testing.T) {
 	t.Parallel()
-	// Frontend submits lat/lon without GEO_CONFIGURED; the helper infers
+	// Frontend submits lat/lon/alt together; auto-derive infers GEO_CONFIGURED
 	// "user is configuring geo" and writes true. MLAT_USER carries through
-	// untouched — the only cross-key rule left is GEO_CONFIGURED→LAT/LON.
+	// untouched. ALTITUDE is also required so the GEO_CONFIGURED=>coords+alt
+	// rule passes ValidateConsistency.
 	got, err := mergeAndValidate(
 		map[string]string{"MLAT_USER": "alice"},
-		map[string]string{"LATITUDE": "51.5", "LONGITUDE": "-0.1"},
+		map[string]string{"LATITUDE": "51.5", "LONGITUDE": "-0.1", "ALTITUDE": "35m"},
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -148,10 +149,11 @@ func TestMergeAndValidate_AutoSetsGeoConfiguredFalseForZeroPair(t *testing.T) {
 func TestMergeAndValidate_AutoSetsGeoConfiguredTrueForEquator(t *testing.T) {
 	t.Parallel()
 	// Real equator coordinate (lat=0, lon=13). Must NOT be classified as
-	// the placeholder pair.
+	// the placeholder pair. Altitude submitted alongside so the consistency
+	// rule's altitude-required-when-GEO_CONFIGURED=true clause is satisfied.
 	got, err := mergeAndValidate(
 		map[string]string{"MLAT_USER": "alice"},
-		map[string]string{"LATITUDE": "0", "LONGITUDE": "13"},
+		map[string]string{"LATITUDE": "0", "LONGITUDE": "13", "ALTITUDE": "20m"},
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -175,6 +177,23 @@ func TestMergeAndValidate_ExplicitGeoConfiguredWinsOverAutoDerive(t *testing.T) 
 	}
 	if got["GEO_CONFIGURED"] != "false" {
 		t.Errorf("GEO_CONFIGURED = %q, want false (explicit wins)", got["GEO_CONFIGURED"])
+	}
+}
+
+func TestMergeAndValidate_MlatEnabledRequiresAltitude(t *testing.T) {
+	t.Parallel()
+	// MLAT_ENABLED=true with lat/lon but empty altitude must be rejected
+	// at the apply-config layer so a webconfig POST never lands a state the
+	// daemon would strict-fail on as altitude_empty.
+	_, err := mergeAndValidate(
+		map[string]string{"LATITUDE": "51.5", "LONGITUDE": "-0.1", "ALTITUDE": ""},
+		map[string]string{"MLAT_ENABLED": "true", "GEO_CONFIGURED": "true"},
+	)
+	if err == nil {
+		t.Fatalf("expected error for MLAT_ENABLED=true with empty ALTITUDE; got nil")
+	}
+	if !strings.Contains(err.Error(), "ALTITUDE") {
+		t.Errorf("error = %q; want it to name ALTITUDE", err)
 	}
 }
 
