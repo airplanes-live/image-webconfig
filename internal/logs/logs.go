@@ -22,6 +22,8 @@ import (
 )
 
 // Whitelist defines which units are exposable via /api/log/{unit}.
+// Keep slugs in sync with LOG_SLUG_TO_UNIT in web/assets/app.js — a slug
+// missing here returns 404, while a slug missing there just hides the link.
 var Whitelist = map[string]string{
 	"feed":      "airplanes-feed.service",
 	"mlat":      "airplanes-mlat.service",
@@ -29,8 +31,9 @@ var Whitelist = map[string]string{
 	"dump978":   "dump978-fa.service",
 	"uat":       "airplanes-978.service",
 	"claim":     "airplanes-claim.service",
-	"webconfig": "airplanes-webconfig.service",
-	"update":    "airplanes-update.service",
+	"webconfig":      "airplanes-webconfig.service",
+	"update":         "airplanes-update.service",
+	"system-upgrade": "airplanes-system-upgrade.service",
 }
 
 // JournalctlBinary is overridable for tests.

@@ -491,3 +491,36 @@ func TestRead_UATDecisionRejectsCrossOwnerReason(t *testing.T) {
 		t.Errorf("UATDecision = %+v, want nil (mlat_enabled_false is not a valid 978 reason)", got.UATDecision)
 	}
 }
+
+func TestRead_RebootRequiredFlag(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name    string
+		create  bool
+		want    bool
+	}{
+		{"present", true, true},
+		{"absent", false, false},
+	}
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			p, dir := newTestPaths(t)
+			p.RebootRequiredFile = filepath.Join(dir, "reboot-required")
+			if tc.create {
+				if err := os.WriteFile(p.RebootRequiredFile, nil, 0o644); err != nil {
+					t.Fatal(err)
+				}
+			}
+			r := NewReader("v", p, fixedRunner("active", nil))
+			got, err := r.Read(context.Background())
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got.RebootRequired != tc.want {
+				t.Errorf("RebootRequired = %v, want %v", got.RebootRequired, tc.want)
+			}
+		})
+	}
+}

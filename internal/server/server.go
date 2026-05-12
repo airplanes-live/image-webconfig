@@ -18,21 +18,22 @@ import (
 
 // Server holds the runtime auth components. Constructed in cmd/webconfig.
 type Server struct {
-	version      string
-	store        *auth.PasswordStore
-	sessions     *auth.Sessions
-	lockout      *auth.Lockout
-	guard        *auth.HashGuard
-	argon2Params auth.Params
-	identity     *identity.Reader
-	feedEnv      *feedenv.Reader
-	status       *status.Reader
-	logs         *logs.Streamer
-	runner       wexec.CommandRunner
-	stdinRunner  wexec.CommandRunnerStdin
-	schema       *schemacache.Cache
-	priv         PrivilegedArgv
-	configMu     sync.Mutex // serializes POST /api/config transactions
+	version       string
+	store         *auth.PasswordStore
+	sessions      *auth.Sessions
+	lockout       *auth.Lockout
+	guard         *auth.HashGuard
+	argon2Params  auth.Params
+	identity      *identity.Reader
+	feedEnv       *feedenv.Reader
+	status        *status.Reader
+	logs          *logs.Streamer
+	runner        wexec.CommandRunner
+	stdinRunner   wexec.CommandRunnerStdin
+	schema        *schemacache.Cache
+	priv          PrivilegedArgv
+	configMu      sync.Mutex // serializes POST /api/config transactions
+	maintenanceMu sync.Mutex // serializes the is-active guard + transient-unit kickoff
 }
 
 // PrivilegedArgv carries the exact sudoers-allowed argv shapes for every
@@ -44,10 +45,11 @@ type Server struct {
 // owns feed.env validation, restart fan-out, and the on-disk schema —
 // webconfig is a thin HTTP shell around its JSON interface.
 type PrivilegedArgv struct {
-	ApplyFeed   []string // sudo -n /usr/local/bin/apl-feed apply --json
-	SchemaFeed  []string // /usr/local/bin/apl-feed schema --json (no sudo: read-only)
-	Reboot      []string
-	StartUpdate []string // sudo systemd-run --unit=airplanes-update ...
+	ApplyFeed          []string // sudo -n /usr/local/bin/apl-feed apply --json
+	SchemaFeed         []string // /usr/local/bin/apl-feed schema --json (no sudo: read-only)
+	Reboot             []string
+	StartUpdate        []string // sudo systemd-run --unit=airplanes-update ...
+	StartSystemUpgrade []string // sudo systemd-run --unit=airplanes-system-upgrade ...
 }
 
 // DefaultPrivilegedArgv returns the production argv shapes for the
@@ -66,6 +68,12 @@ func DefaultPrivilegedArgv() PrivilegedArgv {
 			"--collect",
 			"--property=ExecStopPost=/usr/bin/systemctl kill -s HUP airplanes-webconfig.service",
 			"/usr/local/share/airplanes/update.sh",
+		),
+		StartSystemUpgrade: sudo(
+			"/usr/bin/systemd-run",
+			"--unit=airplanes-system-upgrade",
+			"--collect",
+			"/usr/local/lib/airplanes-webconfig/system-upgrade.sh",
 		),
 	}
 }
@@ -134,6 +142,7 @@ func New(d Deps) http.Handler {
 	mux.HandleFunc("GET /api/log/{unit}", s.requireSession(s.handleLog))
 	mux.HandleFunc("POST /api/config", s.requireSession(s.handleConfigPost))
 	mux.HandleFunc("POST /api/update", s.requireSession(s.handleUpdate))
+	mux.HandleFunc("POST /api/system-upgrade", s.requireSession(s.handleSystemUpgrade))
 	mux.HandleFunc("POST /api/reboot", s.requireSession(s.handleReboot))
 
 	// Static assets at /static/*; the SPA shell is served by the GET /

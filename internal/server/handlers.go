@@ -549,35 +549,102 @@ func (s *Server) runSudo(ctx context.Context, argv []string, timeout time.Durati
 	return nil
 }
 
-// /api/update (POST): kicks off a transient airplanes-update.service via
-// systemd-run. Returns 202 + the unit name so the SPA can stream
-// /api/log/update for live output. systemd-run exits with non-zero on
-// "unit already exists" — we map that to 409.
-func (s *Server) handleUpdate(w http.ResponseWriter, r *http.Request) {
+// maintenanceUnits is the set of transient maintenance units that must not
+// overlap each other or be interrupted by a reboot. Both run apt/dpkg and
+// would deadlock on the dpkg lock or leave half-configured state if either
+// happened concurrently with the other or with a shutdown.
+var maintenanceUnits = []string{
+	"airplanes-system-upgrade.service",
+	"airplanes-update.service",
+}
+
+// maintenanceUnitActive returns the name of any maintenance unit currently
+// active or activating, or "" if none. A single `systemctl is-active u1 u2`
+// invocation prints one state line per unit; we scan for the first busy one.
+// systemctl is-active is read-only and does not require sudo.
+func (s *Server) maintenanceUnitActive(ctx context.Context) string {
+	cctx, cancel := context.WithTimeout(ctx, systemctlTimeout)
+	defer cancel()
+	argv := append([]string{"/usr/bin/systemctl", "is-active"}, maintenanceUnits...)
+	res, _ := s.runner(cctx, argv)
+	lines := strings.Split(strings.TrimRight(string(res.Stdout), "\n"), "\n")
+	for i, line := range lines {
+		if i >= len(maintenanceUnits) {
+			break
+		}
+		state := strings.TrimSpace(line)
+		if state == "active" || state == "activating" {
+			return maintenanceUnits[i]
+		}
+	}
+	return ""
+}
+
+// startTransientUnit kicks off a transient systemd unit via the supplied
+// pinned argv (sudo systemd-run ...). It refuses with 409 if any maintenance
+// unit is already busy, and maps systemd-run's "already exists" stderr to a
+// 409 as well. On success it writes 202 + the unit name.
+//
+// The is-active guard and the systemd-run call are serialized via
+// maintenanceMu so two concurrent POSTs can't both observe an idle state and
+// then both kick off — by the time the second contender acquires the lock,
+// the first's transient unit is already registered and is-active reports it
+// as activating.
+func (s *Server) startTransientUnit(w http.ResponseWriter, r *http.Request, argv []string, unit, label string) {
+	s.maintenanceMu.Lock()
+	defer s.maintenanceMu.Unlock()
+	if busy := s.maintenanceUnitActive(r.Context()); busy != "" {
+		writeJSONError(w, http.StatusConflict, label+" refused: "+busy+" is in progress")
+		return
+	}
 	cctx, cancel := context.WithTimeout(r.Context(), systemctlTimeout)
 	defer cancel()
-	res, err := s.runner(cctx, s.priv.StartUpdate)
+	res, err := s.runner(cctx, argv)
 	if err != nil {
 		stderr := strings.TrimSpace(string(res.Stderr))
-		log.Printf("update: %v stderr=%q", err, stderr)
+		log.Printf("%s: %v stderr=%q", label, err, stderr)
 		if strings.Contains(stderr, "already exists") || strings.Contains(stderr, "already running") {
-			writeJSONError(w, http.StatusConflict, "update is already in progress")
+			writeJSONError(w, http.StatusConflict, label+" is already in progress")
 			return
 		}
-		writeJSONError(w, http.StatusInternalServerError, "update start failed")
+		writeJSONError(w, http.StatusInternalServerError, label+" start failed")
 		return
 	}
 	writeJSON(w, http.StatusAccepted, map[string]string{
 		"status":     "running",
-		"unit":       "airplanes-update.service",
+		"unit":       unit,
 		"started_at": time.Now().UTC().Format(time.RFC3339),
 	})
 }
 
-// /api/reboot (POST): writes 202 + flushes, then triggers reboot from a
-// goroutine after a brief delay so the response actually leaves the wire
-// before init starts tearing things down.
-func (s *Server) handleReboot(w http.ResponseWriter, _ *http.Request) {
+// /api/update (POST): kicks off a transient airplanes-update.service via
+// systemd-run. Returns 202 + the unit name so the SPA can stream
+// /api/log/update for live output. systemd-run exits with non-zero on
+// "unit already exists" — we map that to 409. Also 409s when the
+// system-package upgrade unit is busy (both touch dpkg locks).
+func (s *Server) handleUpdate(w http.ResponseWriter, r *http.Request) {
+	s.startTransientUnit(w, r, s.priv.StartUpdate, "airplanes-update.service", "update")
+}
+
+// /api/system-upgrade (POST): kicks off a transient
+// airplanes-system-upgrade.service that runs apt-get update + upgrade. Same
+// shape as /api/update; the SPA streams /api/log/system-upgrade for output.
+func (s *Server) handleSystemUpgrade(w http.ResponseWriter, r *http.Request) {
+	s.startTransientUnit(w, r, s.priv.StartSystemUpgrade, "airplanes-system-upgrade.service", "system upgrade")
+}
+
+// /api/reboot (POST): refuses with 409 if a maintenance unit is active
+// (rebooting mid-dpkg would brick the device). Otherwise writes 202 + flushes,
+// then triggers reboot from a goroutine after a brief delay so the response
+// actually leaves the wire before init starts tearing things down.
+func (s *Server) handleReboot(w http.ResponseWriter, r *http.Request) {
+	s.maintenanceMu.Lock()
+	if busy := s.maintenanceUnitActive(r.Context()); busy != "" {
+		s.maintenanceMu.Unlock()
+		writeJSONError(w, http.StatusConflict, "reboot refused: "+busy+" is in progress")
+		return
+	}
+	s.maintenanceMu.Unlock()
 	writeJSON(w, http.StatusAccepted, map[string]string{"status": "rebooting"})
 	if f, ok := w.(http.Flusher); ok {
 		f.Flush()
