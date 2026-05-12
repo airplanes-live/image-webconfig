@@ -461,6 +461,16 @@ main {
   color: var(--wc-accent);
 }
 
+/* Hardware tile differentiator. Sits in the same .wc-grid--tiles as the
+   service tiles, but the left-border accent + muted icon tint reads as a
+   different category (hardware vs. services). */
+.wc-tile--hardware {
+  border-left: 3px solid var(--wc-accent);
+}
+.wc-tile--hardware .wc-tile__icon {
+  color: var(--wc-ink-2);
+}
+
 /* Stack of two tile grids (services + apps) on the dashboard. Inherit
    the existing .wc-grid--tiles bottom margin between them; no extra
    styling needed at the wrapper level. */
@@ -579,6 +589,12 @@ button.secondary:hover,
   background: var(--wc-surface-1);
   border-color: var(--wc-line-strong);
   transform: translateY(-1px);
+}
+
+@keyframes wc-spin { to { transform: rotate(360deg); } }
+.wc-btn-icon--spinning svg { animation: wc-spin 0.6s linear infinite; }
+@media (prefers-reduced-motion: reduce) {
+  .wc-btn-icon--spinning svg { animation: none; }
 }
 
 /* The header back button visually matches an icon button when collapsed

@@ -75,12 +75,18 @@
             "M9.405 1.05c-.413-1.4-2.397-1.4-2.81 0l-.1.34a1.464 1.464 0 0 1-2.105.872l-.31-.17c-1.283-.698-2.686.705-1.987 1.987l.169.311c.446.82.023 1.841-.872 2.105l-.34.1c-1.4.413-1.4 2.397 0 2.81l.34.1a1.464 1.464 0 0 1 .872 2.105l-.17.31c-.698 1.283.705 2.686 1.987 1.987l.311-.169a1.464 1.464 0 0 1 2.105.872l.1.34c.413 1.4 2.397 1.4 2.81 0l.1-.34a1.464 1.464 0 0 1 2.105-.872l.31.17c1.283.698 2.686-.705 1.987-1.987l-.169-.311a1.464 1.464 0 0 1 .872-2.105l.34-.1c1.4-.413 1.4-2.397 0-2.81l-.34-.1a1.464 1.464 0 0 1-.872-2.105l.17-.31c.698-1.283-.705-2.686-1.987-1.987l-.311.169a1.464 1.464 0 0 1-2.105-.872zM8 10.93a2.929 2.929 0 1 1 0-5.86 2.929 2.929 0 0 1 0 5.858z",
     };
 
+    // Bootstrap-icons cpu glyph (16×16 viewBox). Same single-path shape
+    // SERVICE_ICONS uses; consumed by svgIcon().
+    const PIHEALTH_ICON =
+        "M5 0a.5.5 0 0 1 .5.5V2h1V.5a.5.5 0 0 1 1 0V2h1V.5a.5.5 0 0 1 1 0V2h1V.5a.5.5 0 0 1 1 0V2A2.5 2.5 0 0 1 14 4.5h1.5a.5.5 0 0 1 0 1H14v1h1.5a.5.5 0 0 1 0 1H14v1h1.5a.5.5 0 0 1 0 1H14v1h1.5a.5.5 0 0 1 0 1H14A2.5 2.5 0 0 1 11.5 14H10v1.5a.5.5 0 0 1-1 0V14H8v1.5a.5.5 0 0 1-1 0V14H6v1.5a.5.5 0 0 1-1 0V14H4.5A2.5 2.5 0 0 1 2 11.5H.5a.5.5 0 0 1 0-1H2v-1H.5a.5.5 0 0 1 0-1H2v-1H.5a.5.5 0 0 1 0-1H2v-1H.5a.5.5 0 0 1 0-1H2A2.5 2.5 0 0 1 4.5 2V.5A.5.5 0 0 1 5 0m-.5 3A1.5 1.5 0 0 0 3 4.5v7A1.5 1.5 0 0 0 4.5 13h7a1.5 1.5 0 0 0 1.5-1.5v-7A1.5 1.5 0 0 0 11.5 3z";
+
     // ===== Runtime state =====
 
     const app = document.getElementById("app");
     const headerTitleEl = document.getElementById("wc-header-title");
     const backBtn = document.getElementById("wc-back-btn");
     const themeBtn = document.getElementById("wc-theme-btn");
+    const refreshBtn = document.getElementById("wc-refresh-btn");
 
     let activeStream = null;       // current EventSource (log viewer)
     let statusTimer = null;        // setInterval handle for status poll
@@ -117,6 +123,7 @@
         const o = opts || {};
         if (headerTitleEl) headerTitleEl.textContent = o.title ? "/ " + o.title : "";
         if (backBtn) backBtn.hidden = !o.showBack;
+        if (refreshBtn) refreshBtn.hidden = !o.showRefresh;
     }
 
     // ===== Navigation (one cleanup point) =====
@@ -146,7 +153,16 @@
         dashboardCtx = null;
         if (opts && opts.flash) pendingFlash = opts.flash;
         setHeader(opts);
-        panelFn();
+        return panelFn();
+    }
+
+    // Dashboard returns funnel through one helper so showRefresh, title,
+    // and showBack stay consistent across every "back to dashboard" path.
+    // Returns the panel promise so the refresh handler can await the
+    // initial fetch and toggle the spinner around it.
+    function navigateDashboard(extraOpts) {
+        return navigate(dashboard, Object.assign(
+            { title: null, showBack: false, showRefresh: true }, extraOpts || {}));
     }
 
     // ===== HTTP helpers =====
@@ -571,6 +587,13 @@
         if (mlatIntendedRunning && get("airplanes-mlat.service") !== "active") {
             return { dot: "warn", label: "partial" };
         }
+        // Hardware health demotes only on err — a warn-level hardware
+        // condition (75°C summer afternoon, history flags) shouldn't paint
+        // the whole dashboard yellow when feeding is otherwise fine.
+        const ph = payload.pi_health || null;
+        if (ph && ph.severity === "err") {
+            return { dot: "warn", label: "partial" };
+        }
         return { dot: "ok", label: "healthy" };
     }
 
@@ -663,11 +686,42 @@
         tile.root.setAttribute("data-state", state);
     }
 
+    function buildPiHealthTile() {
+        const iconNode = el("span", { class: "wc-tile__icon" }, svgIcon(PIHEALTH_ICON));
+        const titleEl  = el("span", { class: "wc-tile__title" }, "Raspberry Pi");
+        const metaEl   = el("span", { class: "wc-tile__meta" }, "—");
+        const dotEl    = el("span", { class: "wc-tile__dot wc-tile__dot--na" });
+        const root = el("div", { class: "wc-tile wc-tile--hardware", "data-state": "unknown" },
+            iconNode,
+            el("span", { class: "wc-tile__body" }, titleEl, metaEl),
+            dotEl,
+        );
+        return { root, titleEl, metaEl, dotEl };
+    }
+
+    function updatePiHealthTile(tile, payload) {
+        const ph = (payload && payload.pi_health) || null;
+        if (!ph) {
+            tile.dotEl.className = "wc-tile__dot wc-tile__dot--na";
+            tile.metaEl.textContent = "—";
+            tile.root.setAttribute("data-state", "unknown");
+            return;
+        }
+        const sev = ph.severity || "na";
+        tile.dotEl.className = "wc-tile__dot wc-tile__dot--" + sev;
+        tile.metaEl.textContent = ph.summary || "—";
+        tile.root.setAttribute("data-state", sev);
+    }
+
     function buildTileGrid() {
         const services = el("div", { class: "wc-grid--tiles" });
         const apps = el("div", { class: "wc-grid--tiles" });
         const tiles = {};
         const appTiles = {};
+        // Hardware tile leads the services grid — the .wc-tile--hardware
+        // class differentiates it visually without needing a separate row.
+        const piHealth = buildPiHealthTile();
+        services.appendChild(piHealth.root);
         for (const unit of MONITORED_SERVICES) {
             const t = buildTile(unit);
             tiles[unit] = t;
@@ -681,7 +735,7 @@
         // Wrap both grids in a fragment-like container so the dashboard
         // render() call gets a single root.
         const root = el("div", { class: "wc-tiles-stack" }, services, apps);
-        return { root, tiles, appTiles };
+        return { root, tiles, appTiles, piHealth };
     }
 
     function buildAppTile(app) {
@@ -749,6 +803,7 @@
         // payload.values and payload.mlat_decision; merging here keeps
         // the call sites simple.
         payload.values = Object.assign({}, payload.values || {}, configValues || {});
+        if (grid.piHealth) updatePiHealthTile(grid.piHealth, payload);
         for (const unit of MONITORED_SERVICES) {
             const tile = grid.tiles[unit];
             if (tile) updateTile(tile, unit, payload);
@@ -992,7 +1047,7 @@
                 // flash through navigate options — without this, the warning
                 // would clear immediately when navigate() rerenders.
                 const pending = (r.payload && r.payload.pending_restart) || [];
-                const opts = { title: null, showBack: false };
+                const opts = {};
                 if (pending.length > 0) {
                     opts.flash = {
                         level: "warn",
@@ -1002,7 +1057,7 @@
                             + pending.join(" "),
                     };
                 }
-                navigate(dashboard, opts);
+                navigateDashboard(opts);
             },
         },
             el("fieldset", { class: "config-fieldset" },
@@ -1091,11 +1146,6 @@
     }
 
     function buildActionsRow() {
-        const refresh = el("button", {
-            type: "button", class: "wc-btn-ghost",
-            onclick: () => navigate(dashboard, { title: null, showBack: false }),
-        }, "Refresh");
-
         const updateBtn = el("button", {
             type: "button", class: "wc-btn-ghost",
             onclick: async () => {
@@ -1146,12 +1196,17 @@
             onclick: () => requestReboot(rebootBtn, true),
         }, "Reboot");
 
+        const poweroffBtn = el("button", {
+            type: "button", class: "wc-btn-danger",
+            onclick: () => navigate(confirmPowerOffPanel, { title: "Power off", showBack: true }),
+        }, "Power off");
+
         const logout = el("button", {
             type: "button", class: "wc-btn-ghost",
             onclick: async () => { await postJSON("/api/auth/logout", {}); await boot(); },
         }, "Log out");
 
-        return el("div", { class: "actions" }, refresh, updateBtn, updateLog, sysUpgradeBtn, sysUpgradeLog, change, rebootBtn, logout);
+        return el("div", { class: "actions" }, updateBtn, updateLog, sysUpgradeBtn, sysUpgradeLog, change, rebootBtn, poweroffBtn, logout);
     }
 
     // buildRebootBannerSlot returns an empty container that the dashboard
@@ -1209,6 +1264,7 @@
             heroEl, tileGrid, identityBody, configBody, rebootBanner,
             configValues: {},
             lastIdentity: null,
+            configDirty: false,
         };
         dashboardCtx = ctx;
 
@@ -1230,6 +1286,14 @@
         updateTiles(tileGrid, status, ctx.configValues);
         updateAppTiles(tileGrid);
         updateRebootBanner(rebootBanner, !!(status && status.payload && status.payload.reboot_required));
+
+        // Track unsaved config edits so the header refresh button can
+        // prompt before discarding them. Initial-render value attributes
+        // don't fire `input`, so this only flips on actual typing.
+        const configForm = configBody.querySelector("form.config-form");
+        if (configForm) {
+            configForm.addEventListener("input", () => { ctx.configDirty = true; });
+        }
 
         // Start partial-refresh poll. Hero + tiles + identity update;
         // config card stays put.
@@ -1358,7 +1422,7 @@
         const submit = el("button", { type: "submit", class: "wc-btn-primary" }, "Change password");
         const cancel = el("button", {
             type: "button", class: "wc-btn-ghost",
-            onclick: () => navigate(dashboard, { title: null, showBack: false }),
+            onclick: () => navigateDashboard(),
         }, "Cancel");
 
         const form = el("form", {
@@ -1383,7 +1447,7 @@
                     err.textContent = (r.payload && r.payload.error) || "Change failed.";
                     return;
                 }
-                navigate(dashboard, { title: null, showBack: false });
+                navigateDashboard();
             },
         },
             el("h2", {}, "Change webconfig password"),
@@ -1396,6 +1460,63 @@
         );
         render(form);
         oldPw.focus();
+    }
+
+    function confirmPowerOffPanel() {
+        const PHRASE = "power off";
+        const err = errorEl();
+        const input = el("input", {
+            id: "poweroff-confirm",
+            type: "text",
+            autocomplete: "off",
+            autocapitalize: "none",
+            autocorrect: "off",
+            spellcheck: "false",
+            required: true,
+        });
+        const submit = el("button", { type: "submit", class: "wc-btn-danger", disabled: true }, "Power off");
+        const cancel = el("button", {
+            type: "button", class: "wc-btn-ghost",
+            onclick: () => navigate(dashboard, { title: null, showBack: false }),
+        }, "Cancel");
+
+        const matches = () => input.value.trim().toLowerCase() === PHRASE;
+        input.addEventListener("input", () => { submit.disabled = !matches(); });
+
+        const form = el("form", {
+            class: "wc-card",
+            onsubmit: async (e) => {
+                e.preventDefault();
+                if (!matches()) return;
+                err.textContent = "";
+                submit.disabled = true;
+                cancel.disabled = true;
+                submit.textContent = "Powering off…";
+                const r = await postJSON("/api/poweroff", {});
+                if (handleAuthFailure(r)) return;
+                if (!r.ok) {
+                    submit.disabled = false;
+                    cancel.disabled = false;
+                    submit.textContent = "Power off";
+                    err.textContent = (r.payload && r.payload.error) || "Power off failed.";
+                    return;
+                }
+                navigate(() => render(el("div", { class: "wc-card" },
+                    el("h2", {}, "Powering off…"),
+                    el("p", {}, "The feeder is shutting down. You'll need to disconnect and reconnect power to turn it back on."),
+                )), { title: "Powering off", showBack: false });
+            },
+        },
+            el("h2", {}, "Power off the feeder?"),
+            el("p", {}, "Shuts the feeder down cleanly so graphs1090 stats and other in-memory data are flushed to disk — safer than pulling the power cord."),
+            el("p", { class: "error" }, "Once powered off, the feeder cannot be turned back on remotely. You'll need physical access to disconnect and reconnect power."),
+            el("p", {}, "Type ", el("code", {}, PHRASE), " below to confirm."),
+            el("div", { class: "field" }, el("label", { for: "poweroff-confirm" }, "Confirmation"), input),
+            el("div", { class: "actions" }, cancel, submit),
+            err,
+        );
+        render(form);
+        input.focus();
     }
 
     function logViewer(slug) {
@@ -1448,7 +1569,7 @@
         }
         const who = await getJSON("/api/auth/whoami");
         if (who.ok) {
-            navigate(dashboard, { title: null, showBack: false });
+            navigateDashboard();
         } else {
             navigate(loginPanel, { title: null, showBack: false });
         }
@@ -1457,7 +1578,22 @@
     // ===== Wire-up =====
 
     if (themeBtn) themeBtn.addEventListener("click", toggleTheme);
-    if (backBtn) backBtn.addEventListener("click", () => navigate(dashboard, { title: null, showBack: false }));
+    if (backBtn) backBtn.addEventListener("click", () => navigateDashboard());
+    if (refreshBtn) refreshBtn.addEventListener("click", async () => {
+        if (refreshBtn.disabled) return;
+        if (dashboardCtx && dashboardCtx.configDirty
+            && !confirm("Discard unsaved configuration changes?")) {
+            return;
+        }
+        refreshBtn.disabled = true;
+        refreshBtn.classList.add("wc-btn-icon--spinning");
+        try {
+            await navigateDashboard();
+        } finally {
+            refreshBtn.classList.remove("wc-btn-icon--spinning");
+            refreshBtn.disabled = false;
+        }
+    });
 
     boot().catch((e) => corruptPanel("Fatal error: " + (e && e.message || e)));
 })();

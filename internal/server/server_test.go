@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/cookiejar"
@@ -12,6 +13,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
@@ -93,9 +95,10 @@ func newTestServer(t *testing.T) (*httptest.Server, *Server) {
 	}
 
 	priv := PrivilegedArgv{
-		ApplyFeed:          []string{"sudo-stub", "apl-feed", "apply", "--json"},
+		ApplyFeed:          []string{"sudo-stub", "apl-feed", "apply", "--json", "--lock-timeout", "5"},
 		SchemaFeed:         []string{"apl-feed", "schema", "--json"},
 		Reboot:             []string{"sudo-stub", "reboot"},
+		Poweroff:           []string{"sudo-stub", "poweroff"},
 		StartUpdate:        []string{"sudo-stub", "update"},
 		StartSystemUpgrade: []string{"sudo-stub", "system-upgrade"},
 	}
@@ -211,9 +214,10 @@ func newWriteHarness(t *testing.T) *writeHarness {
 	}
 
 	priv := PrivilegedArgv{
-		ApplyFeed:          []string{"sudo-stub", "apl-feed", "apply", "--json"},
+		ApplyFeed:          []string{"sudo-stub", "apl-feed", "apply", "--json", "--lock-timeout", "5"},
 		SchemaFeed:         []string{"apl-feed", "schema", "--json"},
 		Reboot:             []string{"sudo-stub", "reboot"},
+		Poweroff:           []string{"sudo-stub", "poweroff"},
 		StartUpdate:        []string{"sudo-stub", "update"},
 		StartSystemUpgrade: []string{"sudo-stub", "system-upgrade"},
 	}
@@ -321,6 +325,58 @@ func TestConfigPost_RejectedEnvelopeReturns400(t *testing.T) {
 	// "save failed" instead of the actual reason.
 	if !strings.Contains(body.Error, "LATITUDE") || !strings.Contains(body.Error, "must be in") {
 		t.Errorf("body.Error = %q, want it to surface the per-key reason", body.Error)
+	}
+}
+
+func TestApplyConfigTimeout_ExceedsApplyLockTimeout(t *testing.T) {
+	// The HTTP wall-clock budget must sit above the lock-acquisition
+	// budget passed to apl-feed, or webconfig will kill the helper
+	// mid-wait and surface a generic 500 instead of the structured
+	// lock_timeout 503. Pin the relationship as a contract.
+	if applyConfigTimeout <= applyLockTimeoutSeconds*time.Second {
+		t.Errorf("applyConfigTimeout %v must exceed applyLockTimeoutSeconds %ds",
+			applyConfigTimeout, applyLockTimeoutSeconds)
+	}
+	// And the sudoers-pinned argv must carry the matching --lock-timeout
+	// token; otherwise sudo rejects the call entirely.
+	argv := DefaultPrivilegedArgv().ApplyFeed
+	want := fmt.Sprintf("%d", applyLockTimeoutSeconds)
+	found := false
+	for i := 0; i < len(argv)-1; i++ {
+		if argv[i] == "--lock-timeout" && argv[i+1] == want {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Errorf("DefaultPrivilegedArgv().ApplyFeed = %v, want --lock-timeout %s pair", argv, want)
+	}
+}
+
+func TestConfigPost_ApplyFeedArgvCarriesLockTimeout(t *testing.T) {
+	// Live integration: a POST to /api/config must invoke apl-feed
+	// with the full sudoers-pinned argv including --lock-timeout 5.
+	h := newWriteHarness(t)
+	r := postJSON(t, h.client, h.ts.URL+"/api/config",
+		map[string]any{"updates": map[string]string{"MLAT_PRIVATE": "true"}})
+	defer r.Body.Close()
+	if r.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", r.StatusCode)
+	}
+	h.mu.Lock()
+	calls := append([]stdinCall(nil), h.stdinCalls...)
+	h.mu.Unlock()
+	if len(calls) != 1 {
+		t.Fatalf("stdinCalls = %d, want 1", len(calls))
+	}
+	want := []string{"sudo-stub", "apl-feed", "apply", "--json", "--lock-timeout", "5"}
+	if len(calls[0].argv) != len(want) {
+		t.Fatalf("argv = %v, want %v", calls[0].argv, want)
+	}
+	for i := range want {
+		if calls[0].argv[i] != want[i] {
+			t.Fatalf("argv[%d] = %q, want %q", i, calls[0].argv[i], want[i])
+		}
 	}
 }
 
@@ -650,6 +706,88 @@ func TestReboot_AuthedReturns202(t *testing.T) {
 	}
 	if !saw {
 		t.Errorf("reboot argv not invoked; calls=%v", h.callsCopy())
+	}
+}
+
+func TestPoweroff_RequiresAuth(t *testing.T) {
+	t.Parallel()
+	ts, _ := newTestServer(t)
+	c := httpClient(t)
+	r := postJSON(t, c, ts.URL+"/api/poweroff", map[string]any{})
+	defer r.Body.Close()
+	if r.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("status = %d", r.StatusCode)
+	}
+}
+
+func TestPoweroff_AuthedReturns202(t *testing.T) {
+	t.Parallel()
+	h := newWriteHarness(t)
+	r := postJSON(t, h.client, h.ts.URL+"/api/poweroff", map[string]any{})
+	defer r.Body.Close()
+	if r.StatusCode != http.StatusAccepted {
+		t.Fatalf("status = %d", r.StatusCode)
+	}
+	// The handler runs a synchronous `systemctl is-active` guard before
+	// firing the async poweroff goroutine (250ms delay). Wait specifically
+	// for the poweroff argv to appear, not just any call.
+	want := []string{"sudo-stub", "poweroff"}
+	saw := false
+	for i := 0; i < 100; i++ {
+		for _, c := range h.callsCopy() {
+			if reflect.DeepEqual(c, want) {
+				saw = true
+				break
+			}
+		}
+		if saw {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if !saw {
+		t.Errorf("poweroff argv not invoked; calls=%v", h.callsCopy())
+	}
+}
+
+func TestPoweroff_RefusedDuringMaintenance(t *testing.T) {
+	t.Parallel()
+	for _, unit := range []string{
+		"airplanes-system-upgrade.service",
+		"airplanes-update.service",
+	} {
+		unit := unit
+		t.Run(unit, func(t *testing.T) {
+			t.Parallel()
+			h := newWriteHarness(t)
+			h.mu.Lock()
+			h.runnerResultFor = activeFor(unit)
+			h.mu.Unlock()
+			r := postJSON(t, h.client, h.ts.URL+"/api/poweroff", map[string]any{})
+			defer r.Body.Close()
+			if r.StatusCode != http.StatusConflict {
+				t.Fatalf("status = %d, want 409", r.StatusCode)
+			}
+			time.Sleep(50 * time.Millisecond)
+			for _, c := range h.callsCopy() {
+				if len(c) >= 2 && c[1] == "poweroff" {
+					t.Fatalf("poweroff argv invoked despite 409: %v", c)
+				}
+			}
+		})
+	}
+}
+
+// TestDefaultPrivilegedArgv_Poweroff pins the production argv shape so the Go
+// default and the sudoers file in stage-airplanes/05-install-webconfig cannot
+// drift. overlay-smoke catches sudoers-side drift on the image; this catches
+// the Go-source side at unit-test time.
+func TestDefaultPrivilegedArgv_Poweroff(t *testing.T) {
+	t.Parallel()
+	want := []string{"/usr/bin/sudo", "-n", "/usr/bin/systemctl", "poweroff"}
+	got := DefaultPrivilegedArgv().Poweroff
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("Poweroff = %v, want %v", got, want)
 	}
 }
 
@@ -1300,6 +1438,7 @@ func TestDefaultPrivilegedArgv_SudoersParity(t *testing.T) {
 	}{
 		{"ApplyFeed", priv.ApplyFeed},
 		{"Reboot", priv.Reboot},
+		{"Poweroff", priv.Poweroff},
 		{"StartUpdate", priv.StartUpdate},
 		{"StartSystemUpgrade", priv.StartSystemUpgrade},
 	}

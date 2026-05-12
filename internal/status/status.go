@@ -16,8 +16,27 @@ import (
 	"time"
 
 	wexec "github.com/airplanes-live/image/webconfig/internal/exec"
+	"github.com/airplanes-live/image/webconfig/internal/pihealth"
 	"github.com/airplanes-live/image/webconfig/internal/runtimestate"
 )
+
+// PiHealthProbe is the interface status.Reader uses to fetch a hardware
+// snapshot. Concrete production type is *pihealth.Reader; tests inject a
+// stub.
+type PiHealthProbe interface {
+	Probe(ctx context.Context) *pihealth.PiHealth
+}
+
+// Option configures optional Reader behavior. Keeps NewReader's 3-arg
+// signature stable so existing callers compile unchanged.
+type Option func(*Reader)
+
+// WithPiHealth wires a PiHealthProbe into the Reader. When set, Read()
+// runs the probe in parallel with the systemctl fan-out and embeds the
+// result as Status.PiHealth.
+func WithPiHealth(p PiHealthProbe) Option {
+	return func(r *Reader) { r.pihealth = p }
+}
 
 // MonitoredServices is the static list every /api/status query reports on.
 var MonitoredServices = []string{
@@ -33,16 +52,16 @@ var MonitoredServices = []string{
 // Paths configures file lookups; defaults match the rootfs layout. Override
 // in tests.
 type Paths struct {
-	ManifestFile        string // /etc/airplanes/build-manifest.json
-	AircraftJSONFile    string // /run/readsb/aircraft.json
-	MlatStateFile       string // /run/airplanes-mlat/state
-	FeedStateFile       string // /run/airplanes-feed/state
-	UAT978StateFile     string // /run/airplanes-978/state
-	Dump978FAStateFile  string // /run/dump978-fa/state
-	RebootRequiredFile  string // /var/run/reboot-required (written by update-notifier-common after kernel/libc upgrades)
-	SystemctlSudoArgv0  []string // [sudo, -n, ...] OR [systemctl] (no sudo: is-active is read-only)
-	SystemctlBinary     string   // /usr/bin/systemctl
-	IsActiveTimeout     time.Duration
+	ManifestFile       string   // /etc/airplanes/build-manifest.json
+	AircraftJSONFile   string   // /run/readsb/aircraft.json
+	MlatStateFile      string   // /run/airplanes-mlat/state
+	FeedStateFile      string   // /run/airplanes-feed/state
+	UAT978StateFile    string   // /run/airplanes-978/state
+	Dump978FAStateFile string   // /run/dump978-fa/state
+	RebootRequiredFile string   // /var/run/reboot-required (written by update-notifier-common after kernel/libc upgrades)
+	SystemctlSudoArgv0 []string // [sudo, -n, ...] OR [systemctl] (no sudo: is-active is read-only)
+	SystemctlBinary    string   // /usr/bin/systemctl
+	IsActiveTimeout    time.Duration
 }
 
 func DefaultPaths() Paths {
@@ -63,16 +82,21 @@ func DefaultPaths() Paths {
 // each is-active call runs in its own goroutine so a single 2s timeout
 // caps total latency at 2s regardless of service count.
 type Reader struct {
-	paths   Paths
-	runner  wexec.CommandRunner
-	version string
+	paths    Paths
+	runner   wexec.CommandRunner
+	version  string
+	pihealth PiHealthProbe
 }
 
-func NewReader(version string, p Paths, r wexec.CommandRunner) *Reader {
+func NewReader(version string, p Paths, r wexec.CommandRunner, opts ...Option) *Reader {
 	if r == nil {
 		r = wexec.RealRunner
 	}
-	return &Reader{paths: p, runner: r, version: version}
+	rr := &Reader{paths: p, runner: r, version: version}
+	for _, o := range opts {
+		o(rr)
+	}
+	return rr
 }
 
 // Status is the GET /api/status payload.
@@ -94,10 +118,16 @@ type Status struct {
 	// no_hardware decision propagates into UATDecision.Reason as
 	// peer_no_hardware so the airplanes-978 tile can render an "idle relay"
 	// state without polling two endpoints.
-	MlatDecision     *Decision `json:"mlat_decision,omitempty"`
-	FeedDecision     *Decision `json:"feed_decision,omitempty"`
-	UATDecision      *Decision `json:"uat_decision,omitempty"`
+	MlatDecision      *Decision `json:"mlat_decision,omitempty"`
+	FeedDecision      *Decision `json:"feed_decision,omitempty"`
+	UATDecision       *Decision `json:"uat_decision,omitempty"`
 	Dump978FADecision *Decision `json:"dump978fa_decision,omitempty"`
+
+	// PiHealth is the hardware-health snapshot. omitempty so a Reader
+	// configured without WithPiHealth (e.g. server tests that don't care)
+	// keeps the JSON shape compatible.
+	PiHealth *pihealth.PiHealth `json:"pi_health,omitempty"`
+
 	// RebootRequired is true when /var/run/reboot-required exists, which
 	// update-notifier-common writes after a kernel or libc upgrade. The
 	// dashboard renders a banner when this flips on.
@@ -145,11 +175,28 @@ func (r *Reader) Read(ctx context.Context) (Status, error) {
 			ch <- svcResult{unit, r.isActive(ctx, unit)}
 		}(unit)
 	}
+
+	// Pi health probe runs in parallel with the systemctl fan-out. The
+	// probe is bounded by its own per-sub-probe timeouts inside the
+	// pihealth package; we just collect its result.
+	var phWG sync.WaitGroup
+	var phResult *pihealth.PiHealth
+	if r.pihealth != nil {
+		phWG.Add(1)
+		go func() {
+			defer phWG.Done()
+			phResult = r.pihealth.Probe(ctx)
+		}()
+	}
+
 	wg.Wait()
 	close(ch)
 	for s := range ch {
 		out.Services[s.unit] = s.state
 	}
+
+	phWG.Wait()
+	out.PiHealth = phResult
 
 	if m, err := os.ReadFile(r.paths.ManifestFile); err == nil {
 		// Validate JSON shape so we never embed garbage in the response.
@@ -311,8 +358,8 @@ func (r *Reader) isActive(ctx context.Context, unit string) string {
 
 // readsbAircraftJSON is the relevant subset of readsb's aircraft.json schema.
 type readsbAircraftJSON struct {
-	Now      float64 `json:"now"`
-	Messages int64   `json:"messages"`
+	Now      float64    `json:"now"`
+	Messages int64      `json:"messages"`
 	Aircraft []struct{} `json:"aircraft"`
 }
 

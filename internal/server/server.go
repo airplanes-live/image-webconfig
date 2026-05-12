@@ -45,23 +45,31 @@ type Server struct {
 // owns feed.env validation, restart fan-out, and the on-disk schema —
 // webconfig is a thin HTTP shell around its JSON interface.
 type PrivilegedArgv struct {
-	ApplyFeed          []string // sudo -n /usr/local/bin/apl-feed apply --json
+	ApplyFeed          []string // sudo -n /usr/local/bin/apl-feed apply --json --lock-timeout 5
 	SchemaFeed         []string // /usr/local/bin/apl-feed schema --json (no sudo: read-only)
-	Reboot             []string
+	Reboot             []string // sudo -n /usr/bin/systemctl reboot
+	Poweroff           []string // sudo -n /usr/bin/systemctl poweroff
 	StartUpdate        []string // sudo systemd-run --unit=airplanes-update ...
 	StartSystemUpgrade []string // sudo systemd-run --unit=airplanes-system-upgrade ...
 }
 
 // DefaultPrivilegedArgv returns the production argv shapes for the
 // airplanes-webconfig sudoers entry. Override per-test via Deps.
+//
+// ApplyFeed pins --lock-timeout 5 so webconfig owns the wall-clock
+// budget end-to-end: apl-feed waits at most 5s for the feed.env flock,
+// then either succeeds or emits a structured lock_timeout envelope. The
+// applyConfigTimeout below (lockTimeout + post-lock budget) sets the
+// outer ceiling.
 func DefaultPrivilegedArgv() PrivilegedArgv {
 	sudo := func(args ...string) []string {
 		return append([]string{"/usr/bin/sudo", "-n"}, args...)
 	}
 	return PrivilegedArgv{
-		ApplyFeed:  sudo("/usr/local/bin/apl-feed", "apply", "--json"),
+		ApplyFeed:  sudo("/usr/local/bin/apl-feed", "apply", "--json", "--lock-timeout", "5"),
 		SchemaFeed: []string{"/usr/local/bin/apl-feed", "schema", "--json"},
 		Reboot:     sudo("/usr/bin/systemctl", "reboot"),
+		Poweroff:   sudo("/usr/bin/systemctl", "poweroff"),
 		StartUpdate: sudo(
 			"/usr/bin/systemd-run",
 			"--unit=airplanes-update",
@@ -144,6 +152,7 @@ func New(d Deps) http.Handler {
 	mux.HandleFunc("POST /api/update", s.requireSession(s.handleUpdate))
 	mux.HandleFunc("POST /api/system-upgrade", s.requireSession(s.handleSystemUpgrade))
 	mux.HandleFunc("POST /api/reboot", s.requireSession(s.handleReboot))
+	mux.HandleFunc("POST /api/poweroff", s.requireSession(s.handlePoweroff))
 
 	// Static assets at /static/*; the SPA shell is served by the GET /
 	// handler below. no-store cache policy: assets are embedded in the

@@ -19,6 +19,7 @@ import (
 	"github.com/airplanes-live/image/webconfig/internal/feedenv"
 	"github.com/airplanes-live/image/webconfig/internal/identity"
 	"github.com/airplanes-live/image/webconfig/internal/logs"
+	"github.com/airplanes-live/image/webconfig/internal/pihealth"
 	"github.com/airplanes-live/image/webconfig/internal/schemacache"
 	"github.com/airplanes-live/image/webconfig/internal/server"
 	"github.com/airplanes-live/image/webconfig/internal/status"
@@ -77,8 +78,8 @@ func main() {
 	loadCtx, loadCancel := context.WithTimeout(context.Background(), 15*time.Second)
 	if err := cache.Load(loadCtx); err != nil {
 		// Degraded mode: /api/config returns 503, but /api/update,
-		// /api/log/*, /api/reboot, and the auth endpoints stay alive so
-		// the operator can still recover via the dashboard.
+		// /api/log/*, /api/reboot, /api/poweroff, and the auth endpoints
+		// stay alive so the operator can still recover via the dashboard.
 		log.Printf("schema: boot fetch failed (degraded mode, /api/config unavailable): %v", err)
 	}
 	loadCancel()
@@ -94,10 +95,16 @@ func main() {
 			Argon2Params: params,
 			Identity:     identity.NewReader(identity.DefaultPaths()),
 			FeedEnv:      feedenv.New(),
-			Status:       status.NewReader(version, status.DefaultPaths(), nil),
-			Logs:         logs.NewStreamer(nil),
-			Schema:       cache,
-			Privileged:   priv,
+			Status: status.NewReader(version, status.DefaultPaths(), nil,
+				status.WithPiHealth(pihealth.NewReader(
+					pihealth.DefaultPaths(),
+					pihealth.DefaultThresholds(),
+					nil, // RealRunner
+					nil, // statfs-backed DiskProber
+				))),
+			Logs:       logs.NewStreamer(nil),
+			Schema:     cache,
+			Privileged: priv,
 		}),
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       15 * time.Second,

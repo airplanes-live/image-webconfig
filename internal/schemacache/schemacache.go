@@ -6,7 +6,8 @@
 //
 // On boot-time fetch failure the cache enters degraded mode: the
 // /api/config endpoint returns 503, but the rest of the webconfig
-// surface (login, /api/update, /api/log, /api/reboot, status tiles)
+// surface (login, /api/update, /api/log, /api/reboot, /api/poweroff,
+// status tiles)
 // stays alive so an operator can still recover via the dashboard.
 package schemacache
 
@@ -26,9 +27,9 @@ import (
 // versions add fields. Unknown future versions cause Load to fail loud
 // so we don't silently lose schema info.
 type schemaJSON struct {
-	Version       int      `json:"version"`
-	WritableKeys  []string `json:"writable_keys"`
-	ReadableKeys  []string `json:"readable_keys"`
+	Version      int      `json:"version"`
+	WritableKeys []string `json:"writable_keys"`
+	ReadableKeys []string `json:"readable_keys"`
 }
 
 // Cache is goroutine-safe; a single instance is shared across handlers.
