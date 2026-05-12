@@ -74,6 +74,11 @@
             "M9.405 1.05c-.413-1.4-2.397-1.4-2.81 0l-.1.34a1.464 1.464 0 0 1-2.105.872l-.31-.17c-1.283-.698-2.686.705-1.987 1.987l.169.311c.446.82.023 1.841-.872 2.105l-.34.1c-1.4.413-1.4 2.397 0 2.81l.34.1a1.464 1.464 0 0 1 .872 2.105l-.17.31c-.698 1.283.705 2.686 1.987 1.987l.311-.169a1.464 1.464 0 0 1 2.105.872l.1.34c.413 1.4 2.397 1.4 2.81 0l.1-.34a1.464 1.464 0 0 1 2.105-.872l.31.17c1.283.698 2.686-.705 1.987-1.987l-.169-.311a1.464 1.464 0 0 1 .872-2.105l.34-.1c1.4-.413 1.4-2.397 0-2.81l-.34-.1a1.464 1.464 0 0 1-.872-2.105l.17-.31c.698-1.283-.705-2.686-1.987-1.987l-.311.169a1.464 1.464 0 0 1-2.105-.872zM8 10.93a2.929 2.929 0 1 1 0-5.86 2.929 2.929 0 0 1 0 5.858z",
     };
 
+    // Bootstrap-icons cpu glyph (16×16 viewBox). Same single-path shape
+    // SERVICE_ICONS uses; consumed by svgIcon().
+    const PIHEALTH_ICON =
+        "M5 0a.5.5 0 0 1 .5.5V2h1V.5a.5.5 0 0 1 1 0V2h1V.5a.5.5 0 0 1 1 0V2h1V.5a.5.5 0 0 1 1 0V2A2.5 2.5 0 0 1 14 4.5h1.5a.5.5 0 0 1 0 1H14v1h1.5a.5.5 0 0 1 0 1H14v1h1.5a.5.5 0 0 1 0 1H14v1h1.5a.5.5 0 0 1 0 1H14A2.5 2.5 0 0 1 11.5 14H10v1.5a.5.5 0 0 1-1 0V14H8v1.5a.5.5 0 0 1-1 0V14H6v1.5a.5.5 0 0 1-1 0V14H4.5A2.5 2.5 0 0 1 2 11.5H.5a.5.5 0 0 1 0-1H2v-1H.5a.5.5 0 0 1 0-1H2v-1H.5a.5.5 0 0 1 0-1H2v-1H.5a.5.5 0 0 1 0-1H2A2.5 2.5 0 0 1 4.5 2V.5A.5.5 0 0 1 5 0m-.5 3A1.5 1.5 0 0 0 3 4.5v7A1.5 1.5 0 0 0 4.5 13h7a1.5 1.5 0 0 0 1.5-1.5v-7A1.5 1.5 0 0 0 11.5 3z";
+
     // ===== Runtime state =====
 
     const app = document.getElementById("app");
@@ -570,6 +575,13 @@
         if (mlatIntendedRunning && get("airplanes-mlat.service") !== "active") {
             return { dot: "warn", label: "partial" };
         }
+        // Hardware health demotes only on err — a warn-level hardware
+        // condition (75°C summer afternoon, history flags) shouldn't paint
+        // the whole dashboard yellow when feeding is otherwise fine.
+        const ph = payload.pi_health || null;
+        if (ph && ph.severity === "err") {
+            return { dot: "warn", label: "partial" };
+        }
         return { dot: "ok", label: "healthy" };
     }
 
@@ -662,11 +674,42 @@
         tile.root.setAttribute("data-state", state);
     }
 
+    function buildPiHealthTile() {
+        const iconNode = el("span", { class: "wc-tile__icon" }, svgIcon(PIHEALTH_ICON));
+        const titleEl  = el("span", { class: "wc-tile__title" }, "Raspberry Pi");
+        const metaEl   = el("span", { class: "wc-tile__meta" }, "—");
+        const dotEl    = el("span", { class: "wc-tile__dot wc-tile__dot--na" });
+        const root = el("div", { class: "wc-tile wc-tile--hardware", "data-state": "unknown" },
+            iconNode,
+            el("span", { class: "wc-tile__body" }, titleEl, metaEl),
+            dotEl,
+        );
+        return { root, titleEl, metaEl, dotEl };
+    }
+
+    function updatePiHealthTile(tile, payload) {
+        const ph = (payload && payload.pi_health) || null;
+        if (!ph) {
+            tile.dotEl.className = "wc-tile__dot wc-tile__dot--na";
+            tile.metaEl.textContent = "—";
+            tile.root.setAttribute("data-state", "unknown");
+            return;
+        }
+        const sev = ph.severity || "na";
+        tile.dotEl.className = "wc-tile__dot wc-tile__dot--" + sev;
+        tile.metaEl.textContent = ph.summary || "—";
+        tile.root.setAttribute("data-state", sev);
+    }
+
     function buildTileGrid() {
         const services = el("div", { class: "wc-grid--tiles" });
         const apps = el("div", { class: "wc-grid--tiles" });
         const tiles = {};
         const appTiles = {};
+        // Hardware tile leads the services grid — the .wc-tile--hardware
+        // class differentiates it visually without needing a separate row.
+        const piHealth = buildPiHealthTile();
+        services.appendChild(piHealth.root);
         for (const unit of MONITORED_SERVICES) {
             const t = buildTile(unit);
             tiles[unit] = t;
@@ -680,7 +723,7 @@
         // Wrap both grids in a fragment-like container so the dashboard
         // render() call gets a single root.
         const root = el("div", { class: "wc-tiles-stack" }, services, apps);
-        return { root, tiles, appTiles };
+        return { root, tiles, appTiles, piHealth };
     }
 
     function buildAppTile(app) {
@@ -748,6 +791,7 @@
         // payload.values and payload.mlat_decision; merging here keeps
         // the call sites simple.
         payload.values = Object.assign({}, payload.values || {}, configValues || {});
+        if (grid.piHealth) updatePiHealthTile(grid.piHealth, payload);
         for (const unit of MONITORED_SERVICES) {
             const tile = grid.tiles[unit];
             if (tile) updateTile(tile, unit, payload);
