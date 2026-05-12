@@ -19,7 +19,8 @@ func TestParse(t *testing.T) {
 		{"lock_timeout", `{"status":"lock_timeout","message":"busy"}`, StatusLockTimeout, false},
 		{"empty body is an error", ``, "", true},
 		{"not an object", `[1,2,3]`, "", true},
-		{"missing status field parses but returns empty", `{"foo":"bar"}`, "", false},
+		{"missing status field is a contract violation", `{"foo":"bar"}`, "", true},
+		{"explicit empty status is a contract violation", `{"status":""}`, "", true},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -35,6 +36,46 @@ func TestParse(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestValidID(t *testing.T) {
+	cases := []struct {
+		id   string
+		want bool
+	}{
+		{"airplanes-config-wifi", true},
+		{"airplanes-wifi-home", true},
+		{"airplanes-wifi-cafenet-2", true},
+		{"airplanes-wifi-0", true},
+		{"airplanes-wifi-a" + repeat("a", 40), true},
+		{"airplanes-wifi-a" + repeat("a", 41), false},
+		{"", false},
+		{"airplanes-wifi-", false},
+		{"airplanes-wifi--double", false},
+		{"airplanes-wifi-UPPER", false},
+		{"airplanes-wifi-with space", false},
+		{"airplanes-wifi-with/slash", false},
+		{"airplanes-wifi-../etc", false},
+		{"airplanes-wifi-..", false},
+		{"airplanes-wifi-with\nnewline", false},
+		{"foreign-net", false},
+		{"airplanes-config-wifi-extra", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.id, func(t *testing.T) {
+			if got := ValidID(tc.id); got != tc.want {
+				t.Fatalf("ValidID(%q) = %v, want %v", tc.id, got, tc.want)
+			}
+		})
+	}
+}
+
+func repeat(s string, n int) string {
+	out := ""
+	for i := 0; i < n; i++ {
+		out += s
+	}
+	return out
 }
 
 func TestHTTPStatus(t *testing.T) {

@@ -309,6 +309,43 @@ func TestWifi_UnparseableHelperStdoutMapsTo500(t *testing.T) {
 	}
 }
 
+func TestWifi_InvalidPathIDRejectedBeforeHelper(t *testing.T) {
+	t.Parallel()
+	h := newWriteHarness(t)
+
+	cases := []struct {
+		method string
+		path   string
+		body   string
+	}{
+		{http.MethodPut, "/api/wifi/airplanes-wifi-..%2Fetc%2Fpasswd", `{"ssid":"X"}`},
+		{http.MethodPut, "/api/wifi/foreign-net", `{"ssid":"X"}`},
+		{http.MethodPut, "/api/wifi/airplanes-wifi-", `{"ssid":"X"}`},
+		{http.MethodPut, "/api/wifi/airplanes-config-wifi-extra", `{"ssid":"X"}`},
+		{http.MethodDelete, "/api/wifi/airplanes-wifi-..", ""},
+		{http.MethodPost, "/api/wifi/foreign/activate", ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.method+" "+tc.path, func(t *testing.T) {
+			req := httpRequest(t, tc.method, h.ts.URL+tc.path, tc.body)
+			r, err := h.client.Do(req)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer r.Body.Close()
+			if r.StatusCode != http.StatusBadRequest && r.StatusCode != http.StatusNotFound {
+				t.Fatalf("status = %d, want 400 or 404 (path mismatch); body=%s", r.StatusCode, mustReadAll(t, r.Body))
+			}
+		})
+	}
+
+	// The helper must never be invoked for any of these.
+	calls := h.stdinCallsCopy()
+	for _, c := range calls {
+		t.Fatalf("helper unexpectedly invoked for invalid id: argv=%v", c.argv)
+	}
+}
+
 func TestWifiAdd_RequiresOriginHeader(t *testing.T) {
 	t.Parallel()
 	h := newWriteHarness(t)

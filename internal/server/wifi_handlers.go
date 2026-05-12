@@ -140,8 +140,8 @@ func (s *Server) handleWifiAdd(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleWifiUpdate(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
-	if id == "" {
-		writeJSONError(w, http.StatusBadRequest, "id is required in the path")
+	if !wifi.ValidID(id) {
+		writeJSONError(w, http.StatusBadRequest, "invalid id; expected airplanes-config-wifi or airplanes-wifi-<slug>")
 		return
 	}
 	body, err := readWifiBody(w, r)
@@ -165,8 +165,8 @@ func (s *Server) handleWifiUpdate(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleWifiDelete(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
-	if id == "" {
-		writeJSONError(w, http.StatusBadRequest, "id is required in the path")
+	if !wifi.ValidID(id) {
+		writeJSONError(w, http.StatusBadRequest, "invalid id; expected airplanes-config-wifi or airplanes-wifi-<slug>")
 		return
 	}
 	body, err := readWifiBody(w, r)
@@ -190,8 +190,8 @@ func (s *Server) handleWifiDelete(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleWifiActivate(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
-	if id == "" {
-		writeJSONError(w, http.StatusBadRequest, "id is required in the path")
+	if !wifi.ValidID(id) {
+		writeJSONError(w, http.StatusBadRequest, "invalid id; expected airplanes-config-wifi or airplanes-wifi-<slug>")
 		return
 	}
 	// activate ignores any client body, but still go through the same path

@@ -7,7 +7,9 @@ package wifi
 
 import (
 	"encoding/json"
+	"errors"
 	"net/http"
+	"regexp"
 )
 
 // Status constants mirror the strings apl-wifi emits in its envelope.
@@ -41,7 +43,23 @@ func Parse(body []byte) (string, error) {
 	if err := json.Unmarshal(body, &env); err != nil {
 		return "", err
 	}
+	if env.Status == "" {
+		return "", errors.New("envelope missing required \"status\" field")
+	}
 	return env.Status, nil
+}
+
+// idRegexp matches the same managed-id shape apl-wifi accepts:
+// `airplanes-config-wifi` (the first-run bootstrap profile) or
+// `airplanes-wifi-<slug>` where the slug is 1-41 lowercase alnum-or-hyphen
+// chars starting alphanumerically. The Go side gates the URL `{id}` against
+// this before piping anything to the helper so attempts at encoded slashes,
+// dot-dot, or control bytes fail at the HTTP layer.
+var idRegexp = regexp.MustCompile(`^(airplanes-config-wifi|airplanes-wifi-[a-z0-9][a-z0-9-]{0,40})$`)
+
+// ValidID reports whether id is a syntactically valid managed Wi-Fi profile id.
+func ValidID(id string) bool {
+	return idRegexp.MatchString(id)
 }
 
 // HTTPStatus maps a helper status to the HTTP status the browser sees.
