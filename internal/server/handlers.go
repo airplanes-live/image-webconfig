@@ -13,8 +13,6 @@ import (
 	"time"
 
 	"github.com/airplanes-live/image/webconfig/internal/auth"
-	"github.com/airplanes-live/image/webconfig/internal/configspec"
-	wexec "github.com/airplanes-live/image/webconfig/internal/exec"
 	"github.com/airplanes-live/image/webconfig/internal/identity"
 	"github.com/airplanes-live/image/webconfig/internal/logs"
 )
@@ -320,15 +318,28 @@ func (s *Server) handleIdentitySecret(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, http.StatusOK, got)
 }
 
-// /api/config (GET): whitelisted feed.env keys.
+// /api/config (GET): feed.env values filtered against the schema-cached
+// readable_keys set. Returns 503 when the schema cache is unavailable
+// (boot-time apl-feed schema --json fetch failed and no SIGHUP has
+// since refreshed it).
 func (s *Server) handleConfigGet(w http.ResponseWriter, _ *http.Request) {
+	if s.schema == nil || s.schema.Degraded() {
+		writeJSONError(w, http.StatusServiceUnavailable, "schema unavailable; retry after the next feed update")
+		return
+	}
 	values, err := s.feedEnv.ReadAll()
 	if err != nil {
 		log.Printf("feedenv read: %v", err)
 		writeJSONError(w, http.StatusInternalServerError, "feed.env read failed")
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"values": values})
+	filtered := make(map[string]string, len(values))
+	for k, v := range values {
+		if s.schema.IsReadable(k) {
+			filtered[k] = v
+		}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"values": filtered})
 }
 
 // /api/status (GET): service states + manifest + feed snapshot.
@@ -368,53 +379,30 @@ const (
 	systemctlTimeout = 10 * time.Second
 )
 
-// /api/config (POST): atomic feed.env write through the apply-config helper,
-// followed by per-unit restart for feed/mlat/dump978-fa/airplanes-978. The
-// whole transaction is serialized by an in-process mutex so concurrent posts
-// can't interleave feed.env writes and unit restarts. The 978 daemons
-// self-decide on UAT_INPUT (mlat-style: exit 64 when not requested), so the
-// server only needs to kick a restart — no more enable/disable reconcile.
+// /api/config (POST): proxies the body to `apl-feed apply --json` over a
+// sudoers-pinned argv. The feed CLI owns validation, the universal-reject
+// scan, the atomic write, and the dirty-key service-restart fan-out;
+// webconfig translates exit codes + JSON envelopes into HTTP responses.
+//
+// The schema cache must be loaded (i.e. !s.schema.Degraded()) before this
+// endpoint accepts writes — without it we cannot pre-filter the payload
+// against the writable_keys set.
 func (s *Server) handleConfigPost(w http.ResponseWriter, r *http.Request) {
+	if s.schema == nil || s.schema.Degraded() {
+		writeJSONError(w, http.StatusServiceUnavailable, "schema unavailable; retry after the next feed update")
+		return
+	}
 	var req configRequest
 	if err := readJSON(w, r, &req); err != nil {
 		writeJSONError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	// Daemon-side validation. The helper re-validates against the same
-	// configspec — keep both layers; drift is exactly what the shared
-	// package prevents.
-	for k, v := range req.Updates {
-		if err := configspec.Validate(k, v); err != nil {
-			writeJSONError(w, http.StatusBadRequest, err.Error())
-			return
-		}
-	}
-	// Cross-key consistency precheck: reject inconsistent shapes (today
-	// MLAT_ENABLED=true requires GEO_CONFIGURED=true + full coords/altitude;
-	// GEO_CONFIGURED=true requires non-empty lat/lon) early so the user
-	// gets a clear 400 from the dashboard rather than a silently-failing
-	// daemon after the helper has already written the bad state. We
-	// compute the projection of (existing ∪ updates) AND apply the same
-	// GEO_CONFIGURED auto-derive that apply-config runs — without that,
-	// "enter lat/lon/alt + enable MLAT" submitted by the form would be
-	// rejected here because GEO_CONFIGURED wouldn't yet be true in the
-	// preview.
-	{
-		preview, err := s.feedEnv.ReadAll()
-		if err != nil {
-			log.Printf("config-post: read feed.env for consistency check: %v", err)
-			writeJSONError(w, http.StatusInternalServerError, "feed.env read failed")
-			return
-		}
-		for k, v := range req.Updates {
-			preview[k] = v
-		}
-		_, explicitGeo := req.Updates["GEO_CONFIGURED"]
-		_, touchedLat := req.Updates["LATITUDE"]
-		_, touchedLon := req.Updates["LONGITUDE"]
-		configspec.ApplyGeoDeriveOnUpdate(preview, explicitGeo, touchedLat, touchedLon)
-		if err := configspec.ValidateConsistency(preview); err != nil {
-			writeJSONError(w, http.StatusBadRequest, err.Error())
+	// Reject keys not in the schema's writable-key set BEFORE shelling out
+	// — saves a privileged invocation on obvious client bugs and produces
+	// a clearer per-key 400.
+	for k := range req.Updates {
+		if !s.schema.IsWritable(k) {
+			writeJSONError(w, http.StatusBadRequest, fmt.Sprintf("not a writable key: %s", k))
 			return
 		}
 	}
@@ -422,101 +410,81 @@ func (s *Server) handleConfigPost(w http.ResponseWriter, r *http.Request) {
 	s.configMu.Lock()
 	defer s.configMu.Unlock()
 
-	if err := s.invokeApplyConfig(r.Context(), req.Updates); err != nil {
-		var ce *configError
-		if errors.As(err, &ce) {
-			writeJSONError(w, ce.status, ce.message)
-			return
-		}
-		log.Printf("config-post: helper: %v", err)
+	resp, status, err := s.invokeApplyFeed(r.Context(), req.Updates)
+	if err != nil {
+		log.Printf("config-post: %v", err)
 		writeJSONError(w, http.StatusInternalServerError, "config write failed")
 		return
 	}
-
-	// Service restart for feed + mlat + dump978-fa + airplanes-978. Failures
-	// here log loudly AND get surfaced to the client as `pending_restart` so
-	// the dashboard can alert the user that their saved config isn't actually
-	// running yet. Restarting the daemon is what makes the new config take
-	// effect; if it doesn't happen, /api/status will continue to reflect the
-	// previous running config — making this a real foot-gun if silently
-	// swallowed.
-	//
-	// `systemctl restart` returns 0 once the unit's start job has been
-	// dispatched, regardless of whether the wrapper later exits 64 (the
-	// self-disable path used by mlat and the 978 daemons when their config
-	// says "off"). So restarting on "UAT_INPUT cleared by user" does NOT
-	// generate a spurious pending_restart entry — the daemon is intentionally
-	// failed-terminal, not "couldn't be restarted".
-	var pendingRestart []string
-	for _, namedArgv := range []struct {
-		unit string
-		argv []string
-	}{
-		{"airplanes-feed.service", s.priv.RestartFeed},
-		{"airplanes-mlat.service", s.priv.RestartMLAT},
-		{"dump978-fa.service", s.priv.RestartDump978},
-		{"airplanes-978.service", s.priv.RestartUAT},
-	} {
-		if err := s.runSudo(r.Context(), namedArgv.argv, systemctlTimeout); err != nil {
-			log.Printf("config-post: %s restart: %v", namedArgv.unit, err)
-			pendingRestart = append(pendingRestart, namedArgv.unit)
-		}
+	if status != http.StatusOK {
+		// Forward the structured error envelope from apl-feed apply
+		// (per-field reasons, lock_timeout message, etc.) without
+		// reshaping it — the client renders the per-key error directly.
+		writeJSON(w, status, resp)
+		return
 	}
-
-	writeJSON(w, http.StatusOK, configApplyResponse{
-		Status:         "applied",
-		PendingRestart: pendingRestart,
-	})
+	writeJSON(w, http.StatusOK, resp)
 }
 
-// configApplyResponse is the body returned by POST /api/config. The
-// PendingRestart field is omitempty so the legacy {"status":"applied"}
-// shape is preserved when all restarts succeed; new clients check for
-// pending_restart and surface a "saved, but restart failed" banner.
-// Unit names are full ("airplanes-mlat.service") so clients don't have
-// to append .service.
-type configApplyResponse struct {
-	Status         string   `json:"status"`
-	PendingRestart []string `json:"pending_restart,omitempty"`
+// applyFeedResponse mirrors the JSON envelope emitted by
+// `apl-feed apply --json`. Any subset of fields can be populated
+// depending on status; the client renders them in priority order
+// (errors > pending_restart > changed).
+type applyFeedResponse struct {
+	Status         string            `json:"status"`
+	Changed        []string          `json:"changed,omitempty"`
+	PendingRestart []string          `json:"pending_restart,omitempty"`
+	Errors         map[string]string `json:"errors,omitempty"`
+	Message        string            `json:"message,omitempty"`
 }
 
-// configError carries an HTTP status + safe-to-surface message.
-type configError struct {
-	status  int
-	message string
-}
-
-func (e *configError) Error() string { return e.message }
-
-// invokeApplyConfig pipes the JSON body to the helper via fixed-argv sudo.
-// Helper exit codes 10/11/12 (validation/parse/oversize) → 400; 20
-// (filesystem) → 500. Stderr is logged server-side; the response carries
-// only a stable message to avoid leaking internals.
-func (s *Server) invokeApplyConfig(ctx context.Context, updates map[string]string) error {
+// invokeApplyFeed pipes the request body through `sudo apl-feed apply --json`
+// and maps the structured response to an HTTP status. The error return
+// is reserved for invocation-layer failures (binary missing, timeout)
+// that are NOT part of the apply contract — those become 500.
+//
+// Status mapping:
+//   applied          → 200 (pending_restart may be non-empty)
+//   no_change        → 200
+//   rejected         → 400
+//   lock_timeout     → 503
+//   filesystem_error → 500
+//   parse_error      → 400 (apl-feed received malformed input from us, but
+//                          forward as 400 so the client sees the message)
+//   usage_error      → 500 (programmer error: argv shape diverged)
+func (s *Server) invokeApplyFeed(ctx context.Context, updates map[string]string) (applyFeedResponse, int, error) {
 	body, err := json.Marshal(map[string]any{"updates": updates})
 	if err != nil {
-		return err
+		return applyFeedResponse{}, 0, err
 	}
 	cctx, cancel := context.WithTimeout(ctx, applyConfigTimeout)
 	defer cancel()
 
-	res, err := s.stdinRunner(cctx, s.priv.ApplyConfig, bytes.NewReader(body))
-	if err == nil {
-		return nil
+	res, runErr := s.stdinRunner(cctx, s.priv.ApplyFeed, bytes.NewReader(body))
+	var parsed applyFeedResponse
+	if perr := json.Unmarshal(res.Stdout, &parsed); perr != nil {
+		// Helper produced no JSON envelope on stdout — treat as an
+		// internal error and surface stderr in the log only.
+		log.Printf("apply-feed: cannot parse stdout: %v stdout=%q stderr=%q",
+			perr, res.Stdout, strings.TrimSpace(string(res.Stderr)))
+		return applyFeedResponse{}, 0, fmt.Errorf("apply-feed: %w", perr)
 	}
-	exit := res.ExitCode
-	logHelper(exit, res, err)
-	switch exit {
-	case 10, 11, 12, 30:
-		return &configError{status: http.StatusBadRequest, message: "config rejected by helper"}
+	switch parsed.Status {
+	case "applied", "no_change":
+		return parsed, http.StatusOK, nil
+	case "rejected":
+		return parsed, http.StatusBadRequest, nil
+	case "lock_timeout":
+		return parsed, http.StatusServiceUnavailable, nil
+	case "filesystem_error":
+		return parsed, http.StatusInternalServerError, nil
+	case "parse_error":
+		return parsed, http.StatusBadRequest, nil
 	default:
-		return fmt.Errorf("helper exit %d: %w", exit, err)
+		log.Printf("apply-feed: unknown status %q exit=%d stderr=%q err=%v",
+			parsed.Status, res.ExitCode, strings.TrimSpace(string(res.Stderr)), runErr)
+		return parsed, http.StatusInternalServerError, nil
 	}
-}
-
-func logHelper(exit int, res wexec.Result, err error) {
-	log.Printf("apply-config exit=%d err=%v stderr=%q",
-		exit, err, strings.TrimSpace(string(res.Stderr)))
 }
 
 // runSudo runs argv with a per-call timeout and logs on failure.

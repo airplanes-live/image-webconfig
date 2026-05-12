@@ -22,6 +22,7 @@ import (
 	"github.com/airplanes-live/image/webconfig/internal/feedenv"
 	"github.com/airplanes-live/image/webconfig/internal/identity"
 	"github.com/airplanes-live/image/webconfig/internal/logs"
+	"github.com/airplanes-live/image/webconfig/internal/schemacache"
 	"github.com/airplanes-live/image/webconfig/internal/status"
 )
 
@@ -92,13 +93,10 @@ func newTestServer(t *testing.T) (*httptest.Server, *Server) {
 	}
 
 	priv := PrivilegedArgv{
-		ApplyConfig:    []string{"sudo-stub", "apply-config"},
-		RestartFeed:    []string{"sudo-stub", "restart", "feed"},
-		RestartMLAT:    []string{"sudo-stub", "restart", "mlat"},
-		RestartDump978: []string{"sudo-stub", "restart", "dump978"},
-		RestartUAT:     []string{"sudo-stub", "restart", "uat"},
-		Reboot:         []string{"sudo-stub", "reboot"},
-		StartUpdate:    []string{"sudo-stub", "update"},
+		ApplyFeed:   []string{"sudo-stub", "apl-feed", "apply", "--json"},
+		SchemaFeed:  []string{"apl-feed", "schema", "--json"},
+		Reboot:      []string{"sudo-stub", "reboot"},
+		StartUpdate: []string{"sudo-stub", "update"},
 	}
 
 	deps := Deps{
@@ -112,9 +110,13 @@ func newTestServer(t *testing.T) (*httptest.Server, *Server) {
 		FeedEnv:      &feedenv.Reader{Path: feedEnvPath},
 		Status:       status.NewReader("test-sha", statusPaths, statusRunner),
 		Logs:         logs.NewStreamer(logsRunner),
-		Runner:       captureRunner,
-		StdinRunner:  captureStdinRunner,
-		Privileged:   priv,
+		Schema: schemacache.NewPrepopulated(
+			[]string{"LATITUDE", "LONGITUDE", "ALTITUDE", "GEO_CONFIGURED", "MLAT_USER", "MLAT_ENABLED", "MLAT_PRIVATE", "GAIN", "UAT_INPUT", "DUMP978_SDR_SERIAL", "DUMP978_GAIN"},
+			[]string{"LATITUDE", "LONGITUDE", "ALTITUDE", "GEO_CONFIGURED", "MLAT_USER", "MLAT_ENABLED", "MLAT_PRIVATE", "INPUT", "INPUT_TYPE", "GAIN", "UAT_INPUT", "DUMP978_SDR_SERIAL", "DUMP978_GAIN"},
+		),
+		Runner:      captureRunner,
+		StdinRunner: captureStdinRunner,
+		Privileged:  priv,
 	}
 	handler := New(deps)
 	ts := httptest.NewServer(handler)
@@ -172,7 +174,14 @@ func newWriteHarness(t *testing.T) *writeHarness {
 		t.Fatal(err)
 	}
 
-	h := &writeHarness{feedEnvPath: feedEnvPath}
+	h := &writeHarness{
+		feedEnvPath: feedEnvPath,
+		// Default response from apl-feed apply --json: every write
+		// succeeds and lands an `applied` envelope. Individual tests
+		// override h.stdinResult / h.stdinErr to exercise rejected,
+		// lock_timeout, filesystem_error, etc.
+		stdinResult: wexec.Result{Stdout: []byte(`{"status":"applied","changed":[],"pending_restart":[]}`)},
+	}
 	captureRunner := func(_ context.Context, argv []string) (wexec.Result, error) {
 		h.mu.Lock()
 		h.calls = append(h.calls, append([]string(nil), argv...))
@@ -196,13 +205,10 @@ func newWriteHarness(t *testing.T) *writeHarness {
 	}
 
 	priv := PrivilegedArgv{
-		ApplyConfig:    []string{"sudo-stub", "apply-config"},
-		RestartFeed:    []string{"sudo-stub", "restart", "feed"},
-		RestartMLAT:    []string{"sudo-stub", "restart", "mlat"},
-		RestartDump978: []string{"sudo-stub", "restart", "dump978"},
-		RestartUAT:     []string{"sudo-stub", "restart", "uat"},
-		Reboot:         []string{"sudo-stub", "reboot"},
-		StartUpdate:    []string{"sudo-stub", "update"},
+		ApplyFeed:   []string{"sudo-stub", "apl-feed", "apply", "--json"},
+		SchemaFeed:  []string{"apl-feed", "schema", "--json"},
+		Reboot:      []string{"sudo-stub", "reboot"},
+		StartUpdate: []string{"sudo-stub", "update"},
 	}
 
 	deps := Deps{
@@ -217,7 +223,11 @@ func newWriteHarness(t *testing.T) *writeHarness {
 		Status: status.NewReader("test-sha", status.Paths{
 			SystemctlBinary: "/bin/true", IsActiveTimeout: time.Second,
 		}, captureRunner),
-		Logs:        logs.NewStreamer(nil),
+		Logs: logs.NewStreamer(nil),
+		Schema: schemacache.NewPrepopulated(
+			[]string{"LATITUDE", "LONGITUDE", "ALTITUDE", "GEO_CONFIGURED", "MLAT_USER", "MLAT_ENABLED", "MLAT_PRIVATE", "GAIN", "UAT_INPUT", "DUMP978_SDR_SERIAL", "DUMP978_GAIN"},
+			[]string{"LATITUDE", "LONGITUDE", "ALTITUDE", "GEO_CONFIGURED", "MLAT_USER", "MLAT_ENABLED", "MLAT_PRIVATE", "INPUT", "INPUT_TYPE", "GAIN", "UAT_INPUT", "DUMP978_SDR_SERIAL", "DUMP978_GAIN"},
+		),
 		Runner:      captureRunner,
 		StdinRunner: captureStdinRunner,
 		Privileged:  priv,
@@ -262,216 +272,86 @@ func TestConfigPost_RequiresAuth(t *testing.T) {
 	}
 }
 
-func TestConfigPost_ValidatedRequestRunsHelperThenRestarts(t *testing.T) {
-	t.Parallel()
+func TestConfigPost_AppliedEnvelopeForwarded(t *testing.T) {
 	h := newWriteHarness(t)
-	r := postJSON(t, h.client, h.ts.URL+"/api/config", map[string]any{
-		"updates": map[string]string{"LATITUDE": "51.5", "MLAT_USER": "alice"},
-	})
+	h.stdinResult = wexec.Result{
+		Stdout: []byte(`{"status":"applied","changed":["MLAT_PRIVATE"],"pending_restart":[]}`),
+	}
+	r := postJSON(t, h.client, h.ts.URL+"/api/config",
+		map[string]any{"updates": map[string]string{"MLAT_PRIVATE": "true"}})
 	defer r.Body.Close()
 	if r.StatusCode != http.StatusOK {
-		t.Fatalf("status = %d (err=%q)", r.StatusCode, decodeError(t, r.Body))
+		t.Fatalf("status = %d, want 200", r.StatusCode)
 	}
-	stdinCalls := h.stdinCallsCopy()
-	if len(stdinCalls) != 1 {
-		t.Fatalf("apply-config calls = %d, want 1", len(stdinCalls))
+	var body applyFeedResponse
+	_ = json.NewDecoder(r.Body).Decode(&body)
+	if body.Status != "applied" {
+		t.Errorf("status = %q, want applied", body.Status)
 	}
-	if got := stdinCalls[0].argv; got[0] != "sudo-stub" || got[1] != "apply-config" {
-		t.Errorf("apply-config argv = %v", got)
-	}
-	var body struct {
-		Updates map[string]string `json:"updates"`
-	}
-	if err := json.Unmarshal(stdinCalls[0].stdin, &body); err != nil {
-		t.Fatal(err)
-	}
-	if body.Updates["LATITUDE"] != "51.5" || body.Updates["MLAT_USER"] != "alice" {
-		t.Errorf("apply-config stdin = %v", body.Updates)
-	}
-	calls := h.callsCopy()
-	// One of the calls should be RestartFeed and another RestartMLAT.
-	sawFeed, sawMLAT := false, false
-	for _, c := range calls {
-		if len(c) >= 3 && c[1] == "restart" && c[2] == "feed" {
-			sawFeed = true
-		}
-		if len(c) >= 3 && c[1] == "restart" && c[2] == "mlat" {
-			sawMLAT = true
-		}
-	}
-	if !sawFeed || !sawMLAT {
-		t.Errorf("missing service restart calls: %v", calls)
+	if len(body.Changed) != 1 || body.Changed[0] != "MLAT_PRIVATE" {
+		t.Errorf("changed = %v, want [MLAT_PRIVATE]", body.Changed)
 	}
 }
 
-func TestConfigPost_EnableMLATFromOffStateAutoDerivesGEO(t *testing.T) {
-	t.Parallel()
+func TestConfigPost_RejectedEnvelopeReturns400(t *testing.T) {
 	h := newWriteHarness(t)
-	// Existing feed.env mirrors a fresh image (PR-1 default): MLAT off,
-	// geo placeholders. The user enters real lat/lon/alt and toggles MLAT
-	// on in one save. The handler must auto-derive GEO_CONFIGURED=true via
-	// the shared helper before ValidateConsistency runs, otherwise the new
-	// MLAT_ENABLED→GEO_CONFIGURED rule would reject this submission with
-	// "GEO_CONFIGURED must be true when MLAT_ENABLED=true".
-	if err := os.WriteFile(h.feedEnvPath, []byte(
-		`LATITUDE=0`+"\n"+`LONGITUDE=0`+"\n"+`ALTITUDE=0m`+"\n"+
-			`MLAT_USER=airplanes-live-image`+"\n"+`MLAT_ENABLED=false`+"\n"+
-			`MLAT_PRIVATE=false`+"\n"+`GEO_CONFIGURED=false`+"\n"),
-		0o644); err != nil {
-		t.Fatal(err)
+	h.stdinResult = wexec.Result{
+		Stdout: []byte(`{"status":"rejected","errors":{"LATITUDE":"must be in [-90, 90]"}}`),
 	}
-	r := postJSON(t, h.client, h.ts.URL+"/api/config", map[string]any{
-		"updates": map[string]string{
-			"LATITUDE":     "48.137",
-			"LONGITUDE":    "11.575",
-			"ALTITUDE":     "520m",
-			"MLAT_ENABLED": "true",
-		},
-	})
-	defer r.Body.Close()
-	if r.StatusCode != http.StatusOK {
-		t.Fatalf("status = %d (err=%q); the handler must derive GEO_CONFIGURED before validating", r.StatusCode, decodeError(t, r.Body))
-	}
-	stdinCalls := h.stdinCallsCopy()
-	if len(stdinCalls) != 1 {
-		t.Fatalf("apply-config calls = %d, want 1", len(stdinCalls))
-	}
-}
-
-func TestConfigPost_RejectsBadValueWithKeyName(t *testing.T) {
-	t.Parallel()
-	h := newWriteHarness(t)
-	r := postJSON(t, h.client, h.ts.URL+"/api/config", map[string]any{
-		"updates": map[string]string{"LATITUDE": "200"},
-	})
+	r := postJSON(t, h.client, h.ts.URL+"/api/config",
+		map[string]any{"updates": map[string]string{"LATITUDE": "200"}})
 	defer r.Body.Close()
 	if r.StatusCode != http.StatusBadRequest {
-		t.Fatalf("status = %d", r.StatusCode)
+		t.Fatalf("status = %d, want 400", r.StatusCode)
 	}
-	body := decodeError(t, r.Body)
-	if !strings.Contains(body, "LATITUDE") {
-		t.Errorf("error %q missing key name", body)
-	}
-	if len(h.stdinCallsCopy()) != 0 {
-		t.Error("apply-config invoked despite validation failure")
+	var body applyFeedResponse
+	_ = json.NewDecoder(r.Body).Decode(&body)
+	if body.Status != "rejected" || body.Errors["LATITUDE"] == "" {
+		t.Errorf("body = %+v, want rejected envelope with per-key error", body)
 	}
 }
+
+func TestConfigPost_LockTimeoutReturns503(t *testing.T) {
+	h := newWriteHarness(t)
+	h.stdinResult = wexec.Result{
+		Stdout: []byte(`{"status":"lock_timeout","message":"could not acquire lock after 30s"}`),
+	}
+	r := postJSON(t, h.client, h.ts.URL+"/api/config",
+		map[string]any{"updates": map[string]string{"MLAT_PRIVATE": "true"}})
+	defer r.Body.Close()
+	if r.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503", r.StatusCode)
+	}
+}
+
+func TestConfigPost_UnknownKeyRejectedPreShellout(t *testing.T) {
+	h := newWriteHarness(t)
+	r := postJSON(t, h.client, h.ts.URL+"/api/config",
+		map[string]any{"updates": map[string]string{"BOGUS_KEY": "x"}})
+	defer r.Body.Close()
+	if r.StatusCode != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400", r.StatusCode)
+	}
+	// stdinRunner must NOT have been invoked — the schema cache catches
+	// it pre-shellout so we save a privileged sudo call on the obvious
+	// client bug.
+	if len(h.stdinCallsCopy()) != 0 {
+		t.Errorf("stdinRunner was called for an unknown key; want pre-shellout reject")
+	}
+}
+
+
+
 
 // PR 4 retired reconcile978On/Off. Both 978 services now restart on every
 // /api/config POST, regardless of UAT_INPUT direction; the daemons self-decide
 // from UAT_INPUT and exit 64 (intentional failed-terminal) when not requested.
 // systemctl restart returns 0 once the start job is dispatched, so the
 // pending_restart payload stays empty on the disable transition.
-func TestConfigPost_978UnitsRestartedRegardless(t *testing.T) {
-	t.Parallel()
-	for _, tc := range []struct {
-		name string
-		body map[string]any
-		seed string
-	}{
-		{
-			name: "uat_on",
-			body: map[string]any{"updates": map[string]string{"UAT_INPUT": "127.0.0.1:30978"}},
-			seed: `UAT_INPUT=""` + "\n",
-		},
-		{
-			name: "uat_off",
-			body: map[string]any{"updates": map[string]string{"UAT_INPUT": ""}},
-			seed: `UAT_INPUT="127.0.0.1:30978"` + "\n",
-		},
-		{
-			name: "no_uat_change_still_restarts",
-			body: map[string]any{"updates": map[string]string{"LATITUDE": "51.5"}},
-			seed: `UAT_INPUT="127.0.0.1:30978"` + "\n" + `LATITUDE="0"` + "\n",
-		},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			h := newWriteHarness(t)
-			if err := os.WriteFile(h.feedEnvPath, []byte(tc.seed), 0o644); err != nil {
-				t.Fatal(err)
-			}
-			r := postJSON(t, h.client, h.ts.URL+"/api/config", tc.body)
-			defer r.Body.Close()
-			if r.StatusCode != http.StatusOK {
-				t.Fatalf("status = %d", r.StatusCode)
-			}
-			calls := h.callsCopy()
-			sawDump978, sawUAT := false, false
-			for _, c := range calls {
-				if len(c) >= 3 && c[1] == "restart" {
-					if c[2] == "dump978" {
-						sawDump978 = true
-					}
-					if c[2] == "uat" {
-						sawUAT = true
-					}
-				}
-			}
-			if !sawDump978 {
-				t.Errorf("missing restart of dump978; calls=%v", calls)
-			}
-			if !sawUAT {
-				t.Errorf("missing restart of uat; calls=%v", calls)
-			}
-		})
-	}
-}
 
 // pending_restart surfaces 978 unit failures alongside feed/mlat. Confirms
 // that both 978 entries land in the response when their restart fails.
-func TestConfigPost_PendingRestartIncludes978(t *testing.T) {
-	t.Parallel()
-	h := newWriteHarness(t)
-	h.mu.Lock()
-	h.runnerErrFor = func(argv []string) error {
-		if len(argv) >= 3 && argv[1] == "restart" && (argv[2] == "dump978" || argv[2] == "uat") {
-			return errors.New("synthetic restart failure")
-		}
-		return nil
-	}
-	h.mu.Unlock()
 
-	r := postJSON(t, h.client, h.ts.URL+"/api/config", map[string]any{
-		"updates": map[string]string{"UAT_INPUT": "127.0.0.1:30978"},
-	})
-	defer r.Body.Close()
-	if r.StatusCode != http.StatusOK {
-		t.Fatalf("status = %d", r.StatusCode)
-	}
-	var body struct {
-		Status         string   `json:"status"`
-		PendingRestart []string `json:"pending_restart"`
-	}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		t.Fatal(err)
-	}
-	want := map[string]bool{
-		"dump978-fa.service":    true,
-		"airplanes-978.service": true,
-	}
-	for _, u := range body.PendingRestart {
-		delete(want, u)
-	}
-	if len(want) != 0 {
-		t.Errorf("missing units in pending_restart=%v: %v", body.PendingRestart, want)
-	}
-}
-
-func TestConfigPost_HelperFailureMaps400(t *testing.T) {
-	t.Parallel()
-	h := newWriteHarness(t)
-	h.mu.Lock()
-	h.stdinResult = wexec.Result{Stderr: []byte("LATITUDE: out of range\n"), ExitCode: 10}
-	h.stdinErr = errors.New("exit status 10")
-	h.mu.Unlock()
-	r := postJSON(t, h.client, h.ts.URL+"/api/config", map[string]any{
-		"updates": map[string]string{"LATITUDE": "10"},
-	})
-	defer r.Body.Close()
-	if r.StatusCode != http.StatusBadRequest {
-		t.Fatalf("status = %d, want 400", r.StatusCode)
-	}
-}
 
 func TestUpdate_RequiresAuth(t *testing.T) {
 	t.Parallel()
@@ -1182,112 +1062,5 @@ func TestLog_KnownUnitStreamsSSE(t *testing.T) {
 
 // --- pending_restart surfacing (PR 3) ---
 
-func TestConfigPost_PendingRestartOmittedWhenAllSucceed(t *testing.T) {
-	t.Parallel()
-	h := newWriteHarness(t)
-	r := postJSON(t, h.client, h.ts.URL+"/api/config", map[string]any{
-		"updates": map[string]string{"LATITUDE": "51.5", "MLAT_USER": "alice"},
-	})
-	defer r.Body.Close()
-	if r.StatusCode != http.StatusOK {
-		t.Fatalf("status = %d", r.StatusCode)
-	}
-	var body struct {
-		Status         string   `json:"status"`
-		PendingRestart []string `json:"pending_restart"`
-	}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		t.Fatalf("decode: %v", err)
-	}
-	if body.Status != "applied" {
-		t.Errorf("status = %q, want applied", body.Status)
-	}
-	if len(body.PendingRestart) != 0 {
-		t.Errorf("PendingRestart = %v, want empty (all restarts succeeded)", body.PendingRestart)
-	}
-}
 
-func TestConfigPost_PendingRestartIncludesMLATWhenOnlyMLATFails(t *testing.T) {
-	t.Parallel()
-	h := newWriteHarness(t)
-	// Only fail RestartMLAT (argv[1]=="restart" && argv[2]=="mlat").
-	h.mu.Lock()
-	h.runnerErrFor = func(argv []string) error {
-		if len(argv) >= 3 && argv[1] == "restart" && argv[2] == "mlat" {
-			return errors.New("simulated mlat restart failure")
-		}
-		return nil
-	}
-	h.mu.Unlock()
 
-	r := postJSON(t, h.client, h.ts.URL+"/api/config", map[string]any{
-		"updates": map[string]string{"LATITUDE": "51.5", "MLAT_USER": "alice"},
-	})
-	defer r.Body.Close()
-	if r.StatusCode != http.StatusOK {
-		t.Fatalf("status = %d (err=%q)", r.StatusCode, decodeError(t, r.Body))
-	}
-	var body struct {
-		Status         string   `json:"status"`
-		PendingRestart []string `json:"pending_restart"`
-	}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		t.Fatalf("decode: %v", err)
-	}
-	if body.Status != "applied" {
-		t.Errorf("status = %q, want applied", body.Status)
-	}
-	if len(body.PendingRestart) != 1 || body.PendingRestart[0] != "airplanes-mlat.service" {
-		t.Errorf("PendingRestart = %v, want [airplanes-mlat.service]", body.PendingRestart)
-	}
-}
-
-func TestConfigPost_PendingRestartIncludesAllWhenAllFail(t *testing.T) {
-	t.Parallel()
-	h := newWriteHarness(t)
-	h.mu.Lock()
-	h.runnerErrFor = func(argv []string) error {
-		if len(argv) >= 3 && argv[1] == "restart" {
-			return errors.New("simulated restart failure")
-		}
-		return nil
-	}
-	h.mu.Unlock()
-
-	r := postJSON(t, h.client, h.ts.URL+"/api/config", map[string]any{
-		"updates": map[string]string{"LATITUDE": "51.5", "MLAT_USER": "alice"},
-	})
-	defer r.Body.Close()
-	if r.StatusCode != http.StatusOK {
-		t.Fatalf("status = %d", r.StatusCode)
-	}
-	var body struct {
-		Status         string   `json:"status"`
-		PendingRestart []string `json:"pending_restart"`
-	}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		t.Fatalf("decode: %v", err)
-	}
-	// PR 4: 978 units join the restart loop. When ALL restarts fail, all four
-	// units land in pending_restart.
-	if len(body.PendingRestart) != 4 {
-		t.Fatalf("PendingRestart len = %d, want 4 (feed+mlat+dump978+uat)", len(body.PendingRestart))
-	}
-	wantAny := map[string]bool{
-		"airplanes-feed.service": false,
-		"airplanes-mlat.service": false,
-		"dump978-fa.service":     false,
-		"airplanes-978.service":  false,
-	}
-	for _, u := range body.PendingRestart {
-		if _, ok := wantAny[u]; !ok {
-			t.Errorf("PendingRestart contains unexpected unit %q", u)
-		}
-		wantAny[u] = true
-	}
-	for u, seen := range wantAny {
-		if !seen {
-			t.Errorf("PendingRestart missing %q", u)
-		}
-	}
-}

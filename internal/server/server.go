@@ -11,6 +11,7 @@ import (
 	"github.com/airplanes-live/image/webconfig/internal/feedenv"
 	"github.com/airplanes-live/image/webconfig/internal/identity"
 	"github.com/airplanes-live/image/webconfig/internal/logs"
+	"github.com/airplanes-live/image/webconfig/internal/schemacache"
 	"github.com/airplanes-live/image/webconfig/internal/status"
 	webassets "github.com/airplanes-live/image/webconfig/web"
 )
@@ -29,6 +30,7 @@ type Server struct {
 	logs         *logs.Streamer
 	runner       wexec.CommandRunner
 	stdinRunner  wexec.CommandRunnerStdin
+	schema       *schemacache.Cache
 	priv         PrivilegedArgv
 	configMu     sync.Mutex // serializes POST /api/config transactions
 }
@@ -36,14 +38,16 @@ type Server struct {
 // PrivilegedArgv carries the exact sudoers-allowed argv shapes for every
 // command webconfig elevates. Each slice is invoked verbatim — no
 // concatenation, no shell.
+//
+// ApplyFeed and SchemaFeed both target the apl-feed binary installed by
+// the feed scripts (canonical writer + schema endpoint). The feed CLI
+// owns feed.env validation, restart fan-out, and the on-disk schema —
+// webconfig is a thin HTTP shell around its JSON interface.
 type PrivilegedArgv struct {
-	ApplyConfig    []string // sudo -n /usr/local/lib/airplanes-webconfig/apply-config
-	RestartFeed    []string
-	RestartMLAT    []string
-	RestartDump978 []string
-	RestartUAT     []string
-	Reboot         []string
-	StartUpdate    []string // sudo systemd-run --unit=airplanes-update ...
+	ApplyFeed   []string // sudo -n /usr/local/bin/apl-feed apply --json
+	SchemaFeed  []string // /usr/local/bin/apl-feed schema --json (no sudo: read-only)
+	Reboot      []string
+	StartUpdate []string // sudo systemd-run --unit=airplanes-update ...
 }
 
 // DefaultPrivilegedArgv returns the production argv shapes for the
@@ -53,16 +57,14 @@ func DefaultPrivilegedArgv() PrivilegedArgv {
 		return append([]string{"/usr/bin/sudo", "-n"}, args...)
 	}
 	return PrivilegedArgv{
-		ApplyConfig:    sudo("/usr/local/lib/airplanes-webconfig/apply-config"),
-		RestartFeed:    sudo("/usr/bin/systemctl", "restart", "airplanes-feed.service"),
-		RestartMLAT:    sudo("/usr/bin/systemctl", "restart", "airplanes-mlat.service"),
-		RestartDump978: sudo("/usr/bin/systemctl", "restart", "dump978-fa.service"),
-		RestartUAT:     sudo("/usr/bin/systemctl", "restart", "airplanes-978.service"),
-		Reboot:         sudo("/usr/bin/systemctl", "reboot"),
+		ApplyFeed:  sudo("/usr/local/bin/apl-feed", "apply", "--json"),
+		SchemaFeed: []string{"/usr/local/bin/apl-feed", "schema", "--json"},
+		Reboot:     sudo("/usr/bin/systemctl", "reboot"),
 		StartUpdate: sudo(
 			"/usr/bin/systemd-run",
 			"--unit=airplanes-update",
 			"--collect",
+			"--property=ExecStopPost=/usr/bin/systemctl kill -s HUP airplanes-webconfig.service",
 			"/usr/local/share/airplanes/update.sh",
 		),
 	}
@@ -70,19 +72,20 @@ func DefaultPrivilegedArgv() PrivilegedArgv {
 
 // Deps is the injection bundle main passes to NewServer.
 type Deps struct {
-	Version       string
-	Store         *auth.PasswordStore
-	Sessions      *auth.Sessions
-	Lockout       *auth.Lockout
-	Guard         *auth.HashGuard
-	Argon2Params  auth.Params
-	Identity      *identity.Reader
-	FeedEnv       *feedenv.Reader
-	Status        *status.Reader
-	Logs          *logs.Streamer
-	Runner        wexec.CommandRunner      // override for tests; nil → exec.RealRunner
-	StdinRunner   wexec.CommandRunnerStdin // ditto; for apply-config (JSON piped via stdin)
-	Privileged    PrivilegedArgv
+	Version      string
+	Store        *auth.PasswordStore
+	Sessions     *auth.Sessions
+	Lockout      *auth.Lockout
+	Guard        *auth.HashGuard
+	Argon2Params auth.Params
+	Identity     *identity.Reader
+	FeedEnv      *feedenv.Reader
+	Status       *status.Reader
+	Logs         *logs.Streamer
+	Schema       *schemacache.Cache       // schema cache; required (use schemacache.New)
+	Runner       wexec.CommandRunner      // override for tests; nil → exec.RealRunner
+	StdinRunner  wexec.CommandRunnerStdin // ditto; piped variant for apl-feed apply
+	Privileged   PrivilegedArgv
 }
 
 // New returns the top-level HTTP handler.
@@ -108,6 +111,7 @@ func New(d Deps) http.Handler {
 		logs:         d.Logs,
 		runner:       runner,
 		stdinRunner:  stdinRunner,
+		schema:       d.Schema,
 		priv:         d.Privileged,
 	}
 
