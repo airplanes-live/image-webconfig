@@ -1158,12 +1158,17 @@
             },
         }, "Reboot");
 
+        const poweroffBtn = el("button", {
+            type: "button", class: "wc-btn-danger",
+            onclick: () => navigate(confirmPowerOffPanel, { title: "Power off", showBack: true }),
+        }, "Power off");
+
         const logout = el("button", {
             type: "button", class: "wc-btn-ghost",
             onclick: async () => { await postJSON("/api/auth/logout", {}); await boot(); },
         }, "Log out");
 
-        return el("div", { class: "actions" }, updateBtn, updateLog, change, rebootBtn, logout);
+        return el("div", { class: "actions" }, updateBtn, updateLog, change, rebootBtn, poweroffBtn, logout);
     }
 
     // ===== Dashboard =====
@@ -1386,6 +1391,63 @@
         );
         render(form);
         oldPw.focus();
+    }
+
+    function confirmPowerOffPanel() {
+        const PHRASE = "power off";
+        const err = errorEl();
+        const input = el("input", {
+            id: "poweroff-confirm",
+            type: "text",
+            autocomplete: "off",
+            autocapitalize: "none",
+            autocorrect: "off",
+            spellcheck: "false",
+            required: true,
+        });
+        const submit = el("button", { type: "submit", class: "wc-btn-danger", disabled: true }, "Power off");
+        const cancel = el("button", {
+            type: "button", class: "wc-btn-ghost",
+            onclick: () => navigate(dashboard, { title: null, showBack: false }),
+        }, "Cancel");
+
+        const matches = () => input.value.trim().toLowerCase() === PHRASE;
+        input.addEventListener("input", () => { submit.disabled = !matches(); });
+
+        const form = el("form", {
+            class: "wc-card",
+            onsubmit: async (e) => {
+                e.preventDefault();
+                if (!matches()) return;
+                err.textContent = "";
+                submit.disabled = true;
+                cancel.disabled = true;
+                submit.textContent = "Powering off…";
+                const r = await postJSON("/api/poweroff", {});
+                if (handleAuthFailure(r)) return;
+                if (!r.ok) {
+                    submit.disabled = false;
+                    cancel.disabled = false;
+                    submit.textContent = "Power off";
+                    err.textContent = (r.payload && r.payload.error) || "Power off failed.";
+                    return;
+                }
+                navigate(() => render(el("div", { class: "wc-card" },
+                    el("h2", {}, "Powering off…"),
+                    el("p", {}, "The feeder is shutting down. You'll need to disconnect and reconnect power to turn it back on."),
+                )), { title: "Powering off", showBack: false });
+            },
+        },
+            el("h2", {}, "Power off the feeder?"),
+            el("p", {}, "Shuts the feeder down cleanly so graphs1090 stats and other in-memory data are flushed to disk — safer than pulling the power cord."),
+            el("p", { class: "error" }, "Once powered off, the feeder cannot be turned back on remotely. You'll need physical access to disconnect and reconnect power."),
+            el("p", {}, "Type ", el("code", {}, PHRASE), " below to confirm."),
+            el("div", { class: "field" }, el("label", { for: "poweroff-confirm" }, "Confirmation"), input),
+            el("div", { class: "actions" }, cancel, submit),
+            err,
+        );
+        render(form);
+        input.focus();
     }
 
     function logViewer(slug) {

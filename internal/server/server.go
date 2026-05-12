@@ -46,7 +46,8 @@ type Server struct {
 type PrivilegedArgv struct {
 	ApplyFeed   []string // sudo -n /usr/local/bin/apl-feed apply --json --lock-timeout 5
 	SchemaFeed  []string // /usr/local/bin/apl-feed schema --json (no sudo: read-only)
-	Reboot      []string
+	Reboot      []string // sudo -n /usr/bin/systemctl reboot
+	Poweroff    []string // sudo -n /usr/bin/systemctl poweroff
 	StartUpdate []string // sudo systemd-run --unit=airplanes-update ...
 }
 
@@ -66,6 +67,7 @@ func DefaultPrivilegedArgv() PrivilegedArgv {
 		ApplyFeed:  sudo("/usr/local/bin/apl-feed", "apply", "--json", "--lock-timeout", "5"),
 		SchemaFeed: []string{"/usr/local/bin/apl-feed", "schema", "--json"},
 		Reboot:     sudo("/usr/bin/systemctl", "reboot"),
+		Poweroff:   sudo("/usr/bin/systemctl", "poweroff"),
 		StartUpdate: sudo(
 			"/usr/bin/systemd-run",
 			"--unit=airplanes-update",
@@ -141,6 +143,7 @@ func New(d Deps) http.Handler {
 	mux.HandleFunc("POST /api/config", s.requireSession(s.handleConfigPost))
 	mux.HandleFunc("POST /api/update", s.requireSession(s.handleUpdate))
 	mux.HandleFunc("POST /api/reboot", s.requireSession(s.handleReboot))
+	mux.HandleFunc("POST /api/poweroff", s.requireSession(s.handlePoweroff))
 
 	// Static assets at /static/*; the SPA shell is served by the GET /
 	// handler below. no-store cache policy: assets are embedded in the

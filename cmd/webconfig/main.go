@@ -78,8 +78,8 @@ func main() {
 	loadCtx, loadCancel := context.WithTimeout(context.Background(), 15*time.Second)
 	if err := cache.Load(loadCtx); err != nil {
 		// Degraded mode: /api/config returns 503, but /api/update,
-		// /api/log/*, /api/reboot, and the auth endpoints stay alive so
-		// the operator can still recover via the dashboard.
+		// /api/log/*, /api/reboot, /api/poweroff, and the auth endpoints
+		// stay alive so the operator can still recover via the dashboard.
 		log.Printf("schema: boot fetch failed (degraded mode, /api/config unavailable): %v", err)
 	}
 	loadCancel()

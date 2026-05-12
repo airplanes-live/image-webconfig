@@ -597,3 +597,20 @@ func (s *Server) handleReboot(w http.ResponseWriter, _ *http.Request) {
 		}
 	}()
 }
+
+// /api/poweroff (POST): mirrors handleReboot but issues `systemctl poweroff`.
+func (s *Server) handlePoweroff(w http.ResponseWriter, _ *http.Request) {
+	writeJSON(w, http.StatusAccepted, map[string]string{"status": "powering-off"})
+	if f, ok := w.(http.Flusher); ok {
+		f.Flush()
+	}
+	go func() {
+		time.Sleep(250 * time.Millisecond)
+		ctx, cancel := context.WithTimeout(context.Background(), systemctlTimeout)
+		defer cancel()
+		res, err := s.runner(ctx, s.priv.Poweroff)
+		if err != nil {
+			log.Printf("poweroff: %v stderr=%q", err, strings.TrimSpace(string(res.Stderr)))
+		}
+	}()
+}

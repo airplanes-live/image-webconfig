@@ -6,7 +6,8 @@
 //
 // On boot-time fetch failure the cache enters degraded mode: the
 // /api/config endpoint returns 503, but the rest of the webconfig
-// surface (login, /api/update, /api/log, /api/reboot, status tiles)
+// surface (login, /api/update, /api/log, /api/reboot, /api/poweroff,
+// status tiles)
 // stays alive so an operator can still recover via the dashboard.
 package schemacache
 
