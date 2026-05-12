@@ -249,6 +249,32 @@ main {
    its row's natural y-origin. Vertical spacing comes from the grid gap
    or from explicit margin on the container. */
 
+/* Banner notifications. .wc-flash is the default neutral tone (used by
+   the pending-flash path after navigation); .wc-flash--warn paints a
+   warm-toned strip for actionable warnings like "reboot required". */
+.wc-flash {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.75rem;
+  padding: 0.75rem 1rem;
+  border-radius: var(--wc-radius);
+  border: 1px solid var(--wc-line-soft);
+  background: var(--wc-surface-2);
+  color: var(--wc-ink-1);
+}
+.wc-flash--warn {
+  background: color-mix(in srgb, var(--wc-warm) 18%, var(--wc-surface-1));
+  border-color: var(--wc-warm);
+}
+.wc-flash button {
+  width: auto;
+  min-height: 2.25rem;
+  padding: 0.4rem 0.9rem;
+  font-size: 0.9rem;
+  flex: 0 0 auto;
+}
+
 .wc-card h2,
 .panel h2,
 .dashboard-card h2 {

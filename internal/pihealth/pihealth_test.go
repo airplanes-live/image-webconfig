@@ -48,10 +48,10 @@ func TestParseThrottled(t *testing.T) {
 func TestParseTimedatectlShow(t *testing.T) {
 	t.Parallel()
 	cases := []struct {
-		name        string
-		in          string
-		wantSynced  bool
-		wantFound   bool
+		name       string
+		in         string
+		wantSynced bool
+		wantFound  bool
 	}{
 		{"yes", "NTPSynchronized=yes\nTimezone=UTC\n", true, true},
 		{"no", "NTPSynchronized=no\n", false, true},
@@ -157,15 +157,15 @@ func (c canned) runner() wexec.CommandRunner {
 // fixture builds a Reader pointed at a tempdir, with configurable file
 // contents + canned runner + stub diskProber.
 type fixture struct {
-	t           *testing.T
-	model       string // device-tree model contents; empty = file absent
-	thermal     string // sysfs temp file contents; empty = absent
-	meminfo     string
-	uptime      string
-	disk        DiskProber
-	canned      canned
-	thresholds  Thresholds
-	wantPaths   func(Paths) Paths // optional override hook
+	t          *testing.T
+	model      string // device-tree model contents; empty = file absent
+	thermal    string // sysfs temp file contents; empty = absent
+	meminfo    string
+	uptime     string
+	disk       DiskProber
+	canned     canned
+	thresholds Thresholds
+	wantPaths  func(Paths) Paths // optional override hook
 }
 
 func (f *fixture) reader() *Reader {

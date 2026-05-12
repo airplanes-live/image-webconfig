@@ -52,15 +52,16 @@ var MonitoredServices = []string{
 // Paths configures file lookups; defaults match the rootfs layout. Override
 // in tests.
 type Paths struct {
-	ManifestFile        string // /etc/airplanes/build-manifest.json
-	AircraftJSONFile    string // /run/readsb/aircraft.json
-	MlatStateFile       string // /run/airplanes-mlat/state
-	FeedStateFile       string // /run/airplanes-feed/state
-	UAT978StateFile     string // /run/airplanes-978/state
-	Dump978FAStateFile  string // /run/dump978-fa/state
-	SystemctlSudoArgv0  []string // [sudo, -n, ...] OR [systemctl] (no sudo: is-active is read-only)
-	SystemctlBinary     string   // /usr/bin/systemctl
-	IsActiveTimeout     time.Duration
+	ManifestFile       string   // /etc/airplanes/build-manifest.json
+	AircraftJSONFile   string   // /run/readsb/aircraft.json
+	MlatStateFile      string   // /run/airplanes-mlat/state
+	FeedStateFile      string   // /run/airplanes-feed/state
+	UAT978StateFile    string   // /run/airplanes-978/state
+	Dump978FAStateFile string   // /run/dump978-fa/state
+	RebootRequiredFile string   // /var/run/reboot-required (written by needrestart after kernel/libc upgrades)
+	SystemctlSudoArgv0 []string // [sudo, -n, ...] OR [systemctl] (no sudo: is-active is read-only)
+	SystemctlBinary    string   // /usr/bin/systemctl
+	IsActiveTimeout    time.Duration
 }
 
 func DefaultPaths() Paths {
@@ -71,6 +72,7 @@ func DefaultPaths() Paths {
 		FeedStateFile:      "/run/airplanes-feed/state",
 		UAT978StateFile:    "/run/airplanes-978/state",
 		Dump978FAStateFile: "/run/dump978-fa/state",
+		RebootRequiredFile: "/var/run/reboot-required",
 		SystemctlBinary:    "/usr/bin/systemctl",
 		IsActiveTimeout:    2 * time.Second,
 	}
@@ -116,15 +118,20 @@ type Status struct {
 	// no_hardware decision propagates into UATDecision.Reason as
 	// peer_no_hardware so the airplanes-978 tile can render an "idle relay"
 	// state without polling two endpoints.
-	MlatDecision     *Decision `json:"mlat_decision,omitempty"`
-	FeedDecision     *Decision `json:"feed_decision,omitempty"`
-	UATDecision      *Decision `json:"uat_decision,omitempty"`
+	MlatDecision      *Decision `json:"mlat_decision,omitempty"`
+	FeedDecision      *Decision `json:"feed_decision,omitempty"`
+	UATDecision       *Decision `json:"uat_decision,omitempty"`
 	Dump978FADecision *Decision `json:"dump978fa_decision,omitempty"`
 
 	// PiHealth is the hardware-health snapshot. omitempty so a Reader
 	// configured without WithPiHealth (e.g. server tests that don't care)
 	// keeps the JSON shape compatible.
 	PiHealth *pihealth.PiHealth `json:"pi_health,omitempty"`
+
+	// RebootRequired is true when /var/run/reboot-required exists, which
+	// needrestart writes after a kernel or libc upgrade. The dashboard
+	// renders a banner when this flips on.
+	RebootRequired bool `json:"reboot_required"`
 }
 
 // Decision is the daemon's last-published runtime decision.
@@ -207,6 +214,12 @@ func (r *Reader) Read(ctx context.Context) (Status, error) {
 	out.FeedDecision = r.readFeedDecision(out.Services["airplanes-feed.service"])
 	out.UATDecision = r.readUATDecision(ctx, out.Services["airplanes-978.service"])
 	out.Dump978FADecision = r.readDump978FADecision(ctx, out.Services["dump978-fa.service"])
+
+	if r.paths.RebootRequiredFile != "" {
+		if _, err := os.Stat(r.paths.RebootRequiredFile); err == nil {
+			out.RebootRequired = true
+		}
+	}
 
 	return out, nil
 }
@@ -345,8 +358,8 @@ func (r *Reader) isActive(ctx context.Context, unit string) string {
 
 // readsbAircraftJSON is the relevant subset of readsb's aircraft.json schema.
 type readsbAircraftJSON struct {
-	Now      float64 `json:"now"`
-	Messages int64   `json:"messages"`
+	Now      float64    `json:"now"`
+	Messages int64      `json:"messages"`
 	Aircraft []struct{} `json:"aircraft"`
 }
 

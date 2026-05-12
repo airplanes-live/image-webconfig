@@ -95,19 +95,20 @@ func newTestServer(t *testing.T) (*httptest.Server, *Server) {
 	}
 
 	priv := PrivilegedArgv{
-		ApplyFeed:     []string{"sudo-stub", "apl-feed", "apply", "--json", "--lock-timeout", "5"},
-		SchemaFeed:    []string{"apl-feed", "schema", "--json"},
-		Reboot:        []string{"sudo-stub", "reboot"},
-		Poweroff:      []string{"sudo-stub", "poweroff"},
-		StartUpdate:   []string{"sudo-stub", "update"},
-		RegisterClaim: []string{"sudo-stub", "systemctl", "start", "--no-block", "airplanes-claim.service"},
-		WifiList:      []string{"sudo-stub", "apl-wifi", "list", "--json"},
-		WifiAdd:       []string{"sudo-stub", "apl-wifi", "add", "--json"},
-		WifiUpdate:    []string{"sudo-stub", "apl-wifi", "update", "--json"},
-		WifiDelete:    []string{"sudo-stub", "apl-wifi", "delete", "--json"},
-		WifiTest:      []string{"sudo-stub", "apl-wifi", "test", "--json"},
-		WifiActivate:  []string{"sudo-stub", "apl-wifi", "activate", "--json"},
-		WifiStatus:    []string{"sudo-stub", "apl-wifi", "status", "--json"},
+		ApplyFeed:          []string{"sudo-stub", "apl-feed", "apply", "--json", "--lock-timeout", "5"},
+		SchemaFeed:         []string{"apl-feed", "schema", "--json"},
+		Reboot:             []string{"sudo-stub", "reboot"},
+		Poweroff:           []string{"sudo-stub", "poweroff"},
+		StartUpdate:        []string{"sudo-stub", "update"},
+		StartSystemUpgrade: []string{"sudo-stub", "system-upgrade"},
+		RegisterClaim:      []string{"sudo-stub", "systemctl", "start", "--no-block", "airplanes-claim.service"},
+		WifiList:           []string{"sudo-stub", "apl-wifi", "list", "--json"},
+		WifiAdd:            []string{"sudo-stub", "apl-wifi", "add", "--json"},
+		WifiUpdate:         []string{"sudo-stub", "apl-wifi", "update", "--json"},
+		WifiDelete:         []string{"sudo-stub", "apl-wifi", "delete", "--json"},
+		WifiTest:           []string{"sudo-stub", "apl-wifi", "test", "--json"},
+		WifiActivate:       []string{"sudo-stub", "apl-wifi", "activate", "--json"},
+		WifiStatus:         []string{"sudo-stub", "apl-wifi", "status", "--json"},
 	}
 
 	deps := Deps{
@@ -157,16 +158,17 @@ type stdinCall struct {
 // /api/reboot — it wires deterministic captures for both runners and
 // pre-authenticates the returned client.
 type writeHarness struct {
-	ts           *httptest.Server
-	client       *http.Client
-	feedEnvPath  string
-	mu           sync.Mutex
-	calls        [][]string
-	stdinCalls   []stdinCall
-	runnerErr    error                     // returned by captureRunner; tests override
-	runnerErrFor func(argv []string) error // optional: per-argv error; falls back to runnerErr when nil
-	stdinErr     error
-	stdinResult  wexec.Result
+	ts              *httptest.Server
+	client          *http.Client
+	feedEnvPath     string
+	mu              sync.Mutex
+	calls           [][]string
+	stdinCalls      []stdinCall
+	runnerErr       error                            // returned by captureRunner; tests override
+	runnerErrFor    func(argv []string) error        // optional: per-argv error; falls back to runnerErr when nil
+	runnerResultFor func(argv []string) wexec.Result // optional: per-argv canned Result (stdout+stderr); falls back to zero value
+	stdinErr        error
+	stdinResult     wexec.Result
 }
 
 func newWriteHarness(t *testing.T) *writeHarness {
@@ -202,8 +204,12 @@ func newWriteHarness(t *testing.T) *writeHarness {
 		} else {
 			err = h.runnerErr
 		}
+		var res wexec.Result
+		if h.runnerResultFor != nil {
+			res = h.runnerResultFor(argv)
+		}
 		h.mu.Unlock()
-		return wexec.Result{}, err
+		return res, err
 	}
 	captureStdinRunner := func(_ context.Context, argv []string, stdin io.Reader) (wexec.Result, error) {
 		body, _ := io.ReadAll(stdin)
@@ -216,19 +222,20 @@ func newWriteHarness(t *testing.T) *writeHarness {
 	}
 
 	priv := PrivilegedArgv{
-		ApplyFeed:     []string{"sudo-stub", "apl-feed", "apply", "--json", "--lock-timeout", "5"},
-		SchemaFeed:    []string{"apl-feed", "schema", "--json"},
-		Reboot:        []string{"sudo-stub", "reboot"},
-		Poweroff:      []string{"sudo-stub", "poweroff"},
-		StartUpdate:   []string{"sudo-stub", "update"},
-		RegisterClaim: []string{"sudo-stub", "systemctl", "start", "--no-block", "airplanes-claim.service"},
-		WifiList:      []string{"sudo-stub", "apl-wifi", "list", "--json"},
-		WifiAdd:       []string{"sudo-stub", "apl-wifi", "add", "--json"},
-		WifiUpdate:    []string{"sudo-stub", "apl-wifi", "update", "--json"},
-		WifiDelete:    []string{"sudo-stub", "apl-wifi", "delete", "--json"},
-		WifiTest:      []string{"sudo-stub", "apl-wifi", "test", "--json"},
-		WifiActivate:  []string{"sudo-stub", "apl-wifi", "activate", "--json"},
-		WifiStatus:    []string{"sudo-stub", "apl-wifi", "status", "--json"},
+		ApplyFeed:          []string{"sudo-stub", "apl-feed", "apply", "--json", "--lock-timeout", "5"},
+		SchemaFeed:         []string{"apl-feed", "schema", "--json"},
+		Reboot:             []string{"sudo-stub", "reboot"},
+		Poweroff:           []string{"sudo-stub", "poweroff"},
+		StartUpdate:        []string{"sudo-stub", "update"},
+		StartSystemUpgrade: []string{"sudo-stub", "system-upgrade"},
+		RegisterClaim:      []string{"sudo-stub", "systemctl", "start", "--no-block", "airplanes-claim.service"},
+		WifiList:           []string{"sudo-stub", "apl-wifi", "list", "--json"},
+		WifiAdd:            []string{"sudo-stub", "apl-wifi", "add", "--json"},
+		WifiUpdate:         []string{"sudo-stub", "apl-wifi", "update", "--json"},
+		WifiDelete:         []string{"sudo-stub", "apl-wifi", "delete", "--json"},
+		WifiTest:           []string{"sudo-stub", "apl-wifi", "test", "--json"},
+		WifiActivate:       []string{"sudo-stub", "apl-wifi", "activate", "--json"},
+		WifiStatus:         []string{"sudo-stub", "apl-wifi", "status", "--json"},
 	}
 
 	deps := Deps{
@@ -498,15 +505,183 @@ func TestUpdate_AlreadyRunning409(t *testing.T) {
 	t.Parallel()
 	h := newWriteHarness(t)
 	h.mu.Lock()
-	h.runnerErr = errors.New("Unit airplanes-update.service already exists")
+	// The handler runs `systemctl is-active` first (empty stdout → no unit
+	// active, proceed), then `sudo systemd-run ...`. Tag the systemd-run
+	// path with the "already exists" stderr so the handler's contains-check
+	// fires and maps to 409.
+	h.runnerErrFor = func(argv []string) error {
+		if len(argv) >= 2 && argv[1] == "update" {
+			return errors.New("systemd-run failed")
+		}
+		return nil
+	}
+	h.runnerResultFor = func(argv []string) wexec.Result {
+		if len(argv) >= 2 && argv[1] == "update" {
+			return wexec.Result{Stderr: []byte("Unit airplanes-update.service already exists")}
+		}
+		return wexec.Result{}
+	}
 	h.mu.Unlock()
 	r := postJSON(t, h.client, h.ts.URL+"/api/update", map[string]any{})
 	defer r.Body.Close()
-	// Stderr-based detection — we wired the captureRunner to return err
-	// only; the handler reads res.Stderr. Update the harness to return a
-	// stderr-bearing Result instead to exercise the 409 path properly.
-	if r.StatusCode != http.StatusInternalServerError && r.StatusCode != http.StatusConflict {
-		t.Fatalf("unexpected status = %d", r.StatusCode)
+	if r.StatusCode != http.StatusConflict {
+		t.Fatalf("status = %d, want 409", r.StatusCode)
+	}
+}
+
+func TestSystemUpgrade_RequiresAuth(t *testing.T) {
+	t.Parallel()
+	ts, _ := newTestServer(t)
+	c := httpClient(t)
+	r := postJSON(t, c, ts.URL+"/api/system-upgrade", map[string]any{})
+	defer r.Body.Close()
+	if r.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("status = %d", r.StatusCode)
+	}
+}
+
+func TestSystemUpgrade_HappyPathReturns202(t *testing.T) {
+	t.Parallel()
+	h := newWriteHarness(t)
+	r := postJSON(t, h.client, h.ts.URL+"/api/system-upgrade", map[string]any{})
+	defer r.Body.Close()
+	if r.StatusCode != http.StatusAccepted {
+		t.Fatalf("status = %d", r.StatusCode)
+	}
+	var got map[string]string
+	_ = json.NewDecoder(r.Body).Decode(&got)
+	if got["unit"] != "airplanes-system-upgrade.service" {
+		t.Errorf("unit = %q", got["unit"])
+	}
+}
+
+func TestSystemUpgrade_AlreadyRunning409(t *testing.T) {
+	t.Parallel()
+	h := newWriteHarness(t)
+	h.mu.Lock()
+	h.runnerErrFor = func(argv []string) error {
+		if len(argv) >= 2 && argv[1] == "system-upgrade" {
+			return errors.New("systemd-run failed")
+		}
+		return nil
+	}
+	h.runnerResultFor = func(argv []string) wexec.Result {
+		if len(argv) >= 2 && argv[1] == "system-upgrade" {
+			return wexec.Result{Stderr: []byte("Unit airplanes-system-upgrade.service already exists")}
+		}
+		return wexec.Result{}
+	}
+	h.mu.Unlock()
+	r := postJSON(t, h.client, h.ts.URL+"/api/system-upgrade", map[string]any{})
+	defer r.Body.Close()
+	if r.StatusCode != http.StatusConflict {
+		t.Fatalf("status = %d, want 409", r.StatusCode)
+	}
+}
+
+func TestSystemUpgrade_ArgvShape(t *testing.T) {
+	t.Parallel()
+	h := newWriteHarness(t)
+	r := postJSON(t, h.client, h.ts.URL+"/api/system-upgrade", map[string]any{})
+	defer r.Body.Close()
+	if r.StatusCode != http.StatusAccepted {
+		t.Fatalf("status = %d", r.StatusCode)
+	}
+	saw := false
+	for _, c := range h.callsCopy() {
+		if len(c) >= 2 && c[0] == "sudo-stub" && c[1] == "system-upgrade" {
+			saw = true
+		}
+	}
+	if !saw {
+		t.Errorf("system-upgrade argv not invoked; calls=%v", h.callsCopy())
+	}
+}
+
+// activeFor stubs `systemctl is-active u1 u2` to report "active" for the
+// named unit (mapped by position via maintenanceUnits) and "inactive" for
+// the other. Returns a wexec.Result with the multi-line stdout shape that
+// systemctl emits for multi-unit is-active calls.
+func activeFor(unit string) func([]string) wexec.Result {
+	return func(argv []string) wexec.Result {
+		if len(argv) < 2 || argv[1] != "is-active" {
+			return wexec.Result{}
+		}
+		var lines []string
+		for _, u := range argv[2:] {
+			if u == unit {
+				lines = append(lines, "active")
+			} else {
+				lines = append(lines, "inactive")
+			}
+		}
+		return wexec.Result{Stdout: []byte(strings.Join(lines, "\n") + "\n")}
+	}
+}
+
+func TestUpdate_RefusedDuringSystemUpgrade(t *testing.T) {
+	t.Parallel()
+	h := newWriteHarness(t)
+	h.mu.Lock()
+	h.runnerResultFor = activeFor("airplanes-system-upgrade.service")
+	h.mu.Unlock()
+	r := postJSON(t, h.client, h.ts.URL+"/api/update", map[string]any{})
+	defer r.Body.Close()
+	if r.StatusCode != http.StatusConflict {
+		t.Fatalf("status = %d, want 409", r.StatusCode)
+	}
+	// systemd-run argv must not have been invoked.
+	for _, c := range h.callsCopy() {
+		if len(c) >= 2 && c[1] == "update" {
+			t.Fatalf("StartUpdate argv invoked despite 409: %v", c)
+		}
+	}
+}
+
+func TestSystemUpgrade_RefusedDuringFeedUpdate(t *testing.T) {
+	t.Parallel()
+	h := newWriteHarness(t)
+	h.mu.Lock()
+	h.runnerResultFor = activeFor("airplanes-update.service")
+	h.mu.Unlock()
+	r := postJSON(t, h.client, h.ts.URL+"/api/system-upgrade", map[string]any{})
+	defer r.Body.Close()
+	if r.StatusCode != http.StatusConflict {
+		t.Fatalf("status = %d, want 409", r.StatusCode)
+	}
+	for _, c := range h.callsCopy() {
+		if len(c) >= 2 && c[1] == "system-upgrade" {
+			t.Fatalf("StartSystemUpgrade argv invoked despite 409: %v", c)
+		}
+	}
+}
+
+func TestReboot_RefusedDuringMaintenance(t *testing.T) {
+	t.Parallel()
+	for _, unit := range []string{
+		"airplanes-system-upgrade.service",
+		"airplanes-update.service",
+	} {
+		unit := unit
+		t.Run(unit, func(t *testing.T) {
+			t.Parallel()
+			h := newWriteHarness(t)
+			h.mu.Lock()
+			h.runnerResultFor = activeFor(unit)
+			h.mu.Unlock()
+			r := postJSON(t, h.client, h.ts.URL+"/api/reboot", map[string]any{})
+			defer r.Body.Close()
+			if r.StatusCode != http.StatusConflict {
+				t.Fatalf("status = %d, want 409", r.StatusCode)
+			}
+			// Reboot argv must not be in the call list.
+			time.Sleep(50 * time.Millisecond) // race-buffer; goroutine should NOT fire
+			for _, c := range h.callsCopy() {
+				if len(c) >= 2 && c[1] == "reboot" {
+					t.Fatalf("reboot argv invoked despite 409: %v", c)
+				}
+			}
+		})
 	}
 }
 
@@ -529,22 +704,24 @@ func TestReboot_AuthedReturns202(t *testing.T) {
 	if r.StatusCode != http.StatusAccepted {
 		t.Fatalf("status = %d", r.StatusCode)
 	}
-	// Reboot is fired async; give the goroutine a moment to record the call.
+	// The handler runs a synchronous `systemctl is-active` guard before
+	// firing the async reboot goroutine (250ms delay). Wait specifically
+	// for the reboot argv to appear, not just any call.
+	saw := false
 	for i := 0; i < 100; i++ {
-		if len(h.callsCopy()) > 0 {
+		for _, c := range h.callsCopy() {
+			if len(c) >= 2 && c[1] == "reboot" {
+				saw = true
+				break
+			}
+		}
+		if saw {
 			break
 		}
 		time.Sleep(5 * time.Millisecond)
 	}
-	calls := h.callsCopy()
-	saw := false
-	for _, c := range calls {
-		if len(c) >= 2 && c[1] == "reboot" {
-			saw = true
-		}
-	}
 	if !saw {
-		t.Errorf("reboot argv not invoked; calls=%v", calls)
+		t.Errorf("reboot argv not invoked; calls=%v", h.callsCopy())
 	}
 }
 
@@ -567,23 +744,53 @@ func TestPoweroff_AuthedReturns202(t *testing.T) {
 	if r.StatusCode != http.StatusAccepted {
 		t.Fatalf("status = %d", r.StatusCode)
 	}
-	// Poweroff is fired async; give the goroutine a moment to record the call.
+	// The handler runs a synchronous `systemctl is-active` guard before
+	// firing the async poweroff goroutine (250ms delay). Wait specifically
+	// for the poweroff argv to appear, not just any call.
 	want := []string{"sudo-stub", "poweroff"}
+	saw := false
 	for i := 0; i < 100; i++ {
-		if len(h.callsCopy()) > 0 {
+		for _, c := range h.callsCopy() {
+			if reflect.DeepEqual(c, want) {
+				saw = true
+				break
+			}
+		}
+		if saw {
 			break
 		}
 		time.Sleep(5 * time.Millisecond)
 	}
-	calls := h.callsCopy()
-	saw := false
-	for _, c := range calls {
-		if reflect.DeepEqual(c, want) {
-			saw = true
-		}
-	}
 	if !saw {
-		t.Errorf("poweroff argv not invoked; calls=%v", calls)
+		t.Errorf("poweroff argv not invoked; calls=%v", h.callsCopy())
+	}
+}
+
+func TestPoweroff_RefusedDuringMaintenance(t *testing.T) {
+	t.Parallel()
+	for _, unit := range []string{
+		"airplanes-system-upgrade.service",
+		"airplanes-update.service",
+	} {
+		unit := unit
+		t.Run(unit, func(t *testing.T) {
+			t.Parallel()
+			h := newWriteHarness(t)
+			h.mu.Lock()
+			h.runnerResultFor = activeFor(unit)
+			h.mu.Unlock()
+			r := postJSON(t, h.client, h.ts.URL+"/api/poweroff", map[string]any{})
+			defer r.Body.Close()
+			if r.StatusCode != http.StatusConflict {
+				t.Fatalf("status = %d, want 409", r.StatusCode)
+			}
+			time.Sleep(50 * time.Millisecond)
+			for _, c := range h.callsCopy() {
+				if len(c) >= 2 && c[1] == "poweroff" {
+					t.Fatalf("poweroff argv invoked despite 409: %v", c)
+				}
+			}
+		})
 	}
 }
 
@@ -1276,6 +1483,45 @@ func TestLog_KnownUnitStreamsSSE(t *testing.T) {
 	body, _ := io.ReadAll(resp.Body)
 	if !strings.Contains(string(body), "data: test-log-line") {
 		t.Errorf("SSE body missing test-log-line: %q", body)
+	}
+}
+
+// TestDefaultPrivilegedArgv_SudoersParity guards against drift between the
+// production argv shapes and the sudoers entries that authorize them. The
+// argv tail (after the `/usr/bin/sudo -n` prefix) must match the sudoers
+// command-spec byte-for-byte, otherwise sudo refuses the call at runtime.
+func TestDefaultPrivilegedArgv_SudoersParity(t *testing.T) {
+	t.Parallel()
+	sudoersPath := filepath.Join("..", "..", "..", "stage-airplanes", "05-install-webconfig", "files", "etc", "sudoers.d", "010_airplanes-webconfig")
+	raw, err := os.ReadFile(sudoersPath)
+	if err != nil {
+		t.Fatalf("read sudoers: %v", err)
+	}
+	sudoers := string(raw)
+
+	priv := DefaultPrivilegedArgv()
+	cases := []struct {
+		label string
+		argv  []string
+	}{
+		{"ApplyFeed", priv.ApplyFeed},
+		{"Reboot", priv.Reboot},
+		{"Poweroff", priv.Poweroff},
+		{"StartUpdate", priv.StartUpdate},
+		{"StartSystemUpgrade", priv.StartSystemUpgrade},
+	}
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.label, func(t *testing.T) {
+			t.Parallel()
+			if len(tc.argv) < 3 || tc.argv[0] != "/usr/bin/sudo" || tc.argv[1] != "-n" {
+				t.Fatalf("%s: argv must start with /usr/bin/sudo -n, got %v", tc.label, tc.argv)
+			}
+			tail := strings.Join(tc.argv[2:], " ")
+			if !strings.Contains(sudoers, tail) {
+				t.Errorf("%s: argv tail not present in sudoers: %q", tc.label, tail)
+			}
+		})
 	}
 }
 

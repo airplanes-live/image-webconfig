@@ -40,8 +40,9 @@
         "dump978":   "dump978-fa.service",
         "uat":       "airplanes-978.service",
         "claim":     "airplanes-claim.service",
-        "webconfig": "airplanes-webconfig.service",
-        "update":    "airplanes-update.service",
+        "webconfig":      "airplanes-webconfig.service",
+        "update":         "airplanes-update.service",
+        "system-upgrade": "airplanes-system-upgrade.service",
     };
     const UNIT_TO_LOG_SLUG = Object.fromEntries(
         Object.entries(LOG_SLUG_TO_UNIT).map(([s, u]) => [u, s])
@@ -1250,6 +1251,32 @@
 
     // ===== Action row =====
 
+    // requestReboot POSTs /api/reboot and handles 409 (server refuses while
+    // a maintenance unit is busy) and other failures uniformly. On 202 it
+    // navigates to the "Rebooting…" card. Used by both the action-row button
+    // and the reboot-required banner.
+    async function requestReboot(triggerBtn, confirmFirst) {
+        if (confirmFirst && !confirm("Reboot the feeder now?")) return;
+        if (triggerBtn) {
+            triggerBtn.disabled = true;
+            triggerBtn.textContent = "Rebooting…";
+        }
+        const r = await postJSON("/api/reboot", {});
+        if (handleAuthFailure(r)) return;
+        if (!r.ok) {
+            if (triggerBtn) {
+                triggerBtn.disabled = false;
+                triggerBtn.textContent = "Reboot";
+            }
+            alert((r.payload && r.payload.error) || "reboot failed");
+            return;
+        }
+        navigate(() => render(el("div", { class: "wc-card" },
+            el("h2", {}, "Rebooting…"),
+            el("p", {}, "The feeder is restarting. This page will go offline for ~30 seconds."),
+        )), { title: "Rebooting", showBack: false });
+    }
+
     function buildActionsRow() {
         const updateBtn = el("button", {
             type: "button", class: "wc-btn-ghost",
@@ -1271,6 +1298,26 @@
             onclick: () => navigate(() => logViewer("update"), { title: "Update log", showBack: true }),
         }, "Update log");
 
+        const sysUpgradeBtn = el("button", {
+            type: "button", class: "wc-btn-ghost",
+            onclick: async () => {
+                sysUpgradeBtn.disabled = true;
+                const r = await postJSON("/api/system-upgrade", {});
+                sysUpgradeBtn.disabled = false;
+                if (handleAuthFailure(r)) return;
+                if (!r.ok) {
+                    alert((r.payload && r.payload.error) || "system upgrade failed");
+                    return;
+                }
+                navigate(() => logViewer("system-upgrade"), { title: "System upgrade log", showBack: true });
+            },
+        }, "Update system packages");
+
+        const sysUpgradeLog = el("button", {
+            type: "button", class: "wc-btn-ghost",
+            onclick: () => navigate(() => logViewer("system-upgrade"), { title: "System upgrade log", showBack: true }),
+        }, "System upgrade log");
+
         const change = el("button", {
             type: "button", class: "wc-btn-ghost",
             onclick: () => navigate(changePasswordPanel, { title: "Change password", showBack: true }),
@@ -1278,16 +1325,7 @@
 
         const rebootBtn = el("button", {
             type: "button", class: "wc-btn-danger",
-            onclick: async () => {
-                if (!confirm("Reboot the feeder now?")) return;
-                rebootBtn.disabled = true;
-                rebootBtn.textContent = "Rebooting…";
-                await postJSON("/api/reboot", {});
-                navigate(() => render(el("div", { class: "wc-card" },
-                    el("h2", {}, "Rebooting…"),
-                    el("p", {}, "The feeder is restarting. This page will go offline for ~30 seconds."),
-                )), { title: "Rebooting", showBack: false });
-            },
+            onclick: () => requestReboot(rebootBtn, true),
         }, "Reboot");
 
         const poweroffBtn = el("button", {
@@ -1305,7 +1343,7 @@
             onclick: () => navigate(wifiPanel, { title: "Wi-Fi networks", showBack: true }),
         }, "Wi-Fi networks");
 
-        return el("div", { class: "actions" }, updateBtn, updateLog, wifiBtn, change, rebootBtn, poweroffBtn, logout);
+        return el("div", { class: "actions" }, updateBtn, updateLog, sysUpgradeBtn, sysUpgradeLog, wifiBtn, change, rebootBtn, poweroffBtn, logout);
     }
 
     // ===== Wi-Fi panel =====
@@ -1563,6 +1601,33 @@
         );
     }
 
+    // buildRebootBannerSlot returns an empty container that the dashboard
+    // mounts at the top of the render tree. updateRebootBanner toggles its
+    // contents based on the /api/status reboot_required flag — invisible
+    // when false, yellow banner with a Reboot button when true.
+    function buildRebootBannerSlot() {
+        return el("div", { class: "wc-reboot-slot" });
+    }
+
+    function updateRebootBanner(slot, rebootRequired) {
+        if (!slot) return;
+        if (!rebootRequired) {
+            slot.replaceChildren();
+            return;
+        }
+        // Already rendered: don't rebuild the DOM (and lose the button's
+        // event handler context) on each 30s poll. Detect by checking the
+        // slot already has children. replaceChildren() above is the only
+        // path that clears it, so this stays in sync with the actual DOM.
+        if (slot.firstChild) return;
+        const btn = el("button", { type: "button", class: "wc-btn-danger" }, "Reboot now");
+        btn.onclick = () => requestReboot(btn, false);
+        slot.replaceChildren(el("div", { class: "wc-flash wc-flash--warn" },
+            el("span", {}, "A reboot is required to finish applying system updates."),
+            btn,
+        ));
+    }
+
     // ===== Dashboard =====
 
     async function dashboard() {
@@ -1575,9 +1640,11 @@
         const configCard = el("section", { class: "wc-card" }, el("h2", {}, "Configuration"), configBody);
 
         const flashNode = buildFlashNode(consumePendingFlash());
+        const rebootBanner = buildRebootBannerSlot();
         const renderArgs = [];
         if (flashNode) renderArgs.push(flashNode);
         renderArgs.push(
+            rebootBanner,
             heroEl.root,
             tileGrid.root,
             el("div", { class: "wc-split" }, identityCard, configCard),
@@ -1586,7 +1653,7 @@
         render.apply(null, renderArgs);
 
         const ctx = {
-            heroEl, tileGrid, identityBody, configBody,
+            heroEl, tileGrid, identityBody, configBody, rebootBanner,
             configValues: {},
             lastIdentity: null,
             configDirty: false,
@@ -1610,6 +1677,7 @@
         updateHero(heroEl, status, ctx.configValues);
         updateTiles(tileGrid, status, ctx.configValues);
         updateAppTiles(tileGrid);
+        updateRebootBanner(rebootBanner, !!(status && status.payload && status.payload.reboot_required));
 
         // Track unsaved config edits so the header refresh button can
         // prompt before discarding them. Initial-render value attributes
@@ -1644,6 +1712,7 @@
         updateHero(ctx.heroEl, status, ctx.configValues);
         updateTiles(ctx.tileGrid, status, ctx.configValues);
         updateAppTiles(ctx.tileGrid);
+        updateRebootBanner(ctx.rebootBanner, !!(status && status.payload && status.payload.reboot_required));
 
         const idPayload = identity && identity.payload ? identity.payload : null;
         if (idPayload && identityChanged(ctx.lastIdentity, idPayload)) {

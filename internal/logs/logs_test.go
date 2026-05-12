@@ -18,14 +18,15 @@ import (
 func TestResolve_Whitelist(t *testing.T) {
 	t.Parallel()
 	cases := map[string]string{
-		"feed":      "airplanes-feed.service",
-		"mlat":      "airplanes-mlat.service",
-		"readsb":    "readsb.service",
-		"dump978":   "dump978-fa.service",
-		"uat":       "airplanes-978.service",
-		"claim":     "airplanes-claim.service",
-		"webconfig": "airplanes-webconfig.service",
-		"update":    "airplanes-update.service",
+		"feed":           "airplanes-feed.service",
+		"mlat":           "airplanes-mlat.service",
+		"readsb":         "readsb.service",
+		"dump978":        "dump978-fa.service",
+		"uat":            "airplanes-978.service",
+		"claim":          "airplanes-claim.service",
+		"webconfig":      "airplanes-webconfig.service",
+		"update":         "airplanes-update.service",
+		"system-upgrade": "airplanes-system-upgrade.service",
 	}
 	for slug, want := range cases {
 		got, err := Resolve(slug)
@@ -100,7 +101,7 @@ func TestServeSSE_StreamsLines(t *testing.T) {
 // exercise the runtime guard.
 type nonFlushingRW struct{ header http.Header }
 
-func (n *nonFlushingRW) Header() http.Header        { return n.header }
+func (n *nonFlushingRW) Header() http.Header         { return n.header }
 func (n *nonFlushingRW) Write(p []byte) (int, error) { return len(p), nil }
 func (n *nonFlushingRW) WriteHeader(int)             {}
 
@@ -132,10 +133,10 @@ type deadlineRecordingRW struct {
 	deadlines []time.Time
 }
 
-func (r *deadlineRecordingRW) Header() http.Header                  { return r.header }
-func (r *deadlineRecordingRW) Write(p []byte) (int, error)          { return len(p), nil }
-func (r *deadlineRecordingRW) WriteHeader(int)                      {}
-func (r *deadlineRecordingRW) Flush()                               {}
+func (r *deadlineRecordingRW) Header() http.Header         { return r.header }
+func (r *deadlineRecordingRW) Write(p []byte) (int, error) { return len(p), nil }
+func (r *deadlineRecordingRW) WriteHeader(int)             {}
+func (r *deadlineRecordingRW) Flush()                      {}
 func (r *deadlineRecordingRW) SetWriteDeadline(t time.Time) error {
 	r.deadlines = append(r.deadlines, t)
 	return nil

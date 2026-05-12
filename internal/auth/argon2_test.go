@@ -92,12 +92,12 @@ func TestVerify_RejectsMalformedPHC(t *testing.T) {
 	cases := []string{
 		"",
 		"not-a-phc",
-		"$argon2i$v=19$m=8,t=1,p=1$YWFhYWFhYWFhYWFhYWFhYQ$YWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWE", // wrong algo
-		"$argon2id$v=18$m=8,t=1,p=1$YWFhYWFhYWFhYWFhYWFhYQ$YWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWE", // wrong version
-		"$argon2id$v=19$m=8,t=1$YWFhYWFhYWFhYWFhYWFhYQ$YWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWE",     // missing p param
+		"$argon2i$v=19$m=8,t=1,p=1$YWFhYWFhYWFhYWFhYWFhYQ$YWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWE",      // wrong algo
+		"$argon2id$v=18$m=8,t=1,p=1$YWFhYWFhYWFhYWFhYWFhYQ$YWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWE",     // wrong version
+		"$argon2id$v=19$m=8,t=1$YWFhYWFhYWFhYWFhYWFhYQ$YWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWE",         // missing p param
 		"$argon2id$v=19$m=8,t=1,p=1,x=2$YWFhYWFhYWFhYWFhYWFhYQ$YWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWE", // unknown param
-		"$argon2id$v=19$m=8,t=1,p=1$!!!notbase64!!!$YWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWE",      // bad salt b64
-		"$argon2id$v=19$m=8,t=1,p=1$YWFhYWFhYWFhYWFhYWFhYQ$short",                                              // short hash
+		"$argon2id$v=19$m=8,t=1,p=1$!!!notbase64!!!$YWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWE",            // bad salt b64
+		"$argon2id$v=19$m=8,t=1,p=1$YWFhYWFhYWFhYWFhYWFhYQ$short",                                                   // short hash
 	}
 	for _, phc := range cases {
 		ok, err := Verify("pw", phc)
