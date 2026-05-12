@@ -468,9 +468,10 @@ func TestConfigPost_UnknownKeyRejectedPreShellout(t *testing.T) {
 
 // PR 4 retired reconcile978On/Off. Both 978 services now restart on every
 // /api/config POST, regardless of UAT_INPUT direction; the daemons self-decide
-// from UAT_INPUT and exit 64 (intentional failed-terminal) when not requested.
-// systemctl restart returns 0 once the start job is dispatched, so the
-// pending_restart payload stays empty on the disable transition.
+// from UAT_INPUT and either exec the daemon, sleep (disabled), or exit 64
+// (misconfigured input) when not requested. systemctl restart returns 0
+// once the start job is dispatched, so the pending_restart payload stays
+// empty on the disable transition.
 
 // pending_restart surfaces 978 unit failures alongside feed/mlat. Confirms
 // that both 978 entries land in the response when their restart fails.

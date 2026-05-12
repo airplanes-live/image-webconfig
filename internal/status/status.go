@@ -264,10 +264,10 @@ func (r *Reader) Read(ctx context.Context) (Status, error) {
 
 // readMlatDecision reads the airplanes-mlat daemon's published decision.
 // Consulted when the unit is active|activating|reloading (state file is
-// fresh) OR failed with ExecMainStatus=64 (the strict misconfig fail; the
-// state file persists across the failed terminal state via
-// RuntimeDirectoryPreserve=yes per feed PR 1+2). Returns nil for any
-// other state (consumer falls back to systemd-only classification).
+// fresh) OR failed with ExecMainStatus=64 (the strict-misconfig branch
+// in the wrapper exits 64; RuntimeDirectoryPreserve=yes keeps the
+// state file alive across that failure per feed PR 1+2). Returns nil
+// for any other state (consumer falls back to systemd-only classification).
 func (r *Reader) readMlatDecision(ctx context.Context, svcState string) *Decision {
 	consult := false
 	switch svcState {
@@ -297,11 +297,11 @@ func (r *Reader) readFeedDecision(svcState string) *Decision {
 
 // readUATDecision reads the airplanes-978 daemon's published decision.
 // Same consultation rule as MLAT (active|activating|reloading OR failed
-// with ExecMainStatus=64): when UAT_INPUT is empty/invalid, the wrapper
-// writes state=disabled or state=misconfigured then exits 64, and
-// RuntimeDirectoryPreserve=yes keeps the file across the failed terminal
-// state. Returns nil otherwise so consumers fall back to UAT_INPUT-truthy
-// classification (the prior behavior).
+// with ExecMainStatus=64): the uat_disabled wrapper branch writes
+// state=disabled then sleeps (unit stays active), so we hit the active
+// branch in normal use; the uat_input_invalid branch exits 64 and
+// surfaces via the failed branch. Returns nil otherwise so consumers
+// fall back to UAT_INPUT-truthy classification (the prior behavior).
 func (r *Reader) readUATDecision(ctx context.Context, svcState string) *Decision {
 	consult := false
 	switch svcState {
@@ -319,10 +319,11 @@ func (r *Reader) readUATDecision(ctx context.Context, svcState string) *Decision
 }
 
 // readDump978FADecision reads dump978-fa.sh's published decision. Same
-// consult rule as the other 64-exit self-disable wrappers. The
-// no_hardware reason is the new state-machine entry from the wrapper's
-// USB-serial probe — dashboards should render it as an "SDR absent" tile
-// rather than a generic failure.
+// consult rule as the other wrappers (active branch covers the
+// disabled/sleeping path; failed-with-status-64 covers misconfigured
+// input). The no_hardware reason comes from the wrapper's non-mutating
+// USB-serial probe — dashboards should render it as an "SDR absent"
+// tile rather than a generic failure.
 func (r *Reader) readDump978FADecision(ctx context.Context, svcState string) *Decision {
 	consult := false
 	switch svcState {
