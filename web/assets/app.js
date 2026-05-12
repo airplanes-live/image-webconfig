@@ -284,28 +284,30 @@
         return null;
     }
 
-    // Mirror the Go validators in configspec.go. Lat/lon are accepted by
-    // strconv.ParseFloat on the server, which permits leading "+", a
-    // bare leading ".", and scientific notation — anything Number() also
-    // accepts. Number()+isFinite() catches the rejection-class values
-    // (NaN, Infinity, "52abc" → NaN). Empty/whitespace fail explicitly.
-    // parseFloat is intentionally avoided — parseFloat("52abc") returns
-    // 52, which would let "52abc" sneak past.
+    // Mirror the bash validators in feed/scripts/lib/configure-validators.sh.
+    // apl-feed apply is the authoritative server-side gate; the JS preview
+    // here only suppresses Save while the user is editing. A JS-vs-bash
+    // mismatch surfaces as "looks valid in the form but save failed", so
+    // these regexes must match the bash side byte-for-byte. Pinned by
+    // test/test_validator_parity.sh.
     //
-    // Altitude is stricter on both sides: a regex anchored to a numeric
-    // prefix + optional m|ft suffix. Mirrors altitudeRE in configspec.go.
-    const altitudeRE = /^(-?\d+(?:\.\d+)?)(m|ft)?$/;
+    // The /* @validator-parity */ markers delimit the block exported to
+    // the parity test; keep them flanking exactly the shared symbols.
+
+    /* @validator-parity start */
+    const latLonRE = /^[+-]?\d+(?:\.\d+)?$/;
+    const altitudeRE = /^(-?\d+(?:\.\d+)?)(?:m|ft)?$/;
 
     function isValidLatitude(v) {
         const s = (v || "").trim();
-        if (s === "") return false;
+        if (!latLonRE.test(s)) return false;
         const f = Number(s);
         if (!Number.isFinite(f)) return false;
         return f >= -90 && f <= 90;
     }
     function isValidLongitude(v) {
         const s = (v || "").trim();
-        if (s === "") return false;
+        if (!latLonRE.test(s)) return false;
         const f = Number(s);
         if (!Number.isFinite(f)) return false;
         return f >= -180 && f <= 180;
@@ -317,6 +319,7 @@
         const f = Number(m[1]);
         return Number.isFinite(f) && f >= -1000 && f <= 10000;
     }
+    /* @validator-parity end */
 
     // previewLatLonSet — projection of unsaved form values onto the
     // daemon's "would MLAT be enabled?" rule. Used ONLY for the form-time
