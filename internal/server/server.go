@@ -51,6 +51,7 @@ type PrivilegedArgv struct {
 	Poweroff           []string // sudo -n /usr/bin/systemctl poweroff
 	StartUpdate        []string // sudo systemd-run --unit=airplanes-update ...
 	StartSystemUpgrade []string // sudo systemd-run --unit=airplanes-system-upgrade ...
+	RegisterClaim      []string // sudo systemctl start --no-block airplanes-claim.service
 }
 
 // DefaultPrivilegedArgv returns the production argv shapes for the
@@ -83,6 +84,12 @@ func DefaultPrivilegedArgv() PrivilegedArgv {
 			"--collect",
 			"/usr/local/lib/airplanes-webconfig/system-upgrade.sh",
 		),
+		// --no-block: the unit is Type=oneshot and apl-feed claim register
+		// retries on network failure for up to ~15s. A blocking start could
+		// exceed systemctlTimeout; --no-block enqueues the job and returns
+		// immediately. Progress and failures show up in the claim activity
+		// log via the SSE stream the SPA opens after this returns.
+		RegisterClaim: sudo("/usr/bin/systemctl", "start", "--no-block", "airplanes-claim.service"),
 	}
 }
 
@@ -153,6 +160,7 @@ func New(d Deps) http.Handler {
 	mux.HandleFunc("POST /api/system-upgrade", s.requireSession(s.handleSystemUpgrade))
 	mux.HandleFunc("POST /api/reboot", s.requireSession(s.handleReboot))
 	mux.HandleFunc("POST /api/poweroff", s.requireSession(s.handlePoweroff))
+	mux.HandleFunc("POST /api/claim/register", s.requireSession(s.handleClaimRegister))
 
 	// Static assets at /static/*; the SPA shell is served by the GET /
 	// handler below. no-store cache policy: assets are embedded in the

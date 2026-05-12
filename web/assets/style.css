@@ -678,20 +678,38 @@ textarea:focus {
   font-family: var(--wc-font-mono);
   font-size: 0.95rem;
 }
-.config-form label code { font-size: 0.75em; color: var(--wc-ink-3); }
 .config-form button[type="submit"] { width: 100%; margin-top: 0.5rem; }
 
-.config-list {
-  display: grid;
-  grid-template-columns: max-content 1fr;
-  gap: 0.25rem 0.75rem;
-  margin: 0;
-  font-size: 0.9rem;
+.config-fieldset {
+  border: 1px solid var(--wc-line-soft);
+  border-radius: var(--wc-radius-sm);
+  padding: 0.75rem 1rem 0.5rem;
+  margin: 0 0 1rem;
 }
-.config-list dt { font-weight: 500; color: var(--wc-ink-3); }
-.config-list dd {
-  margin: 0;
-  word-break: break-all;
+.config-fieldset > legend {
+  padding: 0 0.5rem;
+  font-weight: 500;
+  color: var(--wc-ink-1);
+}
+.config-fieldset .help {
+  margin: 0 0 0.75rem;
+  color: var(--wc-ink-3);
+  font-size: 0.85rem;
+}
+.config-fieldset .help a { color: var(--wc-ink-2); }
+.config-fieldset .help code {
+  font-family: var(--wc-font-mono);
+  color: var(--wc-ink-2);
+}
+
+.location-card {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
+  margin-bottom: 0.25rem;
+}
+.location-card .location-summary {
   font-family: var(--wc-font-mono);
   color: var(--wc-ink-1);
 }
@@ -711,13 +729,6 @@ textarea:focus {
   font-size: 0.8rem;
   white-space: pre-wrap;
   word-break: break-all;
-}
-
-details { margin-top: 1rem; }
-details summary {
-  cursor: pointer;
-  color: var(--wc-ink-2);
-  font-weight: 500;
 }
 
 /* ========== Two-column responsive split (identity + config) ========== */

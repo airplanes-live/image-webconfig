@@ -101,6 +101,7 @@ func newTestServer(t *testing.T) (*httptest.Server, *Server) {
 		Poweroff:           []string{"sudo-stub", "poweroff"},
 		StartUpdate:        []string{"sudo-stub", "update"},
 		StartSystemUpgrade: []string{"sudo-stub", "system-upgrade"},
+		RegisterClaim:      []string{"sudo-stub", "systemctl", "start", "--no-block", "airplanes-claim.service"},
 	}
 
 	deps := Deps{
@@ -220,6 +221,7 @@ func newWriteHarness(t *testing.T) *writeHarness {
 		Poweroff:           []string{"sudo-stub", "poweroff"},
 		StartUpdate:        []string{"sudo-stub", "update"},
 		StartSystemUpgrade: []string{"sudo-stub", "system-upgrade"},
+		RegisterClaim:      []string{"sudo-stub", "systemctl", "start", "--no-block", "airplanes-claim.service"},
 	}
 
 	deps := Deps{
@@ -788,6 +790,58 @@ func TestDefaultPrivilegedArgv_Poweroff(t *testing.T) {
 	got := DefaultPrivilegedArgv().Poweroff
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("Poweroff = %v, want %v", got, want)
+	}
+}
+
+func TestClaimRegister_RequiresAuth(t *testing.T) {
+	t.Parallel()
+	ts, _ := newTestServer(t)
+	c := httpClient(t)
+	r := postJSON(t, c, ts.URL+"/api/claim/register", map[string]any{})
+	defer r.Body.Close()
+	if r.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("status = %d", r.StatusCode)
+	}
+}
+
+func TestClaimRegister_AuthedReturns202(t *testing.T) {
+	t.Parallel()
+	h := newWriteHarness(t)
+	r := postJSON(t, h.client, h.ts.URL+"/api/claim/register", map[string]any{})
+	defer r.Body.Close()
+	if r.StatusCode != http.StatusAccepted {
+		t.Fatalf("status = %d", r.StatusCode)
+	}
+	var got map[string]string
+	_ = json.NewDecoder(r.Body).Decode(&got)
+	if got["unit"] != "airplanes-claim.service" {
+		t.Errorf("unit = %q", got["unit"])
+	}
+	// Compare the full argv: position-based checks let a regression in the
+	// sudo prefix (e.g. dropping -n or sudo) slip through silently.
+	want := []string{"sudo-stub", "systemctl", "start", "--no-block", "airplanes-claim.service"}
+	calls := h.callsCopy()
+	saw := false
+	for _, c := range calls {
+		if reflect.DeepEqual(c, want) {
+			saw = true
+		}
+	}
+	if !saw {
+		t.Errorf("claim-register argv %v not invoked; calls=%v", want, calls)
+	}
+}
+
+func TestClaimRegister_RunnerErrorReturns500(t *testing.T) {
+	t.Parallel()
+	h := newWriteHarness(t)
+	h.mu.Lock()
+	h.runnerErr = errors.New("Failed to start airplanes-claim.service")
+	h.mu.Unlock()
+	r := postJSON(t, h.client, h.ts.URL+"/api/claim/register", map[string]any{})
+	defer r.Body.Close()
+	if r.StatusCode != http.StatusInternalServerError {
+		t.Fatalf("status = %d", r.StatusCode)
 	}
 }
 
