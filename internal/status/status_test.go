@@ -12,6 +12,7 @@ import (
 	"time"
 
 	wexec "github.com/airplanes-live/image/webconfig/internal/exec"
+	"github.com/airplanes-live/image/webconfig/internal/pihealth"
 )
 
 func newTestPaths(t *testing.T) (Paths, string) {
@@ -489,5 +490,52 @@ func TestRead_UATDecisionRejectsCrossOwnerReason(t *testing.T) {
 	got, _ := r.Read(context.Background())
 	if got.UATDecision != nil {
 		t.Errorf("UATDecision = %+v, want nil (mlat_enabled_false is not a valid 978 reason)", got.UATDecision)
+	}
+}
+
+// stubPiHealthProbe returns a fixed *pihealth.PiHealth.
+type stubPiHealthProbe struct{ payload *pihealth.PiHealth }
+
+func (s stubPiHealthProbe) Probe(_ context.Context) *pihealth.PiHealth { return s.payload }
+
+func TestRead_PiHealthEmbedded(t *testing.T) {
+	t.Parallel()
+	p, _ := newTestPaths(t)
+	payload := &pihealth.PiHealth{
+		Severity:       "ok",
+		Summary:        "healthy · 56°C",
+		IsRaspberryPi:  true,
+		ThrottleProbed: true,
+		TempProbed:     true,
+		CPUTempCelsius: 56,
+	}
+	r := NewReader("v", p, fixedRunner("active", nil), WithPiHealth(stubPiHealthProbe{payload}))
+	got, err := r.Read(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.PiHealth == nil {
+		t.Fatal("PiHealth = nil, want populated")
+	}
+	if got.PiHealth.Summary != "healthy · 56°C" {
+		t.Errorf("PiHealth.Summary = %q", got.PiHealth.Summary)
+	}
+	blob, _ := json.Marshal(got)
+	if !strings.Contains(string(blob), `"pi_health"`) {
+		t.Errorf("marshaled JSON missing pi_health field: %s", blob)
+	}
+}
+
+func TestRead_NoPiHealthOption_OmitsField(t *testing.T) {
+	t.Parallel()
+	p, _ := newTestPaths(t)
+	r := NewReader("v", p, fixedRunner("active", nil))
+	got, _ := r.Read(context.Background())
+	if got.PiHealth != nil {
+		t.Errorf("PiHealth = %+v, want nil (no WithPiHealth)", got.PiHealth)
+	}
+	blob, _ := json.Marshal(got)
+	if strings.Contains(string(blob), `"pi_health"`) {
+		t.Errorf("marshaled JSON should omit pi_health: %s", blob)
 	}
 }

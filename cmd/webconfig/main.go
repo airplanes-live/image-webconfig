@@ -19,6 +19,7 @@ import (
 	"github.com/airplanes-live/image/webconfig/internal/feedenv"
 	"github.com/airplanes-live/image/webconfig/internal/identity"
 	"github.com/airplanes-live/image/webconfig/internal/logs"
+	"github.com/airplanes-live/image/webconfig/internal/pihealth"
 	"github.com/airplanes-live/image/webconfig/internal/schemacache"
 	"github.com/airplanes-live/image/webconfig/internal/server"
 	"github.com/airplanes-live/image/webconfig/internal/status"
@@ -94,7 +95,13 @@ func main() {
 			Argon2Params: params,
 			Identity:     identity.NewReader(identity.DefaultPaths()),
 			FeedEnv:      feedenv.New(),
-			Status:       status.NewReader(version, status.DefaultPaths(), nil),
+			Status: status.NewReader(version, status.DefaultPaths(), nil,
+				status.WithPiHealth(pihealth.NewReader(
+					pihealth.DefaultPaths(),
+					pihealth.DefaultThresholds(),
+					nil, // RealRunner
+					nil, // statfs-backed DiskProber
+				))),
 			Logs:         logs.NewStreamer(nil),
 			Schema:       cache,
 			Privileged:   priv,
