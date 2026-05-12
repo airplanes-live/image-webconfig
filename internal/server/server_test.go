@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/cookiejar"
@@ -93,7 +94,7 @@ func newTestServer(t *testing.T) (*httptest.Server, *Server) {
 	}
 
 	priv := PrivilegedArgv{
-		ApplyFeed:   []string{"sudo-stub", "apl-feed", "apply", "--json"},
+		ApplyFeed:   []string{"sudo-stub", "apl-feed", "apply", "--json", "--lock-timeout", "5"},
 		SchemaFeed:  []string{"apl-feed", "schema", "--json"},
 		Reboot:      []string{"sudo-stub", "reboot"},
 		StartUpdate: []string{"sudo-stub", "update"},
@@ -205,7 +206,7 @@ func newWriteHarness(t *testing.T) *writeHarness {
 	}
 
 	priv := PrivilegedArgv{
-		ApplyFeed:   []string{"sudo-stub", "apl-feed", "apply", "--json"},
+		ApplyFeed:   []string{"sudo-stub", "apl-feed", "apply", "--json", "--lock-timeout", "5"},
 		SchemaFeed:  []string{"apl-feed", "schema", "--json"},
 		Reboot:      []string{"sudo-stub", "reboot"},
 		StartUpdate: []string{"sudo-stub", "update"},
@@ -314,6 +315,58 @@ func TestConfigPost_RejectedEnvelopeReturns400(t *testing.T) {
 	// "save failed" instead of the actual reason.
 	if !strings.Contains(body.Error, "LATITUDE") || !strings.Contains(body.Error, "must be in") {
 		t.Errorf("body.Error = %q, want it to surface the per-key reason", body.Error)
+	}
+}
+
+func TestApplyConfigTimeout_ExceedsApplyLockTimeout(t *testing.T) {
+	// The HTTP wall-clock budget must sit above the lock-acquisition
+	// budget passed to apl-feed, or webconfig will kill the helper
+	// mid-wait and surface a generic 500 instead of the structured
+	// lock_timeout 503. Pin the relationship as a contract.
+	if applyConfigTimeout <= applyLockTimeoutSeconds*time.Second {
+		t.Errorf("applyConfigTimeout %v must exceed applyLockTimeoutSeconds %ds",
+			applyConfigTimeout, applyLockTimeoutSeconds)
+	}
+	// And the sudoers-pinned argv must carry the matching --lock-timeout
+	// token; otherwise sudo rejects the call entirely.
+	argv := DefaultPrivilegedArgv().ApplyFeed
+	want := fmt.Sprintf("%d", applyLockTimeoutSeconds)
+	found := false
+	for i := 0; i < len(argv)-1; i++ {
+		if argv[i] == "--lock-timeout" && argv[i+1] == want {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Errorf("DefaultPrivilegedArgv().ApplyFeed = %v, want --lock-timeout %s pair", argv, want)
+	}
+}
+
+func TestConfigPost_ApplyFeedArgvCarriesLockTimeout(t *testing.T) {
+	// Live integration: a POST to /api/config must invoke apl-feed
+	// with the full sudoers-pinned argv including --lock-timeout 5.
+	h := newWriteHarness(t)
+	r := postJSON(t, h.client, h.ts.URL+"/api/config",
+		map[string]any{"updates": map[string]string{"MLAT_PRIVATE": "true"}})
+	defer r.Body.Close()
+	if r.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", r.StatusCode)
+	}
+	h.mu.Lock()
+	calls := append([]stdinCall(nil), h.stdinCalls...)
+	h.mu.Unlock()
+	if len(calls) != 1 {
+		t.Fatalf("stdinCalls = %d, want 1", len(calls))
+	}
+	want := []string{"sudo-stub", "apl-feed", "apply", "--json", "--lock-timeout", "5"}
+	if len(calls[0].argv) != len(want) {
+		t.Fatalf("argv = %v, want %v", calls[0].argv, want)
+	}
+	for i := range want {
+		if calls[0].argv[i] != want[i] {
+			t.Fatalf("argv[%d] = %q, want %q", i, calls[0].argv[i], want[i])
+		}
 	}
 }
 

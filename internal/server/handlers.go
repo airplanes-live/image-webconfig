@@ -373,15 +373,20 @@ type configRequest struct {
 }
 
 const (
-	// applyConfigTimeout caps the helper's wall time. apl-feed apply
-	// defaults to a 30s flock acquisition (APL_FEED_APPLY_LOCK_TIMEOUT_
-	// DEFAULT in feed-env-apply.sh), so this must sit above that so the
-	// structured `lock_timeout` envelope can come back as 503 instead of
-	// being killed mid-wait and surfacing as a generic 500. The extra
-	// 5s margin covers post-lock validation, atomic write, and the
-	// dirty-key service-restart fan-out before context.WithTimeout
-	// fires.
-	applyConfigTimeout = 35 * time.Second
+	// applyLockTimeoutSeconds is the lock-acquisition budget passed to
+	// apl-feed via the sudoers-pinned argv (`--lock-timeout 5`). Keep in
+	// sync with the trailing token in stage-airplanes/05-install-webconfig/
+	// files/etc/sudoers.d/010_airplanes-webconfig — both must match
+	// exactly or sudo rejects the call.
+	applyLockTimeoutSeconds = 5
+	// applyConfigTimeout = lock-timeout budget + post-lock budget.
+	// post-lock covers per-key validation, the atomic mktemp+rename,
+	// and the service-restart fan-out (each restart bounded inside
+	// feed-env-apply.sh). 15s gives generous headroom for the typical
+	// no-restart save plus a slow systemctl on a busy box. webconfig
+	// owns the end-to-end ceiling so a long-held flock surfaces as a
+	// structured 503 rather than a generic 500.
+	applyConfigTimeout = (applyLockTimeoutSeconds + 15) * time.Second
 	// systemctlTimeout caps each per-unit systemctl call.
 	systemctlTimeout = 10 * time.Second
 )
