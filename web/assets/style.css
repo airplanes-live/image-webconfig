@@ -565,6 +565,12 @@ button.secondary:hover,
   transform: translateY(-1px);
 }
 
+@keyframes wc-spin { to { transform: rotate(360deg); } }
+.wc-btn-icon--spinning svg { animation: wc-spin 0.6s linear infinite; }
+@media (prefers-reduced-motion: reduce) {
+  .wc-btn-icon--spinning svg { animation: none; }
+}
+
 /* The header back button visually matches an icon button when collapsed
    on mobile but stretches with text on desktop — keep it as a normal
    ghost button. */

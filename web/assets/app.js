@@ -85,6 +85,7 @@
     const headerTitleEl = document.getElementById("wc-header-title");
     const backBtn = document.getElementById("wc-back-btn");
     const themeBtn = document.getElementById("wc-theme-btn");
+    const refreshBtn = document.getElementById("wc-refresh-btn");
 
     let activeStream = null;       // current EventSource (log viewer)
     let statusTimer = null;        // setInterval handle for status poll
@@ -121,6 +122,7 @@
         const o = opts || {};
         if (headerTitleEl) headerTitleEl.textContent = o.title ? "/ " + o.title : "";
         if (backBtn) backBtn.hidden = !o.showBack;
+        if (refreshBtn) refreshBtn.hidden = !o.showRefresh;
     }
 
     // ===== Navigation (one cleanup point) =====
@@ -150,7 +152,16 @@
         dashboardCtx = null;
         if (opts && opts.flash) pendingFlash = opts.flash;
         setHeader(opts);
-        panelFn();
+        return panelFn();
+    }
+
+    // Dashboard returns funnel through one helper so showRefresh, title,
+    // and showBack stay consistent across every "back to dashboard" path.
+    // Returns the panel promise so the refresh handler can await the
+    // initial fetch and toggle the spinner around it.
+    function navigateDashboard(extraOpts) {
+        return navigate(dashboard, Object.assign(
+            { title: null, showBack: false, showRefresh: true }, extraOpts || {}));
     }
 
     // ===== HTTP helpers =====
@@ -1035,7 +1046,7 @@
                 // flash through navigate options — without this, the warning
                 // would clear immediately when navigate() rerenders.
                 const pending = (r.payload && r.payload.pending_restart) || [];
-                const opts = { title: null, showBack: false };
+                const opts = {};
                 if (pending.length > 0) {
                     opts.flash = {
                         level: "warn",
@@ -1045,7 +1056,7 @@
                             + pending.join(" "),
                     };
                 }
-                navigate(dashboard, opts);
+                navigateDashboard(opts);
             },
         },
             el("fieldset", { class: "config-fieldset" },
@@ -1108,11 +1119,6 @@
     // ===== Action row =====
 
     function buildActionsRow() {
-        const refresh = el("button", {
-            type: "button", class: "wc-btn-ghost",
-            onclick: () => navigate(dashboard, { title: null, showBack: false }),
-        }, "Refresh");
-
         const updateBtn = el("button", {
             type: "button", class: "wc-btn-ghost",
             onclick: async () => {
@@ -1157,7 +1163,7 @@
             onclick: async () => { await postJSON("/api/auth/logout", {}); await boot(); },
         }, "Log out");
 
-        return el("div", { class: "actions" }, refresh, updateBtn, updateLog, change, rebootBtn, logout);
+        return el("div", { class: "actions" }, updateBtn, updateLog, change, rebootBtn, logout);
     }
 
     // ===== Dashboard =====
@@ -1186,6 +1192,7 @@
             heroEl, tileGrid, identityBody, configBody,
             configValues: {},
             lastIdentity: null,
+            configDirty: false,
         };
         dashboardCtx = ctx;
 
@@ -1206,6 +1213,14 @@
         updateHero(heroEl, status, ctx.configValues);
         updateTiles(tileGrid, status, ctx.configValues);
         updateAppTiles(tileGrid);
+
+        // Track unsaved config edits so the header refresh button can
+        // prompt before discarding them. Initial-render value attributes
+        // don't fire `input`, so this only flips on actual typing.
+        const configForm = configBody.querySelector("form.config-form");
+        if (configForm) {
+            configForm.addEventListener("input", () => { ctx.configDirty = true; });
+        }
 
         // Start partial-refresh poll. Hero + tiles + identity update;
         // config card stays put.
@@ -1333,7 +1348,7 @@
         const submit = el("button", { type: "submit", class: "wc-btn-primary" }, "Change password");
         const cancel = el("button", {
             type: "button", class: "wc-btn-ghost",
-            onclick: () => navigate(dashboard, { title: null, showBack: false }),
+            onclick: () => navigateDashboard(),
         }, "Cancel");
 
         const form = el("form", {
@@ -1358,7 +1373,7 @@
                     err.textContent = (r.payload && r.payload.error) || "Change failed.";
                     return;
                 }
-                navigate(dashboard, { title: null, showBack: false });
+                navigateDashboard();
             },
         },
             el("h2", {}, "Change webconfig password"),
@@ -1423,7 +1438,7 @@
         }
         const who = await getJSON("/api/auth/whoami");
         if (who.ok) {
-            navigate(dashboard, { title: null, showBack: false });
+            navigateDashboard();
         } else {
             navigate(loginPanel, { title: null, showBack: false });
         }
@@ -1432,7 +1447,22 @@
     // ===== Wire-up =====
 
     if (themeBtn) themeBtn.addEventListener("click", toggleTheme);
-    if (backBtn) backBtn.addEventListener("click", () => navigate(dashboard, { title: null, showBack: false }));
+    if (backBtn) backBtn.addEventListener("click", () => navigateDashboard());
+    if (refreshBtn) refreshBtn.addEventListener("click", async () => {
+        if (refreshBtn.disabled) return;
+        if (dashboardCtx && dashboardCtx.configDirty
+            && !confirm("Discard unsaved configuration changes?")) {
+            return;
+        }
+        refreshBtn.disabled = true;
+        refreshBtn.classList.add("wc-btn-icon--spinning");
+        try {
+            await navigateDashboard();
+        } finally {
+            refreshBtn.classList.remove("wc-btn-icon--spinning");
+            refreshBtn.disabled = false;
+        }
+    });
 
     boot().catch((e) => corruptPanel("Fatal error: " + (e && e.message || e)));
 })();
