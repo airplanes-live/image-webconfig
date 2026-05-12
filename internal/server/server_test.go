@@ -74,9 +74,9 @@ func newTestServer(t *testing.T) (*httptest.Server, *Server) {
 	// Capture every privileged shell-out so write-endpoint tests can assert
 	// the argv shape that hit sudo.
 	var (
-		runnerCalls       [][]string
-		stdinRunnerCalls  []stdinCall
-		runnerMu          sync.Mutex
+		runnerCalls      [][]string
+		stdinRunnerCalls []stdinCall
+		runnerMu         sync.Mutex
 	)
 	captureRunner := func(_ context.Context, argv []string) (wexec.Result, error) {
 		runnerMu.Lock()
@@ -146,13 +146,13 @@ type stdinCall struct {
 // /api/reboot — it wires deterministic captures for both runners and
 // pre-authenticates the returned client.
 type writeHarness struct {
-	ts          *httptest.Server
-	client      *http.Client
+	ts           *httptest.Server
+	client       *http.Client
 	feedEnvPath  string
 	mu           sync.Mutex
 	calls        [][]string
 	stdinCalls   []stdinCall
-	runnerErr    error                 // returned by captureRunner; tests override
+	runnerErr    error                     // returned by captureRunner; tests override
 	runnerErrFor func(argv []string) error // optional: per-argv error; falls back to runnerErr when nil
 	stdinErr     error
 	stdinResult  wexec.Result
@@ -309,6 +309,12 @@ func TestConfigPost_RejectedEnvelopeReturns400(t *testing.T) {
 	if body.Status != "rejected" || body.Errors["LATITUDE"] == "" {
 		t.Errorf("body = %+v, want rejected envelope with per-key error", body)
 	}
+	// The flat `error` field must be populated for the form's
+	// `r.payload.error` fallback path. Without this the user sees
+	// "save failed" instead of the actual reason.
+	if !strings.Contains(body.Error, "LATITUDE") || !strings.Contains(body.Error, "must be in") {
+		t.Errorf("body.Error = %q, want it to surface the per-key reason", body.Error)
+	}
 }
 
 func TestConfigPost_LockTimeoutReturns503(t *testing.T) {
@@ -321,6 +327,29 @@ func TestConfigPost_LockTimeoutReturns503(t *testing.T) {
 	defer r.Body.Close()
 	if r.StatusCode != http.StatusServiceUnavailable {
 		t.Fatalf("status = %d, want 503", r.StatusCode)
+	}
+	var body applyFeedResponse
+	_ = json.NewDecoder(r.Body).Decode(&body)
+	if body.Error == "" || !strings.Contains(body.Error, "lock") {
+		t.Errorf("body.Error = %q, want it to surface the lock-timeout message", body.Error)
+	}
+}
+
+func TestConfigPost_RejectedErrorIsSorted(t *testing.T) {
+	// Map iteration order is randomised in Go, so the synthesized error
+	// string must sort keys for stable rendering.
+	h := newWriteHarness(t)
+	h.stdinResult = wexec.Result{
+		Stdout: []byte(`{"status":"rejected","errors":{"LONGITUDE":"x","ALTITUDE":"y","LATITUDE":"z"}}`),
+	}
+	r := postJSON(t, h.client, h.ts.URL+"/api/config",
+		map[string]any{"updates": map[string]string{"LATITUDE": "bad"}})
+	defer r.Body.Close()
+	var body applyFeedResponse
+	_ = json.NewDecoder(r.Body).Decode(&body)
+	want := "ALTITUDE: y\nLATITUDE: z\nLONGITUDE: x"
+	if body.Error != want {
+		t.Errorf("body.Error = %q, want %q (sorted)", body.Error, want)
 	}
 }
 
@@ -340,9 +369,6 @@ func TestConfigPost_UnknownKeyRejectedPreShellout(t *testing.T) {
 	}
 }
 
-
-
-
 // PR 4 retired reconcile978On/Off. Both 978 services now restart on every
 // /api/config POST, regardless of UAT_INPUT direction; the daemons self-decide
 // from UAT_INPUT and exit 64 (intentional failed-terminal) when not requested.
@@ -351,7 +377,6 @@ func TestConfigPost_UnknownKeyRejectedPreShellout(t *testing.T) {
 
 // pending_restart surfaces 978 unit failures alongside feed/mlat. Confirms
 // that both 978 entries land in the response when their restart fails.
-
 
 func TestUpdate_RequiresAuth(t *testing.T) {
 	t.Parallel()
@@ -504,7 +529,7 @@ func TestSecurityHeadersOnEveryResponse(t *testing.T) {
 	t.Parallel()
 	ts, _ := newTestServer(t)
 	for _, path := range []string{"/", "/health", "/api/state"} {
-		resp := mustGetDefault(t, ts.URL + path)
+		resp := mustGetDefault(t, ts.URL+path)
 		if resp.Header.Get("X-Frame-Options") != "DENY" {
 			t.Errorf("%s: missing X-Frame-Options DENY", path)
 		}
@@ -524,7 +549,7 @@ func TestSecurityHeadersOnEveryResponse(t *testing.T) {
 func TestRootServesSPAShell(t *testing.T) {
 	t.Parallel()
 	ts, _ := newTestServer(t)
-	resp := mustGetDefault(t, ts.URL + "/")
+	resp := mustGetDefault(t, ts.URL+"/")
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("status = %d, want 200", resp.StatusCode)
@@ -538,7 +563,7 @@ func TestRootServesSPAShell(t *testing.T) {
 func TestUnknownAPIPath404(t *testing.T) {
 	t.Parallel()
 	ts, _ := newTestServer(t)
-	resp := mustGetDefault(t, ts.URL + "/api/no-such-thing")
+	resp := mustGetDefault(t, ts.URL+"/api/no-such-thing")
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusNotFound {
 		t.Fatalf("status = %d, want 404", resp.StatusCode)
@@ -550,7 +575,7 @@ func TestState_UninitializedThenInitialized(t *testing.T) {
 	ts, _ := newTestServer(t)
 	c := httpClient(t)
 
-	resp := mustGet(t, c, ts.URL + "/api/state")
+	resp := mustGet(t, c, ts.URL+"/api/state")
 	var state stateResponse
 	_ = json.NewDecoder(resp.Body).Decode(&state)
 	resp.Body.Close()
@@ -564,7 +589,7 @@ func TestState_UninitializedThenInitialized(t *testing.T) {
 		t.Fatalf("setup status = %d, want 200 (err=%q)", r.StatusCode, decodeError(t, r.Body))
 	}
 
-	resp = mustGet(t, c, ts.URL + "/api/state")
+	resp = mustGet(t, c, ts.URL+"/api/state")
 	_ = json.NewDecoder(resp.Body).Decode(&state)
 	resp.Body.Close()
 	if state.State != "initialized" {
@@ -665,7 +690,7 @@ func TestSetup_AutoLoginsCallerOnSuccess(t *testing.T) {
 		t.Fatal("setup did not set session cookie")
 	}
 	// Confirm the session is actually valid via /api/auth/whoami.
-	resp := mustGet(t, c, ts.URL + "/api/auth/whoami")
+	resp := mustGet(t, c, ts.URL+"/api/auth/whoami")
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("whoami after setup status = %d, want 200", resp.StatusCode)
@@ -698,7 +723,7 @@ func TestLogin_CorrectPasswordIssuesCookie(t *testing.T) {
 	if r.StatusCode != http.StatusOK {
 		t.Fatalf("status = %d, want 200 (err=%q)", r.StatusCode, decodeError(t, r.Body))
 	}
-	resp := mustGet(t, c, ts.URL + "/api/auth/whoami")
+	resp := mustGet(t, c, ts.URL+"/api/auth/whoami")
 	resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		t.Errorf("whoami after login status = %d, want 200", resp.StatusCode)
@@ -734,7 +759,7 @@ func TestLogout_ClearsCookieAndRevokes(t *testing.T) {
 	if r.StatusCode != http.StatusOK {
 		t.Fatalf("logout status = %d, want 200", r.StatusCode)
 	}
-	resp := mustGet(t, c, ts.URL + "/api/auth/whoami")
+	resp := mustGet(t, c, ts.URL+"/api/auth/whoami")
 	resp.Body.Close()
 	if resp.StatusCode != http.StatusUnauthorized {
 		t.Errorf("whoami after logout status = %d, want 401", resp.StatusCode)
@@ -761,7 +786,7 @@ func TestPasswordChange_VerifiesOldAndRotatesAllSessions(t *testing.T) {
 	// other session must be revoked. Spin up a second jar.
 	c2 := httpClient(t)
 	postJSON(t, c2, ts.URL+"/api/auth/login", map[string]string{"password": testPassword}).Body.Close()
-	resp := mustGet(t, c2, ts.URL + "/api/auth/whoami")
+	resp := mustGet(t, c2, ts.URL+"/api/auth/whoami")
 	resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("c2 baseline whoami status = %d, want 200", resp.StatusCode)
@@ -777,14 +802,14 @@ func TestPasswordChange_VerifiesOldAndRotatesAllSessions(t *testing.T) {
 	}
 
 	// Original caller (c) gets a freshly issued cookie → still authed.
-	resp = mustGet(t, c, ts.URL + "/api/auth/whoami")
+	resp = mustGet(t, c, ts.URL+"/api/auth/whoami")
 	resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		t.Errorf("originator whoami after change: status = %d, want 200", resp.StatusCode)
 	}
 
 	// Other session was revoked.
-	resp = mustGet(t, c2, ts.URL + "/api/auth/whoami")
+	resp = mustGet(t, c2, ts.URL+"/api/auth/whoami")
 	resp.Body.Close()
 	if resp.StatusCode != http.StatusUnauthorized {
 		t.Errorf("co-session whoami after change: status = %d, want 401", resp.StatusCode)
@@ -810,7 +835,7 @@ func TestPasswordChange_RejectsWeakNew(t *testing.T) {
 func TestWhoami_RequiresSession(t *testing.T) {
 	t.Parallel()
 	ts, _ := newTestServer(t)
-	resp := mustGetDefault(t, ts.URL + "/api/auth/whoami")
+	resp := mustGetDefault(t, ts.URL+"/api/auth/whoami")
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusUnauthorized {
 		t.Fatalf("status = %d, want 401", resp.StatusCode)
@@ -820,7 +845,7 @@ func TestWhoami_RequiresSession(t *testing.T) {
 func TestStatic_Serves(t *testing.T) {
 	t.Parallel()
 	ts, _ := newTestServer(t)
-	resp := mustGetDefault(t, ts.URL + "/static/style.css")
+	resp := mustGetDefault(t, ts.URL+"/static/style.css")
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("status = %d, want 200", resp.StatusCode)
@@ -1061,6 +1086,3 @@ func TestLog_KnownUnitStreamsSSE(t *testing.T) {
 }
 
 // --- pending_restart surfacing (PR 3) ---
-
-
-

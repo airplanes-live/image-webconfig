@@ -9,6 +9,7 @@ import (
 	"io/fs"
 	"log"
 	"net/http"
+	"sort"
 	"strings"
 	"time"
 
@@ -372,9 +373,15 @@ type configRequest struct {
 }
 
 const (
-	// applyConfigTimeout caps the helper's wall time. The helper itself
-	// has a 5s lock-acquisition timeout; total budget is generous.
-	applyConfigTimeout = 10 * time.Second
+	// applyConfigTimeout caps the helper's wall time. apl-feed apply
+	// defaults to a 30s flock acquisition (APL_FEED_APPLY_LOCK_TIMEOUT_
+	// DEFAULT in feed-env-apply.sh), so this must sit above that so the
+	// structured `lock_timeout` envelope can come back as 503 instead of
+	// being killed mid-wait and surfacing as a generic 500. The extra
+	// 5s margin covers post-lock validation, atomic write, and the
+	// dirty-key service-restart fan-out before context.WithTimeout
+	// fires.
+	applyConfigTimeout = 35 * time.Second
 	// systemctlTimeout caps each per-unit systemctl call.
 	systemctlTimeout = 10 * time.Second
 )
@@ -418,8 +425,10 @@ func (s *Server) handleConfigPost(w http.ResponseWriter, r *http.Request) {
 	}
 	if status != http.StatusOK {
 		// Forward the structured error envelope from apl-feed apply
-		// (per-field reasons, lock_timeout message, etc.) without
-		// reshaping it — the client renders the per-key error directly.
+		// (per-field reasons, lock_timeout message, etc.). Synthesize
+		// a flat Error field too so the client's `r.payload.error`
+		// fallback shows the actual reason instead of "save failed".
+		synthesizeError(&resp)
 		writeJSON(w, status, resp)
 		return
 	}
@@ -430,12 +439,47 @@ func (s *Server) handleConfigPost(w http.ResponseWriter, r *http.Request) {
 // `apl-feed apply --json`. Any subset of fields can be populated
 // depending on status; the client renders them in priority order
 // (errors > pending_restart > changed).
+//
+// Error is synthesized server-side before write (see synthesizeError)
+// so the form's existing `r.payload.error` fallback path surfaces a
+// useful message instead of the generic "save failed". apl-feed itself
+// emits errors / message; we collapse them into a single human string.
 type applyFeedResponse struct {
 	Status         string            `json:"status"`
 	Changed        []string          `json:"changed,omitempty"`
 	PendingRestart []string          `json:"pending_restart,omitempty"`
 	Errors         map[string]string `json:"errors,omitempty"`
 	Message        string            `json:"message,omitempty"`
+	Error          string            `json:"error,omitempty"`
+}
+
+// synthesizeError populates resp.Error from whichever of resp.Errors /
+// resp.Message is the most informative for this status. Called only on
+// non-success paths; success envelopes leave Error empty.
+//
+// rejected envelopes carry per-key reasons in Errors. The form renders
+// a single string today, so we join "KEY: reason" pairs with newlines.
+// Sorted to keep the output stable across runs (Go map iteration is
+// randomised, and the renderer would otherwise re-order on every save).
+func synthesizeError(resp *applyFeedResponse) {
+	if len(resp.Errors) > 0 {
+		keys := make([]string, 0, len(resp.Errors))
+		for k := range resp.Errors {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		parts := make([]string, 0, len(keys))
+		for _, k := range keys {
+			parts = append(parts, k+": "+resp.Errors[k])
+		}
+		resp.Error = strings.Join(parts, "\n")
+		return
+	}
+	if resp.Message != "" {
+		resp.Error = resp.Message
+		return
+	}
+	resp.Error = "save failed (status: " + resp.Status + ")"
 }
 
 // invokeApplyFeed pipes the request body through `sudo apl-feed apply --json`
@@ -444,14 +488,15 @@ type applyFeedResponse struct {
 // that are NOT part of the apply contract — those become 500.
 //
 // Status mapping:
-//   applied          → 200 (pending_restart may be non-empty)
-//   no_change        → 200
-//   rejected         → 400
-//   lock_timeout     → 503
-//   filesystem_error → 500
-//   parse_error      → 400 (apl-feed received malformed input from us, but
-//                          forward as 400 so the client sees the message)
-//   usage_error      → 500 (programmer error: argv shape diverged)
+//
+//	applied          → 200 (pending_restart may be non-empty)
+//	no_change        → 200
+//	rejected         → 400
+//	lock_timeout     → 503
+//	filesystem_error → 500
+//	parse_error      → 400 (apl-feed received malformed input from us, but
+//	                       forward as 400 so the client sees the message)
+//	usage_error      → 500 (programmer error: argv shape diverged)
 func (s *Server) invokeApplyFeed(ctx context.Context, updates map[string]string) (applyFeedResponse, int, error) {
 	body, err := json.Marshal(map[string]any{"updates": updates})
 	if err != nil {
