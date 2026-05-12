@@ -114,9 +114,8 @@ func TestMergeAndValidate_CanonicalizesAltitude(t *testing.T) {
 func TestMergeAndValidate_AutoSetsGeoConfiguredTrueWhenCoordsSubmitted(t *testing.T) {
 	t.Parallel()
 	// Frontend submits lat/lon without GEO_CONFIGURED; the helper infers
-	// "user is configuring geo" and writes true. MLAT_USER is required by
-	// the consistency check for MLAT_ENABLED=true scenarios; here MLAT is
-	// untouched so the cross-key rule doesn't fire.
+	// "user is configuring geo" and writes true. MLAT_USER carries through
+	// untouched — the only cross-key rule left is GEO_CONFIGURED→LAT/LON.
 	got, err := mergeAndValidate(
 		map[string]string{"MLAT_USER": "alice"},
 		map[string]string{"LATITUDE": "51.5", "LONGITUDE": "-0.1"},

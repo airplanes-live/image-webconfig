@@ -310,6 +310,7 @@
     function mlatDisabledReason(reason) {
         switch (reason) {
             case "mlat_enabled_false": return "MLAT_ENABLED=false";
+            case "geo_not_configured": return "GEO_CONFIGURED=false (set latitude/longitude/altitude)";
             case "latitude_zero":      return "LATITUDE=0";
             case "longitude_zero":     return "LONGITUDE=0";
             default:                   return reason || "config";
@@ -318,7 +319,6 @@
 
     function mlatMisconfigReason(reason) {
         switch (reason) {
-            case "mlat_user_empty":       return "MLAT_USER empty — set name or set MLAT_ENABLED=false";
             case "mlat_private_invalid":  return "MLAT_PRIVATE must be 'true' or 'false'";
             case "altitude_empty":        return "ALTITUDE empty — set the antenna altitude";
             default:                      return "misconfigured (" + (reason || "unknown") + ")";

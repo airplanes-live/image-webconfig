@@ -210,12 +210,13 @@ longitude=13.405
 	}
 }
 
-// AllowedReasons*: owner-aware reason whitelists. PR 4 added these so a
-// malformed state file cannot pass through with a cross-owner reason.
+// AllowedReasons*: owner-aware reason whitelists so a malformed state file
+// cannot pass through with a cross-owner reason.
 func TestAllowedReasonsMLAT(t *testing.T) {
 	for _, tok := range []string{
-		"ok", "mlat_enabled_false", "latitude_zero", "longitude_zero",
-		"altitude_empty", "mlat_user_empty", "mlat_private_invalid",
+		"ok", "mlat_enabled_false", "geo_not_configured",
+		"latitude_zero", "longitude_zero", "altitude_empty",
+		"mlat_private_invalid",
 	} {
 		if !AllowedReasonsMLAT[tok] {
 			t.Errorf("AllowedReasonsMLAT[%q] = false, want true", tok)
@@ -245,7 +246,7 @@ func TestAllowedReasons978(t *testing.T) {
 			t.Errorf("AllowedReasons978[%q] = false, want true", tok)
 		}
 	}
-	for _, tok := range []string{"mlat_user_empty", "latitude_zero", "future_token", ""} {
+	for _, tok := range []string{"mlat_enabled_false", "latitude_zero", "future_token", ""} {
 		if AllowedReasons978[tok] {
 			t.Errorf("AllowedReasons978[%q] = true, want false (cross-owner or unknown)", tok)
 		}

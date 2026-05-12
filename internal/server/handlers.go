@@ -389,12 +389,12 @@ func (s *Server) handleConfigPost(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	// Cross-key consistency precheck: reject the inconsistent
-	// MLAT_ENABLED=true + empty/absent MLAT_USER POST early so the user gets
-	// a clear 400 from the dashboard rather than a silently-failing daemon
-	// after the helper has already written the bad state. We compute the
-	// projection of (existing ∪ updates) for the MLAT pair only — full merge
-	// happens in apply-config.
+	// Cross-key consistency precheck: reject inconsistent shapes (today
+	// just GEO_CONFIGURED=true requiring non-empty LATITUDE + LONGITUDE)
+	// early so the user gets a clear 400 from the dashboard rather than
+	// a silently-failing daemon after the helper has already written the
+	// bad state. We compute the projection of (existing ∪ updates) — full
+	// merge happens in apply-config.
 	{
 		preview, err := s.feedEnv.ReadAll()
 		if err != nil {

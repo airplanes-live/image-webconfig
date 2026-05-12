@@ -296,7 +296,7 @@ func TestRead_MlatDecisionNilWhenInactive(t *testing.T) {
 func TestRead_MlatDecisionPopulatedOnFailedExit64(t *testing.T) {
 	t.Parallel()
 	p := newDecisionTestPaths(t)
-	writeStateFile(t, p.MlatStateFile, "schema_version=1\nstate=misconfigured\nreason=mlat_user_empty\n")
+	writeStateFile(t, p.MlatStateFile, "schema_version=1\nstate=misconfigured\nreason=mlat_private_invalid\n")
 	r := NewReader("v", p, perArgvRunner(map[string]func(unit string) (string, error){
 		"is-active:airplanes-mlat.service":             func(_ string) (string, error) { return "failed", errors.New("exit 3") },
 		"is-active:default":                            func(_ string) (string, error) { return "active", nil },
@@ -309,15 +309,15 @@ func TestRead_MlatDecisionPopulatedOnFailedExit64(t *testing.T) {
 	if got.MlatDecision.State != "misconfigured" {
 		t.Errorf("MlatDecision.State = %q, want misconfigured", got.MlatDecision.State)
 	}
-	if got.MlatDecision.Reason != "mlat_user_empty" {
-		t.Errorf("MlatDecision.Reason = %q, want mlat_user_empty", got.MlatDecision.Reason)
+	if got.MlatDecision.Reason != "mlat_private_invalid" {
+		t.Errorf("MlatDecision.Reason = %q, want mlat_private_invalid", got.MlatDecision.Reason)
 	}
 }
 
 func TestRead_MlatDecisionNilOnFailedExitNon64(t *testing.T) {
 	t.Parallel()
 	p := newDecisionTestPaths(t)
-	writeStateFile(t, p.MlatStateFile, "schema_version=1\nstate=misconfigured\nreason=mlat_user_empty\n")
+	writeStateFile(t, p.MlatStateFile, "schema_version=1\nstate=misconfigured\nreason=mlat_private_invalid\n")
 	// failed+ExecMainStatus=1 → not the strict-misconfig shape; don't
 	// consult the (potentially stale) state file.
 	r := NewReader("v", p, perArgvRunner(map[string]func(unit string) (string, error){
@@ -477,17 +477,17 @@ func TestRead_UATDecisionNilOnInactive(t *testing.T) {
 }
 
 // Cross-owner reason rejection: a 978 state file claiming an MLAT-only reason
-// (e.g. `mlat_user_empty`) is dropped by the owner-aware reason whitelist —
+// (e.g. `mlat_enabled_false`) is dropped by the owner-aware reason whitelist —
 // AllowedReasons978 doesn't include it.
 func TestRead_UATDecisionRejectsCrossOwnerReason(t *testing.T) {
 	t.Parallel()
 	p := newDecisionTestPaths(t)
-	writeStateFile(t, p.UAT978StateFile, "schema_version=1\nstate=misconfigured\nreason=mlat_user_empty\n")
+	writeStateFile(t, p.UAT978StateFile, "schema_version=1\nstate=misconfigured\nreason=mlat_enabled_false\n")
 	r := NewReader("v", p, perArgvRunner(map[string]func(unit string) (string, error){
 		"is-active:default": func(_ string) (string, error) { return "active", nil },
 	}))
 	got, _ := r.Read(context.Background())
 	if got.UATDecision != nil {
-		t.Errorf("UATDecision = %+v, want nil (mlat_user_empty is not a valid 978 reason)", got.UATDecision)
+		t.Errorf("UATDecision = %+v, want nil (mlat_enabled_false is not a valid 978 reason)", got.UATDecision)
 	}
 }

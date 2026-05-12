@@ -95,7 +95,8 @@ func CheckUniversal(key, value string) error {
 //
 // Empty string is accepted only where it has a defined semantic:
 //   - UAT_INPUT="" → 978 disabled
-//   - MLAT_USER="" → MLAT name unset (must be paired with MLAT_ENABLED=false)
+//   - MLAT_USER="" → MLAT name unset (daemon falls back to
+//                   "Anonymous-<short-feeder-id>" at startup)
 //
 // Other keys reject empty.
 func Validate(key, value string) error {
@@ -136,23 +137,17 @@ func Validate(key, value string) error {
 }
 
 // ValidateConsistency enforces cross-key rules on the final merged config
-// after each individual key has passed Validate. Today the only cross-key
-// rule is the MLAT pair: MLAT_ENABLED=true requires a non-empty MLAT_USER
-// (otherwise airplanes-mlat.sh strict-fails with exit 64 and the user sees
-// the unit failed without an obvious cause).
+// after each individual key has passed Validate.
 //
 // Apply-config and server both call this before persisting a merged config
 // so an inconsistent state never reaches disk.
+//
+// MLAT_USER is intentionally NOT cross-checked against MLAT_ENABLED.
+// airplanes-mlat.sh substitutes an "Anonymous-<short-feeder-id>" fallback
+// at daemon startup when MLAT_USER is empty, so MLAT_ENABLED=true + empty
+// MLAT_USER is a valid combination — the daemon picks a per-device name
+// rather than refusing to start.
 func ValidateConsistency(merged map[string]string) error {
-	mlatEnabled, hasEnabled := merged["MLAT_ENABLED"]
-	mlatUser, hasUser := merged["MLAT_USER"]
-	if hasEnabled && mlatEnabled == "true" {
-		// MLAT_USER missing or empty + MLAT_ENABLED=true is the inconsistent
-		// shape that strict-fails the daemon.
-		if !hasUser || mlatUser == "" {
-			return validationError("MLAT_USER", "must be non-empty when MLAT_ENABLED=true")
-		}
-	}
 	// GEO_CONFIGURED=true asserts the operator has provided real coordinates.
 	// Both LATITUDE and LONGITUDE must be present in the merged config for
 	// the daemon to pass them to mlat-client. (A single zero axis is fine —

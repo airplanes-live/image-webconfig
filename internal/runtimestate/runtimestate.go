@@ -49,13 +49,13 @@ var AllowedDecisions = map[string]bool{
 
 // AllowedReasonsMLAT mirrors airplanes-mlat.sh's _mlat_classify output.
 var AllowedReasonsMLAT = map[string]bool{
-	"ok":                    true,
-	"mlat_enabled_false":    true,
-	"latitude_zero":         true,
-	"longitude_zero":        true,
-	"altitude_empty":        true,
-	"mlat_user_empty":       true,
-	"mlat_private_invalid":  true,
+	"ok":                   true,
+	"mlat_enabled_false":   true,
+	"geo_not_configured":   true,
+	"latitude_zero":        true,
+	"longitude_zero":       true,
+	"altitude_empty":       true,
+	"mlat_private_invalid": true,
 }
 
 // AllowedReasonsFeed mirrors airplanes-feed.sh — currently only "ok"
