@@ -304,6 +304,40 @@ func TestConfigPost_ValidatedRequestRunsHelperThenRestarts(t *testing.T) {
 	}
 }
 
+func TestConfigPost_EnableMLATFromOffStateAutoDerivesGEO(t *testing.T) {
+	t.Parallel()
+	h := newWriteHarness(t)
+	// Existing feed.env mirrors a fresh image (PR-1 default): MLAT off,
+	// geo placeholders. The user enters real lat/lon/alt and toggles MLAT
+	// on in one save. The handler must auto-derive GEO_CONFIGURED=true via
+	// the shared helper before ValidateConsistency runs, otherwise the new
+	// MLAT_ENABLED→GEO_CONFIGURED rule would reject this submission with
+	// "GEO_CONFIGURED must be true when MLAT_ENABLED=true".
+	if err := os.WriteFile(h.feedEnvPath, []byte(
+		`LATITUDE=0`+"\n"+`LONGITUDE=0`+"\n"+`ALTITUDE=0m`+"\n"+
+			`MLAT_USER=airplanes-live-image`+"\n"+`MLAT_ENABLED=false`+"\n"+
+			`MLAT_PRIVATE=false`+"\n"+`GEO_CONFIGURED=false`+"\n"),
+		0o644); err != nil {
+		t.Fatal(err)
+	}
+	r := postJSON(t, h.client, h.ts.URL+"/api/config", map[string]any{
+		"updates": map[string]string{
+			"LATITUDE":     "48.137",
+			"LONGITUDE":    "11.575",
+			"ALTITUDE":     "520m",
+			"MLAT_ENABLED": "true",
+		},
+	})
+	defer r.Body.Close()
+	if r.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d (err=%q); the handler must derive GEO_CONFIGURED before validating", r.StatusCode, decodeError(t, r.Body))
+	}
+	stdinCalls := h.stdinCallsCopy()
+	if len(stdinCalls) != 1 {
+		t.Fatalf("apply-config calls = %d, want 1", len(stdinCalls))
+	}
+}
+
 func TestConfigPost_RejectsBadValueWithKeyName(t *testing.T) {
 	t.Parallel()
 	h := newWriteHarness(t)

@@ -216,7 +216,7 @@ func TestIsValidationError(t *testing.T) {
 	}
 }
 
-func TestValidateConsistency_GeoConfiguredRequiresCoordsAndAltitude(t *testing.T) {
+func TestValidateConsistency_GeoConfiguredRequiresCoords(t *testing.T) {
 	t.Parallel()
 	cases := []struct {
 		name    string
@@ -224,48 +224,43 @@ func TestValidateConsistency_GeoConfiguredRequiresCoordsAndAltitude(t *testing.T
 		wantErr bool
 	}{
 		{
-			name:    "geo true with full coords + altitude → ok",
-			merged:  map[string]string{"GEO_CONFIGURED": "true", "LATITUDE": "51.5", "LONGITUDE": "-0.1", "ALTITUDE": "35m"},
+			name:    "geo true with both coords → ok",
+			merged:  map[string]string{"GEO_CONFIGURED": "true", "LATITUDE": "51.5", "LONGITUDE": "-0.1"},
 			wantErr: false,
 		},
 		{
-			name:    "geo true with equator (lat=0, lon non-zero) + altitude → ok",
-			merged:  map[string]string{"GEO_CONFIGURED": "true", "LATITUDE": "0", "LONGITUDE": "13", "ALTITUDE": "20m"},
+			name:    "geo true with equator (lat=0, lon non-zero) → ok",
+			merged:  map[string]string{"GEO_CONFIGURED": "true", "LATITUDE": "0", "LONGITUDE": "13"},
 			wantErr: false,
 		},
 		{
 			name:    "geo true with missing LATITUDE → error",
-			merged:  map[string]string{"GEO_CONFIGURED": "true", "LONGITUDE": "-0.1", "ALTITUDE": "35m"},
+			merged:  map[string]string{"GEO_CONFIGURED": "true", "LONGITUDE": "-0.1"},
 			wantErr: true,
 		},
 		{
 			name:    "geo true with empty LATITUDE → error",
-			merged:  map[string]string{"GEO_CONFIGURED": "true", "LATITUDE": "", "LONGITUDE": "-0.1", "ALTITUDE": "35m"},
+			merged:  map[string]string{"GEO_CONFIGURED": "true", "LATITUDE": "", "LONGITUDE": "-0.1"},
 			wantErr: true,
 		},
 		{
 			name:    "geo true with empty LONGITUDE → error",
-			merged:  map[string]string{"GEO_CONFIGURED": "true", "LATITUDE": "51.5", "LONGITUDE": "", "ALTITUDE": "35m"},
+			merged:  map[string]string{"GEO_CONFIGURED": "true", "LATITUDE": "51.5", "LONGITUDE": ""},
 			wantErr: true,
 		},
 		{
-			name:    "geo true with empty ALTITUDE → error (catches altitude_empty)",
+			name:    "geo true with empty ALTITUDE → ok (altitude is the MLAT_ENABLED gate, not the GEO_CONFIGURED gate)",
 			merged:  map[string]string{"GEO_CONFIGURED": "true", "LATITUDE": "51.5", "LONGITUDE": "-0.1", "ALTITUDE": ""},
-			wantErr: true,
-		},
-		{
-			name:    "geo true with missing ALTITUDE → error",
-			merged:  map[string]string{"GEO_CONFIGURED": "true", "LATITUDE": "51.5", "LONGITUDE": "-0.1"},
-			wantErr: true,
+			wantErr: false,
 		},
 		{
 			name:    "geo false with empty coords → ok (no coord requirement)",
-			merged:  map[string]string{"GEO_CONFIGURED": "false", "LATITUDE": "0", "LONGITUDE": "0", "ALTITUDE": ""},
+			merged:  map[string]string{"GEO_CONFIGURED": "false", "LATITUDE": "0", "LONGITUDE": "0"},
 			wantErr: false,
 		},
 		{
 			name:    "geo absent → no coord requirement",
-			merged:  map[string]string{"LATITUDE": "", "LONGITUDE": "", "ALTITUDE": ""},
+			merged:  map[string]string{"LATITUDE": "", "LONGITUDE": ""},
 			wantErr: false,
 		},
 	}
@@ -274,6 +269,71 @@ func TestValidateConsistency_GeoConfiguredRequiresCoordsAndAltitude(t *testing.T
 			err := ValidateConsistency(c.merged)
 			if (err != nil) != c.wantErr {
 				t.Errorf("ValidateConsistency = %v, wantErr=%v", err, c.wantErr)
+			}
+		})
+	}
+}
+
+func TestApplyGeoDeriveOnUpdate(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name       string
+		merged     map[string]string
+		explicit   bool
+		touchedLat bool
+		touchedLon bool
+		wantGeo    string // "" = absent in merged
+	}{
+		{
+			name:       "touched lat + lon, both non-zero → true",
+			merged:     map[string]string{"LATITUDE": "51.5", "LONGITUDE": "-0.1"},
+			touchedLat: true, touchedLon: true,
+			wantGeo: "true",
+		},
+		{
+			name:       "touched lat only, both axes non-zero → true",
+			merged:     map[string]string{"LATITUDE": "51.5", "LONGITUDE": "-0.1"},
+			touchedLat: true,
+			wantGeo:    "true",
+		},
+		{
+			name:       "touched lat, both zero → false",
+			merged:     map[string]string{"LATITUDE": "0", "LONGITUDE": "0"},
+			touchedLat: true,
+			wantGeo:    "false",
+		},
+		{
+			name:    "neither coord touched → no derive",
+			merged:  map[string]string{"LATITUDE": "51.5", "LONGITUDE": "-0.1"},
+			wantGeo: "",
+		},
+		{
+			name:       "touched lat but lon missing → no derive",
+			merged:     map[string]string{"LATITUDE": "51.5"},
+			touchedLat: true,
+			wantGeo:    "",
+		},
+		{
+			name:     "explicit GEO_CONFIGURED → no auto-derive (caller value preserved)",
+			merged:   map[string]string{"LATITUDE": "51.5", "LONGITUDE": "-0.1", "GEO_CONFIGURED": "false"},
+			explicit: true, touchedLat: true,
+			wantGeo: "false",
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			m := map[string]string{}
+			for k, v := range c.merged {
+				m[k] = v
+			}
+			ApplyGeoDeriveOnUpdate(m, c.explicit, c.touchedLat, c.touchedLon)
+			got, has := m["GEO_CONFIGURED"]
+			if c.wantGeo == "" {
+				if has {
+					t.Errorf("GEO_CONFIGURED = %q, want absent", got)
+				}
+			} else if !has || got != c.wantGeo {
+				t.Errorf("GEO_CONFIGURED = %q (has=%v), want %q", got, has, c.wantGeo)
 			}
 		})
 	}

@@ -284,24 +284,31 @@
         return null;
     }
 
-    // Strict full-string regexes mirroring configspec.go validators. Used
-    // by the form-time gate so a value the server would reject doesn't
-    // pass the client check. parseFloat is intentionally avoided —
-    // parseFloat("52abc") returns 52, which would let "52abc" sneak past.
-    const decimalRE = /^-?\d+(?:\.\d+)?$/;
+    // Mirror the Go validators in configspec.go. Lat/lon are accepted by
+    // strconv.ParseFloat on the server, which permits leading "+", a
+    // bare leading ".", and scientific notation — anything Number() also
+    // accepts. Number()+isFinite() catches the rejection-class values
+    // (NaN, Infinity, "52abc" → NaN). Empty/whitespace fail explicitly.
+    // parseFloat is intentionally avoided — parseFloat("52abc") returns
+    // 52, which would let "52abc" sneak past.
+    //
+    // Altitude is stricter on both sides: a regex anchored to a numeric
+    // prefix + optional m|ft suffix. Mirrors altitudeRE in configspec.go.
     const altitudeRE = /^(-?\d+(?:\.\d+)?)(m|ft)?$/;
 
     function isValidLatitude(v) {
         const s = (v || "").trim();
-        if (!decimalRE.test(s)) return false;
+        if (s === "") return false;
         const f = Number(s);
-        return Number.isFinite(f) && f >= -90 && f <= 90;
+        if (!Number.isFinite(f)) return false;
+        return f >= -90 && f <= 90;
     }
     function isValidLongitude(v) {
         const s = (v || "").trim();
-        if (!decimalRE.test(s)) return false;
+        if (s === "") return false;
         const f = Number(s);
-        return Number.isFinite(f) && f >= -180 && f <= 180;
+        if (!Number.isFinite(f)) return false;
+        return f >= -180 && f <= 180;
     }
     function isValidAltitude(v) {
         const s = (v || "").trim();

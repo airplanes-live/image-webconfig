@@ -148,11 +148,12 @@ func Validate(key, value string) error {
 // MLAT_USER is a valid combination — the daemon picks a per-device name
 // rather than refusing to start.
 func ValidateConsistency(merged map[string]string) error {
-	// GEO_CONFIGURED=true asserts the operator has provided real coordinates
-	// and an altitude. LATITUDE, LONGITUDE, ALTITUDE must all be non-empty
-	// for the daemon to pass them to mlat-client. A single zero axis is fine
-	// (a real equator or prime-meridian feeder); an empty ALTITUDE is not
-	// (airplanes-mlat.sh strict-fails with reason=altitude_empty).
+	// GEO_CONFIGURED=true asserts the operator has provided real coordinates.
+	// LATITUDE and LONGITUDE must be non-empty for the daemon to pass them
+	// to mlat-client. A single zero axis is fine — that's a real equator or
+	// prime-meridian feeder. Altitude is NOT required here; an existing
+	// feeder with GEO_CONFIGURED=true and empty ALTITUDE must still be
+	// editable (e.g. to turn MLAT off) without supplying altitude first.
 	if geo, hasGeo := merged["GEO_CONFIGURED"]; hasGeo && geo == "true" {
 		if lat, ok := merged["LATITUDE"]; !ok || lat == "" {
 			return validationError("LATITUDE", "must be non-empty when GEO_CONFIGURED=true")
@@ -160,14 +161,11 @@ func ValidateConsistency(merged map[string]string) error {
 		if lon, ok := merged["LONGITUDE"]; !ok || lon == "" {
 			return validationError("LONGITUDE", "must be non-empty when GEO_CONFIGURED=true")
 		}
-		if alt, ok := merged["ALTITUDE"]; !ok || alt == "" {
-			return validationError("ALTITUDE", "must be non-empty when GEO_CONFIGURED=true")
-		}
 	}
-	// MLAT_ENABLED=true requires the full geo set up front. Mirrors the
-	// daemon classifier: airplanes-mlat.sh refuses to start when
+	// MLAT_ENABLED=true requires the full geo set including altitude.
+	// Mirrors the daemon classifier: airplanes-mlat.sh refuses to start when
 	// GEO_CONFIGURED!=true (reason=geo_not_configured) or ALTITUDE is empty
-	// (reason=altitude_empty). Catching it here gives the operator a clear
+	// (reason=altitude_empty). Catching both here gives the operator a clear
 	// per-field error at save time instead of "service failed; check logs".
 	if mlat, ok := merged["MLAT_ENABLED"]; ok && mlat == "true" {
 		if geo, ok := merged["GEO_CONFIGURED"]; !ok || geo != "true" {
@@ -184,6 +182,35 @@ func ValidateConsistency(merged map[string]string) error {
 		}
 	}
 	return nil
+}
+
+// ApplyGeoDeriveOnUpdate mutates merged in place: when the caller's update
+// touches LATITUDE or LONGITUDE without explicitly setting GEO_CONFIGURED,
+// derive the flag from the resulting merged coords. Mirrors apply-config's
+// auto-derive so the pre-validation step in the HTTP handler agrees with
+// the privileged helper's final shape.
+//
+// ALTITUDE is deliberately NOT a trigger: an altitude-only update must not
+// flip an existing explicit GEO_CONFIGURED value. Geo intent requires
+// touching a coordinate axis.
+//
+// No-op when the update explicitly set GEO_CONFIGURED, or when neither
+// coordinate axis was touched, or when either axis is empty in the merged
+// config (a single-axis update doesn't have enough info to set the flag
+// correctly).
+func ApplyGeoDeriveOnUpdate(merged map[string]string, explicitGeo, touchedLat, touchedLon bool) {
+	if explicitGeo {
+		return
+	}
+	if !touchedLat && !touchedLon {
+		return
+	}
+	lat, hasLat := merged["LATITUDE"]
+	lon, hasLon := merged["LONGITUDE"]
+	if !hasLat || !hasLon || lat == "" || lon == "" {
+		return
+	}
+	merged["GEO_CONFIGURED"] = DeriveGeoConfigured(lat, lon)
 }
 
 // numericZero matches the same set of strings the feed-side bash helpers

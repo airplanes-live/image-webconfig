@@ -390,11 +390,15 @@ func (s *Server) handleConfigPost(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	// Cross-key consistency precheck: reject inconsistent shapes (today
-	// just GEO_CONFIGURED=true requiring non-empty LATITUDE + LONGITUDE)
-	// early so the user gets a clear 400 from the dashboard rather than
-	// a silently-failing daemon after the helper has already written the
-	// bad state. We compute the projection of (existing ∪ updates) — full
-	// merge happens in apply-config.
+	// MLAT_ENABLED=true requires GEO_CONFIGURED=true + full coords/altitude;
+	// GEO_CONFIGURED=true requires non-empty lat/lon) early so the user
+	// gets a clear 400 from the dashboard rather than a silently-failing
+	// daemon after the helper has already written the bad state. We
+	// compute the projection of (existing ∪ updates) AND apply the same
+	// GEO_CONFIGURED auto-derive that apply-config runs — without that,
+	// "enter lat/lon/alt + enable MLAT" submitted by the form would be
+	// rejected here because GEO_CONFIGURED wouldn't yet be true in the
+	// preview.
 	{
 		preview, err := s.feedEnv.ReadAll()
 		if err != nil {
@@ -405,6 +409,10 @@ func (s *Server) handleConfigPost(w http.ResponseWriter, r *http.Request) {
 		for k, v := range req.Updates {
 			preview[k] = v
 		}
+		_, explicitGeo := req.Updates["GEO_CONFIGURED"]
+		_, touchedLat := req.Updates["LATITUDE"]
+		_, touchedLon := req.Updates["LONGITUDE"]
+		configspec.ApplyGeoDeriveOnUpdate(preview, explicitGeo, touchedLat, touchedLon)
 		if err := configspec.ValidateConsistency(preview); err != nil {
 			writeJSONError(w, http.StatusBadRequest, err.Error())
 			return

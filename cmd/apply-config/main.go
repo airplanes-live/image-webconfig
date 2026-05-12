@@ -216,36 +216,16 @@ func mergeAndValidate(existing, updates map[string]string) (map[string]string, e
 	for k, v := range updates {
 		merged[k] = configspec.Canonicalize(k, v)
 	}
-	// Auto-derive GEO_CONFIGURED when the update touched lat or lon
-	// without setting the flag explicitly. Frontends that submit lat/lon
-	// don't need to know about GEO_CONFIGURED; we infer "user is
-	// configuring geo" from the presence of a coordinate key in the
-	// update. The derivation uses the same numerically-zero heuristic as
-	// configure.sh and the feed-side migration so writers agree on what
-	// counts as the (0,0) placeholder pair vs a real equator/prime-
-	// meridian coordinate.
-	//
-	// Only fires when BOTH LATITUDE and LONGITUDE are present and non-
-	// empty in the merged config — a single-axis update doesn't have
-	// enough info to set the flag correctly, and an existing empty
-	// counterpart would otherwise produce GEO_CONFIGURED=true that
-	// trips the consistency check.
-	//
-	// ALTITUDE is deliberately NOT a trigger: an altitude-only update
-	// (e.g., user fixes an altitude typo after location is already set)
-	// must not flip an existing explicit GEO_CONFIGURED value. Geo intent
-	// requires touching a coordinate axis.
-	if _, explicit := updates["GEO_CONFIGURED"]; !explicit {
-		_, touchedLat := updates["LATITUDE"]
-		_, touchedLon := updates["LONGITUDE"]
-		if touchedLat || touchedLon {
-			lat, hasLat := merged["LATITUDE"]
-			lon, hasLon := merged["LONGITUDE"]
-			if hasLat && hasLon && lat != "" && lon != "" {
-				merged["GEO_CONFIGURED"] = configspec.DeriveGeoConfigured(lat, lon)
-			}
-		}
-	}
+	// Auto-derive GEO_CONFIGURED via the shared helper so the HTTP handler's
+	// pre-validation projection agrees with the merged shape this helper
+	// commits. Frontends that submit lat/lon don't need to know about
+	// GEO_CONFIGURED; we infer "user is configuring geo" from the presence
+	// of a coordinate key in the update. See configspec.ApplyGeoDeriveOnUpdate
+	// for the trigger and skip rules.
+	_, explicitGeo := updates["GEO_CONFIGURED"]
+	_, touchedLat := updates["LATITUDE"]
+	_, touchedLon := updates["LONGITUDE"]
+	configspec.ApplyGeoDeriveOnUpdate(merged, explicitGeo, touchedLat, touchedLon)
 	// Defense in depth: every preserved value (not just the ones we wrote)
 	// must pass the universal-reject scan. If the existing feed.env was
 	// hand-edited and contains shell-sensitive characters, we fail closed
