@@ -614,3 +614,24 @@ func (s *Server) handlePoweroff(w http.ResponseWriter, _ *http.Request) {
 		}
 	}()
 }
+
+// /api/claim/register (POST): kicks airplanes-claim.service via systemctl
+// start --no-block. The unit's ConditionPathExists=!feeder-claim-secret
+// makes re-trigger a no-op once a secret is on disk, so duplicate clicks
+// are safe. The SPA navigates to the claim activity log on 2xx so the
+// user sees progress / failures live; this handler only reports whether
+// the start request was accepted by systemd.
+func (s *Server) handleClaimRegister(w http.ResponseWriter, r *http.Request) {
+	cctx, cancel := context.WithTimeout(r.Context(), systemctlTimeout)
+	defer cancel()
+	res, err := s.runner(cctx, s.priv.RegisterClaim)
+	if err != nil {
+		log.Printf("claim-register: %v stderr=%q", err, strings.TrimSpace(string(res.Stderr)))
+		writeJSONError(w, http.StatusInternalServerError, "claim register start failed")
+		return
+	}
+	writeJSON(w, http.StatusAccepted, map[string]string{
+		"status": "starting",
+		"unit":   "airplanes-claim.service",
+	})
+}

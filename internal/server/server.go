@@ -44,11 +44,12 @@ type Server struct {
 // owns feed.env validation, restart fan-out, and the on-disk schema —
 // webconfig is a thin HTTP shell around its JSON interface.
 type PrivilegedArgv struct {
-	ApplyFeed   []string // sudo -n /usr/local/bin/apl-feed apply --json --lock-timeout 5
-	SchemaFeed  []string // /usr/local/bin/apl-feed schema --json (no sudo: read-only)
-	Reboot      []string // sudo -n /usr/bin/systemctl reboot
-	Poweroff    []string // sudo -n /usr/bin/systemctl poweroff
-	StartUpdate []string // sudo systemd-run --unit=airplanes-update ...
+	ApplyFeed     []string // sudo -n /usr/local/bin/apl-feed apply --json --lock-timeout 5
+	SchemaFeed    []string // /usr/local/bin/apl-feed schema --json (no sudo: read-only)
+	Reboot        []string // sudo -n /usr/bin/systemctl reboot
+	Poweroff      []string // sudo -n /usr/bin/systemctl poweroff
+	StartUpdate   []string // sudo systemd-run --unit=airplanes-update ...
+	RegisterClaim []string // sudo systemctl start --no-block airplanes-claim.service
 }
 
 // DefaultPrivilegedArgv returns the production argv shapes for the
@@ -75,6 +76,12 @@ func DefaultPrivilegedArgv() PrivilegedArgv {
 			"--property=ExecStopPost=/usr/bin/systemctl kill -s HUP airplanes-webconfig.service",
 			"/usr/local/share/airplanes/update.sh",
 		),
+		// --no-block: the unit is Type=oneshot and apl-feed claim register
+		// retries on network failure for up to ~15s. A blocking start could
+		// exceed systemctlTimeout; --no-block enqueues the job and returns
+		// immediately. Progress and failures show up in the claim activity
+		// log via the SSE stream the SPA opens after this returns.
+		RegisterClaim: sudo("/usr/bin/systemctl", "start", "--no-block", "airplanes-claim.service"),
 	}
 }
 
@@ -144,6 +151,7 @@ func New(d Deps) http.Handler {
 	mux.HandleFunc("POST /api/update", s.requireSession(s.handleUpdate))
 	mux.HandleFunc("POST /api/reboot", s.requireSession(s.handleReboot))
 	mux.HandleFunc("POST /api/poweroff", s.requireSession(s.handlePoweroff))
+	mux.HandleFunc("POST /api/claim/register", s.requireSession(s.handleClaimRegister))
 
 	// Static assets at /static/*; the SPA shell is served by the GET /
 	// handler below. no-store cache policy: assets are embedded in the
