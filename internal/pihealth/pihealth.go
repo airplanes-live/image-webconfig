@@ -119,10 +119,10 @@ type PiHealth struct {
 
 	UndervoltageNow   bool `json:"undervoltage_now"`
 	UndervoltageEver  bool `json:"undervoltage_ever"`
-	ARMFreqCapNow     bool `json:"arm_freq_cap_now"`
-	ARMFreqCapEver    bool `json:"arm_freq_cap_ever"`
-	ThrottlingNow     bool `json:"throttling_now"`
-	ThrottlingEver    bool `json:"throttling_ever"`
+	ARMFreqCapNow     bool `json:"freq_capped_now"`
+	ARMFreqCapEver    bool `json:"freq_capped_ever"`
+	ThrottlingNow     bool `json:"throttled_now"`
+	ThrottlingEver    bool `json:"throttled_ever"`
 	SoftTempLimitNow  bool `json:"soft_temp_limit_now"`
 	SoftTempLimitEver bool `json:"soft_temp_limit_ever"`
 
