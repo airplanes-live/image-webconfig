@@ -1,9 +1,15 @@
 # /etc/sudoers.d/011_airplanes-webconfig-update
 #
-# Reserved for the webconfig self-update grant.
-# Replaced when the self-update endpoint lands.
+# Self-update grant for the airplanes-webconfig service account. Pinned to
+# the exact argv that DefaultPrivilegedArgv().StartWebconfigUpdate produces;
+# the Go test TestDefaultPrivilegedArgv_SudoersParity enforces the match.
 #
-# A comment-only file is a valid sudoers file: visudo -cf accepts it,
-# chmod 0440 root:root in the image chroot step succeeds, and no
-# additional privilege is granted to the airplanes-webconfig account
-# until the real entry replaces this placeholder.
+# The transient unit name (airplanes-webconfig-update.service) is the same
+# name the in-product 409-guard checks via maintenanceUnits, so a self-update
+# cannot overlap with a feed update or an apt upgrade.
+#
+# This grant does NOT preserve the caller's environment. The helper script
+# scrubs AIRPLANES_* env vars on entry, but defense in depth — sudoers'
+# default secure_path behaviour prevents PATH-hijacks via this grant.
+
+airplanes-webconfig ALL=(root) NOPASSWD: /usr/bin/systemd-run --unit=airplanes-webconfig-update --collect /usr/local/lib/airplanes-webconfig/webconfig-self-update.sh
