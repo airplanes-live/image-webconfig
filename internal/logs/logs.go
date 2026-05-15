@@ -32,8 +32,9 @@ var Whitelist = map[string]string{
 	"uat":            "airplanes-978.service",
 	"claim":          "airplanes-claim.service",
 	"webconfig":      "airplanes-webconfig.service",
-	"update":         "airplanes-update.service",
-	"system-upgrade": "airplanes-system-upgrade.service",
+	"update":           "airplanes-update.service",
+	"system-upgrade":   "airplanes-system-upgrade.service",
+	"webconfig-update": "airplanes-webconfig-update.service",
 }
 
 // JournalctlBinary is overridable for tests.
