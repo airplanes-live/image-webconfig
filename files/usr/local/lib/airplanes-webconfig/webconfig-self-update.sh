@@ -6,76 +6,116 @@
 #
 # Steps:
 #   1. Scrub the environment — never trust env from the webconfig caller.
-#   2. Run /usr/local/share/airplanes-webconfig/update.sh, which locks,
+#   2. Back up the live unit file alongside the binary so a unit-file
+#      change in the new release can be rolled back together with the
+#      binary if /health fails after the restart.
+#   3. Run /usr/local/share/airplanes-webconfig/update.sh, which locks,
 #      downloads and verifies the release, atomic-renames the binary
 #      (saving the previous as .prev), and extracts the rootfs payload.
-#   3. systemctl daemon-reload + restart airplanes-webconfig.service.
-#   4. Poll /health for up to ~10s. On success, drop the .prev marker.
-#      On failure, restore .prev, restart, and exit non-zero so the SSE
-#      log stream the SPA is reading shows the rollback.
+#   4. systemctl daemon-reload + restart airplanes-webconfig.service.
+#   5. Poll /health for up to ~10s. On success, drop the .prev markers.
+#      On failure, restore .prev for both the binary and the unit, then
+#      restart, and exit non-zero so the SSE log stream the SPA is reading
+#      shows the rollback.
+#
+# Why not `set -e`: a failed daemon-reload or restart under `set -e`
+# would abort before the rollback block runs, leaving the new binary in
+# place and the service down. The script handles errors explicitly so
+# every failure path routes through rollback.
 
-set -euo pipefail
+set -uo pipefail
 
 # Reset the environment. The HTTP-facing process is a non-root service
 # account; we do not trust any AIRPLANES_WEBCONFIG_* env it might have
-# exported through the sudo grant. PATH is set to systemd's default for
-# system services so curl/git/tar/sha256sum/python3 resolve consistently.
-while IFS='=' read -r _var _; do
-    case "$_var" in
-        AIRPLANES_*) unset "$_var" ;;
-    esac
-done < <(env)
-unset _var
-export PATH=/usr/sbin:/usr/bin:/sbin:/bin
-export LC_ALL=C
+# exported through the sudo grant. We also re-exec under `env -i` for a
+# hard guarantee — sudoers' env_reset gives us a clean slate but a global
+# `Defaults env_keep` (if some operator adds one) could leak through.
+if [ -z "${AIRPLANES_WEBCONFIG_SELF_UPDATE_REEXEC:-}" ]; then
+    exec /usr/bin/env -i \
+        PATH=/usr/sbin:/usr/bin:/sbin:/bin \
+        LC_ALL=C \
+        AIRPLANES_WEBCONFIG_SELF_UPDATE_REEXEC=1 \
+        /bin/bash "$0" "$@"
+fi
 
 INSTALLER=/usr/local/share/airplanes-webconfig/update.sh
 BIN=/usr/local/bin/airplanes-webconfig
+UNIT_FILE=/etc/systemd/system/airplanes-webconfig.service
 SERVICE=airplanes-webconfig.service
 HEALTH_URL=http://127.0.0.1:8080/health
 HEALTH_MAX_ATTEMPTS=10
 HEALTH_SLEEP_SECONDS=1
+
+# Restores the previous binary and unit file (if backed up) and restarts the
+# service so the rollback takes effect, then exits with the supplied code.
+rollback_and_exit() {
+    local rc="$1"
+    local restored=0
+    if [ -f "${BIN}.prev" ]; then
+        mv -f "${BIN}.prev" "$BIN" && restored=1
+    fi
+    if [ -f "${UNIT_FILE}.prev" ]; then
+        mv -f "${UNIT_FILE}.prev" "$UNIT_FILE" && restored=1
+    fi
+    if [ "$restored" -eq 1 ]; then
+        systemctl daemon-reload || true
+        systemctl restart "$SERVICE" || true
+    fi
+    exit "$rc"
+}
 
 if [ ! -x "$INSTALLER" ]; then
     echo "ERROR: $INSTALLER missing or not executable" >&2
     exit 1
 fi
 
+# Back up the unit file so we can roll it back too. The installer rolls
+# back the binary on its own failures, but if the unit file is rewritten
+# during rootfs extraction and the new binary then fails /health, we need
+# both old binary + old unit for a coherent rollback.
+if [ -f "$UNIT_FILE" ]; then
+    cp -a "$UNIT_FILE" "${UNIT_FILE}.prev"
+fi
+
 echo "webconfig-self-update: invoking $INSTALLER"
-if ! "$INSTALLER"; then
-    rc=$?
+"$INSTALLER"
+rc=$?
+if [ "$rc" -ne 0 ]; then
     echo "webconfig-self-update: installer failed (rc=$rc)" >&2
+    # The installer's own rollback may have run; we additionally restore
+    # the unit file we backed up.
     if [ -f "${BIN}.prev" ]; then
         echo "webconfig-self-update: restoring ${BIN}.prev"
         mv -f "${BIN}.prev" "$BIN"
+    fi
+    if [ -f "${UNIT_FILE}.prev" ]; then
+        mv -f "${UNIT_FILE}.prev" "$UNIT_FILE"
+        systemctl daemon-reload || true
     fi
     exit "$rc"
 fi
 
 echo "webconfig-self-update: daemon-reload + restart $SERVICE"
-systemctl daemon-reload
-systemctl restart "$SERVICE"
+if ! systemctl daemon-reload; then
+    echo "webconfig-self-update: daemon-reload failed; rolling back" >&2
+    rollback_and_exit 1
+fi
+if ! systemctl restart "$SERVICE"; then
+    echo "webconfig-self-update: restart failed; rolling back" >&2
+    rollback_and_exit 1
+fi
 
 attempt=0
 while [ "$attempt" -lt "$HEALTH_MAX_ATTEMPTS" ]; do
     attempt=$((attempt + 1))
     sleep "$HEALTH_SLEEP_SECONDS"
     if curl -fsS -o /dev/null --max-time 2 "$HEALTH_URL"; then
-        rm -f "${BIN}.prev"
+        rm -f "${BIN}.prev" "${UNIT_FILE}.prev"
         echo "webconfig-self-update: /health OK after restart (attempt=$attempt)"
         exit 0
     fi
     echo "webconfig-self-update: /health probe failed (attempt=$attempt/$HEALTH_MAX_ATTEMPTS)"
 done
 
-# Restart did not produce a healthy service. Roll the binary back to the
-# pre-update copy and restart again. The rootfs tarball changes (units,
-# helper scripts, sudoers) are intentionally not rolled back here — the
-# binary is what determines whether the service can boot; the rest can be
-# fixed by the next successful update cycle.
-echo "webconfig-self-update: health probe exhausted; rolling back binary" >&2
-if [ -f "${BIN}.prev" ]; then
-    mv -f "${BIN}.prev" "$BIN"
-    systemctl restart "$SERVICE" || true
-fi
-exit 1
+echo "webconfig-self-update: health probe exhausted; rolling back" >&2
+rollback_and_exit 1

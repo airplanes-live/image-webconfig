@@ -1399,6 +1399,16 @@
             type: "button", class: "wc-btn-ghost",
             onclick: async () => {
                 webUiUpdateBtn.disabled = true;
+                // Capture /health BEFORE issuing the update POST so the
+                // progress view has a baseline to compare against once the
+                // service restarts. Doing this after the POST opens a race
+                // where a very fast restart could land the new version
+                // here and the poller would then wait forever for a change.
+                let preUpdateHealth = null;
+                try {
+                    const h = await fetch("/health", { cache: "no-store" });
+                    if (h.ok) preUpdateHealth = await h.text();
+                } catch (_) { /* ignore — poller still works without baseline */ }
                 const r = await postJSON("/api/webconfig-update", {});
                 webUiUpdateBtn.disabled = false;
                 if (handleAuthFailure(r)) return;
@@ -1406,7 +1416,7 @@
                     alert((r.payload && r.payload.error) || "web UI update failed");
                     return;
                 }
-                navigate(webconfigUpdateProgress, { title: "Web UI update", showBack: true });
+                navigate(() => webconfigUpdateProgress(preUpdateHealth), { title: "Web UI update", showBack: true });
             },
         }, "Update web UI");
 
@@ -2022,7 +2032,12 @@
     // (success) or until we give up (failure). On success, reload so the
     // SPA reconnects to the new binary; on failure, stay on the page with
     // a hint to refresh manually.
-    function webconfigUpdateProgress() {
+    //
+    // baselineHealth: the /health response text captured BEFORE the POST
+    // that started this update. May be null (fetch failed); the poller
+    // treats null as "any successful /health after SSE death counts as
+    // restart", which is a slightly weaker signal but still safe.
+    function webconfigUpdateProgress(baselineHealth) {
         const slug = "webconfig-update";
         const pre = el("pre", { class: "log-output" });
         const status = el("p", { class: "muted" }, "Update in progress; the page will reload when the new web UI is ready.");
@@ -2039,16 +2054,22 @@
             ),
         );
 
-        // Capture the current /health response so we can detect the restart.
-        // /health returns "ok <version>\n"; after the new binary starts the
-        // version segment will differ. If the initial probe fails we fall
-        // through to polling and treat the FIRST successful response as the
-        // restart signal.
-        let preUpdateHealth = null;
-        fetch("/health", { cache: "no-store" })
-            .then((r) => (r.ok ? r.text() : null))
-            .then((t) => { preUpdateHealth = t; })
-            .catch(() => { /* ignore — we'll detect restart via polling */ });
+        // cancelled lets the polling loop bail out cleanly when the user
+        // navigates away. activeAbort + activeStream are reset by navigate()
+        // on transition; setting both here ties this panel's resources to
+        // that lifecycle.
+        let cancelled = false;
+        let pollTimer = null;
+        const ctrl = new AbortController();
+        const prevAbort = activeAbort;
+        activeAbort = {
+            abort: () => {
+                cancelled = true;
+                if (pollTimer) { clearTimeout(pollTimer); pollTimer = null; }
+                try { ctrl.abort(); } catch (_) {}
+                if (prevAbort && typeof prevAbort.abort === "function") prevAbort.abort();
+            },
+        };
 
         const es = new EventSource("/api/log/" + encodeURIComponent(slug));
         activeStream = es;
@@ -2062,6 +2083,7 @@
             pre.appendChild(document.createTextNode("[restart in progress]\n"));
             try { es.close(); } catch (_) {}
             if (activeStream === es) activeStream = null;
+            if (cancelled) return;
             status.textContent = "Waiting for the new web UI to come back online…";
             pollForRestart();
         };
@@ -2070,26 +2092,29 @@
         const POLL_MAX_ATTEMPTS = 90; // 90 seconds total
         let attempts = 0;
         function pollForRestart() {
+            if (cancelled) return;
             attempts += 1;
-            fetch("/health", { cache: "no-store" })
+            fetch("/health", { cache: "no-store", signal: ctrl.signal })
                 .then((r) => (r.ok ? r.text() : null))
                 .then((t) => {
-                    if (t && (preUpdateHealth === null || t !== preUpdateHealth)) {
+                    if (cancelled) return;
+                    if (t && (baselineHealth === null || t !== baselineHealth)) {
                         status.textContent = "Update applied — reloading…";
                         pre.appendChild(document.createTextNode("[restart complete: " + t.trim() + "]\n"));
-                        setTimeout(() => window.location.reload(), 500);
+                        pollTimer = setTimeout(() => { if (!cancelled) window.location.reload(); }, 500);
                         return;
                     }
                     scheduleNext();
                 })
-                .catch(() => { scheduleNext(); });
+                .catch(() => { if (!cancelled) scheduleNext(); });
         }
         function scheduleNext() {
+            if (cancelled) return;
             if (attempts >= POLL_MAX_ATTEMPTS) {
                 status.textContent = "The web UI did not come back online within 90 seconds. Refresh the page once the feeder is reachable, or check the log for a rollback message.";
                 return;
             }
-            setTimeout(pollForRestart, POLL_INTERVAL_MS);
+            pollTimer = setTimeout(pollForRestart, POLL_INTERVAL_MS);
         }
     }
 
