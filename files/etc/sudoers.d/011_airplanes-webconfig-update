@@ -1,0 +1,9 @@
+# /etc/sudoers.d/011_airplanes-webconfig-update
+#
+# Reserved for the webconfig self-update grant.
+# Replaced when the self-update endpoint lands.
+#
+# A comment-only file is a valid sudoers file: visudo -cf accepts it,
+# chmod 0440 root:root in the image chroot step succeeds, and no
+# additional privilege is granted to the airplanes-webconfig account
+# until the real entry replaces this placeholder.

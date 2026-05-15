@@ -19,13 +19,13 @@ import (
 	"testing"
 	"time"
 
-	"github.com/airplanes-live/image/webconfig/internal/auth"
-	wexec "github.com/airplanes-live/image/webconfig/internal/exec"
-	"github.com/airplanes-live/image/webconfig/internal/feedenv"
-	"github.com/airplanes-live/image/webconfig/internal/identity"
-	"github.com/airplanes-live/image/webconfig/internal/logs"
-	"github.com/airplanes-live/image/webconfig/internal/schemacache"
-	"github.com/airplanes-live/image/webconfig/internal/status"
+	"github.com/airplanes-live/image-webconfig/internal/auth"
+	wexec "github.com/airplanes-live/image-webconfig/internal/exec"
+	"github.com/airplanes-live/image-webconfig/internal/feedenv"
+	"github.com/airplanes-live/image-webconfig/internal/identity"
+	"github.com/airplanes-live/image-webconfig/internal/logs"
+	"github.com/airplanes-live/image-webconfig/internal/schemacache"
+	"github.com/airplanes-live/image-webconfig/internal/status"
 )
 
 const testPassword = "correct horse battery staple"
@@ -796,9 +796,9 @@ func TestPoweroff_RefusedDuringMaintenance(t *testing.T) {
 }
 
 // TestDefaultPrivilegedArgv_Poweroff pins the production argv shape so the Go
-// default and the sudoers file in stage-airplanes/05-install-webconfig cannot
-// drift. overlay-smoke catches sudoers-side drift on the image; this catches
-// the Go-source side at unit-test time.
+// default and the sudoers file under files/etc/sudoers.d/ cannot drift.
+// The sudoers-argv parity test catches the matching sudoers-side drift;
+// this test catches the Go-source side at unit-test time.
 func TestDefaultPrivilegedArgv_Poweroff(t *testing.T) {
 	t.Parallel()
 	want := []string{"/usr/bin/sudo", "-n", "/usr/bin/systemctl", "poweroff"}
@@ -1493,7 +1493,7 @@ func TestLog_KnownUnitStreamsSSE(t *testing.T) {
 // command-spec byte-for-byte, otherwise sudo refuses the call at runtime.
 func TestDefaultPrivilegedArgv_SudoersParity(t *testing.T) {
 	t.Parallel()
-	sudoersPath := filepath.Join("..", "..", "..", "stage-airplanes", "05-install-webconfig", "files", "etc", "sudoers.d", "010_airplanes-webconfig")
+	sudoersPath := filepath.Join("..", "..", "files", "etc", "sudoers.d", "010_airplanes-webconfig")
 	raw, err := os.ReadFile(sudoersPath)
 	if err != nil {
 		t.Fatalf("read sudoers: %v", err)

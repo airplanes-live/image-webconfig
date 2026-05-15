@@ -11,9 +11,9 @@ import (
 	"testing"
 	"time"
 
-	wexec "github.com/airplanes-live/image/webconfig/internal/exec"
-	"github.com/airplanes-live/image/webconfig/internal/pihealth"
-	"github.com/airplanes-live/image/webconfig/internal/wifi"
+	wexec "github.com/airplanes-live/image-webconfig/internal/exec"
+	"github.com/airplanes-live/image-webconfig/internal/pihealth"
+	"github.com/airplanes-live/image-webconfig/internal/wifi"
 )
 
 func newTestPaths(t *testing.T) (Paths, string) {

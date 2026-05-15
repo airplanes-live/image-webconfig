@@ -1,0 +1,103 @@
+name: CI
+
+on:
+  push:
+    branches: [main, dev]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+      - uses: actions/setup-go@d35c59abb061a4a6fb18e82ac0862c26744d6ab5  # v5.5.0
+        with:
+          go-version-file: go.mod
+      - run: go vet ./...
+      - run: go mod verify
+      - run: go test ./...
+
+  cross-build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { arch: arm64, goarch: arm64, goarm: "" }
+          - { arch: armhf, goarch: arm,   goarm: "7" }
+    concurrency:
+      group: cross-build-${{ matrix.arch }}-${{ github.ref }}
+      cancel-in-progress: true
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+      - uses: actions/setup-go@d35c59abb061a4a6fb18e82ac0862c26744d6ab5  # v5.5.0
+        with:
+          go-version-file: go.mod
+      - name: cross-compile airplanes-webconfig-${{ matrix.arch }}
+        env:
+          GOOS: linux
+          GOARCH: ${{ matrix.goarch }}
+          GOARM: ${{ matrix.goarm }}
+          CGO_ENABLED: "0"
+        run: |
+          go build -trimpath -buildvcs=false \
+            -ldflags "-s -w -X main.version=${{ github.sha }} -X main.commitSha=${{ github.sha }}" \
+            -o airplanes-webconfig-${{ matrix.arch }} \
+            ./cmd/webconfig
+          file airplanes-webconfig-${{ matrix.arch }}
+
+  shell-lint:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+      - name: Install shellcheck
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends shellcheck
+      - name: shellcheck
+        run: |
+          shellcheck -x install.sh update.sh scripts/lib/install-common.sh \
+            files/usr/local/lib/airplanes-webconfig/*.sh \
+            files/usr/local/bin/apl-wifi \
+            files/usr/local/lib/airplanes/*.sh
+      - name: bash -n
+        run: |
+          for f in install.sh update.sh scripts/lib/install-common.sh \
+                   files/usr/local/lib/airplanes-webconfig/*.sh \
+                   files/usr/local/bin/apl-wifi \
+                   files/usr/local/lib/airplanes/*.sh; do
+            bash -n "$f"
+          done
+
+  visudo:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+      - name: visudo -cf
+        run: |
+          for f in files/etc/sudoers.d/*; do
+            name="$(basename "$f")"
+            sudo cp "$f" "/etc/sudoers.d/$name"
+            sudo chmod 0440 "/etc/sudoers.d/$name"
+            sudo chown root:root "/etc/sudoers.d/$name"
+            sudo visudo -cf "/etc/sudoers.d/$name"
+          done
+
+  bats:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+      - name: Install bats
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends bats
+      - name: Run bats suite
+        run: bats test/bats/

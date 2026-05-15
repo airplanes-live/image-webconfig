@@ -26,7 +26,7 @@ import (
 	"strings"
 	"time"
 
-	wexec "github.com/airplanes-live/image/webconfig/internal/exec"
+	wexec "github.com/airplanes-live/image-webconfig/internal/exec"
 )
 
 // Signal is the JSON shape embedded in /api/status as `wifi`. Connected

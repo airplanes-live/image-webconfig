@@ -15,10 +15,10 @@ import (
 	"sync"
 	"time"
 
-	wexec "github.com/airplanes-live/image/webconfig/internal/exec"
-	"github.com/airplanes-live/image/webconfig/internal/pihealth"
-	"github.com/airplanes-live/image/webconfig/internal/runtimestate"
-	"github.com/airplanes-live/image/webconfig/internal/wifi"
+	wexec "github.com/airplanes-live/image-webconfig/internal/exec"
+	"github.com/airplanes-live/image-webconfig/internal/pihealth"
+	"github.com/airplanes-live/image-webconfig/internal/runtimestate"
+	"github.com/airplanes-live/image-webconfig/internal/wifi"
 )
 
 // PiHealthProbe is the interface status.Reader uses to fetch a hardware

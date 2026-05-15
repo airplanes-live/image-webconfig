@@ -6,14 +6,14 @@ import (
 	"net/http"
 	"sync"
 
-	"github.com/airplanes-live/image/webconfig/internal/auth"
-	wexec "github.com/airplanes-live/image/webconfig/internal/exec"
-	"github.com/airplanes-live/image/webconfig/internal/feedenv"
-	"github.com/airplanes-live/image/webconfig/internal/identity"
-	"github.com/airplanes-live/image/webconfig/internal/logs"
-	"github.com/airplanes-live/image/webconfig/internal/schemacache"
-	"github.com/airplanes-live/image/webconfig/internal/status"
-	webassets "github.com/airplanes-live/image/webconfig/web"
+	"github.com/airplanes-live/image-webconfig/internal/auth"
+	wexec "github.com/airplanes-live/image-webconfig/internal/exec"
+	"github.com/airplanes-live/image-webconfig/internal/feedenv"
+	"github.com/airplanes-live/image-webconfig/internal/identity"
+	"github.com/airplanes-live/image-webconfig/internal/logs"
+	"github.com/airplanes-live/image-webconfig/internal/schemacache"
+	"github.com/airplanes-live/image-webconfig/internal/status"
+	webassets "github.com/airplanes-live/image-webconfig/web"
 )
 
 // Server holds the runtime auth components. Constructed in cmd/webconfig.

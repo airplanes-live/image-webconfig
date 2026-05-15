@@ -7,7 +7,7 @@ import (
 	"reflect"
 	"testing"
 
-	"github.com/airplanes-live/image/webconfig/internal/configspec"
+	"github.com/airplanes-live/image-webconfig/internal/configspec"
 )
 
 // TestReadKeysMatchConfigspecAllReadKeys enforces the comment-block invariant

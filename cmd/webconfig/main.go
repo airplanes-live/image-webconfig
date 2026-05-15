@@ -14,16 +14,16 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/airplanes-live/image/webconfig/internal/auth"
-	wexec "github.com/airplanes-live/image/webconfig/internal/exec"
-	"github.com/airplanes-live/image/webconfig/internal/feedenv"
-	"github.com/airplanes-live/image/webconfig/internal/identity"
-	"github.com/airplanes-live/image/webconfig/internal/logs"
-	"github.com/airplanes-live/image/webconfig/internal/pihealth"
-	"github.com/airplanes-live/image/webconfig/internal/schemacache"
-	"github.com/airplanes-live/image/webconfig/internal/server"
-	"github.com/airplanes-live/image/webconfig/internal/status"
-	"github.com/airplanes-live/image/webconfig/internal/wifi"
+	"github.com/airplanes-live/image-webconfig/internal/auth"
+	wexec "github.com/airplanes-live/image-webconfig/internal/exec"
+	"github.com/airplanes-live/image-webconfig/internal/feedenv"
+	"github.com/airplanes-live/image-webconfig/internal/identity"
+	"github.com/airplanes-live/image-webconfig/internal/logs"
+	"github.com/airplanes-live/image-webconfig/internal/pihealth"
+	"github.com/airplanes-live/image-webconfig/internal/schemacache"
+	"github.com/airplanes-live/image-webconfig/internal/server"
+	"github.com/airplanes-live/image-webconfig/internal/status"
+	"github.com/airplanes-live/image-webconfig/internal/wifi"
 )
 
 // version is overridden via -ldflags "-X main.version=<sha>".

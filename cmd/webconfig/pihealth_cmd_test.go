@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/airplanes-live/image/webconfig/internal/pihealth"
+	"github.com/airplanes-live/image-webconfig/internal/pihealth"
 )
 
 func TestAsciiSafe(t *testing.T) {

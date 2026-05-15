@@ -1,0 +1,1073 @@
+#!/bin/bash
+# apl-wifi — privileged Wi-Fi network management for airplanes-webconfig.
+#
+# Reads JSON on stdin (mutating subcommands), emits a single JSON envelope on
+# stdout for every status. Exit codes follow the apl-feed contract:
+#   0 applied / no_change / ok
+#   2 rejected / test_failed
+#   3 filesystem_error
+#   4 lock_timeout
+#   5 parse_error / usage_error
+#
+# The webconfig caller's sudoers grants pin one argv per subcommand
+# (`apl-wifi <verb> --json`), so the trust boundary is the sudoers layer.
+# All NetworkManager operations target the connection UUID. The URL-visible
+# id is the keyfile basename and is reused unchanged across edits so NM keeps
+# using the same in-memory profile.
+#
+# Managed-only CRUD: keyfiles named airplanes-config-wifi.nmconnection or
+# airplanes-wifi-*.nmconnection are editable; anything else is reported with
+# managed=false and mutating ops on it are rejected.
+
+set -Eeuo pipefail
+
+# --- paths + constants -----------------------------------------------------
+
+APL_WIFI_LIB_DIR="${APL_WIFI_LIB_DIR:-/usr/local/lib/airplanes}"
+APL_WIFI_KEYFILE_DIR="${APL_WIFI_KEYFILE_DIR:-/etc/NetworkManager/system-connections}"
+APL_WIFI_LOCK="${APL_WIFI_LOCK:-/run/airplanes/wifi.lock}"
+APL_WIFI_ROLLBACK_DIR="${APL_WIFI_ROLLBACK_DIR:-/run/airplanes/wifi-rollback}"
+APL_WIFI_NMCLI="${APL_WIFI_NMCLI:-nmcli}"
+APL_WIFI_CARRIER_DIR="${APL_WIFI_CARRIER_DIR:-/sys/class/net}"
+APL_WIFI_UUID_SOURCE="${APL_WIFI_UUID_SOURCE:-/proc/sys/kernel/random/uuid}"
+APL_WIFI_LOCK_TIMEOUT="${APL_WIFI_LOCK_TIMEOUT:-5}"
+APL_WIFI_NMCLI_WAIT="${APL_WIFI_NMCLI_WAIT:-45}"
+APL_WIFI_OUTER_TIMEOUT="${APL_WIFI_OUTER_TIMEOUT:-60}"
+
+APL_WIFI_FIRST_RUN_ID="airplanes-config-wifi"
+APL_WIFI_MANAGED_PREFIX="airplanes-wifi-"
+APL_WIFI_KEYFILE_EXT=".nmconnection"
+
+# Managed id regex: the first-run keyfile or airplanes-wifi-<slug>, where the
+# slug is 1-41 lowercase alnum-or-hyphen chars starting alphanumerically. This
+# matches apl_wifi_slugify's output. Enforced server-side so a path-traversal
+# attempt (encoded slashes, .., control bytes, …) is rejected before any
+# filesystem op.
+APL_WIFI_MANAGED_ID_RE='^(airplanes-config-wifi|airplanes-wifi-[a-z0-9][a-z0-9-]{0,40})$'
+
+# --- JSON envelope helpers + traps -----------------------------------------
+#
+# Trap is installed BEFORE library sourcing so a missing/corrupt library can
+# still surface as a JSON envelope rather than empty stdout. Cleanup trap on
+# EXIT removes orphan transient test keyfiles and rollback snapshots that
+# would otherwise survive a crashed helper.
+
+_apl_wifi_emitted=0
+
+_emit_json() {
+	_apl_wifi_emitted=1
+	printf '%s\n' "$1"
+}
+
+_emit_error() {
+	local status="$1" message="$2"
+	shift 2
+	local body
+	if ! body="$(jq -nc --arg s "$status" --arg m "$message" "$@" '{status:$s, message:$m} + $ARGS.named')"; then
+		printf '{"status":"%s","message":"jq emit failed"}\n' "$status"
+		_apl_wifi_emitted=1
+		return
+	fi
+	_emit_json "$body"
+}
+
+_apl_wifi_err_trap() {
+	local rc=$?
+	if (( _apl_wifi_emitted == 0 )); then
+		printf '{"status":"filesystem_error","message":"apl-wifi: unexpected error (exit %d)"}\n' "$rc"
+	fi
+	exit "$rc"
+}
+
+_apl_wifi_exit_cleanup() {
+	# Best-effort sweep of files only this helper would have created. Glob is
+	# tight enough that we won't disturb production keyfiles, but we still
+	# silence errors so a missing directory at test-host shutdown can't blow
+	# up the trap chain.
+	[[ -d "$APL_WIFI_KEYFILE_DIR" ]] && \
+		rm -f "$APL_WIFI_KEYFILE_DIR/${APL_WIFI_MANAGED_PREFIX}test-"*"$APL_WIFI_KEYFILE_EXT" 2>/dev/null
+	[[ -d "$APL_WIFI_ROLLBACK_DIR" ]] && \
+		rm -f "$APL_WIFI_ROLLBACK_DIR"/*"$APL_WIFI_KEYFILE_EXT" 2>/dev/null
+	return 0
+}
+
+trap _apl_wifi_err_trap ERR
+trap _apl_wifi_exit_cleanup EXIT
+
+# shellcheck source=../lib/airplanes/wifi-validators.sh disable=SC1091
+. "$APL_WIFI_LIB_DIR/wifi-validators.sh"
+# shellcheck source=../lib/airplanes/wifi-keyfile.sh disable=SC1091
+. "$APL_WIFI_LIB_DIR/wifi-keyfile.sh"
+
+# --- id / slug / managed helpers -------------------------------------------
+
+apl_wifi_slugify() {
+	local s="$1"
+	s="$(LC_ALL=C printf '%s' "$s" | LC_ALL=C tr '[:upper:]' '[:lower:]')"
+	s="$(LC_ALL=C printf '%s' "$s" | LC_ALL=C tr -c 'a-z0-9' '-')"
+	# Strip leading/trailing dashes and collapse runs.
+	s="$(LC_ALL=C printf '%s' "$s" | LC_ALL=C sed -e 's/^-\{1,\}//' -e 's/-\{1,\}$//' -e 's/-\{1,\}/-/g')"
+	[[ -z "$s" ]] && s="wifi"
+	# Cap at 40 chars and re-strip trailing dash if the cut left one.
+	s="${s:0:40}"
+	s="${s%-}"
+	printf '%s' "$s"
+}
+
+apl_wifi_keyfile_path() {
+	printf '%s/%s%s' "$APL_WIFI_KEYFILE_DIR" "$1" "$APL_WIFI_KEYFILE_EXT"
+}
+
+apl_wifi_is_managed_id() {
+	[[ "$1" =~ $APL_WIFI_MANAGED_ID_RE ]]
+}
+
+# Generate a unique managed id from an SSID. Appends -2, -3, … if the slug
+# collides with an existing keyfile (managed or not). Caps at 10 attempts;
+# returns 1 (and prints nothing) if it can't find a free slug.
+apl_wifi_unique_id() {
+	local base candidate n=1
+	base="$(apl_wifi_slugify "$1")"
+	candidate="${APL_WIFI_MANAGED_PREFIX}${base}"
+	while [[ -e "$(apl_wifi_keyfile_path "$candidate")" ]]; do
+		n=$((n + 1))
+		(( n > 10 )) && return 1
+		candidate="${APL_WIFI_MANAGED_PREFIX}${base}-${n}"
+	done
+	printf '%s' "$candidate"
+}
+
+# --- keyfile parsing -------------------------------------------------------
+
+# Read a single field from a section of a keyfile. Stops at the next section
+# header. Echoes "" if not found.
+_apl_wifi_keyfile_field() {
+	local file="$1" section="$2" key="$3"
+	[[ -f "$file" ]] || return 0
+	LC_ALL=C awk -v sec="[$section]" -v k="$key" '
+		BEGIN { in_sec = 0 }
+		/^\[.*\]$/ { in_sec = ($0 == sec) ? 1 : 0; next }
+		in_sec && index($0, k "=") == 1 { print substr($0, length(k) + 2); exit }
+	' "$file"
+}
+
+# Echo each managed keyfile basename (without extension) found in the
+# keyfile dir. Sorted for stable ordering.
+_apl_wifi_list_keyfile_ids() {
+	local f base
+	[[ -d "$APL_WIFI_KEYFILE_DIR" ]] || return 0
+	for f in "$APL_WIFI_KEYFILE_DIR"/*"$APL_WIFI_KEYFILE_EXT"; do
+		[[ -e "$f" ]] || continue
+		base="${f##*/}"
+		base="${base%"$APL_WIFI_KEYFILE_EXT"}"
+		printf '%s\n' "$base"
+	done | LC_ALL=C sort
+}
+
+# Build a single network entry from a keyfile id. Prints the JSON object on
+# stdout. Returns non-zero on parse failure.
+_apl_wifi_network_json() {
+	local id="$1" file uuid ssid hidden psk priority autoconnect ctype
+	file="$(apl_wifi_keyfile_path "$id")"
+	[[ -f "$file" ]] || return 1
+	ctype="$(_apl_wifi_keyfile_field "$file" connection type)"
+	# Skip non-wifi profiles (e.g. ethernet, gsm) but still surface their
+	# existence in the foreign-keyfile list. type=wifi or type=802-11-wireless
+	# both appear in NM-produced keyfiles.
+	[[ "$ctype" == "wifi" || "$ctype" == "802-11-wireless" ]] || return 1
+	uuid="$(_apl_wifi_keyfile_field "$file" connection uuid)"
+	ssid="$(_apl_wifi_keyfile_field "$file" wifi ssid)"
+	hidden="$(_apl_wifi_keyfile_field "$file" wifi hidden)"
+	psk="$(_apl_wifi_keyfile_field "$file" wifi-security psk)"
+	priority="$(_apl_wifi_keyfile_field "$file" connection autoconnect-priority)"
+	autoconnect="$(_apl_wifi_keyfile_field "$file" connection autoconnect)"
+	[[ -n "$priority" ]] || priority=0
+	[[ -n "$autoconnect" ]] || autoconnect=true
+	local managed=false first_run=false
+	apl_wifi_is_managed_id "$id" && managed=true
+	[[ "$id" == "$APL_WIFI_FIRST_RUN_ID" ]] && first_run=true
+	local has_psk=false
+	[[ -n "$psk" ]] && has_psk=true
+	local hidden_bool=false
+	[[ "$hidden" == "true" ]] && hidden_bool=true
+	jq -nc \
+		--arg id "$id" \
+		--arg uuid "$uuid" \
+		--arg ssid "$ssid" \
+		--argjson hidden "$hidden_bool" \
+		--argjson priority "$priority" \
+		--argjson has_psk "$has_psk" \
+		--argjson managed "$managed" \
+		--argjson first_run "$first_run" \
+		--arg autoconnect "$autoconnect" \
+		'{id:$id, uuid:$uuid, ssid:$ssid, hidden:$hidden, priority:$priority,
+		  has_psk:$has_psk, managed:$managed, first_run_profile:$first_run,
+		  autoconnect:$autoconnect}'
+}
+
+# --- nmcli wrappers --------------------------------------------------------
+
+# Sets globals: NMCLI_AVAILABLE, NMCLI_ACTIVE_WIFI_UUID, NMCLI_ACTIVE_WIFI_DEV,
+# NMCLI_NON_WIFI_UPLINKS_JSON.
+_apl_wifi_load_nm_state() {
+	NMCLI_AVAILABLE=false
+	NMCLI_ACTIVE_WIFI_UUID=""
+	NMCLI_ACTIVE_WIFI_DEV=""
+	NMCLI_NON_WIFI_UPLINKS_JSON='[]'
+
+	command -v "$APL_WIFI_NMCLI" >/dev/null 2>&1 || return 0
+	NMCLI_AVAILABLE=true
+
+	local out
+	if ! out="$("$APL_WIFI_NMCLI" -t -g UUID,TYPE,DEVICE connection show --active 2>/dev/null)"; then
+		return 0
+	fi
+
+	# Pragmatic colon-split: UUID is hex (no colons), TYPE values are static
+	# (no colons), DEVICE names are alnum/hyphen (no colons). If a future NM
+	# version starts surfacing colon-bearing values here, switch to a proper
+	# unescape pass.
+	# Whitelist physical uplinks only. Loopback, VPN/tunnel/wireguard, bridges,
+	# and container interfaces appear in `connection show --active` but cannot
+	# replace a Wi-Fi link if it's deleted; counting them as a non-Wi-Fi uplink
+	# would bypass the strong-confirm lockout. Ethernet + cellular cover the
+	# real recovery paths.
+	local uplinks='[]' line u t d ipv4
+	while IFS= read -r line; do
+		[[ -n "$line" ]] || continue
+		IFS=: read -r u t d <<< "$line"
+		case "$t" in
+			802-11-wireless)
+				NMCLI_ACTIVE_WIFI_UUID="$u"
+				NMCLI_ACTIVE_WIFI_DEV="$d"
+				;;
+			802-3-ethernet|gsm|cdma)
+				ipv4="$(_apl_wifi_device_ipv4 "$d")"
+				uplinks="$(jq -c \
+					--arg device "$d" --arg type "$t" --arg uuid "$u" --arg ipv4 "$ipv4" \
+					'. + [{device:$device, type:$type, uuid:$uuid, state:"activated", ipv4:$ipv4}]' \
+					<<< "$uplinks")"
+				;;
+			*)
+				# loopback, vpn, wireguard, tun, tap, bridge, bond, team, vlan,
+				# container, dummy, … — not real independent uplinks.
+				continue
+				;;
+		esac
+	done <<< "$out"
+	NMCLI_NON_WIFI_UPLINKS_JSON="$uplinks"
+}
+
+_apl_wifi_device_ipv4() {
+	local dev="$1" out addr
+	[[ -n "$dev" ]] || return 0
+	# Single-field -g call; output is just the IPv4 address (possibly empty)
+	# with no colon ambiguity, since the field name is fully qualified.
+	out="$("$APL_WIFI_NMCLI" -t -g IP4.ADDRESS device show "$dev" 2>/dev/null || true)"
+	# Take the first line, strip the /CIDR.
+	addr="${out%%$'\n'*}"
+	printf '%s' "${addr%%/*}"
+}
+
+# Returns 0 if any non-wifi uplink is currently activated. Re-uses the
+# state already loaded by _apl_wifi_load_nm_state.
+_apl_wifi_has_non_wifi_uplink() {
+	local count
+	count="$(jq 'length' <<< "$NMCLI_NON_WIFI_UPLINKS_JSON")"
+	(( count > 0 ))
+}
+
+_apl_wifi_nmcli_reload() {
+	[[ "$NMCLI_AVAILABLE" == true ]] || return 0
+	"$APL_WIFI_NMCLI" connection reload >/dev/null 2>&1 || return 1
+	return 0
+}
+
+_apl_wifi_nmcli_up() {
+	local uuid="$1" nmcli_out rc
+	nmcli_out="$(timeout "$APL_WIFI_OUTER_TIMEOUT" "$APL_WIFI_NMCLI" --wait "$APL_WIFI_NMCLI_WAIT" connection up uuid "$uuid" 2>&1)" && rc=0 || rc=$?
+	NMCLI_OUT_LAST="$nmcli_out"
+	NMCLI_RC_LAST="$rc"
+	return "$rc"
+}
+
+_apl_wifi_nmcli_down() {
+	local uuid="$1"
+	"$APL_WIFI_NMCLI" connection down uuid "$uuid" >/dev/null 2>&1 || true
+}
+
+_apl_wifi_nmcli_delete_inmem() {
+	local uuid="$1"
+	"$APL_WIFI_NMCLI" connection delete uuid "$uuid" >/dev/null 2>&1 || true
+}
+
+# Classify an nmcli failure from its stderr + exit code.
+_apl_wifi_classify_failure() {
+	local out="$1" rc="$2"
+	if (( rc == 124 )); then
+		printf 'timeout'
+		return
+	fi
+	local lc
+	lc="$(LC_ALL=C printf '%s' "$out" | LC_ALL=C tr '[:upper:]' '[:lower:]')"
+	case "$lc" in
+		*"secrets were required"*|*"key-mgmt failure"*|*"802.1x supplicant authentication"*|*"no key"*) printf 'auth_failed' ;;
+		*"is already activating"*|*"not yet available"*|*"is busy"*) printf 'nm_busy' ;;
+		*"timeout expired"*|*"connection activation failed"*timeout*) printf 'timeout' ;;
+		*"disconnected"*|*"no carrier"*|*"network not found"*) printf 'no_carrier' ;;
+		*) printf 'unknown' ;;
+	esac
+}
+
+# Return the device of a connection (post-activation), or empty if unknown.
+_apl_wifi_connection_device() {
+	local uuid="$1"
+	"$APL_WIFI_NMCLI" -t -g GENERAL.DEVICES connection show uuid "$uuid" 2>/dev/null | head -n1
+}
+
+# Return the connection state, e.g. "activated".
+_apl_wifi_connection_state() {
+	local uuid="$1"
+	"$APL_WIFI_NMCLI" -t -g GENERAL.STATE connection show uuid "$uuid" 2>/dev/null | head -n1
+}
+
+# --- input parsing ---------------------------------------------------------
+
+# Read the entire stdin into a global, then assert it parses as a JSON object
+# and contains only the allowed top-level keys.
+APL_WIFI_REQ_JSON=""
+_apl_wifi_read_request() {
+	local allowed_csv="$1" buf
+	buf="$(cat)"
+	if ! jq -e 'type == "object"' >/dev/null 2>&1 <<< "$buf"; then
+		_emit_error parse_error "request body must be a JSON object"
+		exit 5
+	fi
+	# Reject unknown fields. allowed_csv = "field1,field2,…"
+	if ! jq -e --arg allowed "$allowed_csv" \
+		'(keys - ($allowed | split(","))) as $extra | $extra | length == 0' \
+		>/dev/null 2>&1 <<< "$buf"; then
+		local extras
+		extras="$(jq -r --arg allowed "$allowed_csv" \
+			'(keys - ($allowed | split(","))) | join(",")' <<< "$buf")"
+		_emit_error parse_error "unknown field(s): $extras"
+		exit 5
+	fi
+	# Reject control bytes (C0 0x00-0x1f, DEL 0x7f) in any string field.
+	# jq -r → bash command substitution silently strips trailing newlines and
+	# drops NUL bytes downstream, so a payload like {"ssid":"abc\n"} would
+	# slip past validators after sanitization. Catch it at the JSON layer
+	# while we still see the raw bytes. The walk is over `..` so nested
+	# objects/arrays are covered, defense-in-depth even though our schemas
+	# are flat.
+	if jq -e '[.. | strings | test("[[:cntrl:]]")] | any' >/dev/null 2>&1 <<< "$buf"; then
+		_emit_error parse_error "string fields must not contain control characters"
+		exit 5
+	fi
+	APL_WIFI_REQ_JSON="$buf"
+}
+
+_apl_wifi_req_string() {
+	local key="$1" default="${2:-}"
+	jq -r --arg key "$key" --arg default "$default" \
+		'if has($key) then .[$key] else $default end' <<< "$APL_WIFI_REQ_JSON"
+}
+
+_apl_wifi_req_has() {
+	local key="$1"
+	jq -e --arg key "$key" 'has($key)' >/dev/null 2>&1 <<< "$APL_WIFI_REQ_JSON"
+}
+
+_apl_wifi_req_bool() {
+	local key="$1" default="${2:-false}"
+	jq -r --arg key "$key" --argjson default "$default" \
+		'if has($key) then .[$key] else $default end' <<< "$APL_WIFI_REQ_JSON"
+}
+
+_apl_wifi_req_int() {
+	local key="$1" default="${2:-0}"
+	jq -r --arg key "$key" --argjson default "$default" \
+		'if has($key) then .[$key] else $default end' <<< "$APL_WIFI_REQ_JSON"
+}
+
+# Validate the upsert payload's field shapes (after _apl_wifi_read_request).
+# Echoes a JSON {"errors":{...}} object; empty {} means OK.
+_apl_wifi_validate_upsert_fields() {
+	local require_ssid="$1" allow_psk_unchanged="$2"
+	local errors='{}'
+	local ssid_set=true psk_set=false
+
+	if ! _apl_wifi_req_has ssid; then
+		ssid_set=false
+	fi
+	if [[ "$require_ssid" == true && "$ssid_set" != true ]]; then
+		errors="$(jq -c '. + {ssid:"required"}' <<< "$errors")"
+	fi
+
+	if [[ "$ssid_set" == true ]]; then
+		local ssid
+		ssid="$(_apl_wifi_req_string ssid)"
+		if ! apl_wifi_valid_ssid "$ssid"; then
+			errors="$(jq -c '. + {ssid:"must be 1-32 bytes, no control characters"}' <<< "$errors")"
+		fi
+	fi
+
+	if _apl_wifi_req_has psk; then
+		psk_set=true
+		local psk
+		psk="$(_apl_wifi_req_string psk)"
+		# Explicit empty string = "convert to open network", always allowed.
+		# Non-empty must pass the predicate.
+		if [[ -n "$psk" ]] && ! apl_wifi_valid_psk "$psk"; then
+			errors="$(jq -c '. + {psk:"must be 8-63 printable ASCII or 64 hex chars"}' <<< "$errors")"
+		fi
+	elif [[ "$allow_psk_unchanged" != true ]]; then
+		# add path with no psk = treat as open network. No error.
+		:
+	fi
+
+	if _apl_wifi_req_has hidden; then
+		local hidden
+		hidden="$(_apl_wifi_req_string hidden)"
+		case "$hidden" in
+			true|false) ;;
+			*) errors="$(jq -c '. + {hidden:"must be true or false"}' <<< "$errors") " ;;
+		esac
+	fi
+
+	if _apl_wifi_req_has priority; then
+		local priority
+		priority="$(_apl_wifi_req_string priority)"
+		if ! apl_wifi_valid_priority "$priority"; then
+			errors="$(jq -c '. + {priority:"must be integer 0-999"}' <<< "$errors")"
+		fi
+	fi
+
+	printf '%s' "$errors"
+	[[ "$psk_set" == true ]] && return 0 || return 0
+}
+
+# --- locking ---------------------------------------------------------------
+
+_apl_wifi_with_lock() {
+	local fn="$1"
+	shift
+	mkdir -p "$(dirname "$APL_WIFI_LOCK")" 2>/dev/null || true
+	exec 9>"$APL_WIFI_LOCK"
+	if ! flock -w "$APL_WIFI_LOCK_TIMEOUT" -x 9; then
+		_emit_error lock_timeout "another wifi operation is in progress; retry in a few seconds"
+		exit 4
+	fi
+	"$fn" "$@"
+	local rc=$?
+	exec 9>&-
+	return "$rc"
+}
+
+# --- subcommand: list ------------------------------------------------------
+
+cmd_list() {
+	_apl_wifi_load_nm_state
+
+	local nets='[]' id entry
+	while IFS= read -r id; do
+		[[ -n "$id" ]] || continue
+		if ! entry="$(_apl_wifi_network_json "$id" 2>/dev/null)"; then
+			continue
+		fi
+		# Tag active flag from the loaded NM state.
+		local active=false
+		if [[ -n "$NMCLI_ACTIVE_WIFI_UUID" ]]; then
+			local entry_uuid
+			entry_uuid="$(jq -r '.uuid' <<< "$entry")"
+			[[ "$entry_uuid" == "$NMCLI_ACTIVE_WIFI_UUID" ]] && active=true
+		fi
+		entry="$(jq -c --argjson a "$active" '. + {active:$a}' <<< "$entry")"
+		nets="$(jq -c --argjson e "$entry" '. + [$e]' <<< "$nets")"
+	done < <(_apl_wifi_list_keyfile_ids)
+
+	local active_json='null'
+	if [[ -n "$NMCLI_ACTIVE_WIFI_UUID" ]]; then
+		active_json="$(jq -c --arg u "$NMCLI_ACTIVE_WIFI_UUID" --arg d "$NMCLI_ACTIVE_WIFI_DEV" \
+			'{uuid:$u, device:$d}' <<< '{}')"
+		# Add ssid + id from the matching managed entry if present.
+		local match
+		if match="$(jq -c --arg u "$NMCLI_ACTIVE_WIFI_UUID" \
+			'.[] | select(.uuid == $u) | {id, ssid}' <<< "$nets" | head -n1)"; then
+			[[ -n "$match" ]] && active_json="$(jq -c '. + '"$match" <<< "$active_json")"
+		fi
+	fi
+
+	_emit_json "$(jq -nc \
+		--argjson nets "$nets" \
+		--argjson active "$active_json" \
+		--argjson uplinks "$NMCLI_NON_WIFI_UPLINKS_JSON" \
+		--argjson nm "$NMCLI_AVAILABLE" \
+		'{status:"ok", active_connection:$active, non_wifi_uplinks:$uplinks,
+		  networks:$nets, networkmanager_available:$nm}')"
+}
+
+# --- subcommand: status ----------------------------------------------------
+
+cmd_status() {
+	_apl_wifi_load_nm_state
+
+	local wifi_state="disconnected"
+	if [[ "$NMCLI_AVAILABLE" == true && -n "$NMCLI_ACTIVE_WIFI_DEV" ]]; then
+		local s
+		s="$("$APL_WIFI_NMCLI" -t -g GENERAL.STATE device show "$NMCLI_ACTIVE_WIFI_DEV" 2>/dev/null | head -n1)"
+		if [[ "$s" == 100* ]]; then
+			wifi_state="connected"
+		elif [[ -n "$s" ]]; then
+			wifi_state="${s#*\(}"
+			wifi_state="${wifi_state%\)*}"
+		fi
+	fi
+
+	local active_json='null'
+	if [[ -n "$NMCLI_ACTIVE_WIFI_UUID" ]]; then
+		local ssid="" ipv4=""
+		if [[ -n "$NMCLI_ACTIVE_WIFI_DEV" ]]; then
+			ipv4="$(_apl_wifi_device_ipv4 "$NMCLI_ACTIVE_WIFI_DEV")"
+			# Best-effort: find the SSID via the matching keyfile.
+			local id
+			while IFS= read -r id; do
+				local f u
+				f="$(apl_wifi_keyfile_path "$id")"
+				u="$(_apl_wifi_keyfile_field "$f" connection uuid)"
+				if [[ "$u" == "$NMCLI_ACTIVE_WIFI_UUID" ]]; then
+					ssid="$(_apl_wifi_keyfile_field "$f" wifi ssid)"
+					break
+				fi
+			done < <(_apl_wifi_list_keyfile_ids)
+		fi
+		active_json="$(jq -nc \
+			--arg uuid "$NMCLI_ACTIVE_WIFI_UUID" \
+			--arg dev "$NMCLI_ACTIVE_WIFI_DEV" \
+			--arg ssid "$ssid" \
+			--arg ipv4 "$ipv4" \
+			'{uuid:$uuid, device:$dev, ssid:$ssid, ipv4:$ipv4}')"
+	fi
+
+	local wifi_dev_json
+	wifi_dev_json="$(jq -nc \
+		--arg name "${NMCLI_ACTIVE_WIFI_DEV:-wlan0}" \
+		--arg state "$wifi_state" \
+		'{name:$name, state:$state}')"
+
+	_emit_json "$(jq -nc \
+		--argjson active "$active_json" \
+		--argjson wifi_device "$wifi_dev_json" \
+		--argjson uplinks "$NMCLI_NON_WIFI_UPLINKS_JSON" \
+		--argjson nm "$NMCLI_AVAILABLE" \
+		'{status:"ok", active_connection:$active, wifi_device:$wifi_device,
+		  non_wifi_uplinks:$uplinks, networkmanager_available:$nm}')"
+}
+
+# --- shared: write a candidate keyfile -------------------------------------
+
+# Args: dest_path id uuid ssid psk hidden priority autoconnect
+# Wraps apl_wifi_write_keyfile so cmd_* call sites stay short.
+_apl_wifi_write() {
+	if ! apl_wifi_write_keyfile "$1" "$2" "$3" "$4" "$5" "$6" "$7" "$8"; then
+		_emit_error filesystem_error "failed to write keyfile"
+		return 3
+	fi
+	return 0
+}
+
+# Snapshot a keyfile body for rollback. Args: id.
+_apl_wifi_snapshot() {
+	local id="$1" src dest
+	src="$(apl_wifi_keyfile_path "$id")"
+	[[ -f "$src" ]] || return 0
+	mkdir -p "$APL_WIFI_ROLLBACK_DIR" 2>/dev/null || true
+	dest="$APL_WIFI_ROLLBACK_DIR/${id}${APL_WIFI_KEYFILE_EXT}"
+	cp -f "$src" "$dest"
+}
+
+_apl_wifi_restore_snapshot() {
+	local id="$1" src dest
+	src="$APL_WIFI_ROLLBACK_DIR/${id}${APL_WIFI_KEYFILE_EXT}"
+	dest="$(apl_wifi_keyfile_path "$id")"
+	if [[ -f "$src" ]]; then
+		mv -f "$src" "$dest"
+		chmod 0600 "$dest" 2>/dev/null || true
+		_apl_wifi_nmcli_reload
+	fi
+}
+
+_apl_wifi_clear_snapshot() {
+	local id="$1"
+	rm -f "$APL_WIFI_ROLLBACK_DIR/${id}${APL_WIFI_KEYFILE_EXT}" 2>/dev/null || true
+}
+
+# Run the test flow for a candidate. Args: uuid, action ("add"|"update"), id,
+# dest_path, plus the same field arguments as _apl_wifi_write. On success,
+# rewrites the keyfile with autoconnect=true. On failure, rolls back.
+_apl_wifi_run_test_flow() {
+	local uuid="$1" action="$2" id="$3" dest="$4"
+	local ssid="$5" psk="$6" hidden="$7" priority="$8"
+	# Snapshot prior active wifi (for restore-on-fail).
+	local prior_active="$NMCLI_ACTIVE_WIFI_UUID"
+
+	# Write the candidate with autoconnect=false so a parallel autoconnect
+	# attempt doesn't fight the test bring-up.
+	_apl_wifi_write "$dest" "$id" "$uuid" "$ssid" "$psk" "$hidden" "$priority" false || return $?
+	_apl_wifi_nmcli_reload || {
+		_emit_error filesystem_error "nmcli reload failed before test"
+		return 3
+	}
+
+	# When the candidate is already the active connection (update path on the
+	# in-use profile), NM may report "already activated" without re-evaluating
+	# the new PSK — accepting a wrong password as a passing test. Force a
+	# disconnect first so the up call actually re-associates.
+	if [[ "$uuid" == "$prior_active" ]]; then
+		_apl_wifi_nmcli_down "$uuid"
+	fi
+
+	if _apl_wifi_nmcli_up "$uuid"; then
+		local state
+		state="$(_apl_wifi_connection_state "$uuid")"
+		if [[ "$state" == activated || "$state" == 100* ]]; then
+			# Pass — commit with autoconnect=true.
+			_apl_wifi_write "$dest" "$id" "$uuid" "$ssid" "$psk" "$hidden" "$priority" true || return $?
+			_apl_wifi_nmcli_reload
+			_apl_wifi_clear_snapshot "$id"
+			return 0
+		fi
+	fi
+
+	# Fail path. Capture the classifier inputs before rollback so a slow or
+	# failing restore can't overwrite NMCLI_OUT_LAST / NMCLI_RC_LAST and lose
+	# the original reason.
+	local last_out="${NMCLI_OUT_LAST:-}" last_rc="${NMCLI_RC_LAST:-1}"
+	local reason
+	reason="$(_apl_wifi_classify_failure "$last_out" "$last_rc")"
+	_apl_wifi_nmcli_down "$uuid"
+
+	case "$action" in
+		add)
+			_apl_wifi_nmcli_delete_inmem "$uuid"
+			apl_wifi_delete_keyfile "$dest" || true
+			_apl_wifi_nmcli_reload
+			;;
+		update)
+			_apl_wifi_restore_snapshot "$id"
+			;;
+	esac
+
+	# Bound the prior-active restore. If the prior network is no longer
+	# reachable, nmcli can block past the Go handler ceiling — losing the
+	# JSON envelope and leaving the helper as an orphan sudo child.
+	if [[ -n "$prior_active" && "$prior_active" != "$uuid" ]]; then
+		timeout 10 "$APL_WIFI_NMCLI" --wait 5 connection up uuid "$prior_active" >/dev/null 2>&1 || true
+	fi
+
+	_emit_json "$(jq -nc \
+		--arg r "$reason" \
+		--arg nm "$last_out" \
+		--argjson rolled true \
+		'{status:"test_failed", reason:$r, nm_reason:$nm, rolled_back:$rolled}')"
+	return 2
+}
+
+# --- subcommand: add -------------------------------------------------------
+
+cmd_add() {
+	_apl_wifi_read_request "ssid,psk,hidden,priority,test"
+
+	local errors
+	errors="$(_apl_wifi_validate_upsert_fields true false)"
+	if [[ "$errors" != '{}' ]]; then
+		_emit_json "$(jq -nc --argjson e "$errors" '{status:"rejected", errors:$e}')"
+		return 2
+	fi
+
+	local ssid psk hidden priority do_test
+	ssid="$(_apl_wifi_req_string ssid)"
+	psk="$(_apl_wifi_req_string psk)"
+	hidden="$(_apl_wifi_req_string hidden false)"
+	priority="$(_apl_wifi_req_int priority 0)"
+	do_test="$(_apl_wifi_req_bool test false)"
+	[[ "$hidden" == true || "$hidden" == false ]] || hidden=false
+
+	_apl_wifi_with_lock _cmd_add_locked "$ssid" "$psk" "$hidden" "$priority" "$do_test"
+}
+
+_cmd_add_locked() {
+	local ssid="$1" psk="$2" hidden="$3" priority="$4" do_test="$5"
+
+	local id uuid dest
+	if ! id="$(apl_wifi_unique_id "$ssid")"; then
+		_emit_error filesystem_error "could not allocate a unique connection id from SSID"
+		return 3
+	fi
+	uuid="$(cat "$APL_WIFI_UUID_SOURCE")" || {
+		_emit_error filesystem_error "failed to read $APL_WIFI_UUID_SOURCE"
+		return 3
+	}
+	dest="$(apl_wifi_keyfile_path "$id")"
+
+	_apl_wifi_load_nm_state
+
+	if [[ "$do_test" == true ]]; then
+		if [[ "$NMCLI_AVAILABLE" != true ]]; then
+			_emit_json "$(jq -nc '{status:"rejected", reason:"nm_unavailable", message:"NetworkManager is not available; cannot test"}')"
+			return 2
+		fi
+		_apl_wifi_run_test_flow "$uuid" add "$id" "$dest" "$ssid" "$psk" "$hidden" "$priority"
+		local rc=$?
+		(( rc == 0 )) || return "$rc"
+	else
+		_apl_wifi_write "$dest" "$id" "$uuid" "$ssid" "$psk" "$hidden" "$priority" true || return $?
+		_apl_wifi_nmcli_reload || true
+	fi
+
+	local active=false
+	if [[ "$NMCLI_AVAILABLE" == true && "$do_test" == true ]]; then
+		active=true
+	fi
+	_emit_json "$(jq -nc \
+		--arg id "$id" --arg uuid "$uuid" --arg ssid "$ssid" --argjson active "$active" \
+		'{status:"applied", id:$id, uuid:$uuid, ssid:$ssid, active:$active, changed:[$id]}')"
+}
+
+# --- subcommand: update ----------------------------------------------------
+
+cmd_update() {
+	_apl_wifi_read_request "id,ssid,psk,hidden,priority,test"
+
+	if ! _apl_wifi_req_has id; then
+		_emit_error parse_error "id is required"
+		return 5
+	fi
+	local id; id="$(_apl_wifi_req_string id)"
+	if ! apl_wifi_is_managed_id "$id"; then
+		_emit_json "$(jq -nc --arg id "$id" '{status:"rejected", reason:"unmanaged_id", message:"\($id) is not a managed keyfile (only airplanes-config-wifi and airplanes-wifi-* are editable)", id:$id}')"
+		return 2
+	fi
+
+	local errors
+	errors="$(_apl_wifi_validate_upsert_fields false true)"
+	if [[ "$errors" != '{}' ]]; then
+		_emit_json "$(jq -nc --argjson e "$errors" '{status:"rejected", errors:$e}')"
+		return 2
+	fi
+
+	_apl_wifi_with_lock _cmd_update_locked "$id"
+}
+
+_cmd_update_locked() {
+	local id="$1" dest
+	dest="$(apl_wifi_keyfile_path "$id")"
+	if [[ ! -f "$dest" ]]; then
+		_emit_json "$(jq -nc --arg id "$id" '{status:"rejected", reason:"unknown_id", id:$id}')"
+		return 2
+	fi
+
+	local cur_uuid cur_ssid cur_psk cur_hidden cur_priority
+	cur_uuid="$(_apl_wifi_keyfile_field "$dest" connection uuid)"
+	cur_ssid="$(_apl_wifi_keyfile_field "$dest" wifi ssid)"
+	cur_psk="$(_apl_wifi_keyfile_field "$dest" wifi-security psk)"
+	cur_hidden="$(_apl_wifi_keyfile_field "$dest" wifi hidden)"
+	cur_priority="$(_apl_wifi_keyfile_field "$dest" connection autoconnect-priority)"
+	[[ -n "$cur_priority" ]] || cur_priority=0
+	[[ "$cur_hidden" == true ]] || cur_hidden=false
+
+	local ssid psk hidden priority do_test
+	if _apl_wifi_req_has ssid; then ssid="$(_apl_wifi_req_string ssid)"; else ssid="$cur_ssid"; fi
+	if _apl_wifi_req_has psk; then
+		psk="$(_apl_wifi_req_string psk)"
+		# explicit empty string honored as "open network"
+	else
+		psk="$cur_psk"
+	fi
+	if _apl_wifi_req_has hidden; then
+		hidden="$(_apl_wifi_req_string hidden)"
+	else
+		hidden="$cur_hidden"
+	fi
+	if _apl_wifi_req_has priority; then
+		priority="$(_apl_wifi_req_int priority 0)"
+	else
+		priority="$cur_priority"
+	fi
+	do_test="$(_apl_wifi_req_bool test false)"
+
+	_apl_wifi_load_nm_state
+	_apl_wifi_snapshot "$id"
+
+	if [[ "$do_test" == true ]]; then
+		if [[ "$NMCLI_AVAILABLE" != true ]]; then
+			_emit_json "$(jq -nc '{status:"rejected", reason:"nm_unavailable", message:"NetworkManager is not available; cannot test"}')"
+			return 2
+		fi
+		_apl_wifi_run_test_flow "$cur_uuid" update "$id" "$dest" "$ssid" "$psk" "$hidden" "$priority"
+		local rc=$?
+		(( rc == 0 )) || return "$rc"
+	else
+		_apl_wifi_write "$dest" "$id" "$cur_uuid" "$ssid" "$psk" "$hidden" "$priority" true || return $?
+		_apl_wifi_nmcli_reload || true
+		_apl_wifi_clear_snapshot "$id"
+	fi
+
+	_emit_json "$(jq -nc \
+		--arg id "$id" --arg uuid "$cur_uuid" --arg ssid "$ssid" \
+		'{status:"applied", id:$id, uuid:$uuid, ssid:$ssid, changed:[$id]}')"
+}
+
+# --- subcommand: delete ----------------------------------------------------
+
+cmd_delete() {
+	_apl_wifi_read_request "id,force_last,force_active_no_uplink"
+
+	if ! _apl_wifi_req_has id; then
+		_emit_error parse_error "id is required"
+		return 5
+	fi
+	local id; id="$(_apl_wifi_req_string id)"
+	if ! apl_wifi_is_managed_id "$id"; then
+		_emit_json "$(jq -nc --arg id "$id" '{status:"rejected", reason:"unmanaged_id", id:$id}')"
+		return 2
+	fi
+
+	local force_last force_active
+	force_last="$(_apl_wifi_req_bool force_last false)"
+	force_active="$(_apl_wifi_req_bool force_active_no_uplink false)"
+
+	_apl_wifi_with_lock _cmd_delete_locked "$id" "$force_last" "$force_active"
+}
+
+_cmd_delete_locked() {
+	local id="$1" force_last="$2" force_active="$3"
+	local dest; dest="$(apl_wifi_keyfile_path "$id")"
+	if [[ ! -f "$dest" ]]; then
+		_emit_json "$(jq -nc --arg id "$id" '{status:"rejected", reason:"unknown_id", id:$id}')"
+		return 2
+	fi
+
+	_apl_wifi_load_nm_state
+
+	# Count remaining managed profiles after the delete.
+	local total=0 entry_id
+	while IFS= read -r entry_id; do
+		[[ -n "$entry_id" ]] || continue
+		apl_wifi_is_managed_id "$entry_id" || continue
+		total=$((total + 1))
+	done < <(_apl_wifi_list_keyfile_ids)
+	local remaining=$((total - 1))
+
+	# Last-managed-network check.
+	if (( remaining <= 0 )) && [[ "$force_last" != true ]]; then
+		_emit_json "$(jq -nc --arg id "$id" \
+			'{status:"rejected", reason:"requires_force_flag", missing:["force_last"], id:$id, message:"this is the last saved Wi-Fi network; set force_last to confirm"}')"
+		return 2
+	fi
+
+	# Active-no-uplink check.
+	local target_uuid
+	target_uuid="$(_apl_wifi_keyfile_field "$dest" connection uuid)"
+	if [[ "$target_uuid" == "$NMCLI_ACTIVE_WIFI_UUID" && "$NMCLI_ACTIVE_WIFI_UUID" != "" ]] \
+		&& ! _apl_wifi_has_non_wifi_uplink \
+		&& [[ "$force_active" != true ]]; then
+		_emit_json "$(jq -nc --arg id "$id" \
+			'{status:"rejected", reason:"requires_force_flag", missing:["force_active_no_uplink"], id:$id, message:"this is the active Wi-Fi connection and no Ethernet uplink is up; set force_active_no_uplink to confirm"}')"
+		return 2
+	fi
+
+	# Perform the delete: nmcli down + delete in-memory profile + rm keyfile + reload.
+	if [[ -n "$target_uuid" ]]; then
+		_apl_wifi_nmcli_down "$target_uuid"
+		_apl_wifi_nmcli_delete_inmem "$target_uuid"
+	fi
+	if ! apl_wifi_delete_keyfile "$dest"; then
+		_emit_error filesystem_error "failed to remove keyfile"
+		return 3
+	fi
+	_apl_wifi_nmcli_reload || true
+
+	_emit_json "$(jq -nc --arg id "$id" '{status:"applied", id:$id, deleted:true, changed:[$id]}')"
+}
+
+# --- subcommand: activate --------------------------------------------------
+
+cmd_activate() {
+	_apl_wifi_read_request "id"
+
+	if ! _apl_wifi_req_has id; then
+		_emit_error parse_error "id is required"
+		return 5
+	fi
+	local id; id="$(_apl_wifi_req_string id)"
+	if ! apl_wifi_is_managed_id "$id"; then
+		_emit_json "$(jq -nc --arg id "$id" '{status:"rejected", reason:"unmanaged_id", id:$id}')"
+		return 2
+	fi
+	_apl_wifi_with_lock _cmd_activate_locked "$id"
+}
+
+_cmd_activate_locked() {
+	local id="$1" dest uuid
+	dest="$(apl_wifi_keyfile_path "$id")"
+	if [[ ! -f "$dest" ]]; then
+		_emit_json "$(jq -nc --arg id "$id" '{status:"rejected", reason:"unknown_id", id:$id}')"
+		return 2
+	fi
+	uuid="$(_apl_wifi_keyfile_field "$dest" connection uuid)"
+	_apl_wifi_load_nm_state
+	if [[ "$NMCLI_AVAILABLE" != true ]]; then
+		_emit_json "$(jq -nc '{status:"rejected", reason:"nm_unavailable"}')"
+		return 2
+	fi
+	if ! _apl_wifi_nmcli_up "$uuid"; then
+		local reason
+		reason="$(_apl_wifi_classify_failure "${NMCLI_OUT_LAST:-}" "${NMCLI_RC_LAST:-1}")"
+		_emit_json "$(jq -nc --arg id "$id" --arg r "$reason" --arg nm "${NMCLI_OUT_LAST:-}" \
+			'{status:"test_failed", id:$id, reason:$r, nm_reason:$nm}')"
+		return 2
+	fi
+	_emit_json "$(jq -nc --arg id "$id" --arg uuid "$uuid" \
+		'{status:"applied", id:$id, uuid:$uuid, active:true}')"
+}
+
+# --- subcommand: test ------------------------------------------------------
+# Dry-run a brand-new connection. Never persists. Used by /api/wifi/test.
+
+cmd_test() {
+	_apl_wifi_read_request "ssid,psk,hidden,priority"
+
+	local errors
+	errors="$(_apl_wifi_validate_upsert_fields true false)"
+	if [[ "$errors" != '{}' ]]; then
+		_emit_json "$(jq -nc --argjson e "$errors" '{status:"rejected", errors:$e}')"
+		return 2
+	fi
+
+	local ssid psk hidden priority
+	ssid="$(_apl_wifi_req_string ssid)"
+	psk="$(_apl_wifi_req_string psk)"
+	hidden="$(_apl_wifi_req_string hidden false)"
+	priority="$(_apl_wifi_req_int priority 0)"
+	[[ "$hidden" == true || "$hidden" == false ]] || hidden=false
+
+	_apl_wifi_with_lock _cmd_test_locked "$ssid" "$psk" "$hidden" "$priority"
+}
+
+_cmd_test_locked() {
+	local ssid="$1" psk="$2" hidden="$3" priority="$4"
+
+	local uuid id dest
+	uuid="$(cat "$APL_WIFI_UUID_SOURCE")" || {
+		_emit_error filesystem_error "failed to read $APL_WIFI_UUID_SOURCE"
+		return 3
+	}
+	# Use a synthetic transient id; the keyfile lives only for the duration
+	# of the test. Suffix with the UUID short-form so concurrent test calls
+	# (already serialized by flock) can't collide on filename if interrupted
+	# before cleanup.
+	id="${APL_WIFI_MANAGED_PREFIX}test-${uuid:0:8}"
+	dest="$(apl_wifi_keyfile_path "$id")"
+
+	_apl_wifi_load_nm_state
+	if [[ "$NMCLI_AVAILABLE" != true ]]; then
+		_emit_json "$(jq -nc '{status:"rejected", reason:"nm_unavailable"}')"
+		return 2
+	fi
+
+	local prior_active="$NMCLI_ACTIVE_WIFI_UUID"
+
+	_apl_wifi_write "$dest" "$id" "$uuid" "$ssid" "$psk" "$hidden" "$priority" false || return $?
+	_apl_wifi_nmcli_reload || {
+		apl_wifi_delete_keyfile "$dest" || true
+		_emit_error filesystem_error "nmcli reload failed before test"
+		return 3
+	}
+
+	local pass=false dev="" ipv4=""
+	if _apl_wifi_nmcli_up "$uuid"; then
+		local state; state="$(_apl_wifi_connection_state "$uuid")"
+		if [[ "$state" == activated || "$state" == 100* ]]; then
+			pass=true
+			# Capture device + ipv4 BEFORE teardown — querying the UUID after
+			# `nmcli connection delete` fails (the connection is gone), and
+			# with set -Eeuo pipefail the resulting non-zero would fire the
+			# ERR trap and turn a passing test into filesystem_error.
+			dev="$(_apl_wifi_connection_device "$uuid")"
+			ipv4="$(_apl_wifi_device_ipv4 "$dev")"
+		fi
+	fi
+
+	# Capture the failure-classifier inputs too, since teardown / restore can
+	# overwrite NMCLI_OUT_LAST / NMCLI_RC_LAST.
+	local last_out="${NMCLI_OUT_LAST:-}" last_rc="${NMCLI_RC_LAST:-1}"
+
+	# Always tear down the test connection — it never persists.
+	_apl_wifi_nmcli_down "$uuid"
+	_apl_wifi_nmcli_delete_inmem "$uuid"
+	apl_wifi_delete_keyfile "$dest" || true
+	_apl_wifi_nmcli_reload || true
+
+	# Bound the prior-active restore; see the matching note in
+	# _apl_wifi_run_test_flow for the timeout rationale.
+	if [[ -n "$prior_active" && "$prior_active" != "$uuid" ]]; then
+		timeout 10 "$APL_WIFI_NMCLI" --wait 5 connection up uuid "$prior_active" >/dev/null 2>&1 || true
+	fi
+
+	if [[ "$pass" == true ]]; then
+		_emit_json "$(jq -nc --arg dev "$dev" --arg ipv4 "$ipv4" \
+			'{status:"test_passed", device:$dev, ipv4:$ipv4}')"
+		return 0
+	fi
+
+	local reason; reason="$(_apl_wifi_classify_failure "$last_out" "$last_rc")"
+	_emit_json "$(jq -nc --arg r "$reason" --arg nm "$last_out" \
+		'{status:"test_failed", reason:$r, nm_reason:$nm, rolled_back:true}')"
+	return 2
+}
+
+# --- dispatcher ------------------------------------------------------------
+
+_apl_wifi_usage() {
+	cat >&2 <<'USAGE'
+usage: apl-wifi {list|add|update|delete|test|activate|status} --json
+
+Reads JSON on stdin for mutating subcommands; emits a JSON envelope on
+stdout for every status. Exit codes:
+  0  applied | no_change | ok
+  2  rejected | test_failed
+  3  filesystem_error
+  4  lock_timeout
+  5  parse_error | usage_error
+USAGE
+}
+
+main() {
+	local sub="${1:-}" mode="${2:-}"
+	case "$sub:$mode" in
+		list:--json) cmd_list ;;
+		add:--json) cmd_add ;;
+		update:--json) cmd_update ;;
+		delete:--json) cmd_delete ;;
+		test:--json) cmd_test ;;
+		activate:--json) cmd_activate ;;
+		status:--json) cmd_status ;;
+		-h:*|--help:*|help:*)
+			_apl_wifi_emitted=1
+			_apl_wifi_usage
+			return 0
+			;;
+		*)
+			# JSON only on stdout — the human-readable usage hint stays in
+			# the message field so the caller (webconfig) can render it
+			# without parsing stderr.
+			_emit_error usage_error "unknown subcommand or missing --json: '$sub $mode'. Use: list|add|update|delete|test|activate|status --json"
+			return 5
+			;;
+	esac
+}
+
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+	main "$@"
+fi

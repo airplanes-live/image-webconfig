@@ -12,7 +12,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/airplanes-live/image/webconfig/internal/wifi"
+	"github.com/airplanes-live/image-webconfig/internal/wifi"
 )
 
 const (

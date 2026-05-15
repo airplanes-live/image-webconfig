@@ -19,7 +19,7 @@ import (
 	"syscall"
 	"time"
 
-	wexec "github.com/airplanes-live/image/webconfig/internal/exec"
+	wexec "github.com/airplanes-live/image-webconfig/internal/exec"
 )
 
 // Throttle bit positions from the Raspberry Pi docs. "Now" bits live in
