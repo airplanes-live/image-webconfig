@@ -14,12 +14,7 @@ on:
   push:
     tags: ['v*']
     branches: [dev]
-  workflow_dispatch:
-    inputs:
-      dev_only:
-        description: 'Force dev-latest rebuild from the current default branch'
-        type: boolean
-        default: true
+  workflow_dispatch: {}
 
 permissions:
   contents: read
@@ -75,6 +70,13 @@ jobs:
       - uses: actions/setup-go@d35c59abb061a4a6fb18e82ac0862c26744d6ab5  # v5.5.0
         with:
           go-version-file: go.mod
+      - name: resolve commit sha
+        id: sha
+        # github.sha resolves to the tag-object SHA on annotated tag pushes,
+        # which would not equal `git rev-parse HEAD` at runtime. Capture the
+        # commit SHA explicitly so the manifest and ldflags both agree with
+        # the cloned source HEAD.
+        run: echo "commit=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
       - name: cross-compile
         env:
           GOOS: linux
@@ -82,9 +84,10 @@ jobs:
           GOARM: ${{ matrix.goarm }}
           CGO_ENABLED: "0"
           TAG: ${{ needs.classify.outputs.tag }}
+          COMMIT_SHA: ${{ steps.sha.outputs.commit }}
         run: |
           go build -trimpath -buildvcs=false \
-            -ldflags "-s -w -X main.version=$TAG -X main.commitSha=${{ github.sha }}" \
+            -ldflags "-s -w -X main.version=$TAG -X main.commitSha=$COMMIT_SHA" \
             -o "airplanes-webconfig-${{ matrix.arch }}" \
             ./cmd/webconfig
           file "airplanes-webconfig-${{ matrix.arch }}"
@@ -99,8 +102,6 @@ jobs:
     needs: [classify, build]
     runs-on: ubuntu-24.04
     timeout-minutes: 5
-    outputs:
-      commit_sha: ${{ steps.manifest.outputs.commit_sha }}
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
         with:
@@ -109,24 +110,39 @@ jobs:
         with:
           path: artifacts
           merge-multiple: true
+      - name: stage installer in rootfs payload
+        # Ship install.sh, update.sh, and the lib inside the rootfs tarball so
+        # extraction lands them at /usr/local/share/airplanes-webconfig/. The
+        # on-device self-update helper invokes the installed copy, so each
+        # release includes the installer needed to apply the NEXT release.
+        run: |
+          install -d -m 0755 files/usr/local/share/airplanes-webconfig
+          install -d -m 0755 files/usr/local/share/airplanes-webconfig/scripts/lib
+          install -m 0755 install.sh files/usr/local/share/airplanes-webconfig/install.sh
+          install -m 0755 update.sh files/usr/local/share/airplanes-webconfig/update.sh
+          install -m 0644 scripts/lib/install-common.sh files/usr/local/share/airplanes-webconfig/scripts/lib/install-common.sh
+      - name: enforce sudoers mode in payload
+        # sudo refuses to load a sudoers file whose mode is not 0440. Encode
+        # the right mode in the tarball so on-device extraction lands it
+        # ready-to-use without an extra chmod step.
+        run: chmod 0440 files/etc/sudoers.d/*
       - name: assemble rootfs.tar.gz
         run: |
-          # Pack files/ into a tarball that extracts onto the rootfs.
-          # Deterministic ownership/mtime so reruns produce byte-identical
-          # output (and so SHA256SUMS is stable when the same tag is rebuilt).
           tar -C files \
               --owner=0 --group=0 --numeric-owner \
               --mtime='2024-01-01 00:00:00 UTC' \
               --sort=name \
               -czf rootfs.tar.gz .
+      - name: resolve commit sha
+        id: sha
+        run: echo "commit=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
       - name: write manifest.json
-        id: manifest
         env:
           TAG: ${{ needs.classify.outputs.tag }}
           KIND: ${{ needs.classify.outputs.kind }}
+          COMMIT_SHA: ${{ steps.sha.outputs.commit }}
         run: |
           BUILD_DATE="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-          COMMIT_SHA="${{ github.sha }}"
           cat > manifest.json <<MANIFEST
           {
             "version": "$TAG",
@@ -136,7 +152,6 @@ jobs:
             "arches": ["arm64", "armhf"]
           }
           MANIFEST
-          echo "commit_sha=$COMMIT_SHA" >> "$GITHUB_OUTPUT"
       - name: SHA256SUMS
         run: |
           mv artifacts/airplanes-webconfig-arm64 .
@@ -166,10 +181,20 @@ jobs:
     timeout-minutes: 10
     permissions:
       contents: write
+    # Two updates against the same target must not interleave: a slow older
+    # run could overwrite a newer release's assets, leaving devices on an
+    # older binary while the tag points at the newer commit. For dev pushes
+    # cancel the older in-flight run; for stable tags fail fast on overlap.
+    concurrency:
+      group: publish-${{ needs.classify.outputs.tag }}
+      cancel-in-progress: ${{ needs.classify.outputs.kind == 'dev' }}
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
         with:
-          persist-credentials: false
+          # The dev path runs `git tag -f` and `git push --force` to move
+          # dev-latest. Persist the default GITHUB_TOKEN credentials so git
+          # has push auth without re-encoding the token in a remote URL.
+          persist-credentials: true
           fetch-depth: 0
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4.3.0
         with:
@@ -205,19 +230,21 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG: dev-latest
+          SHA: ${{ github.sha }}
         run: |
-          # Force-move dev-latest to point at the current commit, then
-          # rebuild the release in place with the new assets. The release
-          # is marked prerelease so it does not appear as "Latest" on the
-          # repo home page (only stable tags get that badge).
+          # Force-move dev-latest to point at the current commit and
+          # rebuild the release in place. Concurrency: cancel-in-progress on
+          # dev means an older run cannot land after this one. The release
+          # is marked prerelease so the repo home page still shows the
+          # latest stable tag as "Latest".
           if gh release view "$TAG" >/dev/null 2>&1; then
             gh release delete "$TAG" --yes --cleanup-tag
           fi
-          git tag -f "$TAG" "${{ github.sha }}"
+          git tag -f "$TAG" "$SHA"
           git push origin "refs/tags/$TAG" --force
           gh release create "$TAG" \
-            --title "dev-latest (${GITHUB_SHA::8})" \
-            --notes "Moving prerelease for the dev channel. Commit: ${{ github.sha }}" \
+            --title "dev-latest (${SHA:0:8})" \
+            --notes "Moving prerelease for the dev channel. Commit: $SHA" \
             --prerelease \
             dist/airplanes-webconfig-arm64 \
             dist/airplanes-webconfig-armhf \

@@ -28,10 +28,16 @@ setup() {
     printf 'fake-armhf-binary\n' > "$PAYLOAD/airplanes-webconfig-armhf"
 
     # Fake rootfs.tar.gz that ships a sentinel file under /usr/local/bin
-    # so we can prove it extracted.
+    # AND a copy of the installer at /usr/local/share/airplanes-webconfig/
+    # (mirrors the release packaging step). The on-device self-update path
+    # invokes the installed installer, not the original clone.
     FAKEFS="$WORK/fake-rootfs"
     install -d -m 755 "$FAKEFS/usr/local/bin"
+    install -d -m 755 "$FAKEFS/usr/local/share/airplanes-webconfig/scripts/lib"
     printf 'sentinel\n' > "$FAKEFS/usr/local/bin/sentinel.txt"
+    install -m 0755 "$REPO_ROOT/install.sh" "$FAKEFS/usr/local/share/airplanes-webconfig/install.sh"
+    install -m 0755 "$REPO_ROOT/update.sh" "$FAKEFS/usr/local/share/airplanes-webconfig/update.sh"
+    install -m 0644 "$REPO_ROOT/scripts/lib/install-common.sh" "$FAKEFS/usr/local/share/airplanes-webconfig/scripts/lib/install-common.sh"
     tar -C "$FAKEFS" --owner=0 --group=0 --numeric-owner \
         -czf "$PAYLOAD/rootfs.tar.gz" .
 
@@ -112,6 +118,25 @@ teardown() {
     grep -q fake-armhf-binary "$ROOTFS_DIR/usr/local/bin/airplanes-webconfig"
 }
 
+@test "install.sh rejects manifest whose version differs from the resolved tag" {
+    # Caller asks for v9.9.9 but the server serves a manifest with v8.8.8.
+    # The version cross-check catches this regardless of mode.
+    cat > "$PAYLOAD/manifest.json" <<JSON
+{"version":"v8.8.8","commit_sha":"$EXPECTED_SHA","kind":"stable","build_date":"2026-01-01T00:00:00Z","arches":["arm64"]}
+JSON
+    ( cd "$PAYLOAD" && sha256sum \
+        airplanes-webconfig-arm64 \
+        airplanes-webconfig-armhf \
+        rootfs.tar.gz \
+        manifest.json \
+        > SHA256SUMS )
+
+    export AIRPLANES_WEBCONFIG_BRANCH=v9.9.9
+    ARCH=arm64 run bash "$REPO_ROOT/install.sh" --build-mode
+    [ "$status" -ne 0 ]
+    echo "$output" | grep -q "version=v8.8.8"
+}
+
 @test "install.sh --build-mode rejects mismatched manifest commit_sha" {
     # Overwrite manifest.json with a wrong SHA and re-sign the SHA256SUMS.
     cat > "$PAYLOAD/manifest.json" <<JSON
@@ -138,6 +163,18 @@ JSON
     ARCH=arm64 run bash "$REPO_ROOT/install.sh" --build-mode
     [ "$status" -ne 0 ]
     echo "$output" | grep -qE "SHA256|sha256"
+}
+
+@test "install.sh rejects SHA256SUMS missing the binary line" {
+    # Re-sign SHA256SUMS but strip the arm64 binary line. The filter step
+    # must catch this — a missing line would otherwise be silently skipped
+    # by sha256sum --ignore-missing.
+    ( cd "$PAYLOAD" && sha256sum airplanes-webconfig-armhf rootfs.tar.gz manifest.json > SHA256SUMS )
+
+    export AIRPLANES_WEBCONFIG_BRANCH=v9.9.9
+    ARCH=arm64 run bash "$REPO_ROOT/install.sh" --build-mode
+    [ "$status" -ne 0 ]
+    echo "$output" | grep -qE "SHA256SUMS missing"
 }
 
 @test "install.sh --runtime preserves previous binary as .prev" {

@@ -42,6 +42,11 @@ echo "image-webconfig install: mode=$(airplanes_webconfig_is_build_mode && echo 
 
 airplanes_webconfig_download_release "$TAG" "$ARCH_NAME" "$WORK_DIR"
 
+# Cross-check manifest.version against the resolved tag so a tag moved
+# between resolution and download (dev-latest force-push mid-update,
+# stale-asset replay) is caught loudly.
+airplanes_webconfig_verify_manifest_version "$WORK_DIR/manifest.json" "$TAG"
+
 if airplanes_webconfig_is_build_mode; then
     # In build mode the caller cloned the source at AIRPLANES_WEBCONFIG_BRANCH.
     # The release manifest must point at the same commit, otherwise the baked
@@ -55,12 +60,9 @@ airplanes_webconfig_extract_rootfs "$WORK_DIR/rootfs.tar.gz" "${TARGET_ROOT:-/}"
 airplanes_webconfig_install_binary "$WORK_DIR/airplanes-webconfig-$ARCH_NAME" "${TARGET_ROOT:-/}"
 airplanes_webconfig_install_manifest "$WORK_DIR/manifest.json" "${TARGET_ROOT:-/}"
 
-# Drop a copy of install.sh + its lib into the rootfs so subsequent on-device
-# updates have the installer they need without re-cloning the repo.
-INSTALL_LIB_DEST="${TARGET_ROOT:-/}/usr/local/share/airplanes-webconfig"
-install -d -m 0755 "$INSTALL_LIB_DEST" "$INSTALL_LIB_DEST/scripts/lib"
-install -m 0755 "$SCRIPT_DIR/install.sh" "$INSTALL_LIB_DEST/install.sh"
-install -m 0755 "$SCRIPT_DIR/update.sh" "$INSTALL_LIB_DEST/update.sh"
-install -m 0644 "$SCRIPT_DIR/scripts/lib/install-common.sh" "$INSTALL_LIB_DEST/scripts/lib/install-common.sh"
+# The release tarball already ships install.sh, update.sh, and
+# scripts/lib/install-common.sh under /usr/local/share/airplanes-webconfig/.
+# Subsequent on-device updates invoke that installed copy, not the original
+# clone or the previous version's copy.
 
 echo "image-webconfig install: done"

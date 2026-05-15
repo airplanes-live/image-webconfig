@@ -62,3 +62,29 @@ The cross-check turns either of those into a build failure rather than a silentl
 ## Filter-repo history note
 
 `airplanes-live/image-webconfig` was seeded by `git filter-repo --subdirectory-filter webconfig` over a clone of `airplanes-live/image`. **No tags were pushed during seeding** — image had a `dev-latest` tag whose history now lives only in `airplanes-live/image`, and image's semver tags don't apply to this repo's release namespace. The release namespace here starts fresh at `v0.1.0`.
+
+## Runtime dependencies on the Pi
+
+The on-device updater needs `git` (used by `airplanes_webconfig_resolve_latest_stable_tag` / `airplanes_webconfig_resolve_dev_latest_tag` for `git ls-remote`), `curl`, `tar`, `sha256sum`, `flock`, and `python3` (one-liner JSON parse in `airplanes_webconfig_verify_manifest_*`). The image install path covers all of these (`git` and `python3` already needed elsewhere in the feed/cloud-init stack); a hand-installed webconfig on a stripped-down OS without `git` would fail tag resolution with what looks like a network error. If we ever drop `git` as a runtime dep, replace `git ls-remote` with a curl-against-the-releases-API path and refactor the resolver.
+
+## GNU-only target
+
+`install.sh`, `update.sh`, and `scripts/lib/install-common.sh` use `sort -V`, GNU `tar`, `flock`, and `sha256sum -c` — Linux/GNU only. The target is Raspberry Pi OS, so this is fine. Don't try to support these scripts on BSD/macOS; write Go for anything that needs cross-platform reach.
+
+## Self-update privilege boundary (PR-3 contract)
+
+When the on-device self-update helper invokes `update.sh` via the sudoers-pinned `systemd-run` line, it must:
+
+- Run with `env -i` (or equivalent) so the running webconfig service (compromised attacker) cannot pass `AIRPLANES_WEBCONFIG_REPO=…` or `AIRPLANES_WEBCONFIG_DOWNLOAD_BASE=…` to point downloads at an attacker server.
+- Set only the safe defaults inside the helper: `PATH=/usr/sbin:/usr/bin:/sbin:/bin`, no other AIRPLANES_* env.
+- Reset the lock-file path to a hard-coded value (no `AIRPLANES_WEBCONFIG_LOCK_DIR` override from the caller's env).
+
+The script files themselves still accept the env-var overrides because the bats tests rely on them — that's safe as long as the sudo-pinned helper scrubs the environment before invocation. The test suite covers the env-override path; the production privilege boundary is the helper's responsibility.
+
+## Accepted v1 limitations
+
+These are known, deferred to a follow-up rather than fixed in the install/update pipeline:
+
+- **TOFU on the release server.** Verification is SHA256 + HTTPS to `github.com`. A repo-admin compromise (or a sufficiently-deep GitHub compromise) lets an attacker serve an arbitrary `rootfs.tar.gz` + `airplanes-webconfig-arm64` and matching `SHA256SUMS`, and devices will install them. Mitigation in the roadmap: detached minisign signatures (the helper is structured to verify an extra `SHA256SUMS.minisig` next to `SHA256SUMS` once the signing key is provisioned in CI).
+- **Atomic rootfs swap.** The runtime path extracts `rootfs.tar.gz` first, then atomic-swaps the binary, then writes the manifest. A power loss or ENOSPC mid-extraction can leave systemd units and helper scripts updated against the still-old binary. The binary's `.prev` rollback covers the most common failure (new binary doesn't start), but a partial tarball is not rolled back. Acceptable because (a) the binary is the one that breaks user-visible boot, and (b) the helper's `/health` probe + binary rollback recovers from the only failure that takes the UI down. A future hardening adds staged tar extract + bulk rename.
+- **Operator discipline for tag pushes.** A `v[0-9]+.[0-9]+.[0-9]+` tag pushed without a successful release pipeline run will be picked up by `airplanes_webconfig_resolve_latest_stable_tag` and lead to a "release assets not found" failure on every device that resolves it. Don't push semver tags by hand — let the release workflow create them, or push from a state where you can confirm the workflow ran green before any device picks the tag up.

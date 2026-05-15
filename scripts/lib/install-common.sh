@@ -204,7 +204,25 @@ airplanes_webconfig_download_release() {
         fi
     done
 
-    if ! ( cd "$dest_dir" && sha256sum -c --ignore-missing SHA256SUMS ); then
+    # Filter SHA256SUMS to exactly the four assets we just downloaded and
+    # check those without --ignore-missing. A SHA256SUMS that omits the
+    # selected binary or rootfs would otherwise pass on the lines that
+    # happen to be present, leaving the omitted asset unverified.
+    local filtered="$dest_dir/SHA256SUMS.expected"
+    {
+        grep -E "  ${binary_name}\$" "$dest_dir/SHA256SUMS"
+        grep -E "  rootfs\.tar\.gz\$" "$dest_dir/SHA256SUMS"
+        grep -E "  manifest\.json\$" "$dest_dir/SHA256SUMS"
+    } > "$filtered" || true
+    local expected_lines
+    expected_lines="$(wc -l < "$filtered")"
+    if [[ "$expected_lines" -ne 3 ]]; then
+        echo "ERROR: SHA256SUMS missing one of $binary_name / rootfs.tar.gz / manifest.json" >&2
+        cat "$dest_dir/SHA256SUMS" >&2
+        return 1
+    fi
+
+    if ! ( cd "$dest_dir" && sha256sum -c SHA256SUMS.expected ); then
         echo "ERROR: SHA256 verification failed in $dest_dir" >&2
         return 1
     fi
@@ -225,6 +243,25 @@ airplanes_webconfig_verify_manifest_sha() {
     if [[ "$got" != "$expected_sha" ]]; then
         echo "ERROR: manifest.json commit_sha=$got does not match expected=$expected_sha" >&2
         echo "       The release binary was built from a different source than the cloned repo." >&2
+        return 1
+    fi
+}
+
+# Verifies that the downloaded manifest's "version" field matches the tag we
+# asked the release server for. Defends against a moved tag (dev-latest force-
+# pushed mid-update) returning a manifest whose recorded version doesn't match
+# the tag we resolved seconds earlier.
+airplanes_webconfig_verify_manifest_version() {
+    local manifest="$1" expected_tag="$2"
+    local got
+    got="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("version",""))' "$manifest" 2>/dev/null || true)"
+    if [[ -z "$got" ]]; then
+        echo "ERROR: manifest.json missing version field (path: $manifest)" >&2
+        return 1
+    fi
+    if [[ "$got" != "$expected_tag" ]]; then
+        echo "ERROR: manifest.json version=$got does not match resolved tag=$expected_tag" >&2
+        echo "       A release tag may have moved between resolution and download." >&2
         return 1
     fi
 }
