@@ -14,6 +14,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"sort"
 	"strings"
 	"sync"
 	"testing"
@@ -1540,21 +1541,18 @@ func TestLog_KnownUnitStreamsSSE(t *testing.T) {
 }
 
 // TestDefaultPrivilegedArgv_SudoersParity guards against drift between the
-// production argv shapes and the sudoers entries that authorize them. The
-// argv tail (after the `/usr/bin/sudo -n` prefix) must match a sudoers
-// command-spec byte-for-byte in 010 (base privileges) or 011 (self-update),
-// otherwise sudo refuses the call at runtime.
+// production argv shapes and the sudoers entries that authorize them. Each
+// argv tail (after the `/usr/bin/sudo -n` prefix) must EXACTLY equal a
+// NOPASSWD command-spec from 010 or 011 — a substring match would not
+// catch a sudoers entry of `apl-feed apply --json` failing to authorize
+// `apl-feed apply --json --extra` (Contains would pass, sudo would reject
+// at runtime).
 func TestDefaultPrivilegedArgv_SudoersParity(t *testing.T) {
 	t.Parallel()
-	base010, err := os.ReadFile(filepath.Join("..", "..", "files", "etc", "sudoers.d", "010_airplanes-webconfig"))
-	if err != nil {
-		t.Fatalf("read 010 sudoers: %v", err)
-	}
-	update011, err := os.ReadFile(filepath.Join("..", "..", "files", "etc", "sudoers.d", "011_airplanes-webconfig-update"))
-	if err != nil {
-		t.Fatalf("read 011 sudoers: %v", err)
-	}
-	merged := string(base010) + "\n" + string(update011)
+	commands := loadSudoersCommands(t,
+		filepath.Join("..", "..", "files", "etc", "sudoers.d", "010_airplanes-webconfig"),
+		filepath.Join("..", "..", "files", "etc", "sudoers.d", "011_airplanes-webconfig-update"),
+	)
 
 	priv := DefaultPrivilegedArgv()
 	cases := []struct {
@@ -1576,11 +1574,51 @@ func TestDefaultPrivilegedArgv_SudoersParity(t *testing.T) {
 				t.Fatalf("%s: argv must start with /usr/bin/sudo -n, got %v", tc.label, tc.argv)
 			}
 			tail := strings.Join(tc.argv[2:], " ")
-			if !strings.Contains(merged, tail) {
-				t.Errorf("%s: argv tail not present in 010/011 sudoers: %q", tc.label, tail)
+			if _, ok := commands[tail]; !ok {
+				t.Errorf("%s: argv tail not present as an exact NOPASSWD command in 010/011 sudoers: %q\nknown commands:\n  %s",
+					tc.label, tail, strings.Join(sortedKeys(commands), "\n  "))
 			}
 		})
 	}
+}
+
+// loadSudoersCommands parses one or more sudoers files and returns a set
+// of the NOPASSWD command-specs they authorize, keyed by the command
+// string after the colon. Comments and lines without NOPASSWD: are
+// skipped; whitespace in the command is normalised to single spaces so
+// the comparison ignores sudoers' tolerance for extra spacing.
+func loadSudoersCommands(t *testing.T, paths ...string) map[string]struct{} {
+	t.Helper()
+	out := make(map[string]struct{})
+	for _, p := range paths {
+		raw, err := os.ReadFile(p)
+		if err != nil {
+			t.Fatalf("read sudoers %s: %v", p, err)
+		}
+		for _, line := range strings.Split(string(raw), "\n") {
+			line = strings.TrimSpace(line)
+			if line == "" || strings.HasPrefix(line, "#") {
+				continue
+			}
+			idx := strings.Index(line, "NOPASSWD:")
+			if idx < 0 {
+				continue
+			}
+			cmd := strings.TrimSpace(line[idx+len("NOPASSWD:"):])
+			cmd = strings.Join(strings.Fields(cmd), " ")
+			out[cmd] = struct{}{}
+		}
+	}
+	return out
+}
+
+func sortedKeys(m map[string]struct{}) []string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return keys
 }
 
 // --- pending_restart surfacing (PR 3) ---
