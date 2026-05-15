@@ -100,7 +100,8 @@ func newTestServer(t *testing.T) (*httptest.Server, *Server) {
 		Reboot:             []string{"sudo-stub", "reboot"},
 		Poweroff:           []string{"sudo-stub", "poweroff"},
 		StartUpdate:        []string{"sudo-stub", "update"},
-		StartSystemUpgrade: []string{"sudo-stub", "system-upgrade"},
+		StartSystemUpgrade:   []string{"sudo-stub", "system-upgrade"},
+		StartWebconfigUpdate: []string{"sudo-stub", "webconfig-update"},
 		RegisterClaim:      []string{"sudo-stub", "systemctl", "start", "--no-block", "airplanes-claim.service"},
 		WifiList:           []string{"sudo-stub", "apl-wifi", "list", "--json"},
 		WifiAdd:            []string{"sudo-stub", "apl-wifi", "add", "--json"},
@@ -227,7 +228,8 @@ func newWriteHarness(t *testing.T) *writeHarness {
 		Reboot:             []string{"sudo-stub", "reboot"},
 		Poweroff:           []string{"sudo-stub", "poweroff"},
 		StartUpdate:        []string{"sudo-stub", "update"},
-		StartSystemUpgrade: []string{"sudo-stub", "system-upgrade"},
+		StartSystemUpgrade:   []string{"sudo-stub", "system-upgrade"},
+		StartWebconfigUpdate: []string{"sudo-stub", "webconfig-update"},
 		RegisterClaim:      []string{"sudo-stub", "systemctl", "start", "--no-block", "airplanes-claim.service"},
 		WifiList:           []string{"sudo-stub", "apl-wifi", "list", "--json"},
 		WifiAdd:            []string{"sudo-stub", "apl-wifi", "add", "--json"},
@@ -524,6 +526,56 @@ func TestUpdate_AlreadyRunning409(t *testing.T) {
 	}
 	h.mu.Unlock()
 	r := postJSON(t, h.client, h.ts.URL+"/api/update", map[string]any{})
+	defer r.Body.Close()
+	if r.StatusCode != http.StatusConflict {
+		t.Fatalf("status = %d, want 409", r.StatusCode)
+	}
+}
+
+func TestWebconfigUpdate_RequiresAuth(t *testing.T) {
+	t.Parallel()
+	ts, _ := newTestServer(t)
+	c := httpClient(t)
+	r := postJSON(t, c, ts.URL+"/api/webconfig-update", map[string]any{})
+	defer r.Body.Close()
+	if r.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("status = %d", r.StatusCode)
+	}
+}
+
+func TestWebconfigUpdate_HappyPathReturns202(t *testing.T) {
+	t.Parallel()
+	h := newWriteHarness(t)
+	r := postJSON(t, h.client, h.ts.URL+"/api/webconfig-update", map[string]any{})
+	defer r.Body.Close()
+	if r.StatusCode != http.StatusAccepted {
+		t.Fatalf("status = %d", r.StatusCode)
+	}
+	var got map[string]string
+	_ = json.NewDecoder(r.Body).Decode(&got)
+	if got["unit"] != "airplanes-webconfig-update.service" {
+		t.Errorf("unit = %q", got["unit"])
+	}
+}
+
+func TestWebconfigUpdate_AlreadyRunning409(t *testing.T) {
+	t.Parallel()
+	h := newWriteHarness(t)
+	h.mu.Lock()
+	h.runnerErrFor = func(argv []string) error {
+		if len(argv) >= 2 && argv[1] == "webconfig-update" {
+			return errors.New("systemd-run failed")
+		}
+		return nil
+	}
+	h.runnerResultFor = func(argv []string) wexec.Result {
+		if len(argv) >= 2 && argv[1] == "webconfig-update" {
+			return wexec.Result{Stderr: []byte("Unit airplanes-webconfig-update.service already exists")}
+		}
+		return wexec.Result{}
+	}
+	h.mu.Unlock()
+	r := postJSON(t, h.client, h.ts.URL+"/api/webconfig-update", map[string]any{})
 	defer r.Body.Close()
 	if r.StatusCode != http.StatusConflict {
 		t.Fatalf("status = %d, want 409", r.StatusCode)
@@ -1489,16 +1541,20 @@ func TestLog_KnownUnitStreamsSSE(t *testing.T) {
 
 // TestDefaultPrivilegedArgv_SudoersParity guards against drift between the
 // production argv shapes and the sudoers entries that authorize them. The
-// argv tail (after the `/usr/bin/sudo -n` prefix) must match the sudoers
-// command-spec byte-for-byte, otherwise sudo refuses the call at runtime.
+// argv tail (after the `/usr/bin/sudo -n` prefix) must match a sudoers
+// command-spec byte-for-byte in 010 (base privileges) or 011 (self-update),
+// otherwise sudo refuses the call at runtime.
 func TestDefaultPrivilegedArgv_SudoersParity(t *testing.T) {
 	t.Parallel()
-	sudoersPath := filepath.Join("..", "..", "files", "etc", "sudoers.d", "010_airplanes-webconfig")
-	raw, err := os.ReadFile(sudoersPath)
+	base010, err := os.ReadFile(filepath.Join("..", "..", "files", "etc", "sudoers.d", "010_airplanes-webconfig"))
 	if err != nil {
-		t.Fatalf("read sudoers: %v", err)
+		t.Fatalf("read 010 sudoers: %v", err)
 	}
-	sudoers := string(raw)
+	update011, err := os.ReadFile(filepath.Join("..", "..", "files", "etc", "sudoers.d", "011_airplanes-webconfig-update"))
+	if err != nil {
+		t.Fatalf("read 011 sudoers: %v", err)
+	}
+	merged := string(base010) + "\n" + string(update011)
 
 	priv := DefaultPrivilegedArgv()
 	cases := []struct {
@@ -1510,6 +1566,7 @@ func TestDefaultPrivilegedArgv_SudoersParity(t *testing.T) {
 		{"Poweroff", priv.Poweroff},
 		{"StartUpdate", priv.StartUpdate},
 		{"StartSystemUpgrade", priv.StartSystemUpgrade},
+		{"StartWebconfigUpdate", priv.StartWebconfigUpdate},
 	}
 	for _, tc := range cases {
 		tc := tc
@@ -1519,8 +1576,8 @@ func TestDefaultPrivilegedArgv_SudoersParity(t *testing.T) {
 				t.Fatalf("%s: argv must start with /usr/bin/sudo -n, got %v", tc.label, tc.argv)
 			}
 			tail := strings.Join(tc.argv[2:], " ")
-			if !strings.Contains(sudoers, tail) {
-				t.Errorf("%s: argv tail not present in sudoers: %q", tc.label, tail)
+			if !strings.Contains(merged, tail) {
+				t.Errorf("%s: argv tail not present in 010/011 sudoers: %q", tc.label, tail)
 			}
 		})
 	}

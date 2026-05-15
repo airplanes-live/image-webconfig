@@ -55,8 +55,9 @@ type PrivilegedArgv struct {
 	SchemaFeed         []string // /usr/local/bin/apl-feed schema --json (no sudo: read-only)
 	Reboot             []string // sudo -n /usr/bin/systemctl reboot
 	Poweroff           []string // sudo -n /usr/bin/systemctl poweroff
-	StartUpdate        []string // sudo systemd-run --unit=airplanes-update ...
-	StartSystemUpgrade []string // sudo systemd-run --unit=airplanes-system-upgrade ...
+	StartUpdate          []string // sudo systemd-run --unit=airplanes-update ...
+	StartSystemUpgrade   []string // sudo systemd-run --unit=airplanes-system-upgrade ...
+	StartWebconfigUpdate []string // sudo systemd-run --unit=airplanes-webconfig-update ...
 	RegisterClaim      []string // sudo systemctl start --no-block airplanes-claim.service
 	WifiList           []string
 	WifiAdd            []string
@@ -96,6 +97,16 @@ func DefaultPrivilegedArgv() PrivilegedArgv {
 			"--unit=airplanes-system-upgrade",
 			"--collect",
 			"/usr/local/lib/airplanes-webconfig/system-upgrade.sh",
+		),
+		// StartWebconfigUpdate launches the in-product self-update helper as
+		// a transient systemd unit. The HTTP request returns 202 before the
+		// helper runs systemctl restart on this service, so the client sees
+		// a clean response and then reconnects against the new version.
+		StartWebconfigUpdate: sudo(
+			"/usr/bin/systemd-run",
+			"--unit=airplanes-webconfig-update",
+			"--collect",
+			"/usr/local/lib/airplanes-webconfig/webconfig-self-update.sh",
 		),
 		// --no-block: the unit is Type=oneshot and apl-feed claim register
 		// retries on network failure for up to ~15s. A blocking start could
@@ -178,6 +189,7 @@ func New(d Deps) http.Handler {
 	mux.HandleFunc("POST /api/config", s.requireSession(s.handleConfigPost))
 	mux.HandleFunc("POST /api/update", s.requireSession(s.handleUpdate))
 	mux.HandleFunc("POST /api/system-upgrade", s.requireSession(s.handleSystemUpgrade))
+	mux.HandleFunc("POST /api/webconfig-update", s.requireSession(s.handleWebconfigUpdate))
 	mux.HandleFunc("POST /api/reboot", s.requireSession(s.handleReboot))
 	mux.HandleFunc("POST /api/poweroff", s.requireSession(s.handlePoweroff))
 	mux.HandleFunc("POST /api/claim/register", s.requireSession(s.handleClaimRegister))

@@ -41,8 +41,9 @@
         "uat":       "airplanes-978.service",
         "claim":     "airplanes-claim.service",
         "webconfig":      "airplanes-webconfig.service",
-        "update":         "airplanes-update.service",
-        "system-upgrade": "airplanes-system-upgrade.service",
+        "update":           "airplanes-update.service",
+        "system-upgrade":   "airplanes-system-upgrade.service",
+        "webconfig-update": "airplanes-webconfig-update.service",
     };
     const UNIT_TO_LOG_SLUG = Object.fromEntries(
         Object.entries(LOG_SLUG_TO_UNIT).map(([s, u]) => [u, s])
@@ -1394,6 +1395,26 @@
             onclick: () => navigate(() => logViewer("system-upgrade"), { title: "System upgrade log", showBack: true }),
         }, "System upgrade log");
 
+        const webUiUpdateBtn = el("button", {
+            type: "button", class: "wc-btn-ghost",
+            onclick: async () => {
+                webUiUpdateBtn.disabled = true;
+                const r = await postJSON("/api/webconfig-update", {});
+                webUiUpdateBtn.disabled = false;
+                if (handleAuthFailure(r)) return;
+                if (!r.ok) {
+                    alert((r.payload && r.payload.error) || "web UI update failed");
+                    return;
+                }
+                navigate(webconfigUpdateProgress, { title: "Web UI update", showBack: true });
+            },
+        }, "Update web UI");
+
+        const webUiUpdateLog = el("button", {
+            type: "button", class: "wc-btn-ghost",
+            onclick: () => navigate(() => logViewer("webconfig-update"), { title: "Web UI update log", showBack: true }),
+        }, "Web UI update log");
+
         const change = el("button", {
             type: "button", class: "wc-btn-ghost",
             onclick: () => navigate(changePasswordPanel, { title: "Change password", showBack: true }),
@@ -1419,7 +1440,12 @@
             onclick: () => navigate(wifiPanel, { title: "Wi-Fi networks", showBack: true }),
         }, "Wi-Fi networks");
 
-        return el("div", { class: "actions" }, updateBtn, updateLog, sysUpgradeBtn, sysUpgradeLog, wifiBtn, change, rebootBtn, poweroffBtn, logout);
+        return el("div", { class: "actions" },
+            updateBtn, updateLog,
+            sysUpgradeBtn, sysUpgradeLog,
+            webUiUpdateBtn, webUiUpdateLog,
+            wifiBtn, change, rebootBtn, poweroffBtn, logout,
+        );
     }
 
     // ===== Wi-Fi panel =====
@@ -1985,6 +2011,86 @@
         );
         render(form);
         input.focus();
+    }
+
+    // webconfigUpdateProgress is a specialised log viewer for the webconfig
+    // self-update flow. The standard logViewer closes its EventSource on the
+    // first error and prints "[stream closed]" — that's correct for feed
+    // updates but wrong here, where the update INTENTIONALLY restarts this
+    // service mid-stream. We extend the pattern: tail the journal until SSE
+    // dies, then poll /health until it responds with a different version
+    // (success) or until we give up (failure). On success, reload so the
+    // SPA reconnects to the new binary; on failure, stay on the page with
+    // a hint to refresh manually.
+    function webconfigUpdateProgress() {
+        const slug = "webconfig-update";
+        const pre = el("pre", { class: "log-output" });
+        const status = el("p", { class: "muted" }, "Update in progress; the page will reload when the new web UI is ready.");
+        const placeholder = el("span", { class: "muted" }, "(waiting for the update to begin)");
+        pre.appendChild(placeholder);
+        const clearPlaceholder = () => {
+            if (placeholder.parentNode === pre) pre.removeChild(placeholder);
+        };
+        render(
+            el("section", { class: "wc-card" },
+                el("h2", {}, "Web UI update"),
+                status,
+                pre,
+            ),
+        );
+
+        // Capture the current /health response so we can detect the restart.
+        // /health returns "ok <version>\n"; after the new binary starts the
+        // version segment will differ. If the initial probe fails we fall
+        // through to polling and treat the FIRST successful response as the
+        // restart signal.
+        let preUpdateHealth = null;
+        fetch("/health", { cache: "no-store" })
+            .then((r) => (r.ok ? r.text() : null))
+            .then((t) => { preUpdateHealth = t; })
+            .catch(() => { /* ignore — we'll detect restart via polling */ });
+
+        const es = new EventSource("/api/log/" + encodeURIComponent(slug));
+        activeStream = es;
+        es.onmessage = (ev) => {
+            clearPlaceholder();
+            pre.appendChild(document.createTextNode(ev.data + "\n"));
+            pre.scrollTop = pre.scrollHeight;
+        };
+        es.onerror = () => {
+            clearPlaceholder();
+            pre.appendChild(document.createTextNode("[restart in progress]\n"));
+            try { es.close(); } catch (_) {}
+            if (activeStream === es) activeStream = null;
+            status.textContent = "Waiting for the new web UI to come back online…";
+            pollForRestart();
+        };
+
+        const POLL_INTERVAL_MS = 1000;
+        const POLL_MAX_ATTEMPTS = 90; // 90 seconds total
+        let attempts = 0;
+        function pollForRestart() {
+            attempts += 1;
+            fetch("/health", { cache: "no-store" })
+                .then((r) => (r.ok ? r.text() : null))
+                .then((t) => {
+                    if (t && (preUpdateHealth === null || t !== preUpdateHealth)) {
+                        status.textContent = "Update applied — reloading…";
+                        pre.appendChild(document.createTextNode("[restart complete: " + t.trim() + "]\n"));
+                        setTimeout(() => window.location.reload(), 500);
+                        return;
+                    }
+                    scheduleNext();
+                })
+                .catch(() => { scheduleNext(); });
+        }
+        function scheduleNext() {
+            if (attempts >= POLL_MAX_ATTEMPTS) {
+                status.textContent = "The web UI did not come back online within 90 seconds. Refresh the page once the feeder is reachable, or check the log for a rollback message.";
+                return;
+            }
+            setTimeout(pollForRestart, POLL_INTERVAL_MS);
+        }
     }
 
     function logViewer(slug) {
