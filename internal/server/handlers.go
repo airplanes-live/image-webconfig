@@ -9,14 +9,13 @@ import (
 	"io/fs"
 	"log"
 	"net/http"
+	"sort"
 	"strings"
 	"time"
 
-	"github.com/airplanes-live/image/webconfig/internal/auth"
-	"github.com/airplanes-live/image/webconfig/internal/configspec"
-	wexec "github.com/airplanes-live/image/webconfig/internal/exec"
-	"github.com/airplanes-live/image/webconfig/internal/identity"
-	"github.com/airplanes-live/image/webconfig/internal/logs"
+	"github.com/airplanes-live/image-webconfig/internal/auth"
+	"github.com/airplanes-live/image-webconfig/internal/identity"
+	"github.com/airplanes-live/image-webconfig/internal/logs"
 )
 
 // MinPasswordLen is the minimum length we accept for setup / change-password.
@@ -320,15 +319,28 @@ func (s *Server) handleIdentitySecret(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, http.StatusOK, got)
 }
 
-// /api/config (GET): whitelisted feed.env keys.
+// /api/config (GET): feed.env values filtered against the schema-cached
+// readable_keys set. Returns 503 when the schema cache is unavailable
+// (boot-time apl-feed schema --json fetch failed and no SIGHUP has
+// since refreshed it).
 func (s *Server) handleConfigGet(w http.ResponseWriter, _ *http.Request) {
+	if s.schema == nil || s.schema.Degraded() {
+		writeJSONError(w, http.StatusServiceUnavailable, "schema unavailable; retry after the next feed update")
+		return
+	}
 	values, err := s.feedEnv.ReadAll()
 	if err != nil {
 		log.Printf("feedenv read: %v", err)
 		writeJSONError(w, http.StatusInternalServerError, "feed.env read failed")
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"values": values})
+	filtered := make(map[string]string, len(values))
+	for k, v := range values {
+		if s.schema.IsReadable(k) {
+			filtered[k] = v
+		}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"values": filtered})
 }
 
 // /api/status (GET): service states + manifest + feed snapshot.
@@ -361,60 +373,48 @@ type configRequest struct {
 }
 
 const (
-	// applyConfigTimeout caps the helper's wall time. The helper itself
-	// has a 5s lock-acquisition timeout; total budget is generous.
-	applyConfigTimeout = 10 * time.Second
+	// applyLockTimeoutSeconds is the lock-acquisition budget passed to
+	// apl-feed via the sudoers-pinned argv (`--lock-timeout 5`). Keep in
+	// sync with the trailing token in stage-airplanes/05-install-webconfig/
+	// files/etc/sudoers.d/010_airplanes-webconfig — both must match
+	// exactly or sudo rejects the call.
+	applyLockTimeoutSeconds = 5
+	// applyConfigTimeout = lock-timeout budget + post-lock budget.
+	// post-lock covers per-key validation, the atomic mktemp+rename,
+	// and the service-restart fan-out (each restart bounded inside
+	// feed-env-apply.sh). 15s gives generous headroom for the typical
+	// no-restart save plus a slow systemctl on a busy box. webconfig
+	// owns the end-to-end ceiling so a long-held flock surfaces as a
+	// structured 503 rather than a generic 500.
+	applyConfigTimeout = (applyLockTimeoutSeconds + 15) * time.Second
 	// systemctlTimeout caps each per-unit systemctl call.
 	systemctlTimeout = 10 * time.Second
 )
 
-// /api/config (POST): atomic feed.env write through the apply-config helper,
-// followed by per-unit restart for feed/mlat/dump978-fa/airplanes-978. The
-// whole transaction is serialized by an in-process mutex so concurrent posts
-// can't interleave feed.env writes and unit restarts. The 978 daemons
-// self-decide on UAT_INPUT (mlat-style: exit 64 when not requested), so the
-// server only needs to kick a restart — no more enable/disable reconcile.
+// /api/config (POST): proxies the body to `apl-feed apply --json` over a
+// sudoers-pinned argv. The feed CLI owns validation, the universal-reject
+// scan, the atomic write, and the dirty-key service-restart fan-out;
+// webconfig translates exit codes + JSON envelopes into HTTP responses.
+//
+// The schema cache must be loaded (i.e. !s.schema.Degraded()) before this
+// endpoint accepts writes — without it we cannot pre-filter the payload
+// against the writable_keys set.
 func (s *Server) handleConfigPost(w http.ResponseWriter, r *http.Request) {
+	if s.schema == nil || s.schema.Degraded() {
+		writeJSONError(w, http.StatusServiceUnavailable, "schema unavailable; retry after the next feed update")
+		return
+	}
 	var req configRequest
 	if err := readJSON(w, r, &req); err != nil {
 		writeJSONError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	// Daemon-side validation. The helper re-validates against the same
-	// configspec — keep both layers; drift is exactly what the shared
-	// package prevents.
-	for k, v := range req.Updates {
-		if err := configspec.Validate(k, v); err != nil {
-			writeJSONError(w, http.StatusBadRequest, err.Error())
-			return
-		}
-	}
-	// Cross-key consistency precheck: reject inconsistent shapes (today
-	// MLAT_ENABLED=true requires GEO_CONFIGURED=true + full coords/altitude;
-	// GEO_CONFIGURED=true requires non-empty lat/lon) early so the user
-	// gets a clear 400 from the dashboard rather than a silently-failing
-	// daemon after the helper has already written the bad state. We
-	// compute the projection of (existing ∪ updates) AND apply the same
-	// GEO_CONFIGURED auto-derive that apply-config runs — without that,
-	// "enter lat/lon/alt + enable MLAT" submitted by the form would be
-	// rejected here because GEO_CONFIGURED wouldn't yet be true in the
-	// preview.
-	{
-		preview, err := s.feedEnv.ReadAll()
-		if err != nil {
-			log.Printf("config-post: read feed.env for consistency check: %v", err)
-			writeJSONError(w, http.StatusInternalServerError, "feed.env read failed")
-			return
-		}
-		for k, v := range req.Updates {
-			preview[k] = v
-		}
-		_, explicitGeo := req.Updates["GEO_CONFIGURED"]
-		_, touchedLat := req.Updates["LATITUDE"]
-		_, touchedLon := req.Updates["LONGITUDE"]
-		configspec.ApplyGeoDeriveOnUpdate(preview, explicitGeo, touchedLat, touchedLon)
-		if err := configspec.ValidateConsistency(preview); err != nil {
-			writeJSONError(w, http.StatusBadRequest, err.Error())
+	// Reject keys not in the schema's writable-key set BEFORE shelling out
+	// — saves a privileged invocation on obvious client bugs and produces
+	// a clearer per-key 400.
+	for k := range req.Updates {
+		if !s.schema.IsWritable(k) {
+			writeJSONError(w, http.StatusBadRequest, fmt.Sprintf("not a writable key: %s", k))
 			return
 		}
 	}
@@ -422,101 +422,125 @@ func (s *Server) handleConfigPost(w http.ResponseWriter, r *http.Request) {
 	s.configMu.Lock()
 	defer s.configMu.Unlock()
 
-	if err := s.invokeApplyConfig(r.Context(), req.Updates); err != nil {
-		var ce *configError
-		if errors.As(err, &ce) {
-			writeJSONError(w, ce.status, ce.message)
-			return
-		}
-		log.Printf("config-post: helper: %v", err)
+	resp, status, err := s.invokeApplyFeed(r.Context(), req.Updates)
+	if err != nil {
+		log.Printf("config-post: %v", err)
 		writeJSONError(w, http.StatusInternalServerError, "config write failed")
 		return
 	}
-
-	// Service restart for feed + mlat + dump978-fa + airplanes-978. Failures
-	// here log loudly AND get surfaced to the client as `pending_restart` so
-	// the dashboard can alert the user that their saved config isn't actually
-	// running yet. Restarting the daemon is what makes the new config take
-	// effect; if it doesn't happen, /api/status will continue to reflect the
-	// previous running config — making this a real foot-gun if silently
-	// swallowed.
-	//
-	// `systemctl restart` returns 0 once the unit's start job has been
-	// dispatched, regardless of whether the wrapper later exits 64 (the
-	// self-disable path used by mlat and the 978 daemons when their config
-	// says "off"). So restarting on "UAT_INPUT cleared by user" does NOT
-	// generate a spurious pending_restart entry — the daemon is intentionally
-	// failed-terminal, not "couldn't be restarted".
-	var pendingRestart []string
-	for _, namedArgv := range []struct {
-		unit string
-		argv []string
-	}{
-		{"airplanes-feed.service", s.priv.RestartFeed},
-		{"airplanes-mlat.service", s.priv.RestartMLAT},
-		{"dump978-fa.service", s.priv.RestartDump978},
-		{"airplanes-978.service", s.priv.RestartUAT},
-	} {
-		if err := s.runSudo(r.Context(), namedArgv.argv, systemctlTimeout); err != nil {
-			log.Printf("config-post: %s restart: %v", namedArgv.unit, err)
-			pendingRestart = append(pendingRestart, namedArgv.unit)
-		}
+	if status != http.StatusOK {
+		// Forward the structured error envelope from apl-feed apply
+		// (per-field reasons, lock_timeout message, etc.). Synthesize
+		// a flat Error field too so the client's `r.payload.error`
+		// fallback shows the actual reason instead of "save failed".
+		synthesizeError(&resp)
+		writeJSON(w, status, resp)
+		return
 	}
-
-	writeJSON(w, http.StatusOK, configApplyResponse{
-		Status:         "applied",
-		PendingRestart: pendingRestart,
-	})
+	writeJSON(w, http.StatusOK, resp)
 }
 
-// configApplyResponse is the body returned by POST /api/config. The
-// PendingRestart field is omitempty so the legacy {"status":"applied"}
-// shape is preserved when all restarts succeed; new clients check for
-// pending_restart and surface a "saved, but restart failed" banner.
-// Unit names are full ("airplanes-mlat.service") so clients don't have
-// to append .service.
-type configApplyResponse struct {
-	Status         string   `json:"status"`
-	PendingRestart []string `json:"pending_restart,omitempty"`
+// applyFeedResponse mirrors the JSON envelope emitted by
+// `apl-feed apply --json`. Any subset of fields can be populated
+// depending on status; the client renders them in priority order
+// (errors > pending_restart > changed).
+//
+// Error is synthesized server-side before write (see synthesizeError)
+// so the form's existing `r.payload.error` fallback path surfaces a
+// useful message instead of the generic "save failed". apl-feed itself
+// emits errors / message; we collapse them into a single human string.
+type applyFeedResponse struct {
+	Status         string            `json:"status"`
+	Changed        []string          `json:"changed,omitempty"`
+	PendingRestart []string          `json:"pending_restart,omitempty"`
+	Errors         map[string]string `json:"errors,omitempty"`
+	Message        string            `json:"message,omitempty"`
+	Error          string            `json:"error,omitempty"`
 }
 
-// configError carries an HTTP status + safe-to-surface message.
-type configError struct {
-	status  int
-	message string
+// synthesizeError populates resp.Error from whichever of resp.Errors /
+// resp.Message is the most informative for this status. Called only on
+// non-success paths; success envelopes leave Error empty.
+//
+// rejected envelopes carry per-key reasons in Errors. The form renders
+// resp.Error via textContent, which collapses newlines visually — so we
+// join "KEY: reason" pairs with "; " for a readable one-line message.
+// Sorted to keep the output stable across runs (Go map iteration is
+// randomised, and the renderer would otherwise re-order on every save).
+// If apl-feed (or a future helper) already populated resp.Error, leave
+// it alone — that flat field is authoritative when present.
+func synthesizeError(resp *applyFeedResponse) {
+	if resp.Error != "" {
+		return
+	}
+	if len(resp.Errors) > 0 {
+		keys := make([]string, 0, len(resp.Errors))
+		for k := range resp.Errors {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		parts := make([]string, 0, len(keys))
+		for _, k := range keys {
+			parts = append(parts, k+": "+resp.Errors[k])
+		}
+		resp.Error = strings.Join(parts, "; ")
+		return
+	}
+	if resp.Message != "" {
+		resp.Error = resp.Message
+		return
+	}
+	resp.Error = "save failed (status: " + resp.Status + ")"
 }
 
-func (e *configError) Error() string { return e.message }
-
-// invokeApplyConfig pipes the JSON body to the helper via fixed-argv sudo.
-// Helper exit codes 10/11/12 (validation/parse/oversize) → 400; 20
-// (filesystem) → 500. Stderr is logged server-side; the response carries
-// only a stable message to avoid leaking internals.
-func (s *Server) invokeApplyConfig(ctx context.Context, updates map[string]string) error {
+// invokeApplyFeed pipes the request body through `sudo apl-feed apply --json`
+// and maps the structured response to an HTTP status. The error return
+// is reserved for invocation-layer failures (binary missing, timeout)
+// that are NOT part of the apply contract — those become 500.
+//
+// Status mapping:
+//
+//	applied          → 200 (pending_restart may be non-empty)
+//	no_change        → 200
+//	rejected         → 400
+//	lock_timeout     → 503
+//	filesystem_error → 500
+//	parse_error      → 400 (apl-feed received malformed input from us, but
+//	                       forward as 400 so the client sees the message)
+//	usage_error      → 500 (programmer error: argv shape diverged)
+func (s *Server) invokeApplyFeed(ctx context.Context, updates map[string]string) (applyFeedResponse, int, error) {
 	body, err := json.Marshal(map[string]any{"updates": updates})
 	if err != nil {
-		return err
+		return applyFeedResponse{}, 0, err
 	}
 	cctx, cancel := context.WithTimeout(ctx, applyConfigTimeout)
 	defer cancel()
 
-	res, err := s.stdinRunner(cctx, s.priv.ApplyConfig, bytes.NewReader(body))
-	if err == nil {
-		return nil
+	res, runErr := s.stdinRunner(cctx, s.priv.ApplyFeed, bytes.NewReader(body))
+	var parsed applyFeedResponse
+	if perr := json.Unmarshal(res.Stdout, &parsed); perr != nil {
+		// Helper produced no JSON envelope on stdout — treat as an
+		// internal error and surface stderr in the log only.
+		log.Printf("apply-feed: cannot parse stdout: %v stdout=%q stderr=%q",
+			perr, res.Stdout, strings.TrimSpace(string(res.Stderr)))
+		return applyFeedResponse{}, 0, fmt.Errorf("apply-feed: %w", perr)
 	}
-	exit := res.ExitCode
-	logHelper(exit, res, err)
-	switch exit {
-	case 10, 11, 12, 30:
-		return &configError{status: http.StatusBadRequest, message: "config rejected by helper"}
+	switch parsed.Status {
+	case "applied", "no_change":
+		return parsed, http.StatusOK, nil
+	case "rejected":
+		return parsed, http.StatusBadRequest, nil
+	case "lock_timeout":
+		return parsed, http.StatusServiceUnavailable, nil
+	case "filesystem_error":
+		return parsed, http.StatusInternalServerError, nil
+	case "parse_error":
+		return parsed, http.StatusBadRequest, nil
 	default:
-		return fmt.Errorf("helper exit %d: %w", exit, err)
+		log.Printf("apply-feed: unknown status %q exit=%d stderr=%q err=%v",
+			parsed.Status, res.ExitCode, strings.TrimSpace(string(res.Stderr)), runErr)
+		return parsed, http.StatusInternalServerError, nil
 	}
-}
-
-func logHelper(exit int, res wexec.Result, err error) {
-	log.Printf("apply-config exit=%d err=%v stderr=%q",
-		exit, err, strings.TrimSpace(string(res.Stderr)))
 }
 
 // runSudo runs argv with a per-call timeout and logs on failure.
@@ -530,35 +554,102 @@ func (s *Server) runSudo(ctx context.Context, argv []string, timeout time.Durati
 	return nil
 }
 
-// /api/update (POST): kicks off a transient airplanes-update.service via
-// systemd-run. Returns 202 + the unit name so the SPA can stream
-// /api/log/update for live output. systemd-run exits with non-zero on
-// "unit already exists" — we map that to 409.
-func (s *Server) handleUpdate(w http.ResponseWriter, r *http.Request) {
+// maintenanceUnits is the set of transient maintenance units that must not
+// overlap each other or be interrupted by a reboot. Both run apt/dpkg and
+// would deadlock on the dpkg lock or leave half-configured state if either
+// happened concurrently with the other or with a shutdown.
+var maintenanceUnits = []string{
+	"airplanes-system-upgrade.service",
+	"airplanes-update.service",
+}
+
+// maintenanceUnitActive returns the name of any maintenance unit currently
+// active or activating, or "" if none. A single `systemctl is-active u1 u2`
+// invocation prints one state line per unit; we scan for the first busy one.
+// systemctl is-active is read-only and does not require sudo.
+func (s *Server) maintenanceUnitActive(ctx context.Context) string {
+	cctx, cancel := context.WithTimeout(ctx, systemctlTimeout)
+	defer cancel()
+	argv := append([]string{"/usr/bin/systemctl", "is-active"}, maintenanceUnits...)
+	res, _ := s.runner(cctx, argv)
+	lines := strings.Split(strings.TrimRight(string(res.Stdout), "\n"), "\n")
+	for i, line := range lines {
+		if i >= len(maintenanceUnits) {
+			break
+		}
+		state := strings.TrimSpace(line)
+		if state == "active" || state == "activating" {
+			return maintenanceUnits[i]
+		}
+	}
+	return ""
+}
+
+// startTransientUnit kicks off a transient systemd unit via the supplied
+// pinned argv (sudo systemd-run ...). It refuses with 409 if any maintenance
+// unit is already busy, and maps systemd-run's "already exists" stderr to a
+// 409 as well. On success it writes 202 + the unit name.
+//
+// The is-active guard and the systemd-run call are serialized via
+// maintenanceMu so two concurrent POSTs can't both observe an idle state and
+// then both kick off — by the time the second contender acquires the lock,
+// the first's transient unit is already registered and is-active reports it
+// as activating.
+func (s *Server) startTransientUnit(w http.ResponseWriter, r *http.Request, argv []string, unit, label string) {
+	s.maintenanceMu.Lock()
+	defer s.maintenanceMu.Unlock()
+	if busy := s.maintenanceUnitActive(r.Context()); busy != "" {
+		writeJSONError(w, http.StatusConflict, label+" refused: "+busy+" is in progress")
+		return
+	}
 	cctx, cancel := context.WithTimeout(r.Context(), systemctlTimeout)
 	defer cancel()
-	res, err := s.runner(cctx, s.priv.StartUpdate)
+	res, err := s.runner(cctx, argv)
 	if err != nil {
 		stderr := strings.TrimSpace(string(res.Stderr))
-		log.Printf("update: %v stderr=%q", err, stderr)
+		log.Printf("%s: %v stderr=%q", label, err, stderr)
 		if strings.Contains(stderr, "already exists") || strings.Contains(stderr, "already running") {
-			writeJSONError(w, http.StatusConflict, "update is already in progress")
+			writeJSONError(w, http.StatusConflict, label+" is already in progress")
 			return
 		}
-		writeJSONError(w, http.StatusInternalServerError, "update start failed")
+		writeJSONError(w, http.StatusInternalServerError, label+" start failed")
 		return
 	}
 	writeJSON(w, http.StatusAccepted, map[string]string{
 		"status":     "running",
-		"unit":       "airplanes-update.service",
+		"unit":       unit,
 		"started_at": time.Now().UTC().Format(time.RFC3339),
 	})
 }
 
-// /api/reboot (POST): writes 202 + flushes, then triggers reboot from a
-// goroutine after a brief delay so the response actually leaves the wire
-// before init starts tearing things down.
-func (s *Server) handleReboot(w http.ResponseWriter, _ *http.Request) {
+// /api/update (POST): kicks off a transient airplanes-update.service via
+// systemd-run. Returns 202 + the unit name so the SPA can stream
+// /api/log/update for live output. systemd-run exits with non-zero on
+// "unit already exists" — we map that to 409. Also 409s when the
+// system-package upgrade unit is busy (both touch dpkg locks).
+func (s *Server) handleUpdate(w http.ResponseWriter, r *http.Request) {
+	s.startTransientUnit(w, r, s.priv.StartUpdate, "airplanes-update.service", "update")
+}
+
+// /api/system-upgrade (POST): kicks off a transient
+// airplanes-system-upgrade.service that runs apt-get update + upgrade. Same
+// shape as /api/update; the SPA streams /api/log/system-upgrade for output.
+func (s *Server) handleSystemUpgrade(w http.ResponseWriter, r *http.Request) {
+	s.startTransientUnit(w, r, s.priv.StartSystemUpgrade, "airplanes-system-upgrade.service", "system upgrade")
+}
+
+// /api/reboot (POST): refuses with 409 if a maintenance unit is active
+// (rebooting mid-dpkg would brick the device). Otherwise writes 202 + flushes,
+// then triggers reboot from a goroutine after a brief delay so the response
+// actually leaves the wire before init starts tearing things down.
+func (s *Server) handleReboot(w http.ResponseWriter, r *http.Request) {
+	s.maintenanceMu.Lock()
+	if busy := s.maintenanceUnitActive(r.Context()); busy != "" {
+		s.maintenanceMu.Unlock()
+		writeJSONError(w, http.StatusConflict, "reboot refused: "+busy+" is in progress")
+		return
+	}
+	s.maintenanceMu.Unlock()
 	writeJSON(w, http.StatusAccepted, map[string]string{"status": "rebooting"})
 	if f, ok := w.(http.Flusher); ok {
 		f.Flush()
@@ -572,4 +663,50 @@ func (s *Server) handleReboot(w http.ResponseWriter, _ *http.Request) {
 			log.Printf("reboot: %v stderr=%q", err, strings.TrimSpace(string(res.Stderr)))
 		}
 	}()
+}
+
+// /api/poweroff (POST): mirrors handleReboot but issues `systemctl poweroff`.
+// Same maintenance-active guard so a power-off mid-dpkg can't brick the device.
+func (s *Server) handlePoweroff(w http.ResponseWriter, r *http.Request) {
+	s.maintenanceMu.Lock()
+	if busy := s.maintenanceUnitActive(r.Context()); busy != "" {
+		s.maintenanceMu.Unlock()
+		writeJSONError(w, http.StatusConflict, "power-off refused: "+busy+" is in progress")
+		return
+	}
+	s.maintenanceMu.Unlock()
+	writeJSON(w, http.StatusAccepted, map[string]string{"status": "powering-off"})
+	if f, ok := w.(http.Flusher); ok {
+		f.Flush()
+	}
+	go func() {
+		time.Sleep(250 * time.Millisecond)
+		ctx, cancel := context.WithTimeout(context.Background(), systemctlTimeout)
+		defer cancel()
+		res, err := s.runner(ctx, s.priv.Poweroff)
+		if err != nil {
+			log.Printf("poweroff: %v stderr=%q", err, strings.TrimSpace(string(res.Stderr)))
+		}
+	}()
+}
+
+// /api/claim/register (POST): kicks airplanes-claim.service via systemctl
+// start --no-block. The unit's ConditionPathExists=!feeder-claim-secret
+// makes re-trigger a no-op once a secret is on disk, so duplicate clicks
+// are safe. The SPA navigates to the claim activity log on 2xx so the
+// user sees progress / failures live; this handler only reports whether
+// the start request was accepted by systemd.
+func (s *Server) handleClaimRegister(w http.ResponseWriter, r *http.Request) {
+	cctx, cancel := context.WithTimeout(r.Context(), systemctlTimeout)
+	defer cancel()
+	res, err := s.runner(cctx, s.priv.RegisterClaim)
+	if err != nil {
+		log.Printf("claim-register: %v stderr=%q", err, strings.TrimSpace(string(res.Stderr)))
+		writeJSONError(w, http.StatusInternalServerError, "claim register start failed")
+		return
+	}
+	writeJSON(w, http.StatusAccepted, map[string]string{
+		"status": "starting",
+		"unit":   "airplanes-claim.service",
+	})
 }

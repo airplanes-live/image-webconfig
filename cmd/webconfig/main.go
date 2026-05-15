@@ -14,12 +14,16 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/airplanes-live/image/webconfig/internal/auth"
-	"github.com/airplanes-live/image/webconfig/internal/feedenv"
-	"github.com/airplanes-live/image/webconfig/internal/identity"
-	"github.com/airplanes-live/image/webconfig/internal/logs"
-	"github.com/airplanes-live/image/webconfig/internal/server"
-	"github.com/airplanes-live/image/webconfig/internal/status"
+	"github.com/airplanes-live/image-webconfig/internal/auth"
+	wexec "github.com/airplanes-live/image-webconfig/internal/exec"
+	"github.com/airplanes-live/image-webconfig/internal/feedenv"
+	"github.com/airplanes-live/image-webconfig/internal/identity"
+	"github.com/airplanes-live/image-webconfig/internal/logs"
+	"github.com/airplanes-live/image-webconfig/internal/pihealth"
+	"github.com/airplanes-live/image-webconfig/internal/schemacache"
+	"github.com/airplanes-live/image-webconfig/internal/server"
+	"github.com/airplanes-live/image-webconfig/internal/status"
+	"github.com/airplanes-live/image-webconfig/internal/wifi"
 )
 
 // version is overridden via -ldflags "-X main.version=<sha>".
@@ -46,7 +50,16 @@ func main() {
 		"sliding window for failure counting")
 	lockoutDuration := flag.Duration("lockout-duration", 15*time.Minute,
 		"duration of an active lockout")
+	piHealthMode := flag.Bool("pi-health", false,
+		"emit a one-line pi-health summary and exit (for render-status / MOTD)")
+	piHealthTimeout := flag.Duration("pi-health-timeout", 2*time.Second,
+		"probe timeout for --pi-health (must be < the shell timeout wrapping the call)")
 	flag.Parse()
+
+	if *piHealthMode {
+		ph := pihealth.NewReader(pihealth.DefaultPaths(), pihealth.DefaultThresholds(), nil, nil)
+		os.Exit(runPiHealthCmd(os.Stdout, os.Stderr, ph.Probe, *piHealthTimeout))
+	}
 
 	if *argonThreads > 255 {
 		log.Fatalf("argon2-threads must be <= 255 (got %d)", *argonThreads)
@@ -70,6 +83,17 @@ func main() {
 		log.Fatalf("lockout values must be positive")
 	}
 
+	priv := server.DefaultPrivilegedArgv()
+	cache := schemacache.New(priv.SchemaFeed, wexec.RealRunner)
+	loadCtx, loadCancel := context.WithTimeout(context.Background(), 15*time.Second)
+	if err := cache.Load(loadCtx); err != nil {
+		// Degraded mode: /api/config returns 503, but /api/update,
+		// /api/log/*, /api/reboot, /api/poweroff, and the auth endpoints
+		// stay alive so the operator can still recover via the dashboard.
+		log.Printf("schema: boot fetch failed (degraded mode, /api/config unavailable): %v", err)
+	}
+	loadCancel()
+
 	srv := &http.Server{
 		Addr: *listen,
 		Handler: server.New(server.Deps{
@@ -81,9 +105,18 @@ func main() {
 			Argon2Params: params,
 			Identity:     identity.NewReader(identity.DefaultPaths()),
 			FeedEnv:      feedenv.New(),
-			Status:       status.NewReader(version, status.DefaultPaths(), nil),
-			Logs:         logs.NewStreamer(nil),
-			Privileged:   server.DefaultPrivilegedArgv(),
+			Status: status.NewReader(version, status.DefaultPaths(), nil,
+				status.WithPiHealth(pihealth.NewReader(
+					pihealth.DefaultPaths(),
+					pihealth.DefaultThresholds(),
+					nil, // RealRunner
+					nil, // statfs-backed DiskProber
+				)),
+				status.WithWifi(wifi.NewSignalReader("/usr/bin/nmcli", nil)),
+			),
+			Logs:       logs.NewStreamer(nil),
+			Schema:     cache,
+			Privileged: priv,
 		}),
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       15 * time.Second,
@@ -91,6 +124,25 @@ func main() {
 		IdleTimeout:       60 * time.Second,
 		MaxHeaderBytes:    1 << 14,
 	}
+
+	// SIGHUP refreshes the schema cache. The airplanes-update transient
+	// unit fires this after a feed update so a new feed-env-keys.sh
+	// can take effect without bouncing the webconfig session table
+	// (sessions are in-memory; a restart logs every operator out).
+	hup := make(chan os.Signal, 1)
+	signal.Notify(hup, syscall.SIGHUP)
+	go func() {
+		for range hup {
+			log.Print("schema: SIGHUP — reloading from apl-feed schema --json")
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			if err := cache.Load(ctx); err != nil {
+				log.Printf("schema: SIGHUP reload failed (keeping previous cache): %v", err)
+			} else {
+				log.Print("schema: SIGHUP reload OK")
+			}
+			cancel()
+		}
+	}()
 
 	go func() {
 		log.Printf("airplanes-webconfig %s listening on %s", version, *listen)

@@ -11,7 +11,9 @@ import (
 	"testing"
 	"time"
 
-	wexec "github.com/airplanes-live/image/webconfig/internal/exec"
+	wexec "github.com/airplanes-live/image-webconfig/internal/exec"
+	"github.com/airplanes-live/image-webconfig/internal/pihealth"
+	"github.com/airplanes-live/image-webconfig/internal/wifi"
 )
 
 func newTestPaths(t *testing.T) (Paths, string) {
@@ -468,7 +470,7 @@ func TestRead_UATDecisionNilOnInactive(t *testing.T) {
 	writeStateFile(t, p.UAT978StateFile, "schema_version=1\nstate=enabled\nreason=ok\n")
 	r := NewReader("v", p, perArgvRunner(map[string]func(unit string) (string, error){
 		"is-active:airplanes-978.service": func(_ string) (string, error) { return "inactive", errors.New("exit 3") },
-		"is-active:default":                func(_ string) (string, error) { return "active", nil },
+		"is-active:default":               func(_ string) (string, error) { return "active", nil },
 	}))
 	got, _ := r.Read(context.Background())
 	if got.UATDecision != nil {
@@ -489,5 +491,147 @@ func TestRead_UATDecisionRejectsCrossOwnerReason(t *testing.T) {
 	got, _ := r.Read(context.Background())
 	if got.UATDecision != nil {
 		t.Errorf("UATDecision = %+v, want nil (mlat_enabled_false is not a valid 978 reason)", got.UATDecision)
+	}
+}
+
+func TestRead_RebootRequiredFlag(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name   string
+		create bool
+		want   bool
+	}{
+		{"present", true, true},
+		{"absent", false, false},
+	}
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			p, dir := newTestPaths(t)
+			p.RebootRequiredFile = filepath.Join(dir, "reboot-required")
+			if tc.create {
+				if err := os.WriteFile(p.RebootRequiredFile, nil, 0o644); err != nil {
+					t.Fatal(err)
+				}
+			}
+			r := NewReader("v", p, fixedRunner("active", nil))
+			got, err := r.Read(context.Background())
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got.RebootRequired != tc.want {
+				t.Errorf("RebootRequired = %v, want %v", got.RebootRequired, tc.want)
+			}
+		})
+	}
+}
+
+// stubPiHealthProbe returns a fixed *pihealth.PiHealth.
+type stubPiHealthProbe struct{ payload *pihealth.PiHealth }
+
+func (s stubPiHealthProbe) Probe(_ context.Context) *pihealth.PiHealth { return s.payload }
+
+func TestRead_PiHealthEmbedded(t *testing.T) {
+	t.Parallel()
+	p, _ := newTestPaths(t)
+	payload := &pihealth.PiHealth{
+		Severity:       "ok",
+		Summary:        "healthy · 56°C",
+		IsRaspberryPi:  true,
+		ThrottleProbed: true,
+		TempProbed:     true,
+		CPUTempCelsius: 56,
+	}
+	r := NewReader("v", p, fixedRunner("active", nil), WithPiHealth(stubPiHealthProbe{payload}))
+	got, err := r.Read(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.PiHealth == nil {
+		t.Fatal("PiHealth = nil, want populated")
+	}
+	if got.PiHealth.Summary != "healthy · 56°C" {
+		t.Errorf("PiHealth.Summary = %q", got.PiHealth.Summary)
+	}
+	blob, _ := json.Marshal(got)
+	if !strings.Contains(string(blob), `"pi_health"`) {
+		t.Errorf("marshaled JSON missing pi_health field: %s", blob)
+	}
+}
+
+func TestRead_NoPiHealthOption_OmitsField(t *testing.T) {
+	t.Parallel()
+	p, _ := newTestPaths(t)
+	r := NewReader("v", p, fixedRunner("active", nil))
+	got, _ := r.Read(context.Background())
+	if got.PiHealth != nil {
+		t.Errorf("PiHealth = %+v, want nil (no WithPiHealth)", got.PiHealth)
+	}
+	blob, _ := json.Marshal(got)
+	if strings.Contains(string(blob), `"pi_health"`) {
+		t.Errorf("marshaled JSON should omit pi_health: %s", blob)
+	}
+}
+
+type stubWifiProbe struct{ payload *wifi.Signal }
+
+func (s stubWifiProbe) Probe(_ context.Context) *wifi.Signal { return s.payload }
+
+func TestRead_WifiEmbedded(t *testing.T) {
+	t.Parallel()
+	p, _ := newTestPaths(t)
+	pct := 78
+	payload := &wifi.Signal{
+		Connected: true,
+		Iface:     "wlan0",
+		SSID:      "MyHome",
+		SignalPct: &pct,
+	}
+	r := NewReader("v", p, fixedRunner("active", nil), WithWifi(stubWifiProbe{payload}))
+	got, err := r.Read(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Wifi == nil {
+		t.Fatal("Wifi = nil, want populated")
+	}
+	if got.Wifi.SSID != "MyHome" || got.Wifi.SignalPct == nil || *got.Wifi.SignalPct != 78 {
+		t.Errorf("Wifi mismatch: %+v", got.Wifi)
+	}
+	blob, _ := json.Marshal(got)
+	if !strings.Contains(string(blob), `"wifi"`) {
+		t.Errorf("marshaled JSON missing wifi field: %s", blob)
+	}
+}
+
+func TestRead_NoWifiOption_OmitsField(t *testing.T) {
+	t.Parallel()
+	p, _ := newTestPaths(t)
+	r := NewReader("v", p, fixedRunner("active", nil))
+	got, _ := r.Read(context.Background())
+	if got.Wifi != nil {
+		t.Errorf("Wifi = %+v, want nil (no WithWifi)", got.Wifi)
+	}
+	blob, _ := json.Marshal(got)
+	if strings.Contains(string(blob), `"wifi"`) {
+		t.Errorf("marshaled JSON should omit wifi: %s", blob)
+	}
+}
+
+func TestRead_WifiOption_ProbeReturnsNil_OmitsField(t *testing.T) {
+	t.Parallel()
+	// WithWifi is configured but the probe returns nil (Ethernet-only
+	// host case). The omitempty tag should still hide the field so the
+	// frontend doesn't paint a "—" tile.
+	p, _ := newTestPaths(t)
+	r := NewReader("v", p, fixedRunner("active", nil), WithWifi(stubWifiProbe{nil}))
+	got, _ := r.Read(context.Background())
+	if got.Wifi != nil {
+		t.Errorf("Wifi = %+v, want nil (probe returned nil)", got.Wifi)
+	}
+	blob, _ := json.Marshal(got)
+	if strings.Contains(string(blob), `"wifi"`) {
+		t.Errorf("marshaled JSON should omit wifi when probe returned nil: %s", blob)
 	}
 }

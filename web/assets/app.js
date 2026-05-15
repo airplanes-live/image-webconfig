@@ -40,8 +40,9 @@
         "dump978":   "dump978-fa.service",
         "uat":       "airplanes-978.service",
         "claim":     "airplanes-claim.service",
-        "webconfig": "airplanes-webconfig.service",
-        "update":    "airplanes-update.service",
+        "webconfig":      "airplanes-webconfig.service",
+        "update":         "airplanes-update.service",
+        "system-upgrade": "airplanes-system-upgrade.service",
     };
     const UNIT_TO_LOG_SLUG = Object.fromEntries(
         Object.entries(LOG_SLUG_TO_UNIT).map(([s, u]) => [u, s])
@@ -74,12 +75,22 @@
             "M9.405 1.05c-.413-1.4-2.397-1.4-2.81 0l-.1.34a1.464 1.464 0 0 1-2.105.872l-.31-.17c-1.283-.698-2.686.705-1.987 1.987l.169.311c.446.82.023 1.841-.872 2.105l-.34.1c-1.4.413-1.4 2.397 0 2.81l.34.1a1.464 1.464 0 0 1 .872 2.105l-.17.31c-.698 1.283.705 2.686 1.987 1.987l.311-.169a1.464 1.464 0 0 1 2.105.872l.1.34c.413 1.4 2.397 1.4 2.81 0l.1-.34a1.464 1.464 0 0 1 2.105-.872l.31.17c1.283.698 2.686-.705 1.987-1.987l-.169-.311a1.464 1.464 0 0 1 .872-2.105l.34-.1c1.4-.413 1.4-2.397 0-2.81l-.34-.1a1.464 1.464 0 0 1-.872-2.105l.17-.31c.698-1.283-.705-2.686-1.987-1.987l-.311.169a1.464 1.464 0 0 1-2.105-.872zM8 10.93a2.929 2.929 0 1 1 0-5.86 2.929 2.929 0 0 1 0 5.858z",
     };
 
+    // Bootstrap-icons cpu glyph (16×16 viewBox). Same single-path shape
+    // SERVICE_ICONS uses; consumed by svgIcon().
+    const PIHEALTH_ICON =
+        "M5 0a.5.5 0 0 1 .5.5V2h1V.5a.5.5 0 0 1 1 0V2h1V.5a.5.5 0 0 1 1 0V2h1V.5a.5.5 0 0 1 1 0V2A2.5 2.5 0 0 1 14 4.5h1.5a.5.5 0 0 1 0 1H14v1h1.5a.5.5 0 0 1 0 1H14v1h1.5a.5.5 0 0 1 0 1H14v1h1.5a.5.5 0 0 1 0 1H14A2.5 2.5 0 0 1 11.5 14H10v1.5a.5.5 0 0 1-1 0V14H8v1.5a.5.5 0 0 1-1 0V14H6v1.5a.5.5 0 0 1-1 0V14H4.5A2.5 2.5 0 0 1 2 11.5H.5a.5.5 0 0 1 0-1H2v-1H.5a.5.5 0 0 1 0-1H2v-1H.5a.5.5 0 0 1 0-1H2v-1H.5a.5.5 0 0 1 0-1H2A2.5 2.5 0 0 1 4.5 2V.5A.5.5 0 0 1 5 0m-.5 3A1.5 1.5 0 0 0 3 4.5v7A1.5 1.5 0 0 0 4.5 13h7a1.5 1.5 0 0 0 1.5-1.5v-7A1.5 1.5 0 0 0 11.5 3z";
+
+    // Bootstrap-icons wifi glyph (16×16 viewBox).
+    const WIFI_ICON =
+        "M15.384 6.115a.485.485 0 0 0-.047-.736A12.44 12.44 0 0 0 8 3C5.259 3 2.723 3.882.663 5.379a.485.485 0 0 0-.048.736.518.518 0 0 0 .668.05A11.45 11.45 0 0 1 8 4c2.507 0 4.827.802 6.716 2.164.205.148.49.13.668-.049m-2.55 2.516a.482.482 0 0 0-.063-.745A8.46 8.46 0 0 0 8 7a8.46 8.46 0 0 0-4.77 1.886.482.482 0 0 0-.064.745.525.525 0 0 0 .654.065A7.46 7.46 0 0 1 8 8c1.71 0 3.29.578 4.18 1.696a.525.525 0 0 0 .654-.065zm-2.557 2.514a.483.483 0 0 0-.089-.745A4.47 4.47 0 0 0 8 10c-.83 0-1.605.247-2.188.4a.483.483 0 0 0-.089.745.525.525 0 0 0 .626.085A3.47 3.47 0 0 1 8 11c.488 0 .947.118 1.349.314a.525.525 0 0 0 .626-.085zM9.5 14.25a1.5 1.5 0 1 1-3 0 1.5 1.5 0 0 1 3 0z";
+
     // ===== Runtime state =====
 
     const app = document.getElementById("app");
     const headerTitleEl = document.getElementById("wc-header-title");
     const backBtn = document.getElementById("wc-back-btn");
     const themeBtn = document.getElementById("wc-theme-btn");
+    const refreshBtn = document.getElementById("wc-refresh-btn");
 
     let activeStream = null;       // current EventSource (log viewer)
     let statusTimer = null;        // setInterval handle for status poll
@@ -116,6 +127,7 @@
         const o = opts || {};
         if (headerTitleEl) headerTitleEl.textContent = o.title ? "/ " + o.title : "";
         if (backBtn) backBtn.hidden = !o.showBack;
+        if (refreshBtn) refreshBtn.hidden = !o.showRefresh;
     }
 
     // ===== Navigation (one cleanup point) =====
@@ -145,7 +157,16 @@
         dashboardCtx = null;
         if (opts && opts.flash) pendingFlash = opts.flash;
         setHeader(opts);
-        panelFn();
+        return panelFn();
+    }
+
+    // Dashboard returns funnel through one helper so showRefresh, title,
+    // and showBack stay consistent across every "back to dashboard" path.
+    // Returns the panel promise so the refresh handler can await the
+    // initial fetch and toggle the spinner around it.
+    function navigateDashboard(extraOpts) {
+        return navigate(dashboard, Object.assign(
+            { title: null, showBack: false, showRefresh: true }, extraOpts || {}));
     }
 
     // ===== HTTP helpers =====
@@ -172,16 +193,29 @@
     }
 
     async function postJSON(path, body) {
+        return sendJSON("POST", path, body);
+    }
+
+    async function putJSON(path, body) {
+        return sendJSON("PUT", path, body);
+    }
+
+    async function deleteJSON(path, body) {
+        return sendJSON("DELETE", path, body);
+    }
+
+    async function sendJSON(method, path, body) {
         const ctrl = new AbortController();
         activeAbort = ctrl;
         try {
-            const resp = await fetch(path, {
-                method: "POST",
+            const init = {
+                method,
                 credentials: "same-origin",
                 headers: { "Content-Type": "application/json" },
-                body: JSON.stringify(body),
                 signal: ctrl.signal,
-            });
+            };
+            if (body !== undefined) init.body = JSON.stringify(body);
+            const resp = await fetch(path, init);
             let payload = null;
             try { payload = await resp.json(); } catch (_) {}
             return { ok: resp.ok, status: resp.status, payload: payload || {} };
@@ -284,28 +318,31 @@
         return null;
     }
 
-    // Mirror the Go validators in configspec.go. Lat/lon are accepted by
-    // strconv.ParseFloat on the server, which permits leading "+", a
-    // bare leading ".", and scientific notation — anything Number() also
-    // accepts. Number()+isFinite() catches the rejection-class values
-    // (NaN, Infinity, "52abc" → NaN). Empty/whitespace fail explicitly.
-    // parseFloat is intentionally avoided — parseFloat("52abc") returns
-    // 52, which would let "52abc" sneak past.
+    // Mirror the bash validators in feed/scripts/lib/configure-validators.sh.
+    // apl-feed apply is the authoritative server-side gate; the JS preview
+    // here only suppresses Save while the user is editing. A JS-vs-bash
+    // mismatch surfaces as "looks valid in the form but save failed", so
+    // these accept/reject the same inputs as the bash side. Different
+    // regex engines, semantically equivalent rules. Pinned by
+    // test/test_validator_parity.sh.
     //
-    // Altitude is stricter on both sides: a regex anchored to a numeric
-    // prefix + optional m|ft suffix. Mirrors altitudeRE in configspec.go.
-    const altitudeRE = /^(-?\d+(?:\.\d+)?)(m|ft)?$/;
+    // The /* @validator-parity */ markers delimit the block exported to
+    // the parity test; keep them flanking exactly the shared symbols.
+
+    /* @validator-parity start */
+    const latLonRE = /^[+-]?\d+(?:\.\d+)?$/;
+    const altitudeRE = /^(-?\d+(?:\.\d+)?)(?:m|ft)?$/;
 
     function isValidLatitude(v) {
         const s = (v || "").trim();
-        if (s === "") return false;
+        if (!latLonRE.test(s)) return false;
         const f = Number(s);
         if (!Number.isFinite(f)) return false;
         return f >= -90 && f <= 90;
     }
     function isValidLongitude(v) {
         const s = (v || "").trim();
-        if (s === "") return false;
+        if (!latLonRE.test(s)) return false;
         const f = Number(s);
         if (!Number.isFinite(f)) return false;
         return f >= -180 && f <= 180;
@@ -317,6 +354,34 @@
         const f = Number(m[1]);
         return Number.isFinite(f) && f >= -1000 && f <= 10000;
     }
+
+    // Wi-Fi validators — bash twin lives at
+    // /usr/local/lib/airplanes/wifi-validators.sh (apl_wifi_valid_*). Pinned
+    // by the same parity fixture. CRUCIAL: no trim. WPA passphrases and
+    // SSIDs can legitimately carry leading/trailing whitespace, so pass the
+    // value through verbatim — the form must not normalize.
+    const wifiSSIDControlsRE = /[\x00-\x1f\x7f]/;
+    function isValidWifiSSID(v) {
+        const s = String(v == null ? "" : v);
+        if (wifiSSIDControlsRE.test(s)) return false;
+        const bytes = new TextEncoder().encode(s).length;
+        return bytes >= 1 && bytes <= 32;
+    }
+    const wifiPSKHexRE = /^[A-Fa-f0-9]{64}$/;
+    const wifiPSKASCIIRE = /^[\x20-\x7e]{8,63}$/;
+    function isValidWifiPSK(v) {
+        const s = String(v == null ? "" : v);
+        if (wifiPSKHexRE.test(s)) return true;
+        return wifiPSKASCIIRE.test(s);
+    }
+    function isValidWifiCountry(v) {
+        return /^[A-Z]{2}$/.test(String(v == null ? "" : v));
+    }
+    const wifiPriorityRE = /^(0|[1-9][0-9]{0,2})$/;
+    function isValidWifiPriority(v) {
+        return wifiPriorityRE.test(String(v == null ? "" : v));
+    }
+    /* @validator-parity end */
 
     // previewLatLonSet — projection of unsaved form values onto the
     // daemon's "would MLAT be enabled?" rule. Used ONLY for the form-time
@@ -336,6 +401,13 @@
         const lat = Number(String(values.LATITUDE || "").trim());
         const lon = Number(String(values.LONGITUDE || "").trim());
         return !(lat === 0 && lon === 0);
+    }
+
+    // locationSaved — drives the form cascade. previewLatLonSet covers the
+    // GEO_CONFIGURED-first check; altitude is separate because the daemon
+    // classifies altitude_empty as its own MLAT misconfig reason.
+    function locationSaved(values) {
+        return previewLatLonSet(values || {}) && isValidAltitude((values || {}).ALTITUDE || "");
     }
 
     // previewMlatDisabled — same projection semantics: read MLAT_ENABLED
@@ -566,6 +638,13 @@
         if (mlatIntendedRunning && get("airplanes-mlat.service") !== "active") {
             return { dot: "warn", label: "partial" };
         }
+        // Hardware health demotes only on err — a warn-level hardware
+        // condition (75°C summer afternoon, history flags) shouldn't paint
+        // the whole dashboard yellow when feeding is otherwise fine.
+        const ph = payload.pi_health || null;
+        if (ph && ph.severity === "err") {
+            return { dot: "warn", label: "partial" };
+        }
         return { dot: "ok", label: "healthy" };
     }
 
@@ -655,7 +734,99 @@
         const c = classifyService(unit, state, payload);
         tile.dotEl.className = "wc-tile__dot wc-tile__dot--" + c.dot;
         tile.metaEl.textContent = c.meta;
+        // title= recovers the full meta string when CSS ellipsis truncates
+        // the tile (the fixed-row grid means long reasons clip on narrow
+        // viewports). Hover / long-press surfaces the full text.
+        tile.root.title = c.meta || "";
         tile.root.setAttribute("data-state", state);
+    }
+
+    function buildPiHealthTile() {
+        const iconNode = el("span", { class: "wc-tile__icon" }, svgIcon(PIHEALTH_ICON));
+        const titleEl  = el("span", { class: "wc-tile__title" }, "Raspberry Pi");
+        const metaEl   = el("span", { class: "wc-tile__meta" }, "—");
+        const dotEl    = el("span", { class: "wc-tile__dot wc-tile__dot--na" });
+        const root = el("div", { class: "wc-tile wc-tile--hardware", "data-state": "unknown" },
+            iconNode,
+            el("span", { class: "wc-tile__body" }, titleEl, metaEl),
+            dotEl,
+        );
+        return { root, titleEl, metaEl, dotEl };
+    }
+
+    function updatePiHealthTile(tile, payload) {
+        const ph = (payload && payload.pi_health) || null;
+        if (!ph) {
+            tile.dotEl.className = "wc-tile__dot wc-tile__dot--na";
+            tile.metaEl.textContent = "—";
+            tile.root.title = "";
+            tile.root.setAttribute("data-state", "unknown");
+            return;
+        }
+        const sev = ph.severity || "na";
+        const summary = ph.summary || "—";
+        tile.dotEl.className = "wc-tile__dot wc-tile__dot--" + sev;
+        tile.metaEl.textContent = summary;
+        tile.root.title = summary;
+        tile.root.setAttribute("data-state", sev);
+    }
+
+    // classifyWifi projects the /api/status.wifi payload into a tile
+    // {dot, meta}. Returns null when there's no payload — the tile is
+    // hidden in that case (Ethernet-only hosts have no WiFi field at
+    // all). A connected interface with unparseable signal renders as
+    // warn with just the SSID (conservative — we know it's up but
+    // can't grade it).
+    function classifyWifi(w) {
+        if (!w) return null;
+        if (!w.connected) return { dot: "na", meta: "not connected" };
+        const displaySSID = (w.ssid && w.ssid.length) ? w.ssid : "(hidden)";
+        if (typeof w.signal_pct !== "number") {
+            return { dot: "warn", meta: displaySSID };
+        }
+        const pct = w.signal_pct;
+        let dot = "ok";
+        if (pct < 40) dot = "err";
+        else if (pct < 60) dot = "warn";
+        return { dot, meta: displaySSID + " · " + pct + "%" };
+    }
+
+    function buildWifiTile() {
+        const iconNode = el("span", { class: "wc-tile__icon" }, svgIcon(WIFI_ICON));
+        const titleEl  = el("span", { class: "wc-tile__title" }, "Wi-Fi");
+        const metaEl   = el("span", { class: "wc-tile__meta" }, "—");
+        const dotEl    = el("span", { class: "wc-tile__dot wc-tile__dot--na" });
+        // Hidden until the first payload arrives — avoids a flash on
+        // Ethernet-only hosts where the field is omitted entirely.
+        const root = el("a", {
+            class: "wc-tile wc-tile--wifi",
+            "data-state": "unknown",
+            href: "#",
+            role: "button",
+            hidden: true,
+            onclick: (e) => {
+                e.preventDefault();
+                navigate(wifiPanel, { title: "Wi-Fi networks", showBack: true });
+            },
+        },
+            iconNode,
+            el("span", { class: "wc-tile__body" }, titleEl, metaEl),
+            dotEl,
+        );
+        return { root, titleEl, metaEl, dotEl };
+    }
+
+    function updateWifiTile(tile, payload) {
+        const c = classifyWifi(payload && payload.wifi);
+        if (!c) {
+            tile.root.hidden = true;
+            return;
+        }
+        tile.root.hidden = false;
+        tile.dotEl.className = "wc-tile__dot wc-tile__dot--" + c.dot;
+        tile.metaEl.textContent = c.meta;
+        tile.root.title = c.meta || "";
+        tile.root.setAttribute("data-state", c.dot);
     }
 
     function buildTileGrid() {
@@ -663,6 +834,14 @@
         const apps = el("div", { class: "wc-grid--tiles" });
         const tiles = {};
         const appTiles = {};
+        // Hardware tile leads the services grid — the .wc-tile--hardware
+        // class differentiates it visually without needing a separate row.
+        const piHealth = buildPiHealthTile();
+        services.appendChild(piHealth.root);
+        // WiFi tile follows, hidden by default until /api/status confirms
+        // there is a WiFi adapter at all.
+        const wifi = buildWifiTile();
+        services.appendChild(wifi.root);
         for (const unit of MONITORED_SERVICES) {
             const t = buildTile(unit);
             tiles[unit] = t;
@@ -676,7 +855,7 @@
         // Wrap both grids in a fragment-like container so the dashboard
         // render() call gets a single root.
         const root = el("div", { class: "wc-tiles-stack" }, services, apps);
-        return { root, tiles, appTiles };
+        return { root, tiles, appTiles, piHealth, wifi };
     }
 
     function buildAppTile(app) {
@@ -731,8 +910,10 @@
             const tile = grid.appTiles[a.id];
             if (!tile) return;
             const ok = results[i];
+            const meta = ok ? a.meta : (a.meta + " · unreachable");
             tile.dotEl.className = "wc-tile__dot wc-tile__dot--" + (ok ? "ok" : "err");
-            tile.metaEl.textContent = ok ? a.meta : (a.meta + " · unreachable");
+            tile.metaEl.textContent = meta;
+            tile.root.title = meta || "";
             tile.root.setAttribute("data-state", ok ? "active" : "inactive");
         });
     }
@@ -744,6 +925,8 @@
         // payload.values and payload.mlat_decision; merging here keeps
         // the call sites simple.
         payload.values = Object.assign({}, payload.values || {}, configValues || {});
+        if (grid.piHealth) updatePiHealthTile(grid.piHealth, payload);
+        if (grid.wifi) updateWifiTile(grid.wifi, payload);
         for (const unit of MONITORED_SERVICES) {
             const tile = grid.tiles[unit];
             if (tile) updateTile(tile, unit, payload);
@@ -771,7 +954,31 @@
         parent.appendChild(el("p", {}, el("strong", {}, "Feeder ID: "), id.feeder_id));
         if (!id.claim_secret_present) {
             parent.appendChild(el("p", { class: "muted" },
-                "No claim secret yet — apl-feed claim register will create one."));
+                "Claim secret not yet registered. The feeder retries every 5 minutes; click below to attempt now."));
+            const registerErr = errorEl();
+            const registerBtn = el("button", {
+                class: "wc-btn-primary",
+                type: "button",
+                onclick: async () => {
+                    registerBtn.disabled = true;
+                    registerErr.textContent = "";
+                    const r = await postJSON("/api/claim/register", {});
+                    if (handleAuthFailure(r)) return;
+                    if (!r.ok) {
+                        registerBtn.disabled = false;
+                        registerErr.textContent = (r.payload && r.payload.error) || "register failed";
+                        return;
+                    }
+                    navigate(() => logViewer("claim"), { title: "Claim activity", showBack: true });
+                },
+            }, "Register now");
+            const claimLog = el("button", {
+                class: "wc-btn-ghost",
+                type: "button",
+                onclick: () => navigate(() => logViewer("claim"), { title: "Claim activity", showBack: true }),
+            }, "Claim activity");
+            parent.appendChild(el("div", { class: "actions" }, registerBtn, claimLog));
+            parent.appendChild(registerErr);
             return;
         }
         const claimLog = el("button", {
@@ -825,20 +1032,118 @@
         }
         const values = resp.payload.values || {};
         const inputs = {};
+        const loc = locationSaved(values);
 
         const fieldId = (key) => "config-" + key.toLowerCase().replace(/_/g, "-");
 
+        // field() builds a "Label" + input row. No env-key code: those env
+        // names belong on the wire / in feed.env, not in the user-facing UI.
         const field = (key, label, attrs) => {
             const id = fieldId(key);
             const a = Object.assign({ id, name: key, value: values[key] || "", type: "text" }, attrs || {});
             const input = el("input", a);
             inputs[key] = input;
             return el("div", { class: "field" },
-                el("label", { for: id }, label, " ", el("code", {}, key)),
+                el("label", { for: id }, label),
                 input,
             );
         };
 
+        // ===== Location: collapsed card when saved, inputs otherwise =====
+        const latRow = field("LATITUDE", "Latitude", { inputmode: "decimal", placeholder: "51.5" });
+        const lonRow = field("LONGITUDE", "Longitude", { inputmode: "decimal", placeholder: "-0.1" });
+        const altRow = field("ALTITUDE", "Altitude", { placeholder: "120m" });
+        const locationInputs = el("div", { class: "location-inputs" }, latRow, lonRow, altRow);
+
+        const editLocation = el("button", { type: "button", class: "wc-btn-ghost" }, "Edit");
+        const locationCard = el("div", { class: "location-card" },
+            el("div", { class: "location-summary" },
+                (values.LATITUDE || "?") + ", " + (values.LONGITUDE || "?") + ", " + (values.ALTITUDE || "?"),
+            ),
+            editLocation,
+        );
+        // Both subtrees always exist; toggle visibility via the hidden
+        // attribute so the global form submit always reads from inputs.
+        locationCard.hidden = !loc;
+        locationInputs.hidden = loc;
+        editLocation.addEventListener("click", () => {
+            locationCard.hidden = true;
+            locationInputs.hidden = false;
+        });
+
+        const locationFieldset = el("fieldset", { class: "config-fieldset" },
+            el("legend", {}, "Location"),
+            locationCard,
+            locationInputs,
+        );
+
+        // ===== MLAT: gated on locationSaved =====
+        // Force unchecked when !loc: a stale MLAT_ENABLED=true with no geo
+        // would otherwise be posted on save and apl-feed apply would reject
+        // the whole request via the MLAT-vs-geo consistency check.
+        const mlatOn = loc && ((values["MLAT_ENABLED"] || "true") === "true");
+        const mlatId = fieldId("MLAT_ENABLED");
+        const mlat = el("input", {
+            id: mlatId,
+            type: "checkbox",
+            name: "MLAT_ENABLED",
+            checked: mlatOn ? "" : null,
+            disabled: loc ? null : "",
+        });
+        inputs["MLAT_ENABLED"] = mlat;
+
+        const mlatPrivateOn = (values["MLAT_PRIVATE"] || "false") === "true";
+        const mlatPrivateId = fieldId("MLAT_PRIVATE");
+        const mlatPrivate = el("input", {
+            id: mlatPrivateId,
+            type: "checkbox",
+            name: "MLAT_PRIVATE",
+            checked: mlatPrivateOn ? "" : null,
+        });
+        inputs["MLAT_PRIVATE"] = mlatPrivate;
+
+        const mlatToggleRow = el("div", { class: "field" },
+            el("label", { for: mlatId }, mlat, " Enable MLAT"),
+        );
+        const mlatHelp = el("p", { class: "help" }, "Set your location first to enable MLAT.");
+        mlatHelp.hidden = loc;
+
+        const mlatUserRow = field("MLAT_USER", "MLAT name", { placeholder: "alice" });
+        const mlatPrivateRow = el("div", { class: "field" },
+            el("label", { for: mlatPrivateId }, mlatPrivate, " Hide MLAT name on public map"),
+        );
+        const mlatSubFields = el("div", { class: "mlat-sub" }, mlatUserRow, mlatPrivateRow);
+        mlatSubFields.hidden = !(loc && mlat.checked);
+        mlat.addEventListener("change", () => {
+            mlatSubFields.hidden = !(loc && mlat.checked);
+        });
+
+        const mlatFieldset = el("fieldset", { class: "config-fieldset" },
+            el("legend", {}, "MLAT"),
+            mlatToggleRow,
+            mlatHelp,
+            mlatSubFields,
+        );
+
+        // ===== Gain: own fieldset with description + external doc link =====
+        const gainRow = field("GAIN", "Gain", { placeholder: "auto" });
+        const gainFieldset = el("fieldset", { class: "config-fieldset" },
+            el("legend", {}, "Gain"),
+            el("p", { class: "help" },
+                "RTL-SDR gain in dB, or ",
+                el("code", {}, "auto"),
+                " for adaptive control. See ",
+                el("a", {
+                    href: "https://github.com/wiedehopf/adsb-wiki/wiki/Optimizing-gain",
+                    target: "_blank",
+                    rel: "noopener noreferrer",
+                }, "wiedehopf's gain guide"),
+                ".",
+            ),
+            gainRow,
+        );
+
+        // ===== 978 UAT: toggle + collapsed sub-fields =====
         const dump978On = (values["UAT_INPUT"] || "") !== "";
         const uatId = fieldId("UAT_INPUT");
         const uat = el("input", {
@@ -862,9 +1167,9 @@
         });
         inputs["DUMP978_SDR_SERIAL"] = dump978Serial;
 
-        const gainId = fieldId("DUMP978_GAIN");
+        const dump978GainId = fieldId("DUMP978_GAIN");
         const dump978Gain = el("input", {
-            id: gainId,
+            id: dump978GainId,
             type: "text",
             name: "DUMP978_GAIN",
             value: values["DUMP978_GAIN"] || "42.1",
@@ -873,35 +1178,32 @@
         });
         inputs["DUMP978_GAIN"] = dump978Gain;
 
-        // MLAT_ENABLED is a separate boolean toggle in the new schema. Default
-        // to "true" when the key is absent (e.g. on a fresh feed.env that
-        // hasn't been written yet) to match the daemon's MLAT_ENABLED:-true.
-        const mlatOn = (values["MLAT_ENABLED"] || "true") === "true";
-        const mlatId = fieldId("MLAT_ENABLED");
-        const mlat = el("input", {
-            id: mlatId,
-            type: "checkbox",
-            name: "MLAT_ENABLED",
-            checked: mlatOn ? "" : null,
+        const dump978Sub = el("div", { class: "dump978-sub" },
+            el("div", { class: "field" },
+                el("label", { for: sdrSerialId }, "978 SDR serial"),
+                dump978Serial,
+            ),
+            el("div", { class: "field" },
+                el("label", { for: dump978GainId }, "978 gain"),
+                dump978Gain,
+            ),
+        );
+        dump978Sub.hidden = !uat.checked;
+        uat.addEventListener("change", () => {
+            dump978Sub.hidden = !uat.checked;
         });
-        inputs["MLAT_ENABLED"] = mlat;
 
-        // MLAT_PRIVATE hides the feed name on the public MLAT map. Default
-        // false (name shown) when absent, matching airplanes-mlat.sh's
-        // MLAT_PRIVATE:-false. Position is never shown precisely regardless
-        // of the toggle.
-        const mlatPrivateOn = (values["MLAT_PRIVATE"] || "false") === "true";
-        const mlatPrivateId = fieldId("MLAT_PRIVATE");
-        const mlatPrivate = el("input", {
-            id: mlatPrivateId,
-            type: "checkbox",
-            name: "MLAT_PRIVATE",
-            checked: mlatPrivateOn ? "" : null,
-        });
-        inputs["MLAT_PRIVATE"] = mlatPrivate;
+        const uatFieldset = el("fieldset", { class: "config-fieldset" },
+            el("legend", {}, "978 UAT"),
+            el("div", { class: "field" },
+                el("label", { for: uatId }, uat, " Enable 978 UAT"),
+            ),
+            dump978Sub,
+        );
 
+        // ===== Submit + form =====
         const err = errorEl();
-        const submit = el("button", { type: "submit", class: "wc-btn-primary" }, "Save & restart");
+        const submit = el("button", { type: "submit", class: "wc-btn-primary" }, "Save & apply");
 
         // Gate Save on the same MLAT → geo requirement that
         // configspec.ValidateConsistency enforces server-side. Reading
@@ -945,12 +1247,17 @@
                 err.textContent = "";
                 submit.disabled = true;
                 submit.textContent = "Saving…";
+                // When location isn't saved, force MLAT_ENABLED=false: the
+                // disabled checkbox would otherwise carry a stale "true" and
+                // apl-feed apply would reject every save (including a Gain-
+                // only edit) via the GEO_CONFIGURED consistency check.
+                const mlatEnabled = (loc && mlat.checked) ? "true" : "false";
                 const updates = {
                     LATITUDE: inputs.LATITUDE.value.trim(),
                     LONGITUDE: inputs.LONGITUDE.value.trim(),
                     ALTITUDE: inputs.ALTITUDE.value.trim(),
                     MLAT_USER: inputs.MLAT_USER.value.trim(),
-                    MLAT_ENABLED: mlat.checked ? "true" : "false",
+                    MLAT_ENABLED: mlatEnabled,
                     MLAT_PRIVATE: mlatPrivate.checked ? "true" : "false",
                     GAIN: inputs.GAIN.value.trim(),
                     UAT_INPUT: uat.checked ? "127.0.0.1:30978" : "",
@@ -958,10 +1265,10 @@
                     DUMP978_GAIN: dump978Gain.value.trim(),
                 };
                 // Don't write DUMP978_* keys when UAT is toggled off — they
-                // would be no-ops the daemon never reads, and writing them
-                // anyway would let a stale serial/gain accumulate in feed.env
-                // even after the user disabled 978. The wrapper falls back
-                // to compiled-in defaults (978 / 42.1) on next enable.
+                // would be no-ops the daemon never reads. The wrapper falls
+                // back to compiled-in defaults (978 / 42.1) on next enable.
+                // Note: existing values already in feed.env are retained;
+                // toggling UAT off does not clear them.
                 if (!uat.checked) {
                     delete updates.DUMP978_SDR_SERIAL;
                     delete updates.DUMP978_GAIN;
@@ -976,7 +1283,7 @@
                 }
                 const r = await postJSON("/api/config", { updates });
                 submit.disabled = false;
-                submit.textContent = "Save & restart";
+                submit.textContent = "Save & apply";
                 if (handleAuthFailure(r)) return;
                 if (!r.ok) {
                     err.textContent = (r.payload && r.payload.error) || "save failed";
@@ -987,7 +1294,7 @@
                 // flash through navigate options — without this, the warning
                 // would clear immediately when navigate() rerenders.
                 const pending = (r.payload && r.payload.pending_restart) || [];
-                const opts = { title: null, showBack: false };
+                const opts = {};
                 if (pending.length > 0) {
                     opts.flash = {
                         level: "warn",
@@ -997,37 +1304,13 @@
                             + pending.join(" "),
                     };
                 }
-                navigate(dashboard, opts);
+                navigateDashboard(opts);
             },
         },
-            el("fieldset", { class: "config-fieldset" },
-                el("legend", {}, "Location"),
-                field("LATITUDE", "Latitude", { inputmode: "decimal", placeholder: "51.5" }),
-                field("LONGITUDE", "Longitude", { inputmode: "decimal", placeholder: "-0.1" }),
-                field("ALTITUDE", "Altitude", { placeholder: "120m" }),
-            ),
-            el("fieldset", { class: "config-fieldset" },
-                el("legend", {}, "MLAT"),
-                field("MLAT_USER", "MLAT name", { placeholder: "alice" }),
-                el("div", { class: "field" },
-                    el("label", { for: mlatId }, mlat, " Enable MLAT", " ", el("code", {}, "MLAT_ENABLED")),
-                ),
-                el("div", { class: "field" },
-                    el("label", { for: mlatPrivateId }, mlatPrivate, " Hide MLAT name on public map", " ", el("code", {}, "MLAT_PRIVATE")),
-                ),
-            ),
-            field("GAIN", "Gain", { placeholder: "auto" }),
-            el("div", { class: "field" },
-                el("label", { for: uatId }, uat, " Enable 978 UAT", " ", el("code", {}, "UAT_INPUT")),
-            ),
-            el("div", { class: "field" },
-                el("label", { for: sdrSerialId }, "978 SDR serial", " ", el("code", {}, "DUMP978_SDR_SERIAL")),
-                dump978Serial,
-            ),
-            el("div", { class: "field" },
-                el("label", { for: gainId }, "978 gain", " ", el("code", {}, "DUMP978_GAIN")),
-                dump978Gain,
-            ),
+            locationFieldset,
+            mlatFieldset,
+            gainFieldset,
+            uatFieldset,
             submit,
             err,
         );
@@ -1040,31 +1323,37 @@
         inputs.ALTITUDE.addEventListener("input", recheck);
         mlat.addEventListener("change", recheck);
         recheck();
-
-        const readOnly = Object.keys(values).filter(k =>
-            !["LATITUDE", "LONGITUDE", "ALTITUDE", "MLAT_USER", "MLAT_ENABLED", "MLAT_PRIVATE", "GAIN", "UAT_INPUT", "DUMP978_SDR_SERIAL", "DUMP978_GAIN"].includes(k)
-        ).sort();
-        if (readOnly.length > 0) {
-            const tbl = el("dl", { class: "config-list" });
-            for (const k of readOnly) {
-                tbl.appendChild(el("dt", {}, k));
-                tbl.appendChild(el("dd", {}, values[k] === "" ? "(empty)" : values[k]));
-            }
-            parent.appendChild(el("details", {},
-                el("summary", { class: "muted" }, "Advanced (read-only)"),
-                tbl,
-            ));
-        }
     }
 
     // ===== Action row =====
 
-    function buildActionsRow() {
-        const refresh = el("button", {
-            type: "button", class: "wc-btn-ghost",
-            onclick: () => navigate(dashboard, { title: null, showBack: false }),
-        }, "Refresh");
+    // requestReboot POSTs /api/reboot and handles 409 (server refuses while
+    // a maintenance unit is busy) and other failures uniformly. On 202 it
+    // navigates to the "Rebooting…" card. Used by both the action-row button
+    // and the reboot-required banner.
+    async function requestReboot(triggerBtn, confirmFirst) {
+        if (confirmFirst && !confirm("Reboot the feeder now?")) return;
+        if (triggerBtn) {
+            triggerBtn.disabled = true;
+            triggerBtn.textContent = "Rebooting…";
+        }
+        const r = await postJSON("/api/reboot", {});
+        if (handleAuthFailure(r)) return;
+        if (!r.ok) {
+            if (triggerBtn) {
+                triggerBtn.disabled = false;
+                triggerBtn.textContent = "Reboot";
+            }
+            alert((r.payload && r.payload.error) || "reboot failed");
+            return;
+        }
+        navigate(() => render(el("div", { class: "wc-card" },
+            el("h2", {}, "Rebooting…"),
+            el("p", {}, "The feeder is restarting. This page will go offline for ~30 seconds."),
+        )), { title: "Rebooting", showBack: false });
+    }
 
+    function buildActionsRow() {
         const updateBtn = el("button", {
             type: "button", class: "wc-btn-ghost",
             onclick: async () => {
@@ -1085,6 +1374,26 @@
             onclick: () => navigate(() => logViewer("update"), { title: "Update log", showBack: true }),
         }, "Update log");
 
+        const sysUpgradeBtn = el("button", {
+            type: "button", class: "wc-btn-ghost",
+            onclick: async () => {
+                sysUpgradeBtn.disabled = true;
+                const r = await postJSON("/api/system-upgrade", {});
+                sysUpgradeBtn.disabled = false;
+                if (handleAuthFailure(r)) return;
+                if (!r.ok) {
+                    alert((r.payload && r.payload.error) || "system upgrade failed");
+                    return;
+                }
+                navigate(() => logViewer("system-upgrade"), { title: "System upgrade log", showBack: true });
+            },
+        }, "Update system packages");
+
+        const sysUpgradeLog = el("button", {
+            type: "button", class: "wc-btn-ghost",
+            onclick: () => navigate(() => logViewer("system-upgrade"), { title: "System upgrade log", showBack: true }),
+        }, "System upgrade log");
+
         const change = el("button", {
             type: "button", class: "wc-btn-ghost",
             onclick: () => navigate(changePasswordPanel, { title: "Change password", showBack: true }),
@@ -1092,24 +1401,307 @@
 
         const rebootBtn = el("button", {
             type: "button", class: "wc-btn-danger",
-            onclick: async () => {
-                if (!confirm("Reboot the feeder now?")) return;
-                rebootBtn.disabled = true;
-                rebootBtn.textContent = "Rebooting…";
-                await postJSON("/api/reboot", {});
-                navigate(() => render(el("div", { class: "wc-card" },
-                    el("h2", {}, "Rebooting…"),
-                    el("p", {}, "The feeder is restarting. This page will go offline for ~30 seconds."),
-                )), { title: "Rebooting", showBack: false });
-            },
+            onclick: () => requestReboot(rebootBtn, true),
         }, "Reboot");
+
+        const poweroffBtn = el("button", {
+            type: "button", class: "wc-btn-danger",
+            onclick: () => navigate(confirmPowerOffPanel, { title: "Power off", showBack: true }),
+        }, "Power off");
 
         const logout = el("button", {
             type: "button", class: "wc-btn-ghost",
             onclick: async () => { await postJSON("/api/auth/logout", {}); await boot(); },
         }, "Log out");
 
-        return el("div", { class: "actions" }, refresh, updateBtn, updateLog, change, rebootBtn, logout);
+        const wifiBtn = el("button", {
+            type: "button", class: "wc-btn-ghost",
+            onclick: () => navigate(wifiPanel, { title: "Wi-Fi networks", showBack: true }),
+        }, "Wi-Fi networks");
+
+        return el("div", { class: "actions" }, updateBtn, updateLog, sysUpgradeBtn, sysUpgradeLog, wifiBtn, change, rebootBtn, poweroffBtn, logout);
+    }
+
+    // ===== Wi-Fi panel =====
+
+    async function wifiPanel() {
+        render(el("div", { class: "wc-card" }, el("p", { class: "muted" }, "loading Wi-Fi networks…")));
+
+        const [list, status] = await Promise.all([
+            getJSON("/api/wifi"),
+            getJSON("/api/wifi/status"),
+        ]);
+        if (handleAuthFailure(list) || handleAuthFailure(status)) return;
+
+        const listPayload = (list && list.payload) || {};
+        const statusPayload = (status && status.payload) || {};
+        const networks = listPayload.networks || [];
+        const nmAvailable = !!listPayload.networkmanager_available;
+        const activeConn = listPayload.active_connection || null;
+        const nonWifiUplinks = statusPayload.non_wifi_uplinks || [];
+        const hasEthernet = nonWifiUplinks.length > 0;
+        const managedNets = networks.filter(n => n.managed);
+
+        const flashEl = el("div", { class: "wifi-flash" });
+
+        function setFlash(msg, kind) {
+            flashEl.replaceChildren();
+            if (!msg) return;
+            flashEl.appendChild(el("div", { class: "wifi-flash-" + (kind || "ok"), role: "status" }, msg));
+        }
+        if (!nmAvailable) {
+            setFlash("NetworkManager is not available on this feeder — Wi-Fi changes won't take effect.", "warn");
+        }
+
+        const statusBanner = el("div", { class: "wifi-status" });
+        renderStatusBanner();
+        function renderStatusBanner() {
+            statusBanner.replaceChildren();
+            if (activeConn && activeConn.ssid) {
+                statusBanner.appendChild(el("p", {},
+                    el("span", { class: "wifi-dot-active" }, ""),
+                    " Connected to ",
+                    el("strong", {}, activeConn.ssid),
+                    activeConn.device ? el("span", { class: "muted" }, " on " + activeConn.device) : null,
+                ));
+            } else if (hasEthernet) {
+                const e = nonWifiUplinks[0];
+                statusBanner.appendChild(el("p", { class: "muted" },
+                    "Ethernet only — " + (e.device || "") + (e.ipv4 ? " (" + e.ipv4 + ")" : "")));
+            } else {
+                statusBanner.appendChild(el("p", { class: "muted" }, "No active uplink detected."));
+            }
+        }
+
+        const addBtn = el("button", { type: "button", class: "wc-btn-primary" }, "Add network");
+        const tableHost = el("div", {});
+        const formHost = el("div", {});
+
+        function renderTable() {
+            tableHost.replaceChildren();
+            if (networks.length === 0) {
+                tableHost.appendChild(el("p", { class: "muted" }, "No saved networks."));
+                return;
+            }
+            const rows = networks.map(n => {
+                const editBtn = el("button", {
+                    type: "button", class: "wc-btn-ghost",
+                    disabled: n.managed ? null : "",
+                    title: n.managed ? null : "Foreign keyfile — edit via SSH",
+                    onclick: () => showForm(n),
+                }, "Edit");
+                const activateBtn = el("button", {
+                    type: "button", class: "wc-btn-ghost",
+                    disabled: (!nmAvailable || n.active) ? "" : null,
+                    onclick: () => activateNetwork(n),
+                }, "Activate");
+                const deleteBtn = el("button", {
+                    type: "button", class: "wc-btn-danger",
+                    disabled: n.managed ? null : "",
+                    onclick: () => deleteNetwork(n),
+                }, "Delete");
+                return el("tr", {},
+                    el("td", {},
+                        n.active ? el("span", { class: "wifi-dot-active", title: "Active" }, "") : el("span", { class: "wifi-dot-idle" }, ""),
+                        " ",
+                        el("strong", {}, n.ssid || "(unknown)"),
+                        n.first_run_profile ? el("span", { class: "wifi-badge" }, "first-run") : null,
+                        n.managed ? null : el("span", { class: "wifi-badge wifi-badge-warn" }, "foreign"),
+                        n.hidden ? el("span", { class: "wifi-badge" }, "hidden") : null,
+                    ),
+                    el("td", { class: "wifi-priority" }, String(n.priority || 0)),
+                    el("td", { class: "wifi-actions" }, editBtn, activateBtn, deleteBtn),
+                );
+            });
+            const tbl = el("table", { class: "wifi-table" },
+                el("thead", {}, el("tr", {},
+                    el("th", {}, "Network"),
+                    el("th", {}, "Priority"),
+                    el("th", {}, "Actions"),
+                )),
+                el("tbody", {}, ...rows),
+            );
+            tableHost.appendChild(tbl);
+        }
+
+        // Soft + strong confirm for delete. Both can compose; we always send
+        // both force flags if needed (helper enforces server-side).
+        async function deleteNetwork(n) {
+            const remainingManaged = managedNets.filter(m => m.id !== n.id).length;
+            const needForceLast = remainingManaged === 0;
+            const needForceActive = n.active && !hasEthernet;
+
+            if (needForceActive) {
+                const typed = prompt(
+                    "Deleting the active Wi-Fi network and no Ethernet is plugged in.\n\n" +
+                    "After this the feeder will lose its uplink. To recover you'll need " +
+                    "physical access (SD card) or another network the feeder still knows.\n\n" +
+                    'Type DELETE to confirm:');
+                if (typed !== "DELETE") return;
+            } else if (needForceLast) {
+                if (!confirm("This is the last saved Wi-Fi network. Delete anyway?")) return;
+            } else {
+                if (!confirm("Delete Wi-Fi network \"" + (n.ssid || n.id) + "\"?")) return;
+            }
+
+            const r = await deleteJSON("/api/wifi/" + encodeURIComponent(n.id), {
+                force_last: needForceLast,
+                force_active_no_uplink: needForceActive,
+            });
+            if (handleAuthFailure(r)) return;
+            if (!r.ok) {
+                setFlash((r.payload && (r.payload.message || r.payload.reason || r.payload.error)) || "delete failed", "error");
+                return;
+            }
+            setFlash("Deleted " + (n.ssid || n.id), "ok");
+            await wifiPanel();
+        }
+
+        async function activateNetwork(n) {
+            const r = await postJSON("/api/wifi/" + encodeURIComponent(n.id) + "/activate", {});
+            if (handleAuthFailure(r)) return;
+            if (!r.ok) {
+                setFlash((r.payload && (r.payload.message || r.payload.reason || r.payload.nm_reason || r.payload.error)) || "activate failed", "error");
+                return;
+            }
+            setFlash("Activating " + (n.ssid || n.id) + "…", "ok");
+            await wifiPanel();
+        }
+
+        function showForm(existing) {
+            const isEdit = !!existing;
+            const ssid = el("input", { type: "text", required: true, value: existing ? (existing.ssid || "") : "" });
+            const psk = el("input", {
+                type: "password", autocomplete: "new-password",
+                placeholder: isEdit && existing.has_psk ? "(unchanged — leave blank to keep)" : "8-63 chars or 64-hex",
+            });
+            const hidden = el("input", { type: "checkbox" });
+            if (existing && existing.hidden) hidden.checked = true;
+            const priority = el("input", {
+                type: "number", min: "0", max: "999",
+                value: String(existing ? (existing.priority || 0) : 0),
+            });
+            const testBox = el("input", { type: "checkbox", checked: "" });
+            const submit = el("button", { type: "submit", class: "wc-btn-primary" }, isEdit ? "Save changes" : "Add network");
+            const cancel = el("button", { type: "button", class: "wc-btn-ghost" }, "Cancel");
+            cancel.onclick = () => { formHost.replaceChildren(); };
+            const inlineErr = el("p", { class: "error", role: "alert" });
+
+            const form = el("form", {
+                class: "wifi-form",
+                onsubmit: async (e) => {
+                    e.preventDefault();
+                    inlineErr.textContent = "";
+                    const ssidVal = ssid.value;
+                    const pskVal = psk.value;
+                    if (!isValidWifiSSID(ssidVal)) {
+                        inlineErr.textContent = "SSID must be 1-32 bytes, no control characters.";
+                        return;
+                    }
+                    if (pskVal !== "" && !isValidWifiPSK(pskVal)) {
+                        inlineErr.textContent = "Password must be 8-63 printable ASCII chars or 64 hex chars.";
+                        return;
+                    }
+                    const priVal = priority.value || "0";
+                    if (!isValidWifiPriority(priVal)) {
+                        inlineErr.textContent = "Priority must be an integer 0-999.";
+                        return;
+                    }
+                    const body = {
+                        ssid: ssidVal,
+                        hidden: hidden.checked,
+                        priority: parseInt(priVal, 10),
+                        test: testBox.checked,
+                    };
+                    // On edit: only include PSK when the user typed something.
+                    // Empty input means "leave existing PSK alone". The helper
+                    // honors explicit "" as "convert to open network" — guard
+                    // against that surprise by sending no key at all.
+                    if (!isEdit || pskVal !== "") body.psk = pskVal;
+
+                    submit.disabled = true;
+                    submit.textContent = testBox.checked ? "Testing (up to 30s)…" : "Saving…";
+                    const url = isEdit ? "/api/wifi/" + encodeURIComponent(existing.id) : "/api/wifi";
+                    const r = isEdit ? await putJSON(url, body) : await postJSON(url, body);
+                    submit.disabled = false;
+                    submit.textContent = isEdit ? "Save changes" : "Add network";
+                    if (handleAuthFailure(r)) return;
+                    if (!r.ok) {
+                        const p = r.payload || {};
+                        const errs = p.errors || {};
+                        const parts = Object.keys(errs).map(k => k + ": " + errs[k]);
+                        const reason = p.reason || p.message || p.error || "save failed";
+                        inlineErr.textContent = parts.length ? parts.join("; ") : reason;
+                        if (p.nm_reason) {
+                            inlineErr.textContent += " (" + p.nm_reason.split("\n")[0] + ")";
+                        }
+                        return;
+                    }
+                    setFlash(isEdit ? "Updated " + ssidVal : "Added " + ssidVal, "ok");
+                    await wifiPanel();
+                },
+            },
+                el("h3", {}, isEdit ? "Edit " + (existing.ssid || existing.id) : "Add network"),
+                el("div", { class: "field" }, el("label", {}, "SSID"), ssid),
+                el("div", { class: "field" }, el("label", {}, "Password"), psk),
+                el("div", { class: "field-row" },
+                    el("label", {}, hidden, " Hidden network"),
+                    el("label", {}, "Priority ", priority),
+                ),
+                el("div", { class: "field" },
+                    el("label", {}, testBox, " Test connection before saving"),
+                    el("p", { class: "muted" }, "Tries to join now; rolls back on failure. Connecting to a new network may briefly drop this page if the feeder is on Wi-Fi."),
+                ),
+                inlineErr,
+                el("div", { class: "actions" }, submit, cancel),
+            );
+            formHost.replaceChildren(form);
+            ssid.focus();
+        }
+
+        addBtn.onclick = () => showForm(null);
+
+        renderTable();
+
+        render(
+            el("section", { class: "wc-card" },
+                el("h2", {}, "Wi-Fi networks"),
+                statusBanner,
+                flashEl,
+                el("div", { class: "actions" }, addBtn),
+                tableHost,
+                formHost,
+                el("p", { class: "muted wifi-help" },
+                    "Add a second network before removing the one this feeder is on. The first-run network from airplanes-config.txt is shown as 'first-run'."),
+            ),
+        );
+    }
+
+    // buildRebootBannerSlot returns an empty container that the dashboard
+    // mounts at the top of the render tree. updateRebootBanner toggles its
+    // contents based on the /api/status reboot_required flag — invisible
+    // when false, yellow banner with a Reboot button when true.
+    function buildRebootBannerSlot() {
+        return el("div", { class: "wc-reboot-slot" });
+    }
+
+    function updateRebootBanner(slot, rebootRequired) {
+        if (!slot) return;
+        if (!rebootRequired) {
+            slot.replaceChildren();
+            return;
+        }
+        // Already rendered: don't rebuild the DOM (and lose the button's
+        // event handler context) on each 30s poll. Detect by checking the
+        // slot already has children. replaceChildren() above is the only
+        // path that clears it, so this stays in sync with the actual DOM.
+        if (slot.firstChild) return;
+        const btn = el("button", { type: "button", class: "wc-btn-danger" }, "Reboot now");
+        btn.onclick = () => requestReboot(btn, false);
+        slot.replaceChildren(el("div", { class: "wc-flash wc-flash--warn" },
+            el("span", {}, "A reboot is required to finish applying system updates."),
+            btn,
+        ));
     }
 
     // ===== Dashboard =====
@@ -1124,9 +1716,11 @@
         const configCard = el("section", { class: "wc-card" }, el("h2", {}, "Configuration"), configBody);
 
         const flashNode = buildFlashNode(consumePendingFlash());
+        const rebootBanner = buildRebootBannerSlot();
         const renderArgs = [];
         if (flashNode) renderArgs.push(flashNode);
         renderArgs.push(
+            rebootBanner,
             heroEl.root,
             tileGrid.root,
             el("div", { class: "wc-split" }, identityCard, configCard),
@@ -1135,9 +1729,10 @@
         render.apply(null, renderArgs);
 
         const ctx = {
-            heroEl, tileGrid, identityBody, configBody,
+            heroEl, tileGrid, identityBody, configBody, rebootBanner,
             configValues: {},
             lastIdentity: null,
+            configDirty: false,
         };
         dashboardCtx = ctx;
 
@@ -1158,6 +1753,15 @@
         updateHero(heroEl, status, ctx.configValues);
         updateTiles(tileGrid, status, ctx.configValues);
         updateAppTiles(tileGrid);
+        updateRebootBanner(rebootBanner, !!(status && status.payload && status.payload.reboot_required));
+
+        // Track unsaved config edits so the header refresh button can
+        // prompt before discarding them. Initial-render value attributes
+        // don't fire `input`, so this only flips on actual typing.
+        const configForm = configBody.querySelector("form.config-form");
+        if (configForm) {
+            configForm.addEventListener("input", () => { ctx.configDirty = true; });
+        }
 
         // Start partial-refresh poll. Hero + tiles + identity update;
         // config card stays put.
@@ -1184,6 +1788,7 @@
         updateHero(ctx.heroEl, status, ctx.configValues);
         updateTiles(ctx.tileGrid, status, ctx.configValues);
         updateAppTiles(ctx.tileGrid);
+        updateRebootBanner(ctx.rebootBanner, !!(status && status.payload && status.payload.reboot_required));
 
         const idPayload = identity && identity.payload ? identity.payload : null;
         if (idPayload && identityChanged(ctx.lastIdentity, idPayload)) {
@@ -1285,7 +1890,7 @@
         const submit = el("button", { type: "submit", class: "wc-btn-primary" }, "Change password");
         const cancel = el("button", {
             type: "button", class: "wc-btn-ghost",
-            onclick: () => navigate(dashboard, { title: null, showBack: false }),
+            onclick: () => navigateDashboard(),
         }, "Cancel");
 
         const form = el("form", {
@@ -1310,7 +1915,7 @@
                     err.textContent = (r.payload && r.payload.error) || "Change failed.";
                     return;
                 }
-                navigate(dashboard, { title: null, showBack: false });
+                navigateDashboard();
             },
         },
             el("h2", {}, "Change webconfig password"),
@@ -1325,9 +1930,75 @@
         oldPw.focus();
     }
 
+    function confirmPowerOffPanel() {
+        const PHRASE = "power off";
+        const err = errorEl();
+        const input = el("input", {
+            id: "poweroff-confirm",
+            type: "text",
+            autocomplete: "off",
+            autocapitalize: "none",
+            autocorrect: "off",
+            spellcheck: "false",
+            required: true,
+        });
+        const submit = el("button", { type: "submit", class: "wc-btn-danger", disabled: true }, "Power off");
+        const cancel = el("button", {
+            type: "button", class: "wc-btn-ghost",
+            onclick: () => navigate(dashboard, { title: null, showBack: false }),
+        }, "Cancel");
+
+        const matches = () => input.value.trim().toLowerCase() === PHRASE;
+        input.addEventListener("input", () => { submit.disabled = !matches(); });
+
+        const form = el("form", {
+            class: "wc-card",
+            onsubmit: async (e) => {
+                e.preventDefault();
+                if (!matches()) return;
+                err.textContent = "";
+                submit.disabled = true;
+                cancel.disabled = true;
+                submit.textContent = "Powering off…";
+                const r = await postJSON("/api/poweroff", {});
+                if (handleAuthFailure(r)) return;
+                if (!r.ok) {
+                    submit.disabled = false;
+                    cancel.disabled = false;
+                    submit.textContent = "Power off";
+                    err.textContent = (r.payload && r.payload.error) || "Power off failed.";
+                    return;
+                }
+                navigate(() => render(el("div", { class: "wc-card" },
+                    el("h2", {}, "Powering off…"),
+                    el("p", {}, "The feeder is shutting down. You'll need to disconnect and reconnect power to turn it back on."),
+                )), { title: "Powering off", showBack: false });
+            },
+        },
+            el("h2", {}, "Power off the feeder?"),
+            el("p", {}, "Shuts the feeder down cleanly so graphs1090 stats and other in-memory data are flushed to disk — safer than pulling the power cord."),
+            el("p", { class: "error" }, "Once powered off, the feeder cannot be turned back on remotely. You'll need physical access to disconnect and reconnect power."),
+            el("p", {}, "Type ", el("code", {}, PHRASE), " below to confirm."),
+            el("div", { class: "field" }, el("label", { for: "poweroff-confirm" }, "Confirmation"), input),
+            el("div", { class: "actions" }, cancel, submit),
+            err,
+        );
+        render(form);
+        input.focus();
+    }
+
     function logViewer(slug) {
         const pre = el("pre", { class: "log-output" });
         const unit = LOG_SLUG_TO_UNIT[slug] || slug;
+        // Placeholder shown until the first event arrives (or the stream
+        // closes without one) — without it the <pre> is just an empty box,
+        // which looks broken on services that haven't run yet (e.g. the
+        // update log on a freshly booted feeder).
+        const placeholder = el("span", { class: "muted" }, "(no log entries yet)");
+        pre.appendChild(placeholder);
+        const clearPlaceholder = () => {
+            if (placeholder.parentNode === pre) pre.removeChild(placeholder);
+        };
         render(
             el("section", { class: "wc-card" },
                 el("h2", {}, "journalctl -u " + unit),
@@ -1338,10 +2009,12 @@
         const es = new EventSource("/api/log/" + encodeURIComponent(slug));
         activeStream = es;
         es.onmessage = (ev) => {
+            clearPlaceholder();
             pre.appendChild(document.createTextNode(ev.data + "\n"));
             pre.scrollTop = pre.scrollHeight;
         };
         es.onerror = () => {
+            clearPlaceholder();
             pre.appendChild(document.createTextNode("[stream closed]\n"));
             try { es.close(); } catch (_) {}
             if (activeStream === es) activeStream = null;
@@ -1375,7 +2048,7 @@
         }
         const who = await getJSON("/api/auth/whoami");
         if (who.ok) {
-            navigate(dashboard, { title: null, showBack: false });
+            navigateDashboard();
         } else {
             navigate(loginPanel, { title: null, showBack: false });
         }
@@ -1384,7 +2057,22 @@
     // ===== Wire-up =====
 
     if (themeBtn) themeBtn.addEventListener("click", toggleTheme);
-    if (backBtn) backBtn.addEventListener("click", () => navigate(dashboard, { title: null, showBack: false }));
+    if (backBtn) backBtn.addEventListener("click", () => navigateDashboard());
+    if (refreshBtn) refreshBtn.addEventListener("click", async () => {
+        if (refreshBtn.disabled) return;
+        if (dashboardCtx && dashboardCtx.configDirty
+            && !confirm("Discard unsaved configuration changes?")) {
+            return;
+        }
+        refreshBtn.disabled = true;
+        refreshBtn.classList.add("wc-btn-icon--spinning");
+        try {
+            await navigateDashboard();
+        } finally {
+            refreshBtn.classList.remove("wc-btn-icon--spinning");
+            refreshBtn.disabled = false;
+        }
+    });
 
     boot().catch((e) => corruptPanel("Fatal error: " + (e && e.message || e)));
 })();

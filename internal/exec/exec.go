@@ -56,10 +56,18 @@ func RealRunnerStdin(ctx context.Context, argv []string, stdin io.Reader) (Resul
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
 	err := cmd.Run()
+	// cmd.ProcessState is only non-nil after the process has actually
+	// started; cmd.Run can return an error from Start() (e.g. binary not
+	// found) where ProcessState stays nil. Guard against the panic that
+	// would otherwise mask the underlying error.
+	exitCode := -1
+	if cmd.ProcessState != nil {
+		exitCode = cmd.ProcessState.ExitCode()
+	}
 	res := Result{
 		Stdout:   stdout.Bytes(),
 		Stderr:   stderr.Bytes(),
-		ExitCode: cmd.ProcessState.ExitCode(),
+		ExitCode: exitCode,
 	}
 	return res, err
 }

@@ -190,7 +190,10 @@ code {
 
 .wc-brand__meta {
   margin-top: 0.25rem;
-  color: var(--wc-ink-3);
+  /* ink-2, not ink-3 — at 0.7rem the lighter value falls below WCAG AA in
+     light mode (~3.85:1 on --wc-surface-0). ink-2 lands at ~5.7:1 while
+     still sitting clearly below the brand name in the hierarchy. */
+  color: var(--wc-ink-2);
   font-size: 0.7rem;
   letter-spacing: 0.12em;
   text-transform: uppercase;
@@ -248,6 +251,32 @@ main {
    and a top margin on the second sibling forces it to render below
    its row's natural y-origin. Vertical spacing comes from the grid gap
    or from explicit margin on the container. */
+
+/* Banner notifications. .wc-flash is the default neutral tone (used by
+   the pending-flash path after navigation); .wc-flash--warn paints a
+   warm-toned strip for actionable warnings like "reboot required". */
+.wc-flash {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.75rem;
+  padding: 0.75rem 1rem;
+  border-radius: var(--wc-radius);
+  border: 1px solid var(--wc-line-soft);
+  background: var(--wc-surface-2);
+  color: var(--wc-ink-1);
+}
+.wc-flash--warn {
+  background: color-mix(in srgb, var(--wc-warm) 18%, var(--wc-surface-1));
+  border-color: var(--wc-warm);
+}
+.wc-flash button {
+  width: auto;
+  min-height: 2.25rem;
+  padding: 0.4rem 0.9rem;
+  font-size: 0.9rem;
+  flex: 0 0 auto;
+}
 
 .wc-card h2,
 .panel h2,
@@ -435,6 +464,18 @@ main {
   color: var(--wc-accent);
 }
 
+/* Infrastructure tiles (hardware health, WiFi) share a visual register
+   that's distinct from service tiles. Same grid cell, but the left-
+   border accent + muted icon tint reads as a different category. */
+.wc-tile--hardware,
+.wc-tile--wifi {
+  border-left: 3px solid var(--wc-accent);
+}
+.wc-tile--hardware .wc-tile__icon,
+.wc-tile--wifi .wc-tile__icon {
+  color: var(--wc-ink-2);
+}
+
 /* Stack of two tile grids (services + apps) on the dashboard. Inherit
    the existing .wc-grid--tiles bottom margin between them; no extra
    styling needed at the wrapper level. */
@@ -555,6 +596,12 @@ button.secondary:hover,
   transform: translateY(-1px);
 }
 
+@keyframes wc-spin { to { transform: rotate(360deg); } }
+.wc-btn-icon--spinning svg { animation: wc-spin 0.6s linear infinite; }
+@media (prefers-reduced-motion: reduce) {
+  .wc-btn-icon--spinning svg { animation: none; }
+}
+
 /* The header back button visually matches an icon button when collapsed
    on mobile but stretches with text on desktop — keep it as a normal
    ghost button. */
@@ -636,20 +683,38 @@ textarea:focus {
   font-family: var(--wc-font-mono);
   font-size: 0.95rem;
 }
-.config-form label code { font-size: 0.75em; color: var(--wc-ink-3); }
 .config-form button[type="submit"] { width: 100%; margin-top: 0.5rem; }
 
-.config-list {
-  display: grid;
-  grid-template-columns: max-content 1fr;
-  gap: 0.25rem 0.75rem;
-  margin: 0;
-  font-size: 0.9rem;
+.config-fieldset {
+  border: 1px solid var(--wc-line-soft);
+  border-radius: var(--wc-radius-sm);
+  padding: 0.75rem 1rem 0.5rem;
+  margin: 0 0 1rem;
 }
-.config-list dt { font-weight: 500; color: var(--wc-ink-3); }
-.config-list dd {
-  margin: 0;
-  word-break: break-all;
+.config-fieldset > legend {
+  padding: 0 0.5rem;
+  font-weight: 500;
+  color: var(--wc-ink-1);
+}
+.config-fieldset .help {
+  margin: 0 0 0.75rem;
+  color: var(--wc-ink-3);
+  font-size: 0.85rem;
+}
+.config-fieldset .help a { color: var(--wc-ink-2); }
+.config-fieldset .help code {
+  font-family: var(--wc-font-mono);
+  color: var(--wc-ink-2);
+}
+
+.location-card {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
+  margin-bottom: 0.25rem;
+}
+.location-card .location-summary {
   font-family: var(--wc-font-mono);
   color: var(--wc-ink-1);
 }
@@ -671,13 +736,6 @@ textarea:focus {
   word-break: break-all;
 }
 
-details { margin-top: 1rem; }
-details summary {
-  cursor: pointer;
-  color: var(--wc-ink-2);
-  font-weight: 500;
-}
-
 /* ========== Two-column responsive split (identity + config) ========== */
 
 .wc-split {
@@ -689,6 +747,75 @@ details summary {
 @media (min-width: 768px) {
   .wc-split { grid-template-columns: 1fr 1fr; }
 }
+
+/* ========== Wi-Fi panel ========== */
+
+.wifi-status p { margin: 0.25rem 0; }
+.wifi-dot-active,
+.wifi-dot-idle {
+  display: inline-block;
+  width: 0.6rem;
+  height: 0.6rem;
+  border-radius: 50%;
+  vertical-align: middle;
+  margin-right: 0.35rem;
+}
+.wifi-dot-active { background: #1f8a45; box-shadow: 0 0 0 2px rgba(31, 138, 69, 0.18); }
+.wifi-dot-idle   { background: var(--wc-line-strong); }
+
+.wifi-badge {
+  display: inline-block;
+  font-size: 0.75rem;
+  padding: 0 0.4rem;
+  border-radius: 0.75rem;
+  background: var(--wc-surface-2);
+  color: var(--wc-ink-2);
+  margin-left: 0.4rem;
+  vertical-align: middle;
+}
+.wifi-badge-warn { background: #fdecc8; color: #5e3a00; }
+
+.wifi-table {
+  width: 100%;
+  border-collapse: collapse;
+  margin: 0.5rem 0 0.75rem;
+}
+.wifi-table th,
+.wifi-table td {
+  text-align: left;
+  padding: 0.45rem 0.5rem;
+  border-bottom: 1px solid var(--wc-line-soft);
+  vertical-align: middle;
+}
+.wifi-priority { width: 5rem; }
+.wifi-actions  { width: auto; white-space: nowrap; }
+.wifi-actions button + button { margin-left: 0.35rem; }
+
+.wifi-form .field { margin: 0.5rem 0; }
+.wifi-form .field-row {
+  display: flex;
+  gap: 1.25rem;
+  align-items: center;
+  flex-wrap: wrap;
+  margin: 0.5rem 0;
+}
+.wifi-form input[type="number"] {
+  width: 5rem;
+  margin-left: 0.35rem;
+}
+.wifi-help { margin-top: 0.75rem; }
+
+.wifi-flash:empty { display: none; }
+.wifi-flash-ok,
+.wifi-flash-warn,
+.wifi-flash-error {
+  padding: 0.5rem 0.75rem;
+  border-radius: 0.4rem;
+  margin: 0.25rem 0 0.5rem;
+}
+.wifi-flash-ok    { background: #e3f1e6; color: #14441f; }
+.wifi-flash-warn  { background: #fdecc8; color: #5e3a00; }
+.wifi-flash-error { background: #fbdcdc; color: #6a1b1b; }
 
 /* ========== Reduced motion ========== */
 

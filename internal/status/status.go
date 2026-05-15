@@ -15,9 +15,44 @@ import (
 	"sync"
 	"time"
 
-	wexec "github.com/airplanes-live/image/webconfig/internal/exec"
-	"github.com/airplanes-live/image/webconfig/internal/runtimestate"
+	wexec "github.com/airplanes-live/image-webconfig/internal/exec"
+	"github.com/airplanes-live/image-webconfig/internal/pihealth"
+	"github.com/airplanes-live/image-webconfig/internal/runtimestate"
+	"github.com/airplanes-live/image-webconfig/internal/wifi"
 )
+
+// PiHealthProbe is the interface status.Reader uses to fetch a hardware
+// snapshot. Concrete production type is *pihealth.Reader; tests inject a
+// stub.
+type PiHealthProbe interface {
+	Probe(ctx context.Context) *pihealth.PiHealth
+}
+
+// WifiProbe is the interface status.Reader uses to fetch WiFi signal
+// state. Concrete production type is *wifi.SignalReader; tests inject a
+// stub.
+type WifiProbe interface {
+	Probe(ctx context.Context) *wifi.Signal
+}
+
+// Option configures optional Reader behavior. Keeps NewReader's 3-arg
+// signature stable so existing callers compile unchanged.
+type Option func(*Reader)
+
+// WithPiHealth wires a PiHealthProbe into the Reader. When set, Read()
+// runs the probe in parallel with the systemctl fan-out and embeds the
+// result as Status.PiHealth.
+func WithPiHealth(p PiHealthProbe) Option {
+	return func(r *Reader) { r.pihealth = p }
+}
+
+// WithWifi wires a WifiProbe into the Reader. When set, Read() runs the
+// probe in parallel with the other goroutines and embeds the result as
+// Status.Wifi. A nil probe result yields an omitted field (the frontend
+// hides its tile entirely).
+func WithWifi(p WifiProbe) Option {
+	return func(r *Reader) { r.wifi = p }
+}
 
 // MonitoredServices is the static list every /api/status query reports on.
 var MonitoredServices = []string{
@@ -33,15 +68,16 @@ var MonitoredServices = []string{
 // Paths configures file lookups; defaults match the rootfs layout. Override
 // in tests.
 type Paths struct {
-	ManifestFile        string // /etc/airplanes/build-manifest.json
-	AircraftJSONFile    string // /run/readsb/aircraft.json
-	MlatStateFile       string // /run/airplanes-mlat/state
-	FeedStateFile       string // /run/airplanes-feed/state
-	UAT978StateFile     string // /run/airplanes-978/state
-	Dump978FAStateFile  string // /run/dump978-fa/state
-	SystemctlSudoArgv0  []string // [sudo, -n, ...] OR [systemctl] (no sudo: is-active is read-only)
-	SystemctlBinary     string   // /usr/bin/systemctl
-	IsActiveTimeout     time.Duration
+	ManifestFile       string   // /etc/airplanes/build-manifest.json
+	AircraftJSONFile   string   // /run/readsb/aircraft.json
+	MlatStateFile      string   // /run/airplanes-mlat/state
+	FeedStateFile      string   // /run/airplanes-feed/state
+	UAT978StateFile    string   // /run/airplanes-978/state
+	Dump978FAStateFile string   // /run/dump978-fa/state
+	RebootRequiredFile string   // /var/run/reboot-required (written by needrestart after kernel/libc upgrades)
+	SystemctlSudoArgv0 []string // [sudo, -n, ...] OR [systemctl] (no sudo: is-active is read-only)
+	SystemctlBinary    string   // /usr/bin/systemctl
+	IsActiveTimeout    time.Duration
 }
 
 func DefaultPaths() Paths {
@@ -52,6 +88,7 @@ func DefaultPaths() Paths {
 		FeedStateFile:      "/run/airplanes-feed/state",
 		UAT978StateFile:    "/run/airplanes-978/state",
 		Dump978FAStateFile: "/run/dump978-fa/state",
+		RebootRequiredFile: "/var/run/reboot-required",
 		SystemctlBinary:    "/usr/bin/systemctl",
 		IsActiveTimeout:    2 * time.Second,
 	}
@@ -61,16 +98,22 @@ func DefaultPaths() Paths {
 // each is-active call runs in its own goroutine so a single 2s timeout
 // caps total latency at 2s regardless of service count.
 type Reader struct {
-	paths   Paths
-	runner  wexec.CommandRunner
-	version string
+	paths    Paths
+	runner   wexec.CommandRunner
+	version  string
+	pihealth PiHealthProbe
+	wifi     WifiProbe
 }
 
-func NewReader(version string, p Paths, r wexec.CommandRunner) *Reader {
+func NewReader(version string, p Paths, r wexec.CommandRunner, opts ...Option) *Reader {
 	if r == nil {
 		r = wexec.RealRunner
 	}
-	return &Reader{paths: p, runner: r, version: version}
+	rr := &Reader{paths: p, runner: r, version: version}
+	for _, o := range opts {
+		o(rr)
+	}
+	return rr
 }
 
 // Status is the GET /api/status payload.
@@ -92,10 +135,25 @@ type Status struct {
 	// no_hardware decision propagates into UATDecision.Reason as
 	// peer_no_hardware so the airplanes-978 tile can render an "idle relay"
 	// state without polling two endpoints.
-	MlatDecision     *Decision `json:"mlat_decision,omitempty"`
-	FeedDecision     *Decision `json:"feed_decision,omitempty"`
-	UATDecision      *Decision `json:"uat_decision,omitempty"`
+	MlatDecision      *Decision `json:"mlat_decision,omitempty"`
+	FeedDecision      *Decision `json:"feed_decision,omitempty"`
+	UATDecision       *Decision `json:"uat_decision,omitempty"`
 	Dump978FADecision *Decision `json:"dump978fa_decision,omitempty"`
+
+	// PiHealth is the hardware-health snapshot. omitempty so a Reader
+	// configured without WithPiHealth (e.g. server tests that don't care)
+	// keeps the JSON shape compatible.
+	PiHealth *pihealth.PiHealth `json:"pi_health,omitempty"`
+
+	// Wifi is the live signal snapshot. omitempty when there is no WiFi
+	// hardware (or the probe wasn't configured) so the frontend can hide
+	// its tile rather than show a misleading "—".
+	Wifi *wifi.Signal `json:"wifi,omitempty"`
+
+	// RebootRequired is true when /var/run/reboot-required exists, which
+	// needrestart writes after a kernel or libc upgrade. The dashboard
+	// renders a banner when this flips on.
+	RebootRequired bool `json:"reboot_required"`
 }
 
 // Decision is the daemon's last-published runtime decision.
@@ -139,11 +197,44 @@ func (r *Reader) Read(ctx context.Context) (Status, error) {
 			ch <- svcResult{unit, r.isActive(ctx, unit)}
 		}(unit)
 	}
+
+	// Pi health probe runs in parallel with the systemctl fan-out. The
+	// probe is bounded by its own per-sub-probe timeouts inside the
+	// pihealth package; we just collect its result.
+	var phWG sync.WaitGroup
+	var phResult *pihealth.PiHealth
+	if r.pihealth != nil {
+		phWG.Add(1)
+		go func() {
+			defer phWG.Done()
+			phResult = r.pihealth.Probe(ctx)
+		}()
+	}
+
+	// WiFi signal probe runs alongside the others. Internal timeouts in
+	// the wifi package bound wall-clock; nil result is the normal case
+	// (no hardware) and just means the field is omitted from the payload.
+	var wifiWG sync.WaitGroup
+	var wifiResult *wifi.Signal
+	if r.wifi != nil {
+		wifiWG.Add(1)
+		go func() {
+			defer wifiWG.Done()
+			wifiResult = r.wifi.Probe(ctx)
+		}()
+	}
+
 	wg.Wait()
 	close(ch)
 	for s := range ch {
 		out.Services[s.unit] = s.state
 	}
+
+	phWG.Wait()
+	out.PiHealth = phResult
+
+	wifiWG.Wait()
+	out.Wifi = wifiResult
 
 	if m, err := os.ReadFile(r.paths.ManifestFile); err == nil {
 		// Validate JSON shape so we never embed garbage in the response.
@@ -162,15 +253,21 @@ func (r *Reader) Read(ctx context.Context) (Status, error) {
 	out.UATDecision = r.readUATDecision(ctx, out.Services["airplanes-978.service"])
 	out.Dump978FADecision = r.readDump978FADecision(ctx, out.Services["dump978-fa.service"])
 
+	if r.paths.RebootRequiredFile != "" {
+		if _, err := os.Stat(r.paths.RebootRequiredFile); err == nil {
+			out.RebootRequired = true
+		}
+	}
+
 	return out, nil
 }
 
 // readMlatDecision reads the airplanes-mlat daemon's published decision.
 // Consulted when the unit is active|activating|reloading (state file is
-// fresh) OR failed with ExecMainStatus=64 (the strict misconfig fail; the
-// state file persists across the failed terminal state via
-// RuntimeDirectoryPreserve=yes per feed PR 1+2). Returns nil for any
-// other state (consumer falls back to systemd-only classification).
+// fresh) OR failed with ExecMainStatus=64 (the strict-misconfig branch
+// in the wrapper exits 64; RuntimeDirectoryPreserve=yes keeps the
+// state file alive across that failure per feed PR 1+2). Returns nil
+// for any other state (consumer falls back to systemd-only classification).
 func (r *Reader) readMlatDecision(ctx context.Context, svcState string) *Decision {
 	consult := false
 	switch svcState {
@@ -200,11 +297,11 @@ func (r *Reader) readFeedDecision(svcState string) *Decision {
 
 // readUATDecision reads the airplanes-978 daemon's published decision.
 // Same consultation rule as MLAT (active|activating|reloading OR failed
-// with ExecMainStatus=64): when UAT_INPUT is empty/invalid, the wrapper
-// writes state=disabled or state=misconfigured then exits 64, and
-// RuntimeDirectoryPreserve=yes keeps the file across the failed terminal
-// state. Returns nil otherwise so consumers fall back to UAT_INPUT-truthy
-// classification (the prior behavior).
+// with ExecMainStatus=64): the uat_disabled wrapper branch writes
+// state=disabled then sleeps (unit stays active), so we hit the active
+// branch in normal use; the uat_input_invalid branch exits 64 and
+// surfaces via the failed branch. Returns nil otherwise so consumers
+// fall back to UAT_INPUT-truthy classification (the prior behavior).
 func (r *Reader) readUATDecision(ctx context.Context, svcState string) *Decision {
 	consult := false
 	switch svcState {
@@ -222,10 +319,11 @@ func (r *Reader) readUATDecision(ctx context.Context, svcState string) *Decision
 }
 
 // readDump978FADecision reads dump978-fa.sh's published decision. Same
-// consult rule as the other 64-exit self-disable wrappers. The
-// no_hardware reason is the new state-machine entry from the wrapper's
-// USB-serial probe — dashboards should render it as an "SDR absent" tile
-// rather than a generic failure.
+// consult rule as the other wrappers (active branch covers the
+// disabled/sleeping path; failed-with-status-64 covers misconfigured
+// input). The no_hardware reason comes from the wrapper's non-mutating
+// USB-serial probe — dashboards should render it as an "SDR absent"
+// tile rather than a generic failure.
 func (r *Reader) readDump978FADecision(ctx context.Context, svcState string) *Decision {
 	consult := false
 	switch svcState {
@@ -299,8 +397,8 @@ func (r *Reader) isActive(ctx context.Context, unit string) string {
 
 // readsbAircraftJSON is the relevant subset of readsb's aircraft.json schema.
 type readsbAircraftJSON struct {
-	Now      float64 `json:"now"`
-	Messages int64   `json:"messages"`
+	Now      float64    `json:"now"`
+	Messages int64      `json:"messages"`
 	Aircraft []struct{} `json:"aircraft"`
 }
 

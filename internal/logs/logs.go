@@ -18,23 +18,40 @@ import (
 	"sync"
 	"time"
 
-	wexec "github.com/airplanes-live/image/webconfig/internal/exec"
+	wexec "github.com/airplanes-live/image-webconfig/internal/exec"
 )
 
 // Whitelist defines which units are exposable via /api/log/{unit}.
+// Keep slugs in sync with LOG_SLUG_TO_UNIT in web/assets/app.js — a slug
+// missing here returns 404, while a slug missing there just hides the link.
 var Whitelist = map[string]string{
-	"feed":      "airplanes-feed.service",
-	"mlat":      "airplanes-mlat.service",
-	"readsb":    "readsb.service",
-	"dump978":   "dump978-fa.service",
-	"uat":       "airplanes-978.service",
-	"claim":     "airplanes-claim.service",
-	"webconfig": "airplanes-webconfig.service",
-	"update":    "airplanes-update.service",
+	"feed":           "airplanes-feed.service",
+	"mlat":           "airplanes-mlat.service",
+	"readsb":         "readsb.service",
+	"dump978":        "dump978-fa.service",
+	"uat":            "airplanes-978.service",
+	"claim":          "airplanes-claim.service",
+	"webconfig":      "airplanes-webconfig.service",
+	"update":         "airplanes-update.service",
+	"system-upgrade": "airplanes-system-upgrade.service",
 }
 
 // JournalctlBinary is overridable for tests.
 var JournalctlBinary = "/usr/bin/journalctl"
+
+// streamMaxLifetime caps how long any single SSE stream stays open. The
+// global http.Server.WriteTimeout is disabled for this handler via
+// per-write deadlines, so without this cap a stream could outlive an
+// operator's session revocation (logout / password-change) indefinitely.
+// Default session TTL is 24h; 1h leaves comfortable headroom while still
+// bounding auth-revocation exposure.
+const streamMaxLifetime = 1 * time.Hour
+
+// perWriteTimeout is the deadline applied before each line/ping write.
+// Replaces the implicit cap that http.Server.WriteTimeout would impose;
+// a stuck client trips this and the handler returns, which terminates
+// the journalctl child via ctx cancellation.
+const perWriteTimeout = 5 * time.Second
 
 // Streamer wraps the journalctl exec. The streamer parameter is injectable
 // so tests can substitute a synthetic source.
@@ -65,30 +82,33 @@ func Resolve(slug string) (string, error) {
 }
 
 // ServeSSE streams the unit's journalctl output to w as Server-Sent Events.
-// Returns when the request context is canceled or the journalctl process
-// exits. A `:keepalive` ping every 15s defeats LB / proxy idle timeouts.
+// Returns when ctx is canceled, the per-stream lifetime cap elapses, the
+// journalctl process exits, or a write/flush fails. A `:keepalive` ping
+// every 15s defeats LB / proxy idle timeouts; a per-write 5s deadline
+// guards against stuck clients.
 func (s *Streamer) ServeSSE(ctx context.Context, w http.ResponseWriter, slug string) error {
 	unit, err := Resolve(slug)
 	if err != nil {
 		return err
 	}
 
-	flusher, ok := w.(http.Flusher)
-	if !ok {
-		return errors.New("logs: ResponseWriter does not support flushing")
-	}
+	rc := http.NewResponseController(w)
 
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
-	w.Header().Set("X-Accel-Buffering", "no") // disable buffering in lighttpd
 	w.WriteHeader(http.StatusOK)
-	flusher.Flush()
+	if err := rc.Flush(); err != nil {
+		return fmt.Errorf("logs: initial flush: %w", err)
+	}
+
+	ctx, cancel := context.WithTimeout(ctx, streamMaxLifetime)
+	defer cancel()
 
 	pr, pw := io.Pipe()
 	var (
-		mu      sync.Mutex
-		closed  bool
+		mu     sync.Mutex
+		closed bool
 	)
 	closeOnce := func(err error) {
 		mu.Lock()
@@ -99,7 +119,6 @@ func (s *Streamer) ServeSSE(ctx context.Context, w http.ResponseWriter, slug str
 		mu.Unlock()
 	}
 
-	// Run journalctl in a goroutine, piping stdout into pr/pw.
 	argv := []string{
 		JournalctlBinary,
 		"-u", unit,
@@ -113,8 +132,6 @@ func (s *Streamer) ServeSSE(ctx context.Context, w http.ResponseWriter, slug str
 		closeOnce(err)
 	}()
 
-	// Forward each newline-delimited journalctl line as an SSE event,
-	// interleaved with periodic pings.
 	scanner := bufio.NewScanner(pr)
 	scanner.Buffer(make([]byte, 64*1024), 1024*1024)
 	pingTick := time.NewTicker(15 * time.Second)
@@ -124,9 +141,8 @@ func (s *Streamer) ServeSSE(ctx context.Context, w http.ResponseWriter, slug str
 	scanErrCh := make(chan error, 1)
 	go func() {
 		for scanner.Scan() {
-			line := scanner.Text()
 			select {
-			case lineCh <- line:
+			case lineCh <- scanner.Text():
 			case <-ctx.Done():
 				return
 			}
@@ -134,6 +150,25 @@ func (s *Streamer) ServeSSE(ctx context.Context, w http.ResponseWriter, slug str
 		scanErrCh <- scanner.Err()
 		close(lineCh)
 	}()
+
+	// deadlineUnsupported latches to true the first time SetWriteDeadline
+	// returns http.ErrNotSupported. Production writers always support
+	// deadlines; tests using httptest.ResponseRecorder don't.
+	deadlineUnsupported := false
+	write := func(format string, args ...any) error {
+		if !deadlineUnsupported {
+			if err := rc.SetWriteDeadline(time.Now().Add(perWriteTimeout)); err != nil {
+				if !errors.Is(err, http.ErrNotSupported) {
+					return err
+				}
+				deadlineUnsupported = true
+			}
+		}
+		if _, err := fmt.Fprintf(w, format, args...); err != nil {
+			return err
+		}
+		return rc.Flush()
+	}
 
 	for {
 		select {
@@ -148,11 +183,15 @@ func (s *Streamer) ServeSSE(ctx context.Context, w http.ResponseWriter, slug str
 				}
 				return nil
 			}
-			fmt.Fprintf(w, "data: %s\n\n", strings.ReplaceAll(line, "\n", "\\n"))
-			flusher.Flush()
+			if err := write("data: %s\n\n", strings.ReplaceAll(line, "\n", "\\n")); err != nil {
+				closeOnce(err)
+				return err
+			}
 		case <-pingTick.C:
-			fmt.Fprint(w, ":ping\n\n")
-			flusher.Flush()
+			if err := write(":ping\n\n"); err != nil {
+				closeOnce(err)
+				return err
+			}
 		}
 	}
 }

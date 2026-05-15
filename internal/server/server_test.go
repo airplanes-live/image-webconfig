@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/cookiejar"
@@ -12,17 +13,19 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
-	"github.com/airplanes-live/image/webconfig/internal/auth"
-	wexec "github.com/airplanes-live/image/webconfig/internal/exec"
-	"github.com/airplanes-live/image/webconfig/internal/feedenv"
-	"github.com/airplanes-live/image/webconfig/internal/identity"
-	"github.com/airplanes-live/image/webconfig/internal/logs"
-	"github.com/airplanes-live/image/webconfig/internal/status"
+	"github.com/airplanes-live/image-webconfig/internal/auth"
+	wexec "github.com/airplanes-live/image-webconfig/internal/exec"
+	"github.com/airplanes-live/image-webconfig/internal/feedenv"
+	"github.com/airplanes-live/image-webconfig/internal/identity"
+	"github.com/airplanes-live/image-webconfig/internal/logs"
+	"github.com/airplanes-live/image-webconfig/internal/schemacache"
+	"github.com/airplanes-live/image-webconfig/internal/status"
 )
 
 const testPassword = "correct horse battery staple"
@@ -73,9 +76,9 @@ func newTestServer(t *testing.T) (*httptest.Server, *Server) {
 	// Capture every privileged shell-out so write-endpoint tests can assert
 	// the argv shape that hit sudo.
 	var (
-		runnerCalls       [][]string
-		stdinRunnerCalls  []stdinCall
-		runnerMu          sync.Mutex
+		runnerCalls      [][]string
+		stdinRunnerCalls []stdinCall
+		runnerMu         sync.Mutex
 	)
 	captureRunner := func(_ context.Context, argv []string) (wexec.Result, error) {
 		runnerMu.Lock()
@@ -92,13 +95,20 @@ func newTestServer(t *testing.T) (*httptest.Server, *Server) {
 	}
 
 	priv := PrivilegedArgv{
-		ApplyConfig:    []string{"sudo-stub", "apply-config"},
-		RestartFeed:    []string{"sudo-stub", "restart", "feed"},
-		RestartMLAT:    []string{"sudo-stub", "restart", "mlat"},
-		RestartDump978: []string{"sudo-stub", "restart", "dump978"},
-		RestartUAT:     []string{"sudo-stub", "restart", "uat"},
-		Reboot:         []string{"sudo-stub", "reboot"},
-		StartUpdate:    []string{"sudo-stub", "update"},
+		ApplyFeed:          []string{"sudo-stub", "apl-feed", "apply", "--json", "--lock-timeout", "5"},
+		SchemaFeed:         []string{"apl-feed", "schema", "--json"},
+		Reboot:             []string{"sudo-stub", "reboot"},
+		Poweroff:           []string{"sudo-stub", "poweroff"},
+		StartUpdate:        []string{"sudo-stub", "update"},
+		StartSystemUpgrade: []string{"sudo-stub", "system-upgrade"},
+		RegisterClaim:      []string{"sudo-stub", "systemctl", "start", "--no-block", "airplanes-claim.service"},
+		WifiList:           []string{"sudo-stub", "apl-wifi", "list", "--json"},
+		WifiAdd:            []string{"sudo-stub", "apl-wifi", "add", "--json"},
+		WifiUpdate:         []string{"sudo-stub", "apl-wifi", "update", "--json"},
+		WifiDelete:         []string{"sudo-stub", "apl-wifi", "delete", "--json"},
+		WifiTest:           []string{"sudo-stub", "apl-wifi", "test", "--json"},
+		WifiActivate:       []string{"sudo-stub", "apl-wifi", "activate", "--json"},
+		WifiStatus:         []string{"sudo-stub", "apl-wifi", "status", "--json"},
 	}
 
 	deps := Deps{
@@ -112,9 +122,13 @@ func newTestServer(t *testing.T) (*httptest.Server, *Server) {
 		FeedEnv:      &feedenv.Reader{Path: feedEnvPath},
 		Status:       status.NewReader("test-sha", statusPaths, statusRunner),
 		Logs:         logs.NewStreamer(logsRunner),
-		Runner:       captureRunner,
-		StdinRunner:  captureStdinRunner,
-		Privileged:   priv,
+		Schema: schemacache.NewPrepopulated(
+			[]string{"LATITUDE", "LONGITUDE", "ALTITUDE", "GEO_CONFIGURED", "MLAT_USER", "MLAT_ENABLED", "MLAT_PRIVATE", "GAIN", "UAT_INPUT", "DUMP978_SDR_SERIAL", "DUMP978_GAIN"},
+			[]string{"LATITUDE", "LONGITUDE", "ALTITUDE", "GEO_CONFIGURED", "MLAT_USER", "MLAT_ENABLED", "MLAT_PRIVATE", "INPUT", "INPUT_TYPE", "GAIN", "UAT_INPUT", "DUMP978_SDR_SERIAL", "DUMP978_GAIN"},
+		),
+		Runner:      captureRunner,
+		StdinRunner: captureStdinRunner,
+		Privileged:  priv,
 	}
 	handler := New(deps)
 	ts := httptest.NewServer(handler)
@@ -144,16 +158,17 @@ type stdinCall struct {
 // /api/reboot — it wires deterministic captures for both runners and
 // pre-authenticates the returned client.
 type writeHarness struct {
-	ts          *httptest.Server
-	client      *http.Client
-	feedEnvPath  string
-	mu           sync.Mutex
-	calls        [][]string
-	stdinCalls   []stdinCall
-	runnerErr    error                 // returned by captureRunner; tests override
-	runnerErrFor func(argv []string) error // optional: per-argv error; falls back to runnerErr when nil
-	stdinErr     error
-	stdinResult  wexec.Result
+	ts              *httptest.Server
+	client          *http.Client
+	feedEnvPath     string
+	mu              sync.Mutex
+	calls           [][]string
+	stdinCalls      []stdinCall
+	runnerErr       error                            // returned by captureRunner; tests override
+	runnerErrFor    func(argv []string) error        // optional: per-argv error; falls back to runnerErr when nil
+	runnerResultFor func(argv []string) wexec.Result // optional: per-argv canned Result (stdout+stderr); falls back to zero value
+	stdinErr        error
+	stdinResult     wexec.Result
 }
 
 func newWriteHarness(t *testing.T) *writeHarness {
@@ -172,7 +187,14 @@ func newWriteHarness(t *testing.T) *writeHarness {
 		t.Fatal(err)
 	}
 
-	h := &writeHarness{feedEnvPath: feedEnvPath}
+	h := &writeHarness{
+		feedEnvPath: feedEnvPath,
+		// Default response from apl-feed apply --json: every write
+		// succeeds and lands an `applied` envelope. Individual tests
+		// override h.stdinResult / h.stdinErr to exercise rejected,
+		// lock_timeout, filesystem_error, etc.
+		stdinResult: wexec.Result{Stdout: []byte(`{"status":"applied","changed":[],"pending_restart":[]}`)},
+	}
 	captureRunner := func(_ context.Context, argv []string) (wexec.Result, error) {
 		h.mu.Lock()
 		h.calls = append(h.calls, append([]string(nil), argv...))
@@ -182,8 +204,12 @@ func newWriteHarness(t *testing.T) *writeHarness {
 		} else {
 			err = h.runnerErr
 		}
+		var res wexec.Result
+		if h.runnerResultFor != nil {
+			res = h.runnerResultFor(argv)
+		}
 		h.mu.Unlock()
-		return wexec.Result{}, err
+		return res, err
 	}
 	captureStdinRunner := func(_ context.Context, argv []string, stdin io.Reader) (wexec.Result, error) {
 		body, _ := io.ReadAll(stdin)
@@ -196,13 +222,20 @@ func newWriteHarness(t *testing.T) *writeHarness {
 	}
 
 	priv := PrivilegedArgv{
-		ApplyConfig:    []string{"sudo-stub", "apply-config"},
-		RestartFeed:    []string{"sudo-stub", "restart", "feed"},
-		RestartMLAT:    []string{"sudo-stub", "restart", "mlat"},
-		RestartDump978: []string{"sudo-stub", "restart", "dump978"},
-		RestartUAT:     []string{"sudo-stub", "restart", "uat"},
-		Reboot:         []string{"sudo-stub", "reboot"},
-		StartUpdate:    []string{"sudo-stub", "update"},
+		ApplyFeed:          []string{"sudo-stub", "apl-feed", "apply", "--json", "--lock-timeout", "5"},
+		SchemaFeed:         []string{"apl-feed", "schema", "--json"},
+		Reboot:             []string{"sudo-stub", "reboot"},
+		Poweroff:           []string{"sudo-stub", "poweroff"},
+		StartUpdate:        []string{"sudo-stub", "update"},
+		StartSystemUpgrade: []string{"sudo-stub", "system-upgrade"},
+		RegisterClaim:      []string{"sudo-stub", "systemctl", "start", "--no-block", "airplanes-claim.service"},
+		WifiList:           []string{"sudo-stub", "apl-wifi", "list", "--json"},
+		WifiAdd:            []string{"sudo-stub", "apl-wifi", "add", "--json"},
+		WifiUpdate:         []string{"sudo-stub", "apl-wifi", "update", "--json"},
+		WifiDelete:         []string{"sudo-stub", "apl-wifi", "delete", "--json"},
+		WifiTest:           []string{"sudo-stub", "apl-wifi", "test", "--json"},
+		WifiActivate:       []string{"sudo-stub", "apl-wifi", "activate", "--json"},
+		WifiStatus:         []string{"sudo-stub", "apl-wifi", "status", "--json"},
 	}
 
 	deps := Deps{
@@ -217,7 +250,11 @@ func newWriteHarness(t *testing.T) *writeHarness {
 		Status: status.NewReader("test-sha", status.Paths{
 			SystemctlBinary: "/bin/true", IsActiveTimeout: time.Second,
 		}, captureRunner),
-		Logs:        logs.NewStreamer(nil),
+		Logs: logs.NewStreamer(nil),
+		Schema: schemacache.NewPrepopulated(
+			[]string{"LATITUDE", "LONGITUDE", "ALTITUDE", "GEO_CONFIGURED", "MLAT_USER", "MLAT_ENABLED", "MLAT_PRIVATE", "GAIN", "UAT_INPUT", "DUMP978_SDR_SERIAL", "DUMP978_GAIN"},
+			[]string{"LATITUDE", "LONGITUDE", "ALTITUDE", "GEO_CONFIGURED", "MLAT_USER", "MLAT_ENABLED", "MLAT_PRIVATE", "INPUT", "INPUT_TYPE", "GAIN", "UAT_INPUT", "DUMP978_SDR_SERIAL", "DUMP978_GAIN"},
+		),
 		Runner:      captureRunner,
 		StdinRunner: captureStdinRunner,
 		Privileged:  priv,
@@ -262,216 +299,182 @@ func TestConfigPost_RequiresAuth(t *testing.T) {
 	}
 }
 
-func TestConfigPost_ValidatedRequestRunsHelperThenRestarts(t *testing.T) {
-	t.Parallel()
+func TestConfigPost_AppliedEnvelopeForwarded(t *testing.T) {
 	h := newWriteHarness(t)
-	r := postJSON(t, h.client, h.ts.URL+"/api/config", map[string]any{
-		"updates": map[string]string{"LATITUDE": "51.5", "MLAT_USER": "alice"},
-	})
+	h.stdinResult = wexec.Result{
+		Stdout: []byte(`{"status":"applied","changed":["MLAT_PRIVATE"],"pending_restart":[]}`),
+	}
+	r := postJSON(t, h.client, h.ts.URL+"/api/config",
+		map[string]any{"updates": map[string]string{"MLAT_PRIVATE": "true"}})
 	defer r.Body.Close()
 	if r.StatusCode != http.StatusOK {
-		t.Fatalf("status = %d (err=%q)", r.StatusCode, decodeError(t, r.Body))
+		t.Fatalf("status = %d, want 200", r.StatusCode)
 	}
-	stdinCalls := h.stdinCallsCopy()
-	if len(stdinCalls) != 1 {
-		t.Fatalf("apply-config calls = %d, want 1", len(stdinCalls))
+	var body applyFeedResponse
+	_ = json.NewDecoder(r.Body).Decode(&body)
+	if body.Status != "applied" {
+		t.Errorf("status = %q, want applied", body.Status)
 	}
-	if got := stdinCalls[0].argv; got[0] != "sudo-stub" || got[1] != "apply-config" {
-		t.Errorf("apply-config argv = %v", got)
-	}
-	var body struct {
-		Updates map[string]string `json:"updates"`
-	}
-	if err := json.Unmarshal(stdinCalls[0].stdin, &body); err != nil {
-		t.Fatal(err)
-	}
-	if body.Updates["LATITUDE"] != "51.5" || body.Updates["MLAT_USER"] != "alice" {
-		t.Errorf("apply-config stdin = %v", body.Updates)
-	}
-	calls := h.callsCopy()
-	// One of the calls should be RestartFeed and another RestartMLAT.
-	sawFeed, sawMLAT := false, false
-	for _, c := range calls {
-		if len(c) >= 3 && c[1] == "restart" && c[2] == "feed" {
-			sawFeed = true
-		}
-		if len(c) >= 3 && c[1] == "restart" && c[2] == "mlat" {
-			sawMLAT = true
-		}
-	}
-	if !sawFeed || !sawMLAT {
-		t.Errorf("missing service restart calls: %v", calls)
+	if len(body.Changed) != 1 || body.Changed[0] != "MLAT_PRIVATE" {
+		t.Errorf("changed = %v, want [MLAT_PRIVATE]", body.Changed)
 	}
 }
 
-func TestConfigPost_EnableMLATFromOffStateAutoDerivesGEO(t *testing.T) {
-	t.Parallel()
+func TestConfigPost_RejectedEnvelopeReturns400(t *testing.T) {
 	h := newWriteHarness(t)
-	// Existing feed.env mirrors a fresh image (PR-1 default): MLAT off,
-	// geo placeholders. The user enters real lat/lon/alt and toggles MLAT
-	// on in one save. The handler must auto-derive GEO_CONFIGURED=true via
-	// the shared helper before ValidateConsistency runs, otherwise the new
-	// MLAT_ENABLED→GEO_CONFIGURED rule would reject this submission with
-	// "GEO_CONFIGURED must be true when MLAT_ENABLED=true".
-	if err := os.WriteFile(h.feedEnvPath, []byte(
-		`LATITUDE=0`+"\n"+`LONGITUDE=0`+"\n"+`ALTITUDE=0m`+"\n"+
-			`MLAT_USER=airplanes-live-image`+"\n"+`MLAT_ENABLED=false`+"\n"+
-			`MLAT_PRIVATE=false`+"\n"+`GEO_CONFIGURED=false`+"\n"),
-		0o644); err != nil {
-		t.Fatal(err)
+	h.stdinResult = wexec.Result{
+		Stdout: []byte(`{"status":"rejected","errors":{"LATITUDE":"must be in [-90, 90]"}}`),
 	}
-	r := postJSON(t, h.client, h.ts.URL+"/api/config", map[string]any{
-		"updates": map[string]string{
-			"LATITUDE":     "48.137",
-			"LONGITUDE":    "11.575",
-			"ALTITUDE":     "520m",
-			"MLAT_ENABLED": "true",
-		},
-	})
-	defer r.Body.Close()
-	if r.StatusCode != http.StatusOK {
-		t.Fatalf("status = %d (err=%q); the handler must derive GEO_CONFIGURED before validating", r.StatusCode, decodeError(t, r.Body))
-	}
-	stdinCalls := h.stdinCallsCopy()
-	if len(stdinCalls) != 1 {
-		t.Fatalf("apply-config calls = %d, want 1", len(stdinCalls))
-	}
-}
-
-func TestConfigPost_RejectsBadValueWithKeyName(t *testing.T) {
-	t.Parallel()
-	h := newWriteHarness(t)
-	r := postJSON(t, h.client, h.ts.URL+"/api/config", map[string]any{
-		"updates": map[string]string{"LATITUDE": "200"},
-	})
+	r := postJSON(t, h.client, h.ts.URL+"/api/config",
+		map[string]any{"updates": map[string]string{"LATITUDE": "200"}})
 	defer r.Body.Close()
 	if r.StatusCode != http.StatusBadRequest {
-		t.Fatalf("status = %d", r.StatusCode)
+		t.Fatalf("status = %d, want 400", r.StatusCode)
 	}
-	body := decodeError(t, r.Body)
-	if !strings.Contains(body, "LATITUDE") {
-		t.Errorf("error %q missing key name", body)
+	var body applyFeedResponse
+	_ = json.NewDecoder(r.Body).Decode(&body)
+	if body.Status != "rejected" || body.Errors["LATITUDE"] == "" {
+		t.Errorf("body = %+v, want rejected envelope with per-key error", body)
 	}
+	// The flat `error` field must be populated for the form's
+	// `r.payload.error` fallback path. Without this the user sees
+	// "save failed" instead of the actual reason.
+	if !strings.Contains(body.Error, "LATITUDE") || !strings.Contains(body.Error, "must be in") {
+		t.Errorf("body.Error = %q, want it to surface the per-key reason", body.Error)
+	}
+}
+
+func TestApplyConfigTimeout_ExceedsApplyLockTimeout(t *testing.T) {
+	// The HTTP wall-clock budget must sit above the lock-acquisition
+	// budget passed to apl-feed, or webconfig will kill the helper
+	// mid-wait and surface a generic 500 instead of the structured
+	// lock_timeout 503. Pin the relationship as a contract.
+	if applyConfigTimeout <= applyLockTimeoutSeconds*time.Second {
+		t.Errorf("applyConfigTimeout %v must exceed applyLockTimeoutSeconds %ds",
+			applyConfigTimeout, applyLockTimeoutSeconds)
+	}
+	// And the sudoers-pinned argv must carry the matching --lock-timeout
+	// token; otherwise sudo rejects the call entirely.
+	argv := DefaultPrivilegedArgv().ApplyFeed
+	want := fmt.Sprintf("%d", applyLockTimeoutSeconds)
+	found := false
+	for i := 0; i < len(argv)-1; i++ {
+		if argv[i] == "--lock-timeout" && argv[i+1] == want {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Errorf("DefaultPrivilegedArgv().ApplyFeed = %v, want --lock-timeout %s pair", argv, want)
+	}
+}
+
+func TestConfigPost_ApplyFeedArgvCarriesLockTimeout(t *testing.T) {
+	// Live integration: a POST to /api/config must invoke apl-feed
+	// with the full sudoers-pinned argv including --lock-timeout 5.
+	h := newWriteHarness(t)
+	r := postJSON(t, h.client, h.ts.URL+"/api/config",
+		map[string]any{"updates": map[string]string{"MLAT_PRIVATE": "true"}})
+	defer r.Body.Close()
+	if r.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", r.StatusCode)
+	}
+	h.mu.Lock()
+	calls := append([]stdinCall(nil), h.stdinCalls...)
+	h.mu.Unlock()
+	if len(calls) != 1 {
+		t.Fatalf("stdinCalls = %d, want 1", len(calls))
+	}
+	want := []string{"sudo-stub", "apl-feed", "apply", "--json", "--lock-timeout", "5"}
+	if len(calls[0].argv) != len(want) {
+		t.Fatalf("argv = %v, want %v", calls[0].argv, want)
+	}
+	for i := range want {
+		if calls[0].argv[i] != want[i] {
+			t.Fatalf("argv[%d] = %q, want %q", i, calls[0].argv[i], want[i])
+		}
+	}
+}
+
+func TestConfigPost_LockTimeoutReturns503(t *testing.T) {
+	h := newWriteHarness(t)
+	h.stdinResult = wexec.Result{
+		Stdout: []byte(`{"status":"lock_timeout","message":"could not acquire lock after 30s"}`),
+	}
+	r := postJSON(t, h.client, h.ts.URL+"/api/config",
+		map[string]any{"updates": map[string]string{"MLAT_PRIVATE": "true"}})
+	defer r.Body.Close()
+	if r.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503", r.StatusCode)
+	}
+	var body applyFeedResponse
+	_ = json.NewDecoder(r.Body).Decode(&body)
+	if body.Error == "" || !strings.Contains(body.Error, "lock") {
+		t.Errorf("body.Error = %q, want it to surface the lock-timeout message", body.Error)
+	}
+}
+
+func TestConfigPost_PreservesHelperSuppliedError(t *testing.T) {
+	// If apl-feed (or a future helper) emits a flat error field directly,
+	// synthesizeError must not overwrite it with the joined errors or
+	// the generic last-resort string.
+	h := newWriteHarness(t)
+	h.stdinResult = wexec.Result{
+		Stdout: []byte(`{"status":"rejected","error":"helper-supplied summary","errors":{"LATITUDE":"x"}}`),
+	}
+	r := postJSON(t, h.client, h.ts.URL+"/api/config",
+		map[string]any{"updates": map[string]string{"LATITUDE": "bad"}})
+	defer r.Body.Close()
+	var body applyFeedResponse
+	_ = json.NewDecoder(r.Body).Decode(&body)
+	if body.Error != "helper-supplied summary" {
+		t.Errorf("body.Error = %q, want helper-supplied summary preserved", body.Error)
+	}
+}
+
+func TestConfigPost_RejectedErrorIsSorted(t *testing.T) {
+	// Map iteration order is randomised in Go, so the synthesized error
+	// string must sort keys for stable rendering.
+	h := newWriteHarness(t)
+	h.stdinResult = wexec.Result{
+		Stdout: []byte(`{"status":"rejected","errors":{"LONGITUDE":"x","ALTITUDE":"y","LATITUDE":"z"}}`),
+	}
+	r := postJSON(t, h.client, h.ts.URL+"/api/config",
+		map[string]any{"updates": map[string]string{"LATITUDE": "bad"}})
+	defer r.Body.Close()
+	var body applyFeedResponse
+	_ = json.NewDecoder(r.Body).Decode(&body)
+	want := "ALTITUDE: y; LATITUDE: z; LONGITUDE: x"
+	if body.Error != want {
+		t.Errorf("body.Error = %q, want %q (sorted)", body.Error, want)
+	}
+}
+
+func TestConfigPost_UnknownKeyRejectedPreShellout(t *testing.T) {
+	h := newWriteHarness(t)
+	r := postJSON(t, h.client, h.ts.URL+"/api/config",
+		map[string]any{"updates": map[string]string{"BOGUS_KEY": "x"}})
+	defer r.Body.Close()
+	if r.StatusCode != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400", r.StatusCode)
+	}
+	// stdinRunner must NOT have been invoked — the schema cache catches
+	// it pre-shellout so we save a privileged sudo call on the obvious
+	// client bug.
 	if len(h.stdinCallsCopy()) != 0 {
-		t.Error("apply-config invoked despite validation failure")
+		t.Errorf("stdinRunner was called for an unknown key; want pre-shellout reject")
 	}
 }
 
 // PR 4 retired reconcile978On/Off. Both 978 services now restart on every
 // /api/config POST, regardless of UAT_INPUT direction; the daemons self-decide
-// from UAT_INPUT and exit 64 (intentional failed-terminal) when not requested.
-// systemctl restart returns 0 once the start job is dispatched, so the
-// pending_restart payload stays empty on the disable transition.
-func TestConfigPost_978UnitsRestartedRegardless(t *testing.T) {
-	t.Parallel()
-	for _, tc := range []struct {
-		name string
-		body map[string]any
-		seed string
-	}{
-		{
-			name: "uat_on",
-			body: map[string]any{"updates": map[string]string{"UAT_INPUT": "127.0.0.1:30978"}},
-			seed: `UAT_INPUT=""` + "\n",
-		},
-		{
-			name: "uat_off",
-			body: map[string]any{"updates": map[string]string{"UAT_INPUT": ""}},
-			seed: `UAT_INPUT="127.0.0.1:30978"` + "\n",
-		},
-		{
-			name: "no_uat_change_still_restarts",
-			body: map[string]any{"updates": map[string]string{"LATITUDE": "51.5"}},
-			seed: `UAT_INPUT="127.0.0.1:30978"` + "\n" + `LATITUDE="0"` + "\n",
-		},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			h := newWriteHarness(t)
-			if err := os.WriteFile(h.feedEnvPath, []byte(tc.seed), 0o644); err != nil {
-				t.Fatal(err)
-			}
-			r := postJSON(t, h.client, h.ts.URL+"/api/config", tc.body)
-			defer r.Body.Close()
-			if r.StatusCode != http.StatusOK {
-				t.Fatalf("status = %d", r.StatusCode)
-			}
-			calls := h.callsCopy()
-			sawDump978, sawUAT := false, false
-			for _, c := range calls {
-				if len(c) >= 3 && c[1] == "restart" {
-					if c[2] == "dump978" {
-						sawDump978 = true
-					}
-					if c[2] == "uat" {
-						sawUAT = true
-					}
-				}
-			}
-			if !sawDump978 {
-				t.Errorf("missing restart of dump978; calls=%v", calls)
-			}
-			if !sawUAT {
-				t.Errorf("missing restart of uat; calls=%v", calls)
-			}
-		})
-	}
-}
+// from UAT_INPUT and either exec the daemon, sleep (disabled), or exit 64
+// (misconfigured input) when not requested. systemctl restart returns 0
+// once the start job is dispatched, so the pending_restart payload stays
+// empty on the disable transition.
 
 // pending_restart surfaces 978 unit failures alongside feed/mlat. Confirms
 // that both 978 entries land in the response when their restart fails.
-func TestConfigPost_PendingRestartIncludes978(t *testing.T) {
-	t.Parallel()
-	h := newWriteHarness(t)
-	h.mu.Lock()
-	h.runnerErrFor = func(argv []string) error {
-		if len(argv) >= 3 && argv[1] == "restart" && (argv[2] == "dump978" || argv[2] == "uat") {
-			return errors.New("synthetic restart failure")
-		}
-		return nil
-	}
-	h.mu.Unlock()
-
-	r := postJSON(t, h.client, h.ts.URL+"/api/config", map[string]any{
-		"updates": map[string]string{"UAT_INPUT": "127.0.0.1:30978"},
-	})
-	defer r.Body.Close()
-	if r.StatusCode != http.StatusOK {
-		t.Fatalf("status = %d", r.StatusCode)
-	}
-	var body struct {
-		Status         string   `json:"status"`
-		PendingRestart []string `json:"pending_restart"`
-	}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		t.Fatal(err)
-	}
-	want := map[string]bool{
-		"dump978-fa.service":    true,
-		"airplanes-978.service": true,
-	}
-	for _, u := range body.PendingRestart {
-		delete(want, u)
-	}
-	if len(want) != 0 {
-		t.Errorf("missing units in pending_restart=%v: %v", body.PendingRestart, want)
-	}
-}
-
-func TestConfigPost_HelperFailureMaps400(t *testing.T) {
-	t.Parallel()
-	h := newWriteHarness(t)
-	h.mu.Lock()
-	h.stdinResult = wexec.Result{Stderr: []byte("LATITUDE: out of range\n"), ExitCode: 10}
-	h.stdinErr = errors.New("exit status 10")
-	h.mu.Unlock()
-	r := postJSON(t, h.client, h.ts.URL+"/api/config", map[string]any{
-		"updates": map[string]string{"LATITUDE": "10"},
-	})
-	defer r.Body.Close()
-	if r.StatusCode != http.StatusBadRequest {
-		t.Fatalf("status = %d, want 400", r.StatusCode)
-	}
-}
 
 func TestUpdate_RequiresAuth(t *testing.T) {
 	t.Parallel()
@@ -503,15 +506,183 @@ func TestUpdate_AlreadyRunning409(t *testing.T) {
 	t.Parallel()
 	h := newWriteHarness(t)
 	h.mu.Lock()
-	h.runnerErr = errors.New("Unit airplanes-update.service already exists")
+	// The handler runs `systemctl is-active` first (empty stdout → no unit
+	// active, proceed), then `sudo systemd-run ...`. Tag the systemd-run
+	// path with the "already exists" stderr so the handler's contains-check
+	// fires and maps to 409.
+	h.runnerErrFor = func(argv []string) error {
+		if len(argv) >= 2 && argv[1] == "update" {
+			return errors.New("systemd-run failed")
+		}
+		return nil
+	}
+	h.runnerResultFor = func(argv []string) wexec.Result {
+		if len(argv) >= 2 && argv[1] == "update" {
+			return wexec.Result{Stderr: []byte("Unit airplanes-update.service already exists")}
+		}
+		return wexec.Result{}
+	}
 	h.mu.Unlock()
 	r := postJSON(t, h.client, h.ts.URL+"/api/update", map[string]any{})
 	defer r.Body.Close()
-	// Stderr-based detection — we wired the captureRunner to return err
-	// only; the handler reads res.Stderr. Update the harness to return a
-	// stderr-bearing Result instead to exercise the 409 path properly.
-	if r.StatusCode != http.StatusInternalServerError && r.StatusCode != http.StatusConflict {
-		t.Fatalf("unexpected status = %d", r.StatusCode)
+	if r.StatusCode != http.StatusConflict {
+		t.Fatalf("status = %d, want 409", r.StatusCode)
+	}
+}
+
+func TestSystemUpgrade_RequiresAuth(t *testing.T) {
+	t.Parallel()
+	ts, _ := newTestServer(t)
+	c := httpClient(t)
+	r := postJSON(t, c, ts.URL+"/api/system-upgrade", map[string]any{})
+	defer r.Body.Close()
+	if r.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("status = %d", r.StatusCode)
+	}
+}
+
+func TestSystemUpgrade_HappyPathReturns202(t *testing.T) {
+	t.Parallel()
+	h := newWriteHarness(t)
+	r := postJSON(t, h.client, h.ts.URL+"/api/system-upgrade", map[string]any{})
+	defer r.Body.Close()
+	if r.StatusCode != http.StatusAccepted {
+		t.Fatalf("status = %d", r.StatusCode)
+	}
+	var got map[string]string
+	_ = json.NewDecoder(r.Body).Decode(&got)
+	if got["unit"] != "airplanes-system-upgrade.service" {
+		t.Errorf("unit = %q", got["unit"])
+	}
+}
+
+func TestSystemUpgrade_AlreadyRunning409(t *testing.T) {
+	t.Parallel()
+	h := newWriteHarness(t)
+	h.mu.Lock()
+	h.runnerErrFor = func(argv []string) error {
+		if len(argv) >= 2 && argv[1] == "system-upgrade" {
+			return errors.New("systemd-run failed")
+		}
+		return nil
+	}
+	h.runnerResultFor = func(argv []string) wexec.Result {
+		if len(argv) >= 2 && argv[1] == "system-upgrade" {
+			return wexec.Result{Stderr: []byte("Unit airplanes-system-upgrade.service already exists")}
+		}
+		return wexec.Result{}
+	}
+	h.mu.Unlock()
+	r := postJSON(t, h.client, h.ts.URL+"/api/system-upgrade", map[string]any{})
+	defer r.Body.Close()
+	if r.StatusCode != http.StatusConflict {
+		t.Fatalf("status = %d, want 409", r.StatusCode)
+	}
+}
+
+func TestSystemUpgrade_ArgvShape(t *testing.T) {
+	t.Parallel()
+	h := newWriteHarness(t)
+	r := postJSON(t, h.client, h.ts.URL+"/api/system-upgrade", map[string]any{})
+	defer r.Body.Close()
+	if r.StatusCode != http.StatusAccepted {
+		t.Fatalf("status = %d", r.StatusCode)
+	}
+	saw := false
+	for _, c := range h.callsCopy() {
+		if len(c) >= 2 && c[0] == "sudo-stub" && c[1] == "system-upgrade" {
+			saw = true
+		}
+	}
+	if !saw {
+		t.Errorf("system-upgrade argv not invoked; calls=%v", h.callsCopy())
+	}
+}
+
+// activeFor stubs `systemctl is-active u1 u2` to report "active" for the
+// named unit (mapped by position via maintenanceUnits) and "inactive" for
+// the other. Returns a wexec.Result with the multi-line stdout shape that
+// systemctl emits for multi-unit is-active calls.
+func activeFor(unit string) func([]string) wexec.Result {
+	return func(argv []string) wexec.Result {
+		if len(argv) < 2 || argv[1] != "is-active" {
+			return wexec.Result{}
+		}
+		var lines []string
+		for _, u := range argv[2:] {
+			if u == unit {
+				lines = append(lines, "active")
+			} else {
+				lines = append(lines, "inactive")
+			}
+		}
+		return wexec.Result{Stdout: []byte(strings.Join(lines, "\n") + "\n")}
+	}
+}
+
+func TestUpdate_RefusedDuringSystemUpgrade(t *testing.T) {
+	t.Parallel()
+	h := newWriteHarness(t)
+	h.mu.Lock()
+	h.runnerResultFor = activeFor("airplanes-system-upgrade.service")
+	h.mu.Unlock()
+	r := postJSON(t, h.client, h.ts.URL+"/api/update", map[string]any{})
+	defer r.Body.Close()
+	if r.StatusCode != http.StatusConflict {
+		t.Fatalf("status = %d, want 409", r.StatusCode)
+	}
+	// systemd-run argv must not have been invoked.
+	for _, c := range h.callsCopy() {
+		if len(c) >= 2 && c[1] == "update" {
+			t.Fatalf("StartUpdate argv invoked despite 409: %v", c)
+		}
+	}
+}
+
+func TestSystemUpgrade_RefusedDuringFeedUpdate(t *testing.T) {
+	t.Parallel()
+	h := newWriteHarness(t)
+	h.mu.Lock()
+	h.runnerResultFor = activeFor("airplanes-update.service")
+	h.mu.Unlock()
+	r := postJSON(t, h.client, h.ts.URL+"/api/system-upgrade", map[string]any{})
+	defer r.Body.Close()
+	if r.StatusCode != http.StatusConflict {
+		t.Fatalf("status = %d, want 409", r.StatusCode)
+	}
+	for _, c := range h.callsCopy() {
+		if len(c) >= 2 && c[1] == "system-upgrade" {
+			t.Fatalf("StartSystemUpgrade argv invoked despite 409: %v", c)
+		}
+	}
+}
+
+func TestReboot_RefusedDuringMaintenance(t *testing.T) {
+	t.Parallel()
+	for _, unit := range []string{
+		"airplanes-system-upgrade.service",
+		"airplanes-update.service",
+	} {
+		unit := unit
+		t.Run(unit, func(t *testing.T) {
+			t.Parallel()
+			h := newWriteHarness(t)
+			h.mu.Lock()
+			h.runnerResultFor = activeFor(unit)
+			h.mu.Unlock()
+			r := postJSON(t, h.client, h.ts.URL+"/api/reboot", map[string]any{})
+			defer r.Body.Close()
+			if r.StatusCode != http.StatusConflict {
+				t.Fatalf("status = %d, want 409", r.StatusCode)
+			}
+			// Reboot argv must not be in the call list.
+			time.Sleep(50 * time.Millisecond) // race-buffer; goroutine should NOT fire
+			for _, c := range h.callsCopy() {
+				if len(c) >= 2 && c[1] == "reboot" {
+					t.Fatalf("reboot argv invoked despite 409: %v", c)
+				}
+			}
+		})
 	}
 }
 
@@ -534,22 +705,158 @@ func TestReboot_AuthedReturns202(t *testing.T) {
 	if r.StatusCode != http.StatusAccepted {
 		t.Fatalf("status = %d", r.StatusCode)
 	}
-	// Reboot is fired async; give the goroutine a moment to record the call.
+	// The handler runs a synchronous `systemctl is-active` guard before
+	// firing the async reboot goroutine (250ms delay). Wait specifically
+	// for the reboot argv to appear, not just any call.
+	saw := false
 	for i := 0; i < 100; i++ {
-		if len(h.callsCopy()) > 0 {
+		for _, c := range h.callsCopy() {
+			if len(c) >= 2 && c[1] == "reboot" {
+				saw = true
+				break
+			}
+		}
+		if saw {
 			break
 		}
 		time.Sleep(5 * time.Millisecond)
 	}
+	if !saw {
+		t.Errorf("reboot argv not invoked; calls=%v", h.callsCopy())
+	}
+}
+
+func TestPoweroff_RequiresAuth(t *testing.T) {
+	t.Parallel()
+	ts, _ := newTestServer(t)
+	c := httpClient(t)
+	r := postJSON(t, c, ts.URL+"/api/poweroff", map[string]any{})
+	defer r.Body.Close()
+	if r.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("status = %d", r.StatusCode)
+	}
+}
+
+func TestPoweroff_AuthedReturns202(t *testing.T) {
+	t.Parallel()
+	h := newWriteHarness(t)
+	r := postJSON(t, h.client, h.ts.URL+"/api/poweroff", map[string]any{})
+	defer r.Body.Close()
+	if r.StatusCode != http.StatusAccepted {
+		t.Fatalf("status = %d", r.StatusCode)
+	}
+	// The handler runs a synchronous `systemctl is-active` guard before
+	// firing the async poweroff goroutine (250ms delay). Wait specifically
+	// for the poweroff argv to appear, not just any call.
+	want := []string{"sudo-stub", "poweroff"}
+	saw := false
+	for i := 0; i < 100; i++ {
+		for _, c := range h.callsCopy() {
+			if reflect.DeepEqual(c, want) {
+				saw = true
+				break
+			}
+		}
+		if saw {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if !saw {
+		t.Errorf("poweroff argv not invoked; calls=%v", h.callsCopy())
+	}
+}
+
+func TestPoweroff_RefusedDuringMaintenance(t *testing.T) {
+	t.Parallel()
+	for _, unit := range []string{
+		"airplanes-system-upgrade.service",
+		"airplanes-update.service",
+	} {
+		unit := unit
+		t.Run(unit, func(t *testing.T) {
+			t.Parallel()
+			h := newWriteHarness(t)
+			h.mu.Lock()
+			h.runnerResultFor = activeFor(unit)
+			h.mu.Unlock()
+			r := postJSON(t, h.client, h.ts.URL+"/api/poweroff", map[string]any{})
+			defer r.Body.Close()
+			if r.StatusCode != http.StatusConflict {
+				t.Fatalf("status = %d, want 409", r.StatusCode)
+			}
+			time.Sleep(50 * time.Millisecond)
+			for _, c := range h.callsCopy() {
+				if len(c) >= 2 && c[1] == "poweroff" {
+					t.Fatalf("poweroff argv invoked despite 409: %v", c)
+				}
+			}
+		})
+	}
+}
+
+// TestDefaultPrivilegedArgv_Poweroff pins the production argv shape so the Go
+// default and the sudoers file under files/etc/sudoers.d/ cannot drift.
+// The sudoers-argv parity test catches the matching sudoers-side drift;
+// this test catches the Go-source side at unit-test time.
+func TestDefaultPrivilegedArgv_Poweroff(t *testing.T) {
+	t.Parallel()
+	want := []string{"/usr/bin/sudo", "-n", "/usr/bin/systemctl", "poweroff"}
+	got := DefaultPrivilegedArgv().Poweroff
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("Poweroff = %v, want %v", got, want)
+	}
+}
+
+func TestClaimRegister_RequiresAuth(t *testing.T) {
+	t.Parallel()
+	ts, _ := newTestServer(t)
+	c := httpClient(t)
+	r := postJSON(t, c, ts.URL+"/api/claim/register", map[string]any{})
+	defer r.Body.Close()
+	if r.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("status = %d", r.StatusCode)
+	}
+}
+
+func TestClaimRegister_AuthedReturns202(t *testing.T) {
+	t.Parallel()
+	h := newWriteHarness(t)
+	r := postJSON(t, h.client, h.ts.URL+"/api/claim/register", map[string]any{})
+	defer r.Body.Close()
+	if r.StatusCode != http.StatusAccepted {
+		t.Fatalf("status = %d", r.StatusCode)
+	}
+	var got map[string]string
+	_ = json.NewDecoder(r.Body).Decode(&got)
+	if got["unit"] != "airplanes-claim.service" {
+		t.Errorf("unit = %q", got["unit"])
+	}
+	// Compare the full argv: position-based checks let a regression in the
+	// sudo prefix (e.g. dropping -n or sudo) slip through silently.
+	want := []string{"sudo-stub", "systemctl", "start", "--no-block", "airplanes-claim.service"}
 	calls := h.callsCopy()
 	saw := false
 	for _, c := range calls {
-		if len(c) >= 2 && c[1] == "reboot" {
+		if reflect.DeepEqual(c, want) {
 			saw = true
 		}
 	}
 	if !saw {
-		t.Errorf("reboot argv not invoked; calls=%v", calls)
+		t.Errorf("claim-register argv %v not invoked; calls=%v", want, calls)
+	}
+}
+
+func TestClaimRegister_RunnerErrorReturns500(t *testing.T) {
+	t.Parallel()
+	h := newWriteHarness(t)
+	h.mu.Lock()
+	h.runnerErr = errors.New("Failed to start airplanes-claim.service")
+	h.mu.Unlock()
+	r := postJSON(t, h.client, h.ts.URL+"/api/claim/register", map[string]any{})
+	defer r.Body.Close()
+	if r.StatusCode != http.StatusInternalServerError {
+		t.Fatalf("status = %d", r.StatusCode)
 	}
 }
 
@@ -624,7 +931,7 @@ func TestSecurityHeadersOnEveryResponse(t *testing.T) {
 	t.Parallel()
 	ts, _ := newTestServer(t)
 	for _, path := range []string{"/", "/health", "/api/state"} {
-		resp := mustGetDefault(t, ts.URL + path)
+		resp := mustGetDefault(t, ts.URL+path)
 		if resp.Header.Get("X-Frame-Options") != "DENY" {
 			t.Errorf("%s: missing X-Frame-Options DENY", path)
 		}
@@ -644,7 +951,7 @@ func TestSecurityHeadersOnEveryResponse(t *testing.T) {
 func TestRootServesSPAShell(t *testing.T) {
 	t.Parallel()
 	ts, _ := newTestServer(t)
-	resp := mustGetDefault(t, ts.URL + "/")
+	resp := mustGetDefault(t, ts.URL+"/")
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("status = %d, want 200", resp.StatusCode)
@@ -658,7 +965,7 @@ func TestRootServesSPAShell(t *testing.T) {
 func TestUnknownAPIPath404(t *testing.T) {
 	t.Parallel()
 	ts, _ := newTestServer(t)
-	resp := mustGetDefault(t, ts.URL + "/api/no-such-thing")
+	resp := mustGetDefault(t, ts.URL+"/api/no-such-thing")
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusNotFound {
 		t.Fatalf("status = %d, want 404", resp.StatusCode)
@@ -670,7 +977,7 @@ func TestState_UninitializedThenInitialized(t *testing.T) {
 	ts, _ := newTestServer(t)
 	c := httpClient(t)
 
-	resp := mustGet(t, c, ts.URL + "/api/state")
+	resp := mustGet(t, c, ts.URL+"/api/state")
 	var state stateResponse
 	_ = json.NewDecoder(resp.Body).Decode(&state)
 	resp.Body.Close()
@@ -684,7 +991,7 @@ func TestState_UninitializedThenInitialized(t *testing.T) {
 		t.Fatalf("setup status = %d, want 200 (err=%q)", r.StatusCode, decodeError(t, r.Body))
 	}
 
-	resp = mustGet(t, c, ts.URL + "/api/state")
+	resp = mustGet(t, c, ts.URL+"/api/state")
 	_ = json.NewDecoder(resp.Body).Decode(&state)
 	resp.Body.Close()
 	if state.State != "initialized" {
@@ -785,7 +1092,7 @@ func TestSetup_AutoLoginsCallerOnSuccess(t *testing.T) {
 		t.Fatal("setup did not set session cookie")
 	}
 	// Confirm the session is actually valid via /api/auth/whoami.
-	resp := mustGet(t, c, ts.URL + "/api/auth/whoami")
+	resp := mustGet(t, c, ts.URL+"/api/auth/whoami")
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("whoami after setup status = %d, want 200", resp.StatusCode)
@@ -818,7 +1125,7 @@ func TestLogin_CorrectPasswordIssuesCookie(t *testing.T) {
 	if r.StatusCode != http.StatusOK {
 		t.Fatalf("status = %d, want 200 (err=%q)", r.StatusCode, decodeError(t, r.Body))
 	}
-	resp := mustGet(t, c, ts.URL + "/api/auth/whoami")
+	resp := mustGet(t, c, ts.URL+"/api/auth/whoami")
 	resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		t.Errorf("whoami after login status = %d, want 200", resp.StatusCode)
@@ -854,7 +1161,7 @@ func TestLogout_ClearsCookieAndRevokes(t *testing.T) {
 	if r.StatusCode != http.StatusOK {
 		t.Fatalf("logout status = %d, want 200", r.StatusCode)
 	}
-	resp := mustGet(t, c, ts.URL + "/api/auth/whoami")
+	resp := mustGet(t, c, ts.URL+"/api/auth/whoami")
 	resp.Body.Close()
 	if resp.StatusCode != http.StatusUnauthorized {
 		t.Errorf("whoami after logout status = %d, want 401", resp.StatusCode)
@@ -881,7 +1188,7 @@ func TestPasswordChange_VerifiesOldAndRotatesAllSessions(t *testing.T) {
 	// other session must be revoked. Spin up a second jar.
 	c2 := httpClient(t)
 	postJSON(t, c2, ts.URL+"/api/auth/login", map[string]string{"password": testPassword}).Body.Close()
-	resp := mustGet(t, c2, ts.URL + "/api/auth/whoami")
+	resp := mustGet(t, c2, ts.URL+"/api/auth/whoami")
 	resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("c2 baseline whoami status = %d, want 200", resp.StatusCode)
@@ -897,14 +1204,14 @@ func TestPasswordChange_VerifiesOldAndRotatesAllSessions(t *testing.T) {
 	}
 
 	// Original caller (c) gets a freshly issued cookie → still authed.
-	resp = mustGet(t, c, ts.URL + "/api/auth/whoami")
+	resp = mustGet(t, c, ts.URL+"/api/auth/whoami")
 	resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		t.Errorf("originator whoami after change: status = %d, want 200", resp.StatusCode)
 	}
 
 	// Other session was revoked.
-	resp = mustGet(t, c2, ts.URL + "/api/auth/whoami")
+	resp = mustGet(t, c2, ts.URL+"/api/auth/whoami")
 	resp.Body.Close()
 	if resp.StatusCode != http.StatusUnauthorized {
 		t.Errorf("co-session whoami after change: status = %d, want 401", resp.StatusCode)
@@ -930,7 +1237,7 @@ func TestPasswordChange_RejectsWeakNew(t *testing.T) {
 func TestWhoami_RequiresSession(t *testing.T) {
 	t.Parallel()
 	ts, _ := newTestServer(t)
-	resp := mustGetDefault(t, ts.URL + "/api/auth/whoami")
+	resp := mustGetDefault(t, ts.URL+"/api/auth/whoami")
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusUnauthorized {
 		t.Fatalf("status = %d, want 401", resp.StatusCode)
@@ -940,7 +1247,7 @@ func TestWhoami_RequiresSession(t *testing.T) {
 func TestStatic_Serves(t *testing.T) {
 	t.Parallel()
 	ts, _ := newTestServer(t)
-	resp := mustGetDefault(t, ts.URL + "/static/style.css")
+	resp := mustGetDefault(t, ts.URL+"/static/style.css")
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("status = %d, want 200", resp.StatusCode)
@@ -1180,114 +1487,43 @@ func TestLog_KnownUnitStreamsSSE(t *testing.T) {
 	}
 }
 
+// TestDefaultPrivilegedArgv_SudoersParity guards against drift between the
+// production argv shapes and the sudoers entries that authorize them. The
+// argv tail (after the `/usr/bin/sudo -n` prefix) must match the sudoers
+// command-spec byte-for-byte, otherwise sudo refuses the call at runtime.
+func TestDefaultPrivilegedArgv_SudoersParity(t *testing.T) {
+	t.Parallel()
+	sudoersPath := filepath.Join("..", "..", "files", "etc", "sudoers.d", "010_airplanes-webconfig")
+	raw, err := os.ReadFile(sudoersPath)
+	if err != nil {
+		t.Fatalf("read sudoers: %v", err)
+	}
+	sudoers := string(raw)
+
+	priv := DefaultPrivilegedArgv()
+	cases := []struct {
+		label string
+		argv  []string
+	}{
+		{"ApplyFeed", priv.ApplyFeed},
+		{"Reboot", priv.Reboot},
+		{"Poweroff", priv.Poweroff},
+		{"StartUpdate", priv.StartUpdate},
+		{"StartSystemUpgrade", priv.StartSystemUpgrade},
+	}
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.label, func(t *testing.T) {
+			t.Parallel()
+			if len(tc.argv) < 3 || tc.argv[0] != "/usr/bin/sudo" || tc.argv[1] != "-n" {
+				t.Fatalf("%s: argv must start with /usr/bin/sudo -n, got %v", tc.label, tc.argv)
+			}
+			tail := strings.Join(tc.argv[2:], " ")
+			if !strings.Contains(sudoers, tail) {
+				t.Errorf("%s: argv tail not present in sudoers: %q", tc.label, tail)
+			}
+		})
+	}
+}
+
 // --- pending_restart surfacing (PR 3) ---
-
-func TestConfigPost_PendingRestartOmittedWhenAllSucceed(t *testing.T) {
-	t.Parallel()
-	h := newWriteHarness(t)
-	r := postJSON(t, h.client, h.ts.URL+"/api/config", map[string]any{
-		"updates": map[string]string{"LATITUDE": "51.5", "MLAT_USER": "alice"},
-	})
-	defer r.Body.Close()
-	if r.StatusCode != http.StatusOK {
-		t.Fatalf("status = %d", r.StatusCode)
-	}
-	var body struct {
-		Status         string   `json:"status"`
-		PendingRestart []string `json:"pending_restart"`
-	}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		t.Fatalf("decode: %v", err)
-	}
-	if body.Status != "applied" {
-		t.Errorf("status = %q, want applied", body.Status)
-	}
-	if len(body.PendingRestart) != 0 {
-		t.Errorf("PendingRestart = %v, want empty (all restarts succeeded)", body.PendingRestart)
-	}
-}
-
-func TestConfigPost_PendingRestartIncludesMLATWhenOnlyMLATFails(t *testing.T) {
-	t.Parallel()
-	h := newWriteHarness(t)
-	// Only fail RestartMLAT (argv[1]=="restart" && argv[2]=="mlat").
-	h.mu.Lock()
-	h.runnerErrFor = func(argv []string) error {
-		if len(argv) >= 3 && argv[1] == "restart" && argv[2] == "mlat" {
-			return errors.New("simulated mlat restart failure")
-		}
-		return nil
-	}
-	h.mu.Unlock()
-
-	r := postJSON(t, h.client, h.ts.URL+"/api/config", map[string]any{
-		"updates": map[string]string{"LATITUDE": "51.5", "MLAT_USER": "alice"},
-	})
-	defer r.Body.Close()
-	if r.StatusCode != http.StatusOK {
-		t.Fatalf("status = %d (err=%q)", r.StatusCode, decodeError(t, r.Body))
-	}
-	var body struct {
-		Status         string   `json:"status"`
-		PendingRestart []string `json:"pending_restart"`
-	}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		t.Fatalf("decode: %v", err)
-	}
-	if body.Status != "applied" {
-		t.Errorf("status = %q, want applied", body.Status)
-	}
-	if len(body.PendingRestart) != 1 || body.PendingRestart[0] != "airplanes-mlat.service" {
-		t.Errorf("PendingRestart = %v, want [airplanes-mlat.service]", body.PendingRestart)
-	}
-}
-
-func TestConfigPost_PendingRestartIncludesAllWhenAllFail(t *testing.T) {
-	t.Parallel()
-	h := newWriteHarness(t)
-	h.mu.Lock()
-	h.runnerErrFor = func(argv []string) error {
-		if len(argv) >= 3 && argv[1] == "restart" {
-			return errors.New("simulated restart failure")
-		}
-		return nil
-	}
-	h.mu.Unlock()
-
-	r := postJSON(t, h.client, h.ts.URL+"/api/config", map[string]any{
-		"updates": map[string]string{"LATITUDE": "51.5", "MLAT_USER": "alice"},
-	})
-	defer r.Body.Close()
-	if r.StatusCode != http.StatusOK {
-		t.Fatalf("status = %d", r.StatusCode)
-	}
-	var body struct {
-		Status         string   `json:"status"`
-		PendingRestart []string `json:"pending_restart"`
-	}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		t.Fatalf("decode: %v", err)
-	}
-	// PR 4: 978 units join the restart loop. When ALL restarts fail, all four
-	// units land in pending_restart.
-	if len(body.PendingRestart) != 4 {
-		t.Fatalf("PendingRestart len = %d, want 4 (feed+mlat+dump978+uat)", len(body.PendingRestart))
-	}
-	wantAny := map[string]bool{
-		"airplanes-feed.service": false,
-		"airplanes-mlat.service": false,
-		"dump978-fa.service":     false,
-		"airplanes-978.service":  false,
-	}
-	for _, u := range body.PendingRestart {
-		if _, ok := wantAny[u]; !ok {
-			t.Errorf("PendingRestart contains unexpected unit %q", u)
-		}
-		wantAny[u] = true
-	}
-	for u, seen := range wantAny {
-		if !seen {
-			t.Errorf("PendingRestart missing %q", u)
-		}
-	}
-}

@@ -1,0 +1,38 @@
+# /etc/sudoers.d/010_airplanes-webconfig
+#
+# Allow the airplanes-webconfig service account to invoke a tightly-scoped
+# set of privileged commands without a password. Every line must be a fixed
+# argv — no wildcards, no env passthrough, no shell quoting holes.
+#
+# Feed.env writes route through `apl-feed apply --json` (the canonical
+# writer in airplanes-live/feed). The argv is pinned to exactly that
+# subcommand so a compromised webconfig cannot invoke other apl-feed
+# subcommands (e.g. apl-feed apply --root /mnt) via the same sudo grant.
+#
+# `--lock-timeout 5` caps the helper's flock-acquisition wait at 5 seconds
+# (default in feed-env-apply.sh is 30s). webconfig owns the timeout budget
+# so a long-held lock surfaces as a structured 503 within its HTTP request
+# rather than being killed by the wrapper after the underlying helper
+# is still mid-acquisition.
+
+airplanes-webconfig ALL=(root) NOPASSWD: /usr/local/bin/apl-feed apply --json --lock-timeout 5
+
+# /usr/local/bin/apl-wifi reads /etc/NetworkManager/system-connections/* (root
+# 0600) and writes keyfiles + runs nmcli. Each subcommand has its own pinned
+# argv so a compromised webconfig cannot drift between the read-only (list,
+# status) and mutating (add, update, delete, test, activate) surfaces via one
+# grant. `--json` is mandatory in argv so a future text-mode helper variant
+# can't be reached through this entry.
+airplanes-webconfig ALL=(root) NOPASSWD: /usr/local/bin/apl-wifi list --json
+airplanes-webconfig ALL=(root) NOPASSWD: /usr/local/bin/apl-wifi add --json
+airplanes-webconfig ALL=(root) NOPASSWD: /usr/local/bin/apl-wifi update --json
+airplanes-webconfig ALL=(root) NOPASSWD: /usr/local/bin/apl-wifi delete --json
+airplanes-webconfig ALL=(root) NOPASSWD: /usr/local/bin/apl-wifi test --json
+airplanes-webconfig ALL=(root) NOPASSWD: /usr/local/bin/apl-wifi activate --json
+airplanes-webconfig ALL=(root) NOPASSWD: /usr/local/bin/apl-wifi status --json
+
+airplanes-webconfig ALL=(root) NOPASSWD: /usr/bin/systemctl reboot
+airplanes-webconfig ALL=(root) NOPASSWD: /usr/bin/systemctl poweroff
+airplanes-webconfig ALL=(root) NOPASSWD: /usr/bin/systemctl start --no-block airplanes-claim.service
+airplanes-webconfig ALL=(root) NOPASSWD: /usr/bin/systemd-run --unit=airplanes-update --collect --property=ExecStopPost=/usr/bin/systemctl kill -s HUP airplanes-webconfig.service /usr/local/share/airplanes/update.sh
+airplanes-webconfig ALL=(root) NOPASSWD: /usr/bin/systemd-run --unit=airplanes-system-upgrade --collect /usr/local/lib/airplanes-webconfig/system-upgrade.sh

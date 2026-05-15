@@ -6,83 +6,129 @@ import (
 	"net/http"
 	"sync"
 
-	"github.com/airplanes-live/image/webconfig/internal/auth"
-	wexec "github.com/airplanes-live/image/webconfig/internal/exec"
-	"github.com/airplanes-live/image/webconfig/internal/feedenv"
-	"github.com/airplanes-live/image/webconfig/internal/identity"
-	"github.com/airplanes-live/image/webconfig/internal/logs"
-	"github.com/airplanes-live/image/webconfig/internal/status"
-	webassets "github.com/airplanes-live/image/webconfig/web"
+	"github.com/airplanes-live/image-webconfig/internal/auth"
+	wexec "github.com/airplanes-live/image-webconfig/internal/exec"
+	"github.com/airplanes-live/image-webconfig/internal/feedenv"
+	"github.com/airplanes-live/image-webconfig/internal/identity"
+	"github.com/airplanes-live/image-webconfig/internal/logs"
+	"github.com/airplanes-live/image-webconfig/internal/schemacache"
+	"github.com/airplanes-live/image-webconfig/internal/status"
+	webassets "github.com/airplanes-live/image-webconfig/web"
 )
 
 // Server holds the runtime auth components. Constructed in cmd/webconfig.
 type Server struct {
-	version      string
-	store        *auth.PasswordStore
-	sessions     *auth.Sessions
-	lockout      *auth.Lockout
-	guard        *auth.HashGuard
-	argon2Params auth.Params
-	identity     *identity.Reader
-	feedEnv      *feedenv.Reader
-	status       *status.Reader
-	logs         *logs.Streamer
-	runner       wexec.CommandRunner
-	stdinRunner  wexec.CommandRunnerStdin
-	priv         PrivilegedArgv
-	configMu     sync.Mutex // serializes POST /api/config transactions
+	version       string
+	store         *auth.PasswordStore
+	sessions      *auth.Sessions
+	lockout       *auth.Lockout
+	guard         *auth.HashGuard
+	argon2Params  auth.Params
+	identity      *identity.Reader
+	feedEnv       *feedenv.Reader
+	status        *status.Reader
+	logs          *logs.Streamer
+	runner        wexec.CommandRunner
+	stdinRunner   wexec.CommandRunnerStdin
+	schema        *schemacache.Cache
+	priv          PrivilegedArgv
+	configMu      sync.Mutex // serializes POST /api/config transactions
+	maintenanceMu sync.Mutex // serializes the is-active guard + transient-unit kickoff
 }
 
 // PrivilegedArgv carries the exact sudoers-allowed argv shapes for every
 // command webconfig elevates. Each slice is invoked verbatim — no
 // concatenation, no shell.
+//
+// ApplyFeed and SchemaFeed both target the apl-feed binary installed by
+// the feed scripts (canonical writer + schema endpoint). The feed CLI
+// owns feed.env validation, restart fan-out, and the on-disk schema —
+// webconfig is a thin HTTP shell around its JSON interface.
+//
+// Wifi* target the apl-wifi binary installed by stage-airplanes/05. One
+// entry per subcommand keeps the sudoers grant pinned to a single verb;
+// a compromised webconfig cannot drift between the read-only (list /
+// status) and mutating (add / update / delete / test / activate) surfaces
+// via the same grant.
 type PrivilegedArgv struct {
-	ApplyConfig    []string // sudo -n /usr/local/lib/airplanes-webconfig/apply-config
-	RestartFeed    []string
-	RestartMLAT    []string
-	RestartDump978 []string
-	RestartUAT     []string
-	Reboot         []string
-	StartUpdate    []string // sudo systemd-run --unit=airplanes-update ...
+	ApplyFeed          []string // sudo -n /usr/local/bin/apl-feed apply --json --lock-timeout 5
+	SchemaFeed         []string // /usr/local/bin/apl-feed schema --json (no sudo: read-only)
+	Reboot             []string // sudo -n /usr/bin/systemctl reboot
+	Poweroff           []string // sudo -n /usr/bin/systemctl poweroff
+	StartUpdate        []string // sudo systemd-run --unit=airplanes-update ...
+	StartSystemUpgrade []string // sudo systemd-run --unit=airplanes-system-upgrade ...
+	RegisterClaim      []string // sudo systemctl start --no-block airplanes-claim.service
+	WifiList           []string
+	WifiAdd            []string
+	WifiUpdate         []string
+	WifiDelete         []string
+	WifiTest           []string
+	WifiActivate       []string
+	WifiStatus         []string
 }
 
 // DefaultPrivilegedArgv returns the production argv shapes for the
 // airplanes-webconfig sudoers entry. Override per-test via Deps.
+//
+// ApplyFeed pins --lock-timeout 5 so webconfig owns the wall-clock
+// budget end-to-end: apl-feed waits at most 5s for the feed.env flock,
+// then either succeeds or emits a structured lock_timeout envelope. The
+// applyConfigTimeout below (lockTimeout + post-lock budget) sets the
+// outer ceiling.
 func DefaultPrivilegedArgv() PrivilegedArgv {
 	sudo := func(args ...string) []string {
 		return append([]string{"/usr/bin/sudo", "-n"}, args...)
 	}
 	return PrivilegedArgv{
-		ApplyConfig:    sudo("/usr/local/lib/airplanes-webconfig/apply-config"),
-		RestartFeed:    sudo("/usr/bin/systemctl", "restart", "airplanes-feed.service"),
-		RestartMLAT:    sudo("/usr/bin/systemctl", "restart", "airplanes-mlat.service"),
-		RestartDump978: sudo("/usr/bin/systemctl", "restart", "dump978-fa.service"),
-		RestartUAT:     sudo("/usr/bin/systemctl", "restart", "airplanes-978.service"),
-		Reboot:         sudo("/usr/bin/systemctl", "reboot"),
+		ApplyFeed:  sudo("/usr/local/bin/apl-feed", "apply", "--json", "--lock-timeout", "5"),
+		SchemaFeed: []string{"/usr/local/bin/apl-feed", "schema", "--json"},
+		Reboot:     sudo("/usr/bin/systemctl", "reboot"),
+		Poweroff:   sudo("/usr/bin/systemctl", "poweroff"),
 		StartUpdate: sudo(
 			"/usr/bin/systemd-run",
 			"--unit=airplanes-update",
 			"--collect",
+			"--property=ExecStopPost=/usr/bin/systemctl kill -s HUP airplanes-webconfig.service",
 			"/usr/local/share/airplanes/update.sh",
 		),
+		StartSystemUpgrade: sudo(
+			"/usr/bin/systemd-run",
+			"--unit=airplanes-system-upgrade",
+			"--collect",
+			"/usr/local/lib/airplanes-webconfig/system-upgrade.sh",
+		),
+		// --no-block: the unit is Type=oneshot and apl-feed claim register
+		// retries on network failure for up to ~15s. A blocking start could
+		// exceed systemctlTimeout; --no-block enqueues the job and returns
+		// immediately. Progress and failures show up in the claim activity
+		// log via the SSE stream the SPA opens after this returns.
+		RegisterClaim: sudo("/usr/bin/systemctl", "start", "--no-block", "airplanes-claim.service"),
+		WifiList:      sudo("/usr/local/bin/apl-wifi", "list", "--json"),
+		WifiAdd:       sudo("/usr/local/bin/apl-wifi", "add", "--json"),
+		WifiUpdate:    sudo("/usr/local/bin/apl-wifi", "update", "--json"),
+		WifiDelete:    sudo("/usr/local/bin/apl-wifi", "delete", "--json"),
+		WifiTest:      sudo("/usr/local/bin/apl-wifi", "test", "--json"),
+		WifiActivate:  sudo("/usr/local/bin/apl-wifi", "activate", "--json"),
+		WifiStatus:    sudo("/usr/local/bin/apl-wifi", "status", "--json"),
 	}
 }
 
 // Deps is the injection bundle main passes to NewServer.
 type Deps struct {
-	Version       string
-	Store         *auth.PasswordStore
-	Sessions      *auth.Sessions
-	Lockout       *auth.Lockout
-	Guard         *auth.HashGuard
-	Argon2Params  auth.Params
-	Identity      *identity.Reader
-	FeedEnv       *feedenv.Reader
-	Status        *status.Reader
-	Logs          *logs.Streamer
-	Runner        wexec.CommandRunner      // override for tests; nil → exec.RealRunner
-	StdinRunner   wexec.CommandRunnerStdin // ditto; for apply-config (JSON piped via stdin)
-	Privileged    PrivilegedArgv
+	Version      string
+	Store        *auth.PasswordStore
+	Sessions     *auth.Sessions
+	Lockout      *auth.Lockout
+	Guard        *auth.HashGuard
+	Argon2Params auth.Params
+	Identity     *identity.Reader
+	FeedEnv      *feedenv.Reader
+	Status       *status.Reader
+	Logs         *logs.Streamer
+	Schema       *schemacache.Cache       // schema cache; required (use schemacache.New)
+	Runner       wexec.CommandRunner      // override for tests; nil → exec.RealRunner
+	StdinRunner  wexec.CommandRunnerStdin // ditto; piped variant for apl-feed apply
+	Privileged   PrivilegedArgv
 }
 
 // New returns the top-level HTTP handler.
@@ -108,6 +154,7 @@ func New(d Deps) http.Handler {
 		logs:         d.Logs,
 		runner:       runner,
 		stdinRunner:  stdinRunner,
+		schema:       d.Schema,
 		priv:         d.Privileged,
 	}
 
@@ -130,7 +177,23 @@ func New(d Deps) http.Handler {
 	mux.HandleFunc("GET /api/log/{unit}", s.requireSession(s.handleLog))
 	mux.HandleFunc("POST /api/config", s.requireSession(s.handleConfigPost))
 	mux.HandleFunc("POST /api/update", s.requireSession(s.handleUpdate))
+	mux.HandleFunc("POST /api/system-upgrade", s.requireSession(s.handleSystemUpgrade))
 	mux.HandleFunc("POST /api/reboot", s.requireSession(s.handleReboot))
+	mux.HandleFunc("POST /api/poweroff", s.requireSession(s.handlePoweroff))
+	mux.HandleFunc("POST /api/claim/register", s.requireSession(s.handleClaimRegister))
+
+	// Wi-Fi network management — privileged subcommands of /usr/local/bin/apl-wifi.
+	// No `s.wifiMu` mutex: the helper's flock at /run/airplanes/wifi.lock is
+	// the cross-process serialization point; a Go mutex would queue concurrent
+	// requests behind a 30s-test instead of letting the helper return a fast
+	// 503 lock_timeout to the second caller.
+	mux.HandleFunc("GET /api/wifi", s.requireSession(s.handleWifiList))
+	mux.HandleFunc("GET /api/wifi/status", s.requireSession(s.handleWifiStatus))
+	mux.HandleFunc("POST /api/wifi", s.requireSession(s.handleWifiAdd))
+	mux.HandleFunc("POST /api/wifi/test", s.requireSession(s.handleWifiTest))
+	mux.HandleFunc("PUT /api/wifi/{id}", s.requireSession(s.handleWifiUpdate))
+	mux.HandleFunc("DELETE /api/wifi/{id}", s.requireSession(s.handleWifiDelete))
+	mux.HandleFunc("POST /api/wifi/{id}/activate", s.requireSession(s.handleWifiActivate))
 
 	// Static assets at /static/*; the SPA shell is served by the GET /
 	// handler below. no-store cache policy: assets are embedded in the
