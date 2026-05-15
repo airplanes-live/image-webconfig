@@ -1,0 +1,11 @@
+#!/bin/bash
+# airplanes-webconfig-reset.service entrypoint. Triggered on boot when
+# /boot/firmware/airplanes-reset-password exists; clears the webconfig
+# password hash so the next visit hits the setup panel again. Runs as
+# root with no systemd sandbox so it can write under /boot/firmware.
+set -e
+
+logger -t airplanes-webconfig-reset "clearing password hash and reset marker"
+
+rm -f /etc/airplanes/webconfig/password.hash
+rm -f /boot/firmware/airplanes-reset-password
