@@ -8,7 +8,7 @@ import (
 	"strings"
 	"testing"
 
-	wexec "github.com/airplanes-live/image/webconfig/internal/exec"
+	wexec "github.com/airplanes-live/image-webconfig/internal/exec"
 )
 
 // httpRequest is a small wrapper around http.NewRequest that attaches the

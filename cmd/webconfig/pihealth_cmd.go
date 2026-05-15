@@ -17,7 +17,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/airplanes-live/image/webconfig/internal/pihealth"
+	"github.com/airplanes-live/image-webconfig/internal/pihealth"
 )
 
 // stripTempSuffixRE matches the " · NN°C" tail that pihealth.classify

@@ -5,7 +5,7 @@ import (
 	"errors"
 	"testing"
 
-	wexec "github.com/airplanes-live/image/webconfig/internal/exec"
+	wexec "github.com/airplanes-live/image-webconfig/internal/exec"
 )
 
 func stub(out []byte, err error) wexec.CommandRunner {

@@ -18,7 +18,7 @@ import (
 	"sync"
 	"time"
 
-	wexec "github.com/airplanes-live/image/webconfig/internal/exec"
+	wexec "github.com/airplanes-live/image-webconfig/internal/exec"
 )
 
 // Whitelist defines which units are exposable via /api/log/{unit}.

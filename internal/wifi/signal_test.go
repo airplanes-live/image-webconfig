@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	wexec "github.com/airplanes-live/image/webconfig/internal/exec"
+	wexec "github.com/airplanes-live/image-webconfig/internal/exec"
 )
 
 func intPtr(n int) *int { return &n }

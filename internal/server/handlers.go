@@ -13,9 +13,9 @@ import (
 	"strings"
 	"time"
 
-	"github.com/airplanes-live/image/webconfig/internal/auth"
-	"github.com/airplanes-live/image/webconfig/internal/identity"
-	"github.com/airplanes-live/image/webconfig/internal/logs"
+	"github.com/airplanes-live/image-webconfig/internal/auth"
+	"github.com/airplanes-live/image-webconfig/internal/identity"
+	"github.com/airplanes-live/image-webconfig/internal/logs"
 )
 
 // MinPasswordLen is the minimum length we accept for setup / change-password.

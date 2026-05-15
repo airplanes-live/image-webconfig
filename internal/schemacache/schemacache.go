@@ -19,7 +19,7 @@ import (
 	"sync"
 	"time"
 
-	wexec "github.com/airplanes-live/image/webconfig/internal/exec"
+	wexec "github.com/airplanes-live/image-webconfig/internal/exec"
 )
 
 // schemaJSON mirrors the wire shape emitted by `apl-feed schema --json`.
