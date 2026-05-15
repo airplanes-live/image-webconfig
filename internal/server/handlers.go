@@ -561,6 +561,7 @@ func (s *Server) runSudo(ctx context.Context, argv []string, timeout time.Durati
 var maintenanceUnits = []string{
 	"airplanes-system-upgrade.service",
 	"airplanes-update.service",
+	"airplanes-webconfig-update.service",
 }
 
 // maintenanceUnitActive returns the name of any maintenance unit currently
@@ -636,6 +637,17 @@ func (s *Server) handleUpdate(w http.ResponseWriter, r *http.Request) {
 // shape as /api/update; the SPA streams /api/log/system-upgrade for output.
 func (s *Server) handleSystemUpgrade(w http.ResponseWriter, r *http.Request) {
 	s.startTransientUnit(w, r, s.priv.StartSystemUpgrade, "airplanes-system-upgrade.service", "system upgrade")
+}
+
+// /api/webconfig-update (POST): kicks off a transient
+// airplanes-webconfig-update.service that downloads the latest webconfig
+// release for the device's channel, verifies SHA256, atomic-swaps the
+// binary, extracts the new rootfs payload, restarts this service, and
+// rolls back if /health fails after the restart. Same 202 + unit-name
+// shape as /api/update — the SPA streams /api/log/webconfig-update for
+// live output and then polls /health to detect the restart.
+func (s *Server) handleWebconfigUpdate(w http.ResponseWriter, r *http.Request) {
+	s.startTransientUnit(w, r, s.priv.StartWebconfigUpdate, "airplanes-webconfig-update.service", "webconfig update")
 }
 
 // /api/reboot (POST): refuses with 409 if a maintenance unit is active
