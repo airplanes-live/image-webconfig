@@ -1,0 +1,226 @@
+name: Release
+
+# Triggers:
+#   push of a v[MAJOR].[MINOR].[PATCH] tag — full stable release: build
+#       both arch binaries, assemble rootfs.tar.gz + manifest.json + SHA256SUMS,
+#       publish a GitHub Release at that tag and mark it latest.
+#   push to dev — moving prerelease at the "dev-latest" tag. The tag is
+#       force-recreated to point at the new HEAD; the release is updated
+#       in-place with new assets. This is what feeders on the dev channel
+#       resolve via airplanes_webconfig_resolve_dev_latest_tag.
+#   workflow_dispatch — manual rebuild of dev-latest (rare; for re-pushing
+#       assets when something goes wrong).
+on:
+  push:
+    tags: ['v*']
+    branches: [dev]
+  workflow_dispatch:
+    inputs:
+      dev_only:
+        description: 'Force dev-latest rebuild from the current default branch'
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+jobs:
+  classify:
+    name: classify release type
+    runs-on: ubuntu-24.04
+    timeout-minutes: 2
+    outputs:
+      kind: ${{ steps.k.outputs.kind }}
+      tag: ${{ steps.k.outputs.tag }}
+    steps:
+      - id: k
+        env:
+          EVENT: ${{ github.event_name }}
+          REF: ${{ github.ref }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          if [[ "$EVENT" == "push" && "$REF" == refs/tags/* ]]; then
+            if ! [[ "$REF_NAME" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+              echo "::error::Tag '$REF_NAME' does not match v[MAJOR].[MINOR].[PATCH]"
+              exit 1
+            fi
+            echo "kind=stable" >> "$GITHUB_OUTPUT"
+            echo "tag=$REF_NAME" >> "$GITHUB_OUTPUT"
+          elif [[ "$EVENT" == "push" && "$REF" == "refs/heads/dev" ]]; then
+            echo "kind=dev" >> "$GITHUB_OUTPUT"
+            echo "tag=dev-latest" >> "$GITHUB_OUTPUT"
+          elif [[ "$EVENT" == "workflow_dispatch" ]]; then
+            echo "kind=dev" >> "$GITHUB_OUTPUT"
+            echo "tag=dev-latest" >> "$GITHUB_OUTPUT"
+          else
+            echo "::error::Unsupported trigger: event=$EVENT ref=$REF"
+            exit 1
+          fi
+
+  build:
+    name: build airplanes-webconfig-${{ matrix.arch }}
+    needs: [classify]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { arch: arm64, goarch: arm64, goarm: "" }
+          - { arch: armhf, goarch: arm,   goarm: "7" }
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@d35c59abb061a4a6fb18e82ac0862c26744d6ab5  # v5.5.0
+        with:
+          go-version-file: go.mod
+      - name: cross-compile
+        env:
+          GOOS: linux
+          GOARCH: ${{ matrix.goarch }}
+          GOARM: ${{ matrix.goarm }}
+          CGO_ENABLED: "0"
+          TAG: ${{ needs.classify.outputs.tag }}
+        run: |
+          go build -trimpath -buildvcs=false \
+            -ldflags "-s -w -X main.version=$TAG -X main.commitSha=${{ github.sha }}" \
+            -o "airplanes-webconfig-${{ matrix.arch }}" \
+            ./cmd/webconfig
+          file "airplanes-webconfig-${{ matrix.arch }}"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
+        with:
+          name: bin-${{ matrix.arch }}
+          path: airplanes-webconfig-${{ matrix.arch }}
+          retention-days: 7
+
+  package:
+    name: assemble rootfs + manifest + SHA256SUMS
+    needs: [classify, build]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      commit_sha: ${{ steps.manifest.outputs.commit_sha }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4.3.0
+        with:
+          path: artifacts
+          merge-multiple: true
+      - name: assemble rootfs.tar.gz
+        run: |
+          # Pack files/ into a tarball that extracts onto the rootfs.
+          # Deterministic ownership/mtime so reruns produce byte-identical
+          # output (and so SHA256SUMS is stable when the same tag is rebuilt).
+          tar -C files \
+              --owner=0 --group=0 --numeric-owner \
+              --mtime='2024-01-01 00:00:00 UTC' \
+              --sort=name \
+              -czf rootfs.tar.gz .
+      - name: write manifest.json
+        id: manifest
+        env:
+          TAG: ${{ needs.classify.outputs.tag }}
+          KIND: ${{ needs.classify.outputs.kind }}
+        run: |
+          BUILD_DATE="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          COMMIT_SHA="${{ github.sha }}"
+          cat > manifest.json <<MANIFEST
+          {
+            "version": "$TAG",
+            "kind": "$KIND",
+            "commit_sha": "$COMMIT_SHA",
+            "build_date": "$BUILD_DATE",
+            "arches": ["arm64", "armhf"]
+          }
+          MANIFEST
+          echo "commit_sha=$COMMIT_SHA" >> "$GITHUB_OUTPUT"
+      - name: SHA256SUMS
+        run: |
+          mv artifacts/airplanes-webconfig-arm64 .
+          mv artifacts/airplanes-webconfig-armhf .
+          sha256sum \
+            airplanes-webconfig-arm64 \
+            airplanes-webconfig-armhf \
+            rootfs.tar.gz \
+            manifest.json \
+            > SHA256SUMS
+          cat SHA256SUMS
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
+        with:
+          name: release-assets
+          path: |
+            airplanes-webconfig-arm64
+            airplanes-webconfig-armhf
+            rootfs.tar.gz
+            manifest.json
+            SHA256SUMS
+          retention-days: 7
+
+  publish:
+    name: publish GitHub Release
+    needs: [classify, package]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4.3.0
+        with:
+          name: release-assets
+          path: dist/
+      - name: Verify SHA256SUMS
+        working-directory: dist
+        run: sha256sum -c SHA256SUMS
+      - name: Stable release (tag push)
+        if: needs.classify.outputs.kind == 'stable'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.classify.outputs.tag }}
+        run: |
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" --clobber \
+              dist/airplanes-webconfig-arm64 \
+              dist/airplanes-webconfig-armhf \
+              dist/rootfs.tar.gz \
+              dist/manifest.json \
+              dist/SHA256SUMS
+            gh release edit "$TAG" --draft=false --latest
+          else
+            gh release create "$TAG" --title "$TAG" --generate-notes --latest \
+              dist/airplanes-webconfig-arm64 \
+              dist/airplanes-webconfig-armhf \
+              dist/rootfs.tar.gz \
+              dist/manifest.json \
+              dist/SHA256SUMS
+          fi
+      - name: Dev release (moving dev-latest)
+        if: needs.classify.outputs.kind == 'dev'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: dev-latest
+        run: |
+          # Force-move dev-latest to point at the current commit, then
+          # rebuild the release in place with the new assets. The release
+          # is marked prerelease so it does not appear as "Latest" on the
+          # repo home page (only stable tags get that badge).
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release delete "$TAG" --yes --cleanup-tag
+          fi
+          git tag -f "$TAG" "${{ github.sha }}"
+          git push origin "refs/tags/$TAG" --force
+          gh release create "$TAG" \
+            --title "dev-latest (${GITHUB_SHA::8})" \
+            --notes "Moving prerelease for the dev channel. Commit: ${{ github.sha }}" \
+            --prerelease \
+            dist/airplanes-webconfig-arm64 \
+            dist/airplanes-webconfig-armhf \
+            dist/rootfs.tar.gz \
+            dist/manifest.json \
+            dist/SHA256SUMS
