@@ -1,18 +1,26 @@
 // Package feedmeta builds the JSON payload for `apl-feed apply --json`
-// from a form-posted updates map. Tracked keys carry explicit
-// `{value, edited_at, edited_by}` metadata; non-tracked keys pass through
-// as bare strings. Tracked keys whose posted value matches the current
-// on-disk value are omitted entirely so an unchanged save does not bump
-// the sidecar's edited_at for them.
+// from a form-posted updates map. Tracked keys whose posted value
+// differs from the current on-disk value carry explicit
+// `{value, edited_at, edited_by}` metadata; tracked keys whose value
+// matches current pass through as bare strings; non-tracked keys also
+// pass through as bare strings.
+//
+// Bare-string passthrough on unchanged tracked keys is deliberate. The
+// apply library auto-derives GEO_CONFIGURED when LATITUDE or LONGITUDE
+// is present in the touched-payload set regardless of value change, and
+// the metadata path would bump the sidecar's edited_at for any tracked
+// key carrying explicit metadata even if its canonical value matched.
+// Bare strings skip the metadata path and only stamp on actual change.
 //
 // The tracked-keys list mirrors APL_FEED_APPLY_META_TRACKED_KEYS in
-// feed/scripts/lib/feed-env-apply.sh. Drift is checked by
-// internal/feedmeta/feedmeta_test.go::TestTrackedKeysMatchFeedSide once
-// the contract surface lands in `apl-feed schema --json`; today the list
-// is duplicated here.
+// feed/scripts/lib/feed-env-apply.sh. Parity is checked at test time by
+// drift_test.go.
 package feedmeta
 
-import "time"
+import (
+	"strings"
+	"time"
+)
 
 // EditedBy is the provenance tag attached to local-webconfig writes.
 // Matches the enum in apl-feed apply.sh (feeder|website|legacy).
@@ -71,6 +79,37 @@ func IsTracked(key string) bool {
 	return ok
 }
 
+// canonicalizeForCompare returns a value normalised to the form the
+// apply library would store on disk after its own canonicalization, so
+// the "is this an actual value change" decision in BuildApplyPayload
+// matches apply's view rather than raw-byte equality.
+//
+// Today only ALTITUDE needs canonicalization: apply appends a default
+// `m` suffix when none of `m`/`ft` is present (mirrors
+// _apl_feed_apply_canonicalize_altitude in
+// feed/scripts/lib/feed-env-apply.sh). Without this, a user typing
+// `120` while disk holds `120m` would produce a byte-different but
+// canonically-equal pair; Go would then send object metadata, apply
+// would canonicalize to a no-value-change, and the sidecar's edited_at
+// would still get bumped because explicit metadata is load-bearing.
+//
+// Other tracked keys (LATITUDE/LONGITUDE/MLAT_*) are byte-equal under
+// apply's storage rules, so this helper is a no-op for them.
+func canonicalizeForCompare(key, value string) string {
+	switch key {
+	case "ALTITUDE":
+		if value == "" {
+			return value
+		}
+		if strings.HasSuffix(value, "m") || strings.HasSuffix(value, "ft") {
+			return value
+		}
+		return value + "m"
+	default:
+		return value
+	}
+}
+
 // BuildApplyPayload returns the `updates` map to ship to `apl-feed apply
 // --json`, given the current on-disk values and the form-posted values.
 //
@@ -116,9 +155,13 @@ func BuildApplyPayload(current, posted map[string]string, now time.Time) map[str
 			out[k] = v
 			continue
 		}
-		if cur, ok := current[k]; ok && cur == v {
-			// Tracked + unchanged → bare string. Apply library will
-			// determine no_change without bumping the sidecar.
+		if cur, ok := current[k]; ok && canonicalizeForCompare(k, cur) == canonicalizeForCompare(k, v) {
+			// Tracked + canonically-equal-to-disk → bare string. Apply
+			// library will determine no_change without bumping the
+			// sidecar. canonicalizeForCompare matches apply's view so
+			// ALTITUDE byte-different-but-canonically-equal entries
+			// (e.g. user types "120", disk has "120m") don't trigger a
+			// metadata write.
 			out[k] = v
 			continue
 		}

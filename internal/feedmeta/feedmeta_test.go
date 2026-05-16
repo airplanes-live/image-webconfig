@@ -215,6 +215,66 @@ func TestBuildApplyPayload_BooleanFlipsCarryMetadata(t *testing.T) {
 	}
 }
 
+func TestBuildApplyPayload_AltitudeCanonicalEqualIsBareString(t *testing.T) {
+	// Apply library appends `m` to bare-number ALTITUDE before storing
+	// (mirrors _apl_feed_apply_canonicalize_altitude). A user typing
+	// "120" while disk holds "120m" must NOT produce object metadata —
+	// the canonical value is the same and the sidecar must not be bumped.
+	for _, tc := range []struct {
+		current, posted string
+	}{
+		{"120m", "120"},
+		{"120", "120m"},
+		{"120m", "120m"},
+		{"120ft", "120ft"},
+		{"-30.49", "-30.49"},
+	} {
+		t.Run(tc.current+"_vs_"+tc.posted, func(t *testing.T) {
+			got := BuildApplyPayload(
+				map[string]string{"ALTITUDE": tc.current},
+				map[string]string{"ALTITUDE": tc.posted},
+				fixedNow,
+			)
+			if _, isUpdate := got["ALTITUDE"].(FieldUpdate); isUpdate {
+				t.Errorf("ALTITUDE canonically equal (%q vs %q): expected bare string, got FieldUpdate", tc.current, tc.posted)
+			}
+		})
+	}
+}
+
+func TestBuildApplyPayload_AltitudeRealChangeCarriesMetadata(t *testing.T) {
+	// Genuinely different ALTITUDE values (different canonical form)
+	// still get metadata.
+	got := BuildApplyPayload(
+		map[string]string{"ALTITUDE": "120m"},
+		map[string]string{"ALTITUDE": "150"},
+		fixedNow,
+	)
+	want := FieldUpdate{Value: "150", EditedAt: fixedStamp, EditedBy: "feeder"}
+	if got["ALTITUDE"] != want {
+		t.Errorf("ALTITUDE real change: want %#v, got %#v", want, got["ALTITUDE"])
+	}
+}
+
+func TestCanonicalizeForCompare(t *testing.T) {
+	for _, tc := range []struct {
+		key, in, want string
+	}{
+		{"ALTITUDE", "120", "120m"},
+		{"ALTITUDE", "120m", "120m"},
+		{"ALTITUDE", "120ft", "120ft"},
+		{"ALTITUDE", "-100", "-100m"},
+		{"ALTITUDE", "", ""},
+		{"MLAT_USER", "bob", "bob"}, // non-altitude → no-op
+		{"LATITUDE", "47.0", "47.0"},
+	} {
+		got := canonicalizeForCompare(tc.key, tc.in)
+		if got != tc.want {
+			t.Errorf("canonicalizeForCompare(%q, %q) = %q, want %q", tc.key, tc.in, got, tc.want)
+		}
+	}
+}
+
 func TestBareStringPayload(t *testing.T) {
 	posted := map[string]string{
 		"MLAT_USER":    "bob",

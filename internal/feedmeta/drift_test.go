@@ -18,9 +18,16 @@ import (
 // silently break metadata stamping for the new key (Go would forward
 // bare strings; apply would gate on metadata).
 //
-// The test fetches from raw.githubusercontent.com over HTTPS. In offline
-// runs (TESTING_OFFLINE=1 or network failure) it skips gracefully so
-// dev-machine builds without internet still pass.
+// Known limitations:
+//   - The fetch points at feed/dev, so concurrent feed-side activity
+//     can cause a transient CI failure on an unrelated image-webconfig
+//     PR until this list is bumped to match. Acceptable: real drift is
+//     surfaced loudly; the alternative (silent drift) is worse.
+//   - Offline / network failure skips the test rather than failing,
+//     so a fully air-gapped CI would not detect drift via this path.
+//     Long-term, the contract surface should move to
+//     `apl-feed schema --json` so the check runs against runtime state
+//     rather than a remote file.
 //
 // Branch: dev (workspace convention — production deploys from main, dev
 // is the integration branch).

@@ -26,9 +26,9 @@ var editedAtLayouts = []string{
 
 // captureUpdates POSTs a /api/config payload and returns the raw
 // `updates` map that apl-feed apply --json saw on stdin. Each value is
-// either a JSON string (non-tracked / unchanged-stripped path doesn't
-// occur — those keys are omitted) or a `{value, edited_at, edited_by}`
-// object (tracked, changed). The caller decodes per-key.
+// either a JSON string (non-tracked, or tracked-but-canonically-equal
+// to current on-disk value) or a `{value, edited_at, edited_by}` object
+// (tracked, value differs from current). The caller decodes per-key.
 func captureUpdates(t *testing.T, h *writeHarness, updates map[string]string) map[string]json.RawMessage {
 	t.Helper()
 	r := postJSON(t, h.client, h.ts.URL+"/api/config",
