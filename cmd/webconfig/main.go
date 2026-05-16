@@ -7,6 +7,7 @@ import (
 	"context"
 	"errors"
 	"flag"
+	"fmt"
 	"log"
 	"net/http"
 	"os"
@@ -54,11 +55,24 @@ func main() {
 		"emit a one-line pi-health summary and exit (for render-status / MOTD)")
 	piHealthTimeout := flag.Duration("pi-health-timeout", 2*time.Second,
 		"probe timeout for --pi-health (must be < the shell timeout wrapping the call)")
+	validateSudoers := flag.Bool("validate-sudoers", false,
+		"verify every DefaultPrivilegedArgv() shape is authorized by /etc/sudoers.d/010_* + 011_* and exit (exit 0 on parity, 1 on mismatch)")
 	flag.Parse()
 
 	if *piHealthMode {
 		ph := pihealth.NewReader(pihealth.DefaultPaths(), pihealth.DefaultThresholds(), nil, nil)
 		os.Exit(runPiHealthCmd(os.Stdout, os.Stderr, ph.Probe, *piHealthTimeout))
+	}
+
+	if *validateSudoers {
+		if err := server.ValidatePrivilegedArgvParity(
+			server.DefaultPrivilegedArgv(),
+			server.DefaultSudoersPaths()...,
+		); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		os.Exit(0)
 	}
 
 	if *argonThreads > 255 {

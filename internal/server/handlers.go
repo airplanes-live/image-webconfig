@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/airplanes-live/image-webconfig/internal/auth"
+	"github.com/airplanes-live/image-webconfig/internal/feedmeta"
 	"github.com/airplanes-live/image-webconfig/internal/identity"
 	"github.com/airplanes-live/image-webconfig/internal/logs"
 )
@@ -422,7 +423,28 @@ func (s *Server) handleConfigPost(w http.ResponseWriter, r *http.Request) {
 	s.configMu.Lock()
 	defer s.configMu.Unlock()
 
-	resp, status, err := s.invokeApplyFeed(r.Context(), req.Updates)
+	// Read current feed.env under the same configMu so the "did this
+	// tracked key actually change" determination is consistent against
+	// concurrent webconfig writers. A concurrent `apl-feed config sync`
+	// write is handled by the apply library's flock + LWW gate — the
+	// race is benign (worst case: one wasted no-op apply round trip).
+	//
+	// A read error is not fatal: fall back to a bare-string payload —
+	// every posted key passes through with no metadata, which matches
+	// the pre-DEV-383 behavior. We must NOT treat the read failure as
+	// bootstrap; that would attach metadata to every tracked key the
+	// form posts, including unchanged ones, and stamp fresh edited_at
+	// tuples across the sidecar on every save.
+	current, readErr := s.feedEnv.ReadAll()
+	var payload map[string]any
+	if readErr != nil {
+		log.Printf("config-post: feed.env pre-read for metadata gating failed; falling back to bare-string payload: %v", readErr)
+		payload = feedmeta.BareStringPayload(req.Updates)
+	} else {
+		payload = feedmeta.BuildApplyPayload(current, req.Updates, s.now())
+	}
+
+	resp, status, err := s.invokeApplyFeed(r.Context(), payload)
 	if err != nil {
 		log.Printf("config-post: %v", err)
 		writeJSONError(w, http.StatusInternalServerError, "config write failed")
@@ -508,7 +530,7 @@ func synthesizeError(resp *applyFeedResponse) {
 //	parse_error      → 400 (apl-feed received malformed input from us, but
 //	                       forward as 400 so the client sees the message)
 //	usage_error      → 500 (programmer error: argv shape diverged)
-func (s *Server) invokeApplyFeed(ctx context.Context, updates map[string]string) (applyFeedResponse, int, error) {
+func (s *Server) invokeApplyFeed(ctx context.Context, updates map[string]any) (applyFeedResponse, int, error) {
 	body, err := json.Marshal(map[string]any{"updates": updates})
 	if err != nil {
 		return applyFeedResponse{}, 0, err

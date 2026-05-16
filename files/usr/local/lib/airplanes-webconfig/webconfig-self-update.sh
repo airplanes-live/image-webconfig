@@ -41,13 +41,21 @@ fi
 INSTALLER=/usr/local/share/airplanes-webconfig/update.sh
 BIN=/usr/local/bin/airplanes-webconfig
 UNIT_FILE=/etc/systemd/system/airplanes-webconfig.service
+MANIFEST=/etc/airplanes/webconfig-release.json
 SERVICE=airplanes-webconfig.service
 HEALTH_URL=http://127.0.0.1:8080/health
 HEALTH_MAX_ATTEMPTS=10
 HEALTH_SLEEP_SECONDS=1
 
-# Restores the previous binary and unit file (if backed up) and restarts the
-# service so the rollback takes effect, then exits with the supplied code.
+MANIFEST_EXISTED=0
+
+# Restores the previous binary, unit file, and manifest, then restarts the
+# service so the rollback takes effect. Exits with the supplied code.
+#
+# Manifest handling has two cases: if a manifest existed before the install,
+# the .prev backup is restored. If no manifest existed before (e.g. a feeder
+# that hasn't carried one yet), install.sh's just-written manifest is removed
+# so the device doesn't report the failed release's version.
 rollback_and_exit() {
     local rc="$1"
     local restored=0
@@ -56,6 +64,11 @@ rollback_and_exit() {
     fi
     if [ -f "${UNIT_FILE}.prev" ]; then
         mv -f "${UNIT_FILE}.prev" "$UNIT_FILE" && restored=1
+    fi
+    if [ "$MANIFEST_EXISTED" -eq 1 ] && [ -f "${MANIFEST}.prev" ]; then
+        mv -f "${MANIFEST}.prev" "$MANIFEST" && restored=1
+    elif [ "$MANIFEST_EXISTED" -eq 0 ] && [ -f "$MANIFEST" ]; then
+        rm -f "$MANIFEST" && restored=1
     fi
     if [ "$restored" -eq 1 ]; then
         systemctl daemon-reload || true
@@ -69,12 +82,18 @@ if [ ! -x "$INSTALLER" ]; then
     exit 1
 fi
 
-# Back up the unit file so we can roll it back too. The installer rolls
-# back the binary on its own failures, but if the unit file is rewritten
-# during rootfs extraction and the new binary then fails /health, we need
-# both old binary + old unit for a coherent rollback.
+# Back up the unit file and manifest so we can roll them back together
+# with the binary. The installer rolls back the binary on its own
+# failures; the helper additionally restores the unit (rewritten by
+# rootfs extraction) and the manifest (rewritten by install.sh) so
+# /health and the SPA both report the rolled-back release rather than
+# the failed one after a /health-exhaustion rollback.
 if [ -f "$UNIT_FILE" ]; then
     cp -a "$UNIT_FILE" "${UNIT_FILE}.prev"
+fi
+if [ -f "$MANIFEST" ]; then
+    cp -a "$MANIFEST" "${MANIFEST}.prev"
+    MANIFEST_EXISTED=1
 fi
 
 echo "webconfig-self-update: invoking $INSTALLER"
@@ -91,6 +110,11 @@ if [ "$rc" -ne 0 ]; then
     if [ -f "${UNIT_FILE}.prev" ]; then
         mv -f "${UNIT_FILE}.prev" "$UNIT_FILE"
         systemctl daemon-reload || true
+    fi
+    if [ "$MANIFEST_EXISTED" -eq 1 ] && [ -f "${MANIFEST}.prev" ]; then
+        mv -f "${MANIFEST}.prev" "$MANIFEST"
+    elif [ "$MANIFEST_EXISTED" -eq 0 ] && [ -f "$MANIFEST" ]; then
+        rm -f "$MANIFEST"
     fi
     exit "$rc"
 fi
@@ -110,7 +134,7 @@ while [ "$attempt" -lt "$HEALTH_MAX_ATTEMPTS" ]; do
     attempt=$((attempt + 1))
     sleep "$HEALTH_SLEEP_SECONDS"
     if curl -fsS -o /dev/null --max-time 2 "$HEALTH_URL"; then
-        rm -f "${BIN}.prev" "${UNIT_FILE}.prev"
+        rm -f "${BIN}.prev" "${UNIT_FILE}.prev" "${MANIFEST}.prev"
         echo "webconfig-self-update: /health OK after restart (attempt=$attempt)"
         exit 0
     fi

@@ -211,6 +211,90 @@ STUB
     grep -q "fake-arm64-binary" "$AIRPLANES_ROOT/usr/local/bin/airplanes-webconfig"
 }
 
+@test "install.sh --runtime A→B chain leaves correct .prev and updated manifest" {
+    # Seed a pretend-running install at AIRPLANES_ROOT representing v0.1.0.
+    AIRPLANES_ROOT="$WORK/sysroot-chain"
+    install -d -m 755 "$AIRPLANES_ROOT/usr/local/bin" "$AIRPLANES_ROOT/etc/airplanes"
+    printf 'baseline-binary\n' > "$AIRPLANES_ROOT/usr/local/bin/airplanes-webconfig"
+    chmod 0755 "$AIRPLANES_ROOT/usr/local/bin/airplanes-webconfig"
+    echo stable > "$AIRPLANES_ROOT/etc/airplanes/release-channel"
+
+    # Push v9.9.10 into the fake remote so the stable resolver can pick it.
+    SEED2="$WORK/seed2"
+    git init -q "$SEED2"
+    (
+        cd "$SEED2"
+        git config user.email t@example.com
+        git config user.name test
+        git commit --allow-empty -q -m c2
+        git tag v9.9.10
+        git remote add origin "$FAKE_REMOTE"
+        git push -q origin --tags
+    )
+
+    # Stage a v9.9.10 payload alongside v9.9.9 (different binary contents so
+    # we can prove install B is the one that landed).
+    PAYLOAD10="$WORK/payload10"
+    install -d -m 755 "$PAYLOAD10"
+    printf 'fake-arm64-binary v9.9.10\n' > "$PAYLOAD10/airplanes-webconfig-arm64"
+    printf 'fake-armhf-binary v9.9.10\n' > "$PAYLOAD10/airplanes-webconfig-armhf"
+    cp "$PAYLOAD/rootfs.tar.gz" "$PAYLOAD10/rootfs.tar.gz"
+    cat > "$PAYLOAD10/manifest.json" <<JSON
+{
+  "version": "v9.9.10",
+  "kind": "stable",
+  "commit_sha": "$EXPECTED_SHA",
+  "build_date": "2026-01-01T00:00:00Z",
+  "arches": ["arm64", "armhf"]
+}
+JSON
+    ( cd "$PAYLOAD10" && sha256sum \
+        airplanes-webconfig-arm64 \
+        airplanes-webconfig-armhf \
+        rootfs.tar.gz \
+        manifest.json \
+        > SHA256SUMS )
+    ln -s "$PAYLOAD10" "$WORK/v9.9.10"
+
+    # uname stub: aarch64 → arm64.
+    STUB_DIR="$WORK/stubs-chain"
+    install -d "$STUB_DIR"
+    cat > "$STUB_DIR/uname" <<'STUB'
+#!/bin/bash
+if [[ "$1" == "-m" ]]; then echo aarch64; exit 0; fi
+exec /usr/bin/uname "$@"
+STUB
+    chmod +x "$STUB_DIR/uname"
+
+    unset AIRPLANES_WEBCONFIG_BRANCH
+    unset ROOTFS_DIR
+    export AIRPLANES_ROOT
+
+    # The stable resolver picks the highest semver tag. Drop v9.9.10 from
+    # the remote before install A so the resolver picks v9.9.9; re-push
+    # v9.9.10 between A and B.
+    git -C "$SEED2" push -q origin :refs/tags/v9.9.10
+
+    PATH="$STUB_DIR:$PATH" run bash "$REPO_ROOT/install.sh" --runtime
+    [ "$status" -eq 0 ] || { echo "INSTALL A:"; printf '%s\n' "$output"; false; }
+
+    grep -q "fake-arm64-binary$" "$AIRPLANES_ROOT/usr/local/bin/airplanes-webconfig"
+    [ -f "$AIRPLANES_ROOT/usr/local/bin/airplanes-webconfig.prev" ]
+    grep -q "baseline-binary" "$AIRPLANES_ROOT/usr/local/bin/airplanes-webconfig.prev"
+    grep -q '"version": "v9.9.9"' "$AIRPLANES_ROOT/etc/airplanes/webconfig-release.json"
+
+    # Push v9.9.10 now; install B should pick it as the new highest semver.
+    git -C "$SEED2" push -q origin refs/tags/v9.9.10
+
+    PATH="$STUB_DIR:$PATH" run bash "$REPO_ROOT/install.sh" --runtime
+    [ "$status" -eq 0 ] || { echo "INSTALL B:"; printf '%s\n' "$output"; false; }
+
+    grep -q "fake-arm64-binary v9.9.10" "$AIRPLANES_ROOT/usr/local/bin/airplanes-webconfig"
+    [ -f "$AIRPLANES_ROOT/usr/local/bin/airplanes-webconfig.prev" ]
+    grep -q "fake-arm64-binary$" "$AIRPLANES_ROOT/usr/local/bin/airplanes-webconfig.prev"
+    grep -q '"version": "v9.9.10"' "$AIRPLANES_ROOT/etc/airplanes/webconfig-release.json"
+}
+
 @test "install.sh refuses armv6l (Pi Zero W1) clearly" {
     STUB_DIR="$WORK/stubs"
     install -d "$STUB_DIR"
