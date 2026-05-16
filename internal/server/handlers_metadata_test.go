@@ -11,8 +11,18 @@ import (
 
 // rfc3339UTCRe matches the strict shape `apl-feed apply --json` accepts
 // for `edited_at`. Pin parity with feed/scripts/lib/feed-env-apply.sh
-// (APL_FEED_APPLY_EDITED_AT_RE).
+// (APL_FEED_APPLY_EDITED_AT_RE). The fractional segment is required by
+// formatRFC3339UTC even when the time is a whole second.
 var rfc3339UTCRe = regexp.MustCompile(`^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\.[0-9]+)?Z$`)
+
+// editedAtLayouts is the set of layouts assertFieldUpdate accepts for
+// edited_at. formatRFC3339UTC emits microsecond precision today; the
+// non-fractional layout is kept so the helper is resilient if tests
+// ever override the clock to an integer-second value.
+var editedAtLayouts = []string{
+	"2006-01-02T15:04:05.000000Z",
+	"2006-01-02T15:04:05Z",
+}
 
 // captureUpdates POSTs a /api/config payload and returns the raw
 // `updates` map that apl-feed apply --json saw on stdin. Each value is
@@ -64,9 +74,16 @@ func assertFieldUpdate(t *testing.T, key string, raw json.RawMessage, wantValue 
 	if !rfc3339UTCRe.MatchString(fu.EditedAt) {
 		t.Errorf("%s.edited_at = %q, want RFC 3339 UTC (Z-suffixed)", key, fu.EditedAt)
 	}
-	stamped, err := time.Parse("2006-01-02T15:04:05Z", fu.EditedAt)
+	var stamped time.Time
+	var err error
+	for _, layout := range editedAtLayouts {
+		stamped, err = time.Parse(layout, fu.EditedAt)
+		if err == nil {
+			break
+		}
+	}
 	if err != nil {
-		t.Errorf("%s.edited_at parse: %v", key, err)
+		t.Errorf("%s.edited_at parse: %v (value=%q)", key, err, fu.EditedAt)
 		return
 	}
 	if stamped.Before(start) || stamped.After(end) {
@@ -92,10 +109,12 @@ func TestConfigPost_TrackedKeyChangedCarriesMetadata(t *testing.T) {
 	assertFieldUpdate(t, "MLAT_USER", got["MLAT_USER"], "bob", start, end)
 }
 
-func TestConfigPost_UnchangedTrackedKeyOmitted(t *testing.T) {
+func TestConfigPost_UnchangedTrackedKeyIsBareString(t *testing.T) {
 	// feed.env has MLAT_USER=alice. POST resends the same value plus a
-	// non-tracked key. Captured stdin must NOT contain MLAT_USER, must
-	// contain GAIN as a bare string.
+	// non-tracked key. The captured stdin must contain MLAT_USER as a
+	// bare string (no metadata) so the apply library does not bump
+	// the sidecar's edited_at for an unchanged value, AND must contain
+	// GAIN as a bare string (non-tracked passthrough).
 	h := newWriteHarness(t)
 	if err := os.WriteFile(h.feedEnvPath,
 		[]byte(`MLAT_USER=alice`+"\n"+`GAIN=40`+"\n"), 0o644,
@@ -106,14 +125,37 @@ func TestConfigPost_UnchangedTrackedKeyOmitted(t *testing.T) {
 		"MLAT_USER": "alice",
 		"GAIN":      "42",
 	})
-	if _, ok := got["MLAT_USER"]; ok {
-		t.Errorf("MLAT_USER should be omitted (unchanged tracked key); got %s", string(got["MLAT_USER"]))
-	}
-	if got["GAIN"] == nil {
-		t.Fatal("GAIN missing from updates")
+	if string(got["MLAT_USER"]) != `"alice"` {
+		t.Errorf("MLAT_USER wire shape = %s, want bare string %q (unchanged tracked key)", string(got["MLAT_USER"]), `"alice"`)
 	}
 	if string(got["GAIN"]) != `"42"` {
 		t.Errorf("GAIN wire shape = %s, want bare string %q", string(got["GAIN"]), `"42"`)
+	}
+}
+
+func TestConfigPost_UnchangedLatLonPreservedForGeoDerive(t *testing.T) {
+	// Regression for the GEO_CONFIGURED auto-derive path. The apply
+	// library derives GEO_CONFIGURED from LATITUDE/LONGITUDE being
+	// present in the touched-payload set, regardless of whether their
+	// value changed. The webconfig must therefore keep unchanged lat/lon
+	// in the payload (as bare strings) instead of dropping them.
+	h := newWriteHarness(t)
+	if err := os.WriteFile(h.feedEnvPath,
+		[]byte(`LATITUDE=47.0`+"\n"+`LONGITUDE=8.0`+"\n"+`MLAT_USER=alice`+"\n"),
+		0o644,
+	); err != nil {
+		t.Fatal(err)
+	}
+	got := captureUpdates(t, h, map[string]string{
+		"LATITUDE":  "47.0",
+		"LONGITUDE": "8.0",
+		"MLAT_USER": "bob",
+	})
+	if string(got["LATITUDE"]) != `"47.0"` {
+		t.Errorf("LATITUDE must remain in payload as bare string; got %s", string(got["LATITUDE"]))
+	}
+	if string(got["LONGITUDE"]) != `"8.0"` {
+		t.Errorf("LONGITUDE must remain in payload as bare string; got %s", string(got["LONGITUDE"]))
 	}
 }
 
@@ -174,10 +216,23 @@ func TestConfigPost_MixedChangeUnchangedPassthrough(t *testing.T) {
 	// MLAT_USER is the only tracked key carrying metadata.
 	assertFieldUpdate(t, "MLAT_USER", got["MLAT_USER"], "bob", start, end)
 
-	// Every other tracked key omitted.
-	for _, k := range []string{"LATITUDE", "LONGITUDE", "ALTITUDE", "MLAT_ENABLED", "MLAT_PRIVATE"} {
-		if raw, ok := got[k]; ok {
-			t.Errorf("unchanged tracked key %s should be omitted, got %s", k, string(raw))
+	// Every other tracked key passes through as a bare string. None
+	// gets metadata; the apply lib's bare-string path will treat them
+	// as no-change and leave their sidecar tuples alone.
+	for k, wantBare := range map[string]string{
+		"LATITUDE":     `"47.0"`,
+		"LONGITUDE":    `"8.0"`,
+		"ALTITUDE":     `"120m"`,
+		"MLAT_ENABLED": `"true"`,
+		"MLAT_PRIVATE": `"false"`,
+	} {
+		raw, ok := got[k]
+		if !ok {
+			t.Errorf("unchanged tracked key %s missing from payload; want bare string", k)
+			continue
+		}
+		if string(raw) != wantBare {
+			t.Errorf("%s wire shape = %s, want bare string %s", k, string(raw), wantBare)
 		}
 	}
 
@@ -188,24 +243,31 @@ func TestConfigPost_MixedChangeUnchangedPassthrough(t *testing.T) {
 	}
 }
 
-// TestConfigPost_FeedEnvReadFailureTreatsAllAsBootstrap proves the
+// TestConfigPost_FeedEnvReadFailureFallsBackToBareStrings proves the
 // degrade-rather-than-refuse posture: if feed.env can't be read at the
-// metadata-gate step, every tracked key in the payload is treated as a
-// bootstrap write so the save still goes through.
-func TestConfigPost_FeedEnvReadFailureTreatsAllAsBootstrap(t *testing.T) {
+// metadata-gate step, every key passes through as a bare string (no
+// metadata at all). This matches the pre-DEV-383 behavior so a transient
+// read failure does not silently stamp every tracked key as bootstrap.
+func TestConfigPost_FeedEnvReadFailureFallsBackToBareStrings(t *testing.T) {
 	h := newWriteHarness(t)
-	// Remove the seed feed.env so ReadAll returns ErrNotFound.
 	if err := os.Remove(h.feedEnvPath); err != nil {
 		t.Fatal(err)
 	}
-	start := time.Now().UTC().Add(-time.Second)
 	got := captureUpdates(t, h, map[string]string{
 		"MLAT_USER": "bob",
 		"GAIN":      "42",
 	})
-	end := time.Now().UTC().Add(time.Second)
-	assertFieldUpdate(t, "MLAT_USER", got["MLAT_USER"], "bob", start, end)
+	if string(got["MLAT_USER"]) != `"bob"` {
+		t.Errorf("MLAT_USER must fall back to bare string on read failure; got %s", string(got["MLAT_USER"]))
+	}
 	if string(got["GAIN"]) != `"42"` {
 		t.Errorf("GAIN = %s, want bare string", string(got["GAIN"]))
+	}
+	// Ensure nothing decoded as a FieldUpdate.
+	for k, raw := range got {
+		var probe map[string]any
+		if json.Unmarshal(raw, &probe) == nil {
+			t.Errorf("%s decoded as object %#v; want bare string on read-failure fallback", k, probe)
+		}
 	}
 }

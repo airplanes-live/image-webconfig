@@ -429,16 +429,20 @@ func (s *Server) handleConfigPost(w http.ResponseWriter, r *http.Request) {
 	// write is handled by the apply library's flock + LWW gate — the
 	// race is benign (worst case: one wasted no-op apply round trip).
 	//
-	// A read error here is not fatal: pass an empty current map so every
-	// tracked key in the payload is treated as a bootstrap write
-	// (metadata attached). The apply library still validates and writes
-	// atomically; we degrade rather than refuse the save.
+	// A read error is not fatal: fall back to a bare-string payload —
+	// every posted key passes through with no metadata, which matches
+	// the pre-DEV-383 behavior. We must NOT treat the read failure as
+	// bootstrap; that would attach metadata to every tracked key the
+	// form posts, including unchanged ones, and stamp fresh edited_at
+	// tuples across the sidecar on every save.
 	current, readErr := s.feedEnv.ReadAll()
+	var payload map[string]any
 	if readErr != nil {
-		log.Printf("config-post: feed.env pre-read for metadata gating failed: %v", readErr)
-		current = nil
+		log.Printf("config-post: feed.env pre-read for metadata gating failed; falling back to bare-string payload: %v", readErr)
+		payload = feedmeta.BareStringPayload(req.Updates)
+	} else {
+		payload = feedmeta.BuildApplyPayload(current, req.Updates, s.now())
 	}
-	payload := feedmeta.BuildApplyPayload(current, req.Updates, s.now())
 
 	resp, status, err := s.invokeApplyFeed(r.Context(), payload)
 	if err != nil {
