@@ -47,10 +47,15 @@ HEALTH_URL=http://127.0.0.1:8080/health
 HEALTH_MAX_ATTEMPTS=10
 HEALTH_SLEEP_SECONDS=1
 
-# Restores the previous binary, unit file, and manifest (if backed up) and
-# restarts the service so the rollback takes effect, then exits with the
-# supplied code. The manifest backs up too so /health and the SPA report
-# the actually-running version after a rollback, not the failed release's.
+MANIFEST_EXISTED=0
+
+# Restores the previous binary, unit file, and manifest, then restarts the
+# service so the rollback takes effect. Exits with the supplied code.
+#
+# Manifest handling has two cases: if a manifest existed before the install,
+# the .prev backup is restored. If no manifest existed before (e.g. a feeder
+# that hasn't carried one yet), install.sh's just-written manifest is removed
+# so the device doesn't report the failed release's version.
 rollback_and_exit() {
     local rc="$1"
     local restored=0
@@ -60,8 +65,10 @@ rollback_and_exit() {
     if [ -f "${UNIT_FILE}.prev" ]; then
         mv -f "${UNIT_FILE}.prev" "$UNIT_FILE" && restored=1
     fi
-    if [ -f "${MANIFEST}.prev" ]; then
+    if [ "$MANIFEST_EXISTED" -eq 1 ] && [ -f "${MANIFEST}.prev" ]; then
         mv -f "${MANIFEST}.prev" "$MANIFEST" && restored=1
+    elif [ "$MANIFEST_EXISTED" -eq 0 ] && [ -f "$MANIFEST" ]; then
+        rm -f "$MANIFEST" && restored=1
     fi
     if [ "$restored" -eq 1 ]; then
         systemctl daemon-reload || true
@@ -86,6 +93,7 @@ if [ -f "$UNIT_FILE" ]; then
 fi
 if [ -f "$MANIFEST" ]; then
     cp -a "$MANIFEST" "${MANIFEST}.prev"
+    MANIFEST_EXISTED=1
 fi
 
 echo "webconfig-self-update: invoking $INSTALLER"
@@ -103,8 +111,10 @@ if [ "$rc" -ne 0 ]; then
         mv -f "${UNIT_FILE}.prev" "$UNIT_FILE"
         systemctl daemon-reload || true
     fi
-    if [ -f "${MANIFEST}.prev" ]; then
+    if [ "$MANIFEST_EXISTED" -eq 1 ] && [ -f "${MANIFEST}.prev" ]; then
         mv -f "${MANIFEST}.prev" "$MANIFEST"
+    elif [ "$MANIFEST_EXISTED" -eq 0 ] && [ -f "$MANIFEST" ]; then
+        rm -f "$MANIFEST"
     fi
     exit "$rc"
 fi

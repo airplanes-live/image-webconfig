@@ -23,8 +23,12 @@
 load lib/release_fixture.bash
 
 setup() {
-    # Refuse to mutate a developer's host filesystem.
-    if [ ! -f /.dockerenv ] && [ -z "${AIRPLANES_BATS_INSIDE_CONTAINER:-}" ]; then
+    # The bats mutate /usr/local/bin, /etc/systemd, /etc/airplanes, etc.
+    # An arbitrary container (e.g. a developer's devcontainer) may also
+    # carry /.dockerenv but is not safe to mutate. Require the explicit
+    # opt-in marker that dockerized-bats.sh sets so only that harness can
+    # run this file.
+    if [ -z "${AIRPLANES_BATS_INSIDE_CONTAINER:-}" ]; then
         skip "test_self_update.bats mutates production paths; run via test/bats/dockerized-bats.sh"
     fi
 
@@ -206,9 +210,10 @@ run_helper() {
 
 @test "env -i scrubs caller AIRPLANES_* vars before invoking installer" {
     # Replace update.sh with a marker-writing stub. If env -i scrubs as
-    # documented, the marker will say <unset> for both vars. If the helper
-    # regresses and propagates the caller's env, the marker will say
-    # http://attacker.example — proving the privilege boundary leaked.
+    # documented, the marker reads <unset> for both vars. If the helper
+    # regressed and propagated the caller's env, the marker would carry the
+    # caller-supplied URL — that would let an unprivileged caller redirect
+    # downloads via sudo, breaking the privilege boundary.
     cat > /usr/local/share/airplanes-webconfig/update.sh <<'STUB'
 #!/bin/bash
 {
@@ -219,13 +224,30 @@ exit 0
 STUB
     chmod 0755 /usr/local/share/airplanes-webconfig/update.sh
 
-    AIRPLANES_WEBCONFIG_REPO=http://attacker.example \
-    AIRPLANES_WEBCONFIG_DOWNLOAD_BASE=http://attacker.example \
+    AIRPLANES_WEBCONFIG_REPO=http://caller-supplied.example \
+    AIRPLANES_WEBCONFIG_DOWNLOAD_BASE=http://caller-supplied.example \
         run run_helper
 
     [ "$status" -eq 0 ] || { echo "$output"; false; }
     grep -q '^REPO=<unset>$' /tmp/airplanes-test/env-scrub.log
     grep -q '^DOWNLOAD_BASE=<unset>$' /tmp/airplanes-test/env-scrub.log
+}
+
+@test "rollback when no pre-existing manifest removes the failed-release manifest" {
+    # Simulate a feeder that never carried /etc/airplanes/webconfig-release.json
+    # (e.g. a baseline image that predates the manifest). The helper must not
+    # leave the just-written failed-release manifest in place after rollback —
+    # the device would otherwise lie about its installed version.
+    rm -f /etc/airplanes/webconfig-release.json
+    printf 'fail' > /tmp/airplanes-test/health-mode
+
+    run run_helper
+    [ "$status" -ne 0 ]
+    echo "$output" | grep -q 'health probe exhausted'
+
+    grep -q 'version=v0.1.0 baseline binary' /usr/local/bin/airplanes-webconfig
+    [ ! -f /etc/airplanes/webconfig-release.json ]
+    [ ! -f /etc/airplanes/webconfig-release.json.prev ]
 }
 
 @test "exits 75 when another update is already running" {

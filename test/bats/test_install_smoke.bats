@@ -270,11 +270,9 @@ STUB
     unset ROOTFS_DIR
     export AIRPLANES_ROOT
 
-    # Install A — should resolve to v9.9.10 (highest semver in the remote)
-    # … wait — we want A=v9.9.9 first. The resolver picks the highest tag.
-    # Drop v9.9.10 from the seed-2 push, then re-tag after install A. Use a
-    # narrower fixture: temporarily move the v9.9.10 symlink and re-tag the
-    # remote so install A only sees v9.9.9.
+    # The stable resolver picks the highest semver tag. Drop v9.9.10 from
+    # the remote before install A so the resolver picks v9.9.9; re-push
+    # v9.9.10 between A and B.
     git -C "$SEED2" push -q origin :refs/tags/v9.9.10
 
     PATH="$STUB_DIR:$PATH" run bash "$REPO_ROOT/install.sh" --runtime
