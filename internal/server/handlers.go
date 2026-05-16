@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/airplanes-live/image-webconfig/internal/auth"
+	"github.com/airplanes-live/image-webconfig/internal/feedmeta"
 	"github.com/airplanes-live/image-webconfig/internal/identity"
 	"github.com/airplanes-live/image-webconfig/internal/logs"
 )
@@ -422,7 +423,24 @@ func (s *Server) handleConfigPost(w http.ResponseWriter, r *http.Request) {
 	s.configMu.Lock()
 	defer s.configMu.Unlock()
 
-	resp, status, err := s.invokeApplyFeed(r.Context(), req.Updates)
+	// Read current feed.env under the same configMu so the "did this
+	// tracked key actually change" determination is consistent against
+	// concurrent webconfig writers. A concurrent `apl-feed config sync`
+	// write is handled by the apply library's flock + LWW gate — the
+	// race is benign (worst case: one wasted no-op apply round trip).
+	//
+	// A read error here is not fatal: pass an empty current map so every
+	// tracked key in the payload is treated as a bootstrap write
+	// (metadata attached). The apply library still validates and writes
+	// atomically; we degrade rather than refuse the save.
+	current, readErr := s.feedEnv.ReadAll()
+	if readErr != nil {
+		log.Printf("config-post: feed.env pre-read for metadata gating failed: %v", readErr)
+		current = nil
+	}
+	payload := feedmeta.BuildApplyPayload(current, req.Updates, s.now())
+
+	resp, status, err := s.invokeApplyFeed(r.Context(), payload)
 	if err != nil {
 		log.Printf("config-post: %v", err)
 		writeJSONError(w, http.StatusInternalServerError, "config write failed")
@@ -508,7 +526,7 @@ func synthesizeError(resp *applyFeedResponse) {
 //	parse_error      → 400 (apl-feed received malformed input from us, but
 //	                       forward as 400 so the client sees the message)
 //	usage_error      → 500 (programmer error: argv shape diverged)
-func (s *Server) invokeApplyFeed(ctx context.Context, updates map[string]string) (applyFeedResponse, int, error) {
+func (s *Server) invokeApplyFeed(ctx context.Context, updates map[string]any) (applyFeedResponse, int, error) {
 	body, err := json.Marshal(map[string]any{"updates": updates})
 	if err != nil {
 		return applyFeedResponse{}, 0, err
