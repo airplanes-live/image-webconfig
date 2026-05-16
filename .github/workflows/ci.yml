@@ -14,7 +14,7 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
-      - uses: actions/setup-go@d35c59abb061a4a6fb18e82ac0862c26744d6ab5  # v5.5.0
+      - uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c  # v6.4.0
         with:
           go-version-file: go.mod
       - run: go vet ./...
@@ -35,7 +35,7 @@ jobs:
       cancel-in-progress: true
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
-      - uses: actions/setup-go@d35c59abb061a4a6fb18e82ac0862c26744d6ab5  # v5.5.0
+      - uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c  # v6.4.0
         with:
           go-version-file: go.mod
       - name: cross-compile airplanes-webconfig-${{ matrix.arch }}
@@ -100,4 +100,66 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends bats
       - name: Run bats suite
+        # test_self_update.bats skips on the host (mutates production paths);
+        # it runs via the bats-self-update job below.
         run: bats test/bats/
+
+  build-release-smoke:
+    # Exercise scripts/lib/build-release.sh end-to-end and inspect the produced
+    # release tarball. Catches release-pipeline regressions (missing installer
+    # in the rootfs payload, wrong sudoers mode, missing assets) before they
+    # ship via release.yml — which calls the same script.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+      - uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c  # v6.4.0
+        with:
+          go-version-file: go.mod
+      - name: build a v9.9.9 release locally
+        run: |
+          bash scripts/lib/build-release.sh \
+            --version v9.9.9 \
+            --output "$RUNNER_TEMP/release" \
+            --kind stable
+      - name: assert all five assets present
+        run: |
+          for f in airplanes-webconfig-arm64 airplanes-webconfig-armhf rootfs.tar.gz manifest.json SHA256SUMS; do
+            [ -s "$RUNNER_TEMP/release/$f" ] || { echo "missing $f"; exit 1; }
+          done
+      - name: verify SHA256SUMS
+        working-directory: ${{ runner.temp }}/release
+        run: sha256sum -c SHA256SUMS
+      - name: assert installer staged in rootfs payload
+        run: |
+          tar -tzf "$RUNNER_TEMP/release/rootfs.tar.gz" | \
+            grep -qE '^\./usr/local/share/airplanes-webconfig/install\.sh$'
+          tar -tzf "$RUNNER_TEMP/release/rootfs.tar.gz" | \
+            grep -qE '^\./usr/local/share/airplanes-webconfig/update\.sh$'
+          tar -tzf "$RUNNER_TEMP/release/rootfs.tar.gz" | \
+            grep -qE '^\./usr/local/share/airplanes-webconfig/scripts/lib/install-common\.sh$'
+      - name: assert sudoers files carry mode 0440 in tarball
+        run: |
+          # File entries only (drop the directory entry). Each line that
+          # references files under etc/sudoers.d/ must start with -r--r-----.
+          bad="$(tar -tzvf "$RUNNER_TEMP/release/rootfs.tar.gz" | \
+            awk '/^-/ && $NF ~ /etc\/sudoers\.d\// && $1 != "-r--r-----" {print}')"
+          if [ -n "$bad" ]; then
+            echo "found sudoers file(s) with wrong mode:"
+            echo "$bad"
+            exit 1
+          fi
+
+  bats-self-update:
+    # test_self_update.bats exercises webconfig-self-update.sh end-to-end. The
+    # helper re-execs under env -i and operates on absolute production paths
+    # (/usr/local/bin/airplanes-webconfig, /etc/systemd/..., /etc/airplanes/...,
+    # http://127.0.0.1:8080/health). $PATH shims don't survive env -i and the
+    # paths can't be relocated for a test, so the bats run inside a disposable
+    # debian:trixie-slim container instead. See test/bats/dockerized-bats.sh.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+      - name: Run self-update helper bats inside debian:trixie-slim
+        run: bash test/bats/dockerized-bats.sh
