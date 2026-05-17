@@ -91,12 +91,17 @@ rollback_and_exit() {
             rollback_failed=1
         fi
     fi
+    # Log the rollback summary BEFORE the restart — the restart kills the
+    # webconfig service and with it the SSE log stream the SPA is reading,
+    # so anything logged after the restart never reaches the user.
+    if [ "$rollback_failed" -eq 1 ]; then
+        echo "ERROR: rollback completed with errors; device may need manual intervention" >&2
+    fi
     if [ "$restored" -eq 1 ]; then
         systemctl daemon-reload || true
         systemctl restart "$SERVICE" || true
     fi
     if [ "$rollback_failed" -eq 1 ]; then
-        echo "ERROR: rollback completed with errors; device may need manual intervention" >&2
         exit 2
     fi
     exit "$rc"
