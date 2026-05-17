@@ -60,13 +60,15 @@ type WifiProbe struct {
 // NewWifiProbe binds a probe to a state pointer.
 func NewWifiProbe(s *State) *WifiProbe { return &WifiProbe{state: s} }
 
-// Probe returns a synthetic signal snapshot. The percent jitters in
-// the 60–85 range to avoid the "weak signal" alarm. nil-on-no-active
-// matches what production does when nmcli reports no connection.
+// Probe returns a synthetic signal snapshot. The simulated machine
+// always has a Wi-Fi radio, so we never return nil — production
+// returns nil only on "no hardware". When no profile is active we
+// emit {Connected: false, Iface: "wlan0"} so the dashboard tile
+// renders the disconnected state instead of hiding altogether.
 func (p *WifiProbe) Probe(_ context.Context) *wifi.Signal {
 	active, _ := p.state.WifiStatus()
 	if active == nil {
-		return nil
+		return &wifi.Signal{Connected: false, Iface: "wlan0"}
 	}
 	tick := time.Now().UnixNano() / int64(time.Millisecond)
 	pct := 60 + int(tick%25)

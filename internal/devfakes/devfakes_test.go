@@ -80,28 +80,75 @@ func TestApplyFeed_GeoConfiguredDerived(t *testing.T) {
 	s := mustNewState(t)
 	priv := StubPrivilegedArgv()
 	runner := StdinRunner(s, priv)
-	// Clearing LATITUDE should flip GEO_CONFIGURED to false even though
-	// the client only posted LATITUDE.
+	// Clearing LATITUDE only — LONGITUDE stays "-0.1". Production
+	// considers an axis "zero" only when both are empty/zero; with a
+	// non-zero LONGITUDE, GEO_CONFIGURED stays true.
 	payload := `{"updates":{"LATITUDE":""}}`
-	res, err := runner(context.Background(), priv.ApplyFeed, strings.NewReader(payload))
-	if err != nil {
+	if _, err := runner(context.Background(), priv.ApplyFeed, strings.NewReader(payload)); err != nil {
 		t.Fatalf("runner: %v", err)
 	}
-	var env struct {
-		Changed []string `json:"changed"`
+	if s.FeedEnvSnapshot()["GEO_CONFIGURED"] != "true" {
+		t.Fatalf("GEO_CONFIGURED flipped despite non-zero LONGITUDE, snapshot=%v", s.FeedEnvSnapshot())
 	}
-	_ = json.Unmarshal(res.Stdout, &env)
-	if !containsAll(env.Changed, "LATITUDE", "GEO_CONFIGURED") {
-		t.Fatalf("changed=%v want LATITUDE+GEO_CONFIGURED", env.Changed)
+	// Clearing LONGITUDE too — now both axes are zero/empty → false.
+	payload = `{"updates":{"LONGITUDE":""}}`
+	if _, err := runner(context.Background(), priv.ApplyFeed, strings.NewReader(payload)); err != nil {
+		t.Fatalf("runner: %v", err)
 	}
 	if s.FeedEnvSnapshot()["GEO_CONFIGURED"] != "false" {
-		t.Fatalf("GEO_CONFIGURED not flipped, snapshot=%v", s.FeedEnvSnapshot())
+		t.Fatalf("GEO_CONFIGURED not flipped after clearing both axes, snapshot=%v", s.FeedEnvSnapshot())
 	}
-	// Restoring LATITUDE flips it back.
+	// Re-set just LATITUDE — that one axis non-zero is enough for true.
 	payload = `{"updates":{"LATITUDE":"51.5"}}`
-	_, _ = runner(context.Background(), priv.ApplyFeed, strings.NewReader(payload))
+	if _, err := runner(context.Background(), priv.ApplyFeed, strings.NewReader(payload)); err != nil {
+		t.Fatalf("runner: %v", err)
+	}
 	if s.FeedEnvSnapshot()["GEO_CONFIGURED"] != "true" {
 		t.Fatalf("GEO_CONFIGURED not restored, snapshot=%v", s.FeedEnvSnapshot())
+	}
+}
+
+func TestApplyFeed_GeoDerive_ZeroIsNotMeaningful(t *testing.T) {
+	t.Parallel()
+	s := mustNewState(t)
+	priv := StubPrivilegedArgv()
+	runner := StdinRunner(s, priv)
+	// LATITUDE=0 + LONGITUDE=0 → false (both axes numerically zero).
+	payload := `{"updates":{"LATITUDE":"0","LONGITUDE":"0"}}`
+	if _, err := runner(context.Background(), priv.ApplyFeed, strings.NewReader(payload)); err != nil {
+		t.Fatalf("runner: %v", err)
+	}
+	if s.FeedEnvSnapshot()["GEO_CONFIGURED"] != "false" {
+		t.Fatalf("zero/zero should derive false, snapshot=%v", s.FeedEnvSnapshot())
+	}
+	// LATITUDE=0 alone with prior LONGITUDE intact: production treats
+	// 0 as "zero axis", but the prior LONGITUDE was -0.1 — wait, we
+	// just cleared both. Use a fresh state and exercise the equator
+	// case: lat=0 alongside a real lon stays true.
+	s2 := mustNewState(t)
+	r2 := StdinRunner(s2, priv)
+	payload = `{"updates":{"LATITUDE":"0"}}`
+	if _, err := r2(context.Background(), priv.ApplyFeed, strings.NewReader(payload)); err != nil {
+		t.Fatalf("runner: %v", err)
+	}
+	if s2.FeedEnvSnapshot()["GEO_CONFIGURED"] != "true" {
+		t.Fatalf("equator (lat=0, lon=-0.1) should derive true, snapshot=%v", s2.FeedEnvSnapshot())
+	}
+}
+
+func TestApplyFeed_ExplicitGeoOverrideWins(t *testing.T) {
+	t.Parallel()
+	s := mustNewState(t)
+	priv := StubPrivilegedArgv()
+	runner := StdinRunner(s, priv)
+	// Caller pins GEO_CONFIGURED=false alongside a non-zero lat: the
+	// explicit override skips derivation entirely.
+	payload := `{"updates":{"LATITUDE":"51.5","GEO_CONFIGURED":"false"}}`
+	if _, err := runner(context.Background(), priv.ApplyFeed, strings.NewReader(payload)); err != nil {
+		t.Fatalf("runner: %v", err)
+	}
+	if s.FeedEnvSnapshot()["GEO_CONFIGURED"] != "false" {
+		t.Fatalf("explicit GEO_CONFIGURED=false was overridden, snapshot=%v", s.FeedEnvSnapshot())
 	}
 }
 
@@ -135,14 +182,29 @@ func TestWifi_FullRoundtrip(t *testing.T) {
 		t.Fatalf("seed list networks=%d want 2", len(listEnv["networks"].([]any)))
 	}
 
-	// Add a network.
-	addEnv := decodeStdinCall(t, runStdin, priv.WifiAdd, `{"ssid":"new-net","psk":"abcd1234","priority":3}`)
+	// Add a network with test:true (the SPA default). Production returns
+	// {status, id, uuid, ssid, active, changed} and leaves the tested
+	// profile active.
+	addEnv := decodeStdinCall(t, runStdin, priv.WifiAdd, `{"ssid":"new-net","psk":"abcd1234","priority":3,"test":true}`)
 	if addEnv["status"] != "applied" {
 		t.Fatalf("add status=%v (env=%v)", addEnv["status"], addEnv)
 	}
 	id, _ := addEnv["id"].(string)
 	if id == "" {
 		t.Fatalf("add: no id returned (env=%v)", addEnv)
+	}
+	if addEnv["uuid"] == "" || addEnv["uuid"] == nil {
+		t.Fatalf("add: uuid missing (env=%v)", addEnv)
+	}
+	if addEnv["ssid"] != "new-net" {
+		t.Fatalf("add: ssid=%v want new-net", addEnv["ssid"])
+	}
+	if addEnv["active"] != true {
+		t.Fatalf("add: active=%v want true (test:true should activate)", addEnv["active"])
+	}
+	changed, _ := addEnv["changed"].([]any)
+	if len(changed) != 1 || changed[0] != id {
+		t.Fatalf("add: changed=%v want [%s]", addEnv["changed"], id)
 	}
 
 	listEnv = decodeStdinCall(t, runStdin, priv.WifiList, "")
@@ -202,6 +264,34 @@ func TestSystemctl_IsActiveMixedUnits(t *testing.T) {
 	res, _ = runner(context.Background(), []string{"/usr/bin/systemctl", "is-active", "airplanes-feed.service"})
 	if strings.TrimSpace(string(res.Stdout)) != "active" {
 		t.Fatalf("monitored service state=%q want active", res.Stdout)
+	}
+}
+
+func TestSystemdRun_PinsMaintenanceUnitActivating(t *testing.T) {
+	t.Parallel()
+	s := mustNewState(t)
+	priv := StubPrivilegedArgv()
+	runner := Runner(s, priv)
+	// Fire the update transient — the maintenance unit must flip to
+	// `activating` so a follow-up handlers.maintenanceUnitActive guard
+	// returns the unit name and the second click sees 409.
+	if _, err := runner(context.Background(), priv.StartUpdate); err != nil {
+		t.Fatalf("runner: %v", err)
+	}
+	if got := s.ServiceState("airplanes-update.service"); got != "activating" {
+		t.Fatalf("after StartUpdate: airplanes-update.service=%q want activating", got)
+	}
+	// Fan-out is-active over the three maintenance units; the update
+	// one must come back activating, the others inactive.
+	res, _ := runner(context.Background(), []string{
+		"/usr/bin/systemctl", "is-active",
+		"airplanes-system-upgrade.service",
+		"airplanes-update.service",
+		"airplanes-webconfig-update.service",
+	})
+	lines := strings.Split(strings.TrimRight(string(res.Stdout), "\n"), "\n")
+	if len(lines) != 3 || lines[0] != "inactive" || lines[1] != "activating" || lines[2] != "inactive" {
+		t.Fatalf("is-active fan-out=%v want [inactive activating inactive]", lines)
 	}
 }
 
