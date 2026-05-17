@@ -31,6 +31,8 @@ var ReadKeys = []string{
 	"MLAT_USER",
 	"MLAT_ENABLED",
 	"MLAT_PRIVATE",
+	"REPORT_STATUS",
+	"REMOTE_CONFIG_ENABLED",
 	"INPUT",
 	"INPUT_TYPE",
 	"GAIN",

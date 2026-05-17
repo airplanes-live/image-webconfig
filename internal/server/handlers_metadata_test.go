@@ -243,6 +243,47 @@ func TestConfigPost_MixedChangeUnchangedPassthrough(t *testing.T) {
 	}
 }
 
+// TestConfigPost_PrivacyTogglesPassThroughAsBareStrings is the HTTP-level
+// regression for REPORT_STATUS and REMOTE_CONFIG_ENABLED. These keys are
+// privacy gates, not user-edited state, so the apply payload must carry
+// them as bare strings — never wrapped in a FieldUpdate metadata object —
+// regardless of whether their value differs from the on-disk current.
+func TestConfigPost_PrivacyTogglesPassThroughAsBareStrings(t *testing.T) {
+	h := newWriteHarness(t)
+	if err := os.WriteFile(h.feedEnvPath,
+		[]byte(`REPORT_STATUS=true`+"\n"+`REMOTE_CONFIG_ENABLED=false`+"\n"),
+		0o644,
+	); err != nil {
+		t.Fatal(err)
+	}
+	got := captureUpdates(t, h, map[string]string{
+		"REPORT_STATUS":         "false",
+		"REMOTE_CONFIG_ENABLED": "true",
+	})
+	for k, wantWire := range map[string]string{
+		"REPORT_STATUS":         `"false"`,
+		"REMOTE_CONFIG_ENABLED": `"true"`,
+	} {
+		raw, ok := got[k]
+		if !ok {
+			t.Errorf("%s missing from apply payload; want bare string %s", k, wantWire)
+			continue
+		}
+		if string(raw) != wantWire {
+			t.Errorf("%s wire shape = %s, want bare string %s (privacy gate must not carry metadata)", k, string(raw), wantWire)
+		}
+		// Defence-in-depth: confirm raw does not parse as a metadata object.
+		var probe struct {
+			Value    string `json:"value"`
+			EditedAt string `json:"edited_at"`
+			EditedBy string `json:"edited_by"`
+		}
+		if err := json.Unmarshal(raw, &probe); err == nil && (probe.EditedBy != "" || probe.EditedAt != "") {
+			t.Errorf("%s decoded as FieldUpdate %#v; privacy keys must be bare strings", k, probe)
+		}
+	}
+}
+
 // TestConfigPost_FeedEnvReadFailureFallsBackToBareStrings proves the
 // degrade-rather-than-refuse posture: if feed.env can't be read at the
 // metadata-gate step, every key passes through as a bare string (no
