@@ -1,6 +1,7 @@
 package server
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"sort"
@@ -75,15 +76,27 @@ func privilegedArgvCases(priv PrivilegedArgv) []privilegedArgvCase {
 	}
 }
 
-// ValidatePrivilegedArgvParity asserts every sudo-prefixed argv in priv has
-// an exact NOPASSWD line in the supplied sudoers files. Exact match — not
-// substring — because sudo authorizes by full command line, so an entry
-// allowing `apl-feed apply --json` would NOT authorize `apl-feed apply
-// --json --extra` even though a substring match would say it did.
+// ValidatePrivilegedArgvParity asserts the set of sudo-prefixed argv shapes
+// in priv equals the set of NOPASSWD lines in the supplied sudoers files —
+// both directions. Exact match — not substring — because sudo authorizes
+// by full command line, so an entry allowing `apl-feed apply --json` would
+// NOT authorize `apl-feed apply --json --extra` even though a substring
+// match would say it did.
 //
-// Returns nil on parity, an error otherwise. The error message lists every
-// missing entry and (for diagnosis) the known commands present in the
-// sudoers files.
+// "Missing" entries (argv shape with no matching sudoers line) are the
+// usual case: a new binary calls something the deployed sudoers files don't
+// permit; the sudo call fails at runtime with an unhelpful diagnostic.
+//
+// "Extra" entries (sudoers line with no matching argv shape) are the
+// security-relevant case: a deprecated argv shape was removed from the
+// binary but its NOPASSWD line still lives on the device. The grant is
+// dead code that the running binary doesn't exercise; an attacker who
+// pivots into the airplanes-webconfig service account inherits it
+// unnecessarily.
+//
+// Returns nil on parity, an error otherwise. The error message lists
+// missing and extra entries separately so an operator can act on the
+// right side.
 //
 // Used in two places:
 //   - The unit test TestDefaultPrivilegedArgv_SudoersParity (against the
@@ -98,30 +111,39 @@ func ValidatePrivilegedArgvParity(priv PrivilegedArgv, sudoersPaths ...string) e
 		return err
 	}
 
+	cases := privilegedArgvCases(priv)
+	expected := make(map[string]struct{}, len(cases))
 	var missing []string
-	for _, tc := range privilegedArgvCases(priv) {
+	for _, tc := range cases {
 		if len(tc.argv) < 3 || tc.argv[0] != "/usr/bin/sudo" || tc.argv[1] != "-n" {
 			return fmt.Errorf("%s: argv must start with /usr/bin/sudo -n, got %v", tc.label, tc.argv)
 		}
 		tail := strings.Join(tc.argv[2:], " ")
+		expected[tail] = struct{}{}
 		if _, ok := commands[tail]; !ok {
 			missing = append(missing, fmt.Sprintf("  %s: %q", tc.label, tail))
 		}
 	}
 
-	if len(missing) == 0 {
+	var extras []string
+	for cmd := range commands {
+		if _, ok := expected[cmd]; !ok {
+			extras = append(extras, fmt.Sprintf("  %q", cmd))
+		}
+	}
+	sort.Strings(extras)
+
+	if len(missing) == 0 && len(extras) == 0 {
 		return nil
 	}
 
-	known := make([]string, 0, len(commands))
-	for k := range commands {
-		known = append(known, k)
+	var b strings.Builder
+	fmt.Fprintf(&b, "sudoers parity check failed against %v", sudoersPaths)
+	if len(missing) > 0 {
+		fmt.Fprintf(&b, "\n%d argv shape(s) have no matching NOPASSWD line:\n%s", len(missing), strings.Join(missing, "\n"))
 	}
-	sort.Strings(known)
-
-	return fmt.Errorf("sudoers parity check failed — %d argv shapes have no matching NOPASSWD line:\n%s\nknown NOPASSWD commands in %v:\n  %s",
-		len(missing),
-		strings.Join(missing, "\n"),
-		sudoersPaths,
-		strings.Join(known, "\n  "))
+	if len(extras) > 0 {
+		fmt.Fprintf(&b, "\n%d NOPASSWD line(s) have no matching argv shape:\n%s", len(extras), strings.Join(extras, "\n"))
+	}
+	return errors.New(b.String())
 }
