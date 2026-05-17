@@ -356,6 +356,44 @@ func TestBuildApplyPayload_JSONShape(t *testing.T) {
 	}
 }
 
+// TestBuildApplyPayload_PrivacyTogglesAreBareStrings pins the wire shape
+// for the REPORT_STATUS and REMOTE_CONFIG_ENABLED toggles. They are
+// privacy gates rather than user-edited state, so they must not appear
+// in TrackedKeys and must flow through the apply path as bare strings —
+// no FieldUpdate wrapping even when the value differs from current.
+func TestBuildApplyPayload_PrivacyTogglesAreBareStrings(t *testing.T) {
+	for _, key := range []string{"REPORT_STATUS", "REMOTE_CONFIG_ENABLED"} {
+		if IsTracked(key) {
+			t.Errorf("IsTracked(%q) = true, want false (privacy gate, not tracked state)", key)
+		}
+	}
+	// Mix both keys in a single payload alongside an unrelated value
+	// change so the bare-string assertion is exercised against a real
+	// posted-vs-current diff rather than an empty current map.
+	current := map[string]string{
+		"REPORT_STATUS":         "true",
+		"REMOTE_CONFIG_ENABLED": "false",
+	}
+	posted := map[string]string{
+		"REPORT_STATUS":         "false",
+		"REMOTE_CONFIG_ENABLED": "true",
+	}
+	got := BuildApplyPayload(current, posted, fixedNow)
+	for k, wantValue := range posted {
+		v, ok := got[k]
+		if !ok {
+			t.Errorf("%s missing from payload, want bare string %q", k, wantValue)
+			continue
+		}
+		if _, isUpdate := v.(FieldUpdate); isUpdate {
+			t.Errorf("%s carried FieldUpdate metadata; privacy toggles must be bare strings", k)
+		}
+		if s, isStr := v.(string); !isStr || s != wantValue {
+			t.Errorf("%s = %#v, want bare string %q", k, v, wantValue)
+		}
+	}
+}
+
 // TestTrackedKeys_Sorted is a smoke test: order doesn't affect behavior
 // (we build a set), but a stable canonical order makes diffs against the
 // feed-side list easier to read.

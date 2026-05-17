@@ -1144,6 +1144,50 @@
             gainRow,
         );
 
+        // ===== Privacy & remote control =====
+        // Two bare-string passthrough toggles. REPORT_STATUS defaults to
+        // checked (diagnostics opt-out); REMOTE_CONFIG_ENABLED defaults
+        // to unchecked (remote-config opt-in). Both keys must be in the
+        // "always send" list at submit time so unchecking still POSTs
+        // the literal "false" rather than being stripped as an empty key.
+        const reportStatusOn = (values["REPORT_STATUS"] || "true") === "true";
+        const reportStatusId = fieldId("REPORT_STATUS");
+        const reportStatus = el("input", {
+            id: reportStatusId,
+            type: "checkbox",
+            name: "REPORT_STATUS",
+            checked: reportStatusOn ? "" : null,
+        });
+        inputs["REPORT_STATUS"] = reportStatus;
+
+        const remoteConfigOn = (values["REMOTE_CONFIG_ENABLED"] || "false") === "true";
+        const remoteConfigId = fieldId("REMOTE_CONFIG_ENABLED");
+        const remoteConfig = el("input", {
+            id: remoteConfigId,
+            type: "checkbox",
+            name: "REMOTE_CONFIG_ENABLED",
+            checked: remoteConfigOn ? "" : null,
+        });
+        inputs["REMOTE_CONFIG_ENABLED"] = remoteConfig;
+
+        const privacyFieldset = el("fieldset", { class: "config-fieldset" },
+            el("legend", {}, "Privacy & remote control"),
+            el("div", { class: "field" },
+                el("label", { for: reportStatusId }, reportStatus, " Send feeder diagnostics to airplanes.live"),
+            ),
+            el("p", { class: "help" },
+                "Reports CPU, memory, disk, temperature, Pi health and service state to airplanes.live. ",
+                "Only the feeder's owner can see them. Turning this off sends one final muted signal, then the feeder goes quiet.",
+            ),
+            el("div", { class: "field" },
+                el("label", { for: remoteConfigId }, remoteConfig, " Allow airplanes.live to edit this feeder remotely"),
+            ),
+            el("p", { class: "help" },
+                "Lets the website change position, altitude and MLAT identity for this feeder. ",
+                "Local edits here keep working either way. Leaving this off means the feeder doesn't poll airplanes.live for config at all.",
+            ),
+        );
+
         // ===== 978 UAT: toggle + collapsed sub-fields =====
         const dump978On = (values["UAT_INPUT"] || "") !== "";
         const uatId = fieldId("UAT_INPUT");
@@ -1260,6 +1304,8 @@
                     MLAT_USER: inputs.MLAT_USER.value.trim(),
                     MLAT_ENABLED: mlatEnabled,
                     MLAT_PRIVATE: mlatPrivate.checked ? "true" : "false",
+                    REPORT_STATUS: reportStatus.checked ? "true" : "false",
+                    REMOTE_CONFIG_ENABLED: remoteConfig.checked ? "true" : "false",
                     GAIN: inputs.GAIN.value.trim(),
                     UAT_INPUT: uat.checked ? "127.0.0.1:30978" : "",
                     DUMP978_SDR_SERIAL: dump978Serial.value.trim(),
@@ -1274,13 +1320,22 @@
                     delete updates.DUMP978_SDR_SERIAL;
                     delete updates.DUMP978_GAIN;
                 }
-                // Always send MLAT_ENABLED, MLAT_PRIVATE, and UAT_INPUT —
-                // they're explicit toggles whose "false"/"" form is
-                // meaningful. Strip other keys when empty so the user can
-                // leave a field unchanged from the current value rather
-                // than blanking it.
+                // Always send MLAT_ENABLED, MLAT_PRIVATE, UAT_INPUT,
+                // REPORT_STATUS and REMOTE_CONFIG_ENABLED — they're
+                // explicit toggles whose "false"/"" form is meaningful.
+                // Strip other keys when empty so the user can leave a
+                // field unchanged from the current value rather than
+                // blanking it.
+                const alwaysSend = new Set([
+                    "UAT_INPUT",
+                    "MLAT_ENABLED",
+                    "MLAT_PRIVATE",
+                    "MLAT_USER",
+                    "REPORT_STATUS",
+                    "REMOTE_CONFIG_ENABLED",
+                ]);
                 for (const k of Object.keys(updates)) {
-                    if (k !== "UAT_INPUT" && k !== "MLAT_ENABLED" && k !== "MLAT_PRIVATE" && k !== "MLAT_USER" && updates[k] === "") delete updates[k];
+                    if (!alwaysSend.has(k) && updates[k] === "") delete updates[k];
                 }
                 const r = await postJSON("/api/config", { updates });
                 submit.disabled = false;
@@ -1311,6 +1366,7 @@
             locationFieldset,
             mlatFieldset,
             gainFieldset,
+            privacyFieldset,
             uatFieldset,
             submit,
             err,
