@@ -111,6 +111,14 @@ func dispatchSystemctl(state *State, argv []string) (wexec.Result, error) {
 	}
 	switch argv[1] {
 	case "is-active":
+		// Refresh the aircraft snapshot on every is-active fan-out: the
+		// /api/status handler reads aircraft.json right after the systemctl
+		// loop, so this keeps the feed tile's counters and aircraft count
+		// drifting with wall-clock time. Errors are non-fatal — a stale
+		// snapshot is recoverable, a refused is-active call is not.
+		if err := state.RefreshAircraftJSON(); err != nil {
+			log.Printf("devfakes: refresh aircraft.json: %v", err)
+		}
 		var b strings.Builder
 		for _, unit := range argv[2:] {
 			b.WriteString(state.ServiceState(unit))
@@ -158,7 +166,19 @@ func dispatchStub(state *State, priv server.PrivilegedArgv, argv []string, body 
 		}
 		return wexec.Result{}, nil
 	case "systemd-run":
-		log.Printf("devfakes: would systemd-run %s", argv[2])
+		unit := argv[2] + ".service"
+		log.Printf("devfakes: would systemd-run %s", unit)
+		// Pin the maintenance unit `activating` for a short window so a
+		// double-click on Update / System upgrade / Web UI update exercises
+		// handlers.maintenanceUnitActive's 409 guard the same way it would
+		// on a real Pi. Production systemd flips a transient unit through
+		// activating → active → inactive on its own; we approximate with a
+		// fixed 5 s window which is comfortably longer than the SPA's
+		// confirm-modal round-trip.
+		state.SetServiceState(unit, "activating")
+		time.AfterFunc(5*time.Second, func() {
+			state.SetServiceState(unit, "inactive")
+		})
 		return wexec.Result{}, nil
 	}
 	log.Printf("devfakes: unhandled stub argv %v", argv)
@@ -319,7 +339,10 @@ func wifiStatus(state *State) (wexec.Result, error) {
 
 // wifiInput captures the subset of the apl-wifi {add,update,test,delete,activate}
 // body fields the fake needs. The helper accepts more, but the SPA only
-// posts these.
+// posts these. `Test` mirrors the apl-wifi `test` flag — when true the
+// helper runs the new keyfile through nmcli's connect-before-save flow
+// and the saved profile ends up active; when false the keyfile is
+// written but not activated.
 type wifiInput struct {
 	ID       string `json:"id"`
 	SSID     string `json:"ssid"`
@@ -327,6 +350,7 @@ type wifiInput struct {
 	Country  string `json:"country"`
 	Hidden   bool   `json:"hidden"`
 	Priority int    `json:"priority"`
+	Test     bool   `json:"test"`
 }
 
 func parseWifiInput(body []byte) (wifiInput, error) {
@@ -353,7 +377,28 @@ func wifiAdd(state *State, body []byte) (wexec.Result, error) {
 		return wexec.Result{Stdout: b}, nil
 	}
 	id, _ := state.WifiAdd(in.SSID, in.PSK, in.Country, in.Hidden, in.Priority)
-	env := map[string]any{"status": "applied", "id": id}
+	// Production apl-wifi add returns {status, id, uuid, ssid, active, changed}.
+	// When `test:true` (the SPA's default), nmcli connects before save and
+	// the new profile ends up active — simulate that by flipping the active
+	// flag in State.
+	if in.Test {
+		state.WifiActivate(id)
+	}
+	uuid := ""
+	for _, n := range state.networksSnapshot() {
+		if n.ID == id {
+			uuid = n.UUID
+			break
+		}
+	}
+	env := map[string]any{
+		"status":  "applied",
+		"id":      id,
+		"uuid":    uuid,
+		"ssid":    in.SSID,
+		"active":  in.Test,
+		"changed": []string{id},
+	}
 	b, _ := json.Marshal(env)
 	return wexec.Result{Stdout: b}, nil
 }

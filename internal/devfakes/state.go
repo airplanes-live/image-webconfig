@@ -201,36 +201,44 @@ func (s *State) SyncAll() error {
 }
 
 // ApplyFeedEnv merges the given updates into the in-memory feed.env
-// and re-syncs the on-disk file. Tracks GEO_CONFIGURED automatically
-// when either LATITUDE or LONGITUDE moves through the boundary
-// between "set" (non-empty, non-zero) and "unset" — matches the
-// apl-feed apply behaviour the UI's geo badge depends on. Returns
-// the sorted list of keys that actually changed.
+// and re-syncs the on-disk file. Mirrors `_apl_feed_apply_derive_geo`
+// in feed/scripts/lib/feed-env-apply.sh: when LATITUDE or LONGITUDE
+// appear in the payload (touched, not just changed) and GEO_CONFIGURED
+// is NOT explicit in the same payload, derive GEO_CONFIGURED from the
+// merged pair — false only when BOTH axes are empty or numerically
+// zero, true otherwise. An explicit GEO_CONFIGURED override in the
+// payload wins. Returns the sorted list of keys whose value actually
+// moved.
 func (s *State) ApplyFeedEnv(updates map[string]string) ([]string, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	var changed []string
-	geoTouched := false
+	touchedLat := false
+	touchedLon := false
+	explicitGeo := false
 	for k, v := range updates {
+		switch k {
+		case "LATITUDE":
+			touchedLat = true
+		case "LONGITUDE":
+			touchedLon = true
+		case "GEO_CONFIGURED":
+			explicitGeo = true
+		}
 		prev, existed := s.feedEnv[k]
 		if existed && prev == v {
 			continue
 		}
 		s.feedEnv[k] = v
 		changed = append(changed, k)
-		if k == "LATITUDE" || k == "LONGITUDE" {
-			geoTouched = true
-		}
 	}
-	if geoTouched {
-		lat := s.feedEnv["LATITUDE"]
-		lon := s.feedEnv["LONGITUDE"]
-		newGeo := "false"
-		if isMeaningfulCoord(lat) && isMeaningfulCoord(lon) {
-			newGeo = "true"
+	if !explicitGeo && (touchedLat || touchedLon) {
+		derived := "false"
+		if !isZeroCoord(s.feedEnv["LATITUDE"]) || !isZeroCoord(s.feedEnv["LONGITUDE"]) {
+			derived = "true"
 		}
-		if s.feedEnv["GEO_CONFIGURED"] != newGeo {
-			s.feedEnv["GEO_CONFIGURED"] = newGeo
+		if s.feedEnv["GEO_CONFIGURED"] != derived {
+			s.feedEnv["GEO_CONFIGURED"] = derived
 			changed = appendIfMissing(changed, "GEO_CONFIGURED")
 		}
 	}
@@ -303,6 +311,15 @@ func (s *State) ClaimSecret() string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.claim
+}
+
+// networksSnapshot returns a defensive copy of the network list. Used
+// by the fake wifi runners when they need to read freshly-mutated
+// state without re-entering the public WifiList path.
+func (s *State) networksSnapshot() []WifiNetwork {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]WifiNetwork(nil), s.networks...)
 }
 
 // WifiList returns a snapshot of the network list and the active-
@@ -429,18 +446,15 @@ func (s *State) activeConnLocked() *ActiveConn {
 	return nil
 }
 
-// FeedStatsSnapshot synthesises a plausibly-growing aircraft snapshot.
-// Counters scale with wall clock since startup so the dashboard's
-// feed tile shows numbers that change without needing a backing
-// process.
-func (s *State) FeedStatsSnapshot() (now float64, messages int64, aircraftCount int) {
+// RefreshAircraftJSON re-projects the synthesised aircraft snapshot
+// to Paths.AircraftJSON so a status read sees moving messages_counter
+// + aircraft_count. The fake systemctl runner calls this before every
+// is-active fan-out — handlers.handleStatus reads aircraft.json right
+// after the fan-out, so the snapshot is always fresh to the SPA.
+func (s *State) RefreshAircraftJSON() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	elapsed := time.Since(s.feedStart).Seconds()
-	now = float64(time.Now().UnixNano()) / 1e9
-	messages = int64(elapsed * 4200) // ~4.2k msg/s, a busy-feeder rate
-	aircraftCount = 32 + int(elapsed)%18
-	return
+	return s.syncAircraftJSONLocked()
 }
 
 // --- atomic on-disk projection --------------------------------------------
@@ -560,6 +574,8 @@ func (s *State) syncRuntimeStatesLocked() error {
 		mlatState, mlatReason = "disabled", "mlat_enabled_false"
 	case !geoConfigured:
 		mlatState, mlatReason = "disabled", "geo_not_configured"
+	case strings.TrimSpace(feed["ALTITUDE"]) == "":
+		mlatState, mlatReason = "misconfigured", "altitude_empty"
 	case !mlatPrivateValid:
 		mlatState, mlatReason = "misconfigured", "mlat_private_invalid"
 	}
@@ -589,15 +605,20 @@ func (s *State) syncRuntimeStatesLocked() error {
 
 // --- helpers --------------------------------------------------------------
 
-func isMeaningfulCoord(v string) bool {
-	if v == "" {
-		return false
+// isZeroCoord matches `_apl_feed_apply_derive_geo`'s lat_zero/lon_zero
+// test: an axis is "zero" when its trimmed text is empty OR parses
+// numerically to 0. Anything that doesn't parse (junk text) is treated
+// as zero — the production awk falls into the same branch.
+func isZeroCoord(v string) bool {
+	t := strings.TrimSpace(v)
+	if t == "" {
+		return true
 	}
-	f, err := strconv.ParseFloat(strings.TrimSpace(v), 64)
+	f, err := strconv.ParseFloat(t, 64)
 	if err != nil {
-		return false
+		return true
 	}
-	return f != 0
+	return f == 0
 }
 
 func appendIfMissing(s []string, v string) []string {
