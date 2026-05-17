@@ -77,7 +77,7 @@ When the on-device self-update helper invokes `update.sh` via the sudoers-pinned
 
 - Run with `env -i` (or equivalent) so the running webconfig service (compromised attacker) cannot pass `AIRPLANES_WEBCONFIG_REPO=…` or `AIRPLANES_WEBCONFIG_DOWNLOAD_BASE=…` to point downloads at an attacker server.
 - Set only the safe defaults inside the helper: `PATH=/usr/sbin:/usr/bin:/sbin:/bin`, no other AIRPLANES_* env.
-- Reset the lock-file path to a hard-coded value (no `AIRPLANES_WEBCONFIG_LOCK_DIR` override from the caller's env).
+- Hard-code the upgrade flock path (`/run/airplanes/webconfig-update.lock`) — no `AIRPLANES_WEBCONFIG_LOCK_DIR` override from the caller's env. The helper itself takes the flock; `update.sh` and `install.sh --runtime` run inside it and have no lock of their own.
 
 The script files themselves still accept the env-var overrides because the bats tests rely on them — that's safe as long as the sudo-pinned helper scrubs the environment before invocation. The test suite covers the env-override path; the production privilege boundary is the helper's responsibility.
 
@@ -96,9 +96,9 @@ Three states:
 - `in-progress` — written AFTER preflight + backups succeed, IMMEDIATELY before invoking the installer. The window in which the helper observes live state crossing the mutation boundary.
 - `failed` — written on post-mutation install failures (the helper observed `${BIN}.prev` exists at installer exit, so the binary swap was attempted) OR after `rollback_and_exit` for any reason, even when each restore step succeeded. Also written when a pre-mutation install failure's backup restore (`restore_helper_backups`) itself fails — live state may be partially corrupt because rootfs extract may have run but we couldn't undo it. The narrow signal is `${BIN}.prev` existence after install.sh exit — `install.sh` only creates `.prev` at the atomic-swap step, so its presence after rc!=0 means live state may be inconsistent.
 
-The state-write happens before `exit` at every termination path; see `webconfig-self-update.sh` for the exact write points.
+Inside the lock, the state-write happens before `exit` at every termination path; see `webconfig-self-update.sh` for the exact write points. The one exception is the front-door lock-contention exit — the losing invocation exits 75 BEFORE `state_read`, so it neither reads nor writes the marker (the winner's marker stays authoritative).
 
-`failed` is deliberately narrow. rc=75 (lock contention) and pre-mutation install failures with successful restore route to `clean` so flaky-network upgrades don't wedge the device.
+`failed` is deliberately narrow. Pre-mutation install failures with successful restore route to `clean` so flaky-network upgrades don't wedge the device. Lock contention is handled at the FRONT of the helper, before `state_read` — the losing invocation exits 75 without writing the marker at all, so the marker stays at its prior value (typically `clean` from the device's last successful upgrade). The winner runs uncontended through `clean → in-progress → clean`.
 
 Entry-time cleanup: when the marker is `clean`, the helper `rm -f ${BIN}.prev` before doing anything else. The helper's own backup phase overwrites `${UNIT_FILE}.prev` and `${MANIFEST}.prev` via `cp -a`, but `${BIN}.prev` is created by `install.sh` (atomic-swap step) and is never overwritten otherwise — a stale `${BIN}.prev` left over from a prior `clean`'s failed `rm` cleanup would later be mis-classified as a post-mutation rollback target on a pre-swap install failure, restoring the older binary as a silent downgrade. The entry cleanup keeps the post-mutation heuristic honest. If the cleanup `rm` itself fails, the helper marks `failed` and exits — the heuristic is unsalvageable and operator triage is required.
 
