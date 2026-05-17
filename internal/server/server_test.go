@@ -14,7 +14,6 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
-	"sort"
 	"strings"
 	"sync"
 	"testing"
@@ -96,21 +95,21 @@ func newTestServer(t *testing.T) (*httptest.Server, *Server) {
 	}
 
 	priv := PrivilegedArgv{
-		ApplyFeed:          []string{"sudo-stub", "apl-feed", "apply", "--json", "--lock-timeout", "5"},
-		SchemaFeed:         []string{"apl-feed", "schema", "--json"},
-		Reboot:             []string{"sudo-stub", "reboot"},
-		Poweroff:           []string{"sudo-stub", "poweroff"},
-		StartUpdate:        []string{"sudo-stub", "update"},
+		ApplyFeed:            []string{"sudo-stub", "apl-feed", "apply", "--json", "--lock-timeout", "5"},
+		SchemaFeed:           []string{"apl-feed", "schema", "--json"},
+		Reboot:               []string{"sudo-stub", "reboot"},
+		Poweroff:             []string{"sudo-stub", "poweroff"},
+		StartUpdate:          []string{"sudo-stub", "update"},
 		StartSystemUpgrade:   []string{"sudo-stub", "system-upgrade"},
 		StartWebconfigUpdate: []string{"sudo-stub", "webconfig-update"},
-		RegisterClaim:      []string{"sudo-stub", "systemctl", "start", "--no-block", "airplanes-claim.service"},
-		WifiList:           []string{"sudo-stub", "apl-wifi", "list", "--json"},
-		WifiAdd:            []string{"sudo-stub", "apl-wifi", "add", "--json"},
-		WifiUpdate:         []string{"sudo-stub", "apl-wifi", "update", "--json"},
-		WifiDelete:         []string{"sudo-stub", "apl-wifi", "delete", "--json"},
-		WifiTest:           []string{"sudo-stub", "apl-wifi", "test", "--json"},
-		WifiActivate:       []string{"sudo-stub", "apl-wifi", "activate", "--json"},
-		WifiStatus:         []string{"sudo-stub", "apl-wifi", "status", "--json"},
+		RegisterClaim:        []string{"sudo-stub", "systemctl", "start", "--no-block", "airplanes-claim.service"},
+		WifiList:             []string{"sudo-stub", "apl-wifi", "list", "--json"},
+		WifiAdd:              []string{"sudo-stub", "apl-wifi", "add", "--json"},
+		WifiUpdate:           []string{"sudo-stub", "apl-wifi", "update", "--json"},
+		WifiDelete:           []string{"sudo-stub", "apl-wifi", "delete", "--json"},
+		WifiTest:             []string{"sudo-stub", "apl-wifi", "test", "--json"},
+		WifiActivate:         []string{"sudo-stub", "apl-wifi", "activate", "--json"},
+		WifiStatus:           []string{"sudo-stub", "apl-wifi", "status", "--json"},
 	}
 
 	deps := Deps{
@@ -224,21 +223,21 @@ func newWriteHarness(t *testing.T) *writeHarness {
 	}
 
 	priv := PrivilegedArgv{
-		ApplyFeed:          []string{"sudo-stub", "apl-feed", "apply", "--json", "--lock-timeout", "5"},
-		SchemaFeed:         []string{"apl-feed", "schema", "--json"},
-		Reboot:             []string{"sudo-stub", "reboot"},
-		Poweroff:           []string{"sudo-stub", "poweroff"},
-		StartUpdate:        []string{"sudo-stub", "update"},
+		ApplyFeed:            []string{"sudo-stub", "apl-feed", "apply", "--json", "--lock-timeout", "5"},
+		SchemaFeed:           []string{"apl-feed", "schema", "--json"},
+		Reboot:               []string{"sudo-stub", "reboot"},
+		Poweroff:             []string{"sudo-stub", "poweroff"},
+		StartUpdate:          []string{"sudo-stub", "update"},
 		StartSystemUpgrade:   []string{"sudo-stub", "system-upgrade"},
 		StartWebconfigUpdate: []string{"sudo-stub", "webconfig-update"},
-		RegisterClaim:      []string{"sudo-stub", "systemctl", "start", "--no-block", "airplanes-claim.service"},
-		WifiList:           []string{"sudo-stub", "apl-wifi", "list", "--json"},
-		WifiAdd:            []string{"sudo-stub", "apl-wifi", "add", "--json"},
-		WifiUpdate:         []string{"sudo-stub", "apl-wifi", "update", "--json"},
-		WifiDelete:         []string{"sudo-stub", "apl-wifi", "delete", "--json"},
-		WifiTest:           []string{"sudo-stub", "apl-wifi", "test", "--json"},
-		WifiActivate:       []string{"sudo-stub", "apl-wifi", "activate", "--json"},
-		WifiStatus:         []string{"sudo-stub", "apl-wifi", "status", "--json"},
+		RegisterClaim:        []string{"sudo-stub", "systemctl", "start", "--no-block", "airplanes-claim.service"},
+		WifiList:             []string{"sudo-stub", "apl-wifi", "list", "--json"},
+		WifiAdd:              []string{"sudo-stub", "apl-wifi", "add", "--json"},
+		WifiUpdate:           []string{"sudo-stub", "apl-wifi", "update", "--json"},
+		WifiDelete:           []string{"sudo-stub", "apl-wifi", "delete", "--json"},
+		WifiTest:             []string{"sudo-stub", "apl-wifi", "test", "--json"},
+		WifiActivate:         []string{"sudo-stub", "apl-wifi", "activate", "--json"},
+		WifiStatus:           []string{"sudo-stub", "apl-wifi", "status", "--json"},
 	}
 
 	deps := Deps{
@@ -1546,79 +1545,18 @@ func TestLog_KnownUnitStreamsSSE(t *testing.T) {
 // NOPASSWD command-spec from 010 or 011 — a substring match would not
 // catch a sudoers entry of `apl-feed apply --json` failing to authorize
 // `apl-feed apply --json --extra` (Contains would pass, sudo would reject
-// at runtime).
+// at runtime). Implementation lives in ValidatePrivilegedArgvParity so the
+// runtime --validate-sudoers subcommand exercises the same logic against
+// the installed /etc/sudoers.d/* files.
 func TestDefaultPrivilegedArgv_SudoersParity(t *testing.T) {
 	t.Parallel()
-	commands := loadSudoersCommands(t,
+	err := ValidatePrivilegedArgvParity(DefaultPrivilegedArgv(),
 		filepath.Join("..", "..", "files", "etc", "sudoers.d", "010_airplanes-webconfig"),
 		filepath.Join("..", "..", "files", "etc", "sudoers.d", "011_airplanes-webconfig-update"),
 	)
-
-	priv := DefaultPrivilegedArgv()
-	cases := []struct {
-		label string
-		argv  []string
-	}{
-		{"ApplyFeed", priv.ApplyFeed},
-		{"Reboot", priv.Reboot},
-		{"Poweroff", priv.Poweroff},
-		{"StartUpdate", priv.StartUpdate},
-		{"StartSystemUpgrade", priv.StartSystemUpgrade},
-		{"StartWebconfigUpdate", priv.StartWebconfigUpdate},
+	if err != nil {
+		t.Fatal(err)
 	}
-	for _, tc := range cases {
-		tc := tc
-		t.Run(tc.label, func(t *testing.T) {
-			t.Parallel()
-			if len(tc.argv) < 3 || tc.argv[0] != "/usr/bin/sudo" || tc.argv[1] != "-n" {
-				t.Fatalf("%s: argv must start with /usr/bin/sudo -n, got %v", tc.label, tc.argv)
-			}
-			tail := strings.Join(tc.argv[2:], " ")
-			if _, ok := commands[tail]; !ok {
-				t.Errorf("%s: argv tail not present as an exact NOPASSWD command in 010/011 sudoers: %q\nknown commands:\n  %s",
-					tc.label, tail, strings.Join(sortedKeys(commands), "\n  "))
-			}
-		})
-	}
-}
-
-// loadSudoersCommands parses one or more sudoers files and returns a set
-// of the NOPASSWD command-specs they authorize, keyed by the command
-// string after the colon. Comments and lines without NOPASSWD: are
-// skipped; whitespace in the command is normalised to single spaces so
-// the comparison ignores sudoers' tolerance for extra spacing.
-func loadSudoersCommands(t *testing.T, paths ...string) map[string]struct{} {
-	t.Helper()
-	out := make(map[string]struct{})
-	for _, p := range paths {
-		raw, err := os.ReadFile(p)
-		if err != nil {
-			t.Fatalf("read sudoers %s: %v", p, err)
-		}
-		for _, line := range strings.Split(string(raw), "\n") {
-			line = strings.TrimSpace(line)
-			if line == "" || strings.HasPrefix(line, "#") {
-				continue
-			}
-			idx := strings.Index(line, "NOPASSWD:")
-			if idx < 0 {
-				continue
-			}
-			cmd := strings.TrimSpace(line[idx+len("NOPASSWD:"):])
-			cmd = strings.Join(strings.Fields(cmd), " ")
-			out[cmd] = struct{}{}
-		}
-	}
-	return out
-}
-
-func sortedKeys(m map[string]struct{}) []string {
-	keys := make([]string, 0, len(m))
-	for k := range m {
-		keys = append(keys, k)
-	}
-	sort.Strings(keys)
-	return keys
 }
 
 // --- pending_restart surfacing (PR 3) ---

@@ -5,6 +5,7 @@ import (
 	"io/fs"
 	"net/http"
 	"sync"
+	"time"
 
 	"github.com/airplanes-live/image-webconfig/internal/auth"
 	wexec "github.com/airplanes-live/image-webconfig/internal/exec"
@@ -32,9 +33,14 @@ type Server struct {
 	stdinRunner   wexec.CommandRunnerStdin
 	schema        *schemacache.Cache
 	priv          PrivilegedArgv
-	configMu      sync.Mutex // serializes POST /api/config transactions
-	maintenanceMu sync.Mutex // serializes the is-active guard + transient-unit kickoff
+	nowFunc       func() time.Time // injected for tests; defaults to time.Now
+	configMu      sync.Mutex       // serializes POST /api/config transactions
+	maintenanceMu sync.Mutex       // serializes the is-active guard + transient-unit kickoff
 }
+
+// now returns the current time via the injected clock so tests can pin
+// the value used for sidecar `edited_at` stamps.
+func (s *Server) now() time.Time { return s.nowFunc() }
 
 // PrivilegedArgv carries the exact sudoers-allowed argv shapes for every
 // command webconfig elevates. Each slice is invoked verbatim — no
@@ -139,6 +145,7 @@ type Deps struct {
 	Schema       *schemacache.Cache       // schema cache; required (use schemacache.New)
 	Runner       wexec.CommandRunner      // override for tests; nil → exec.RealRunner
 	StdinRunner  wexec.CommandRunnerStdin // ditto; piped variant for apl-feed apply
+	Now          func() time.Time         // override for tests; nil → time.Now
 	Privileged   PrivilegedArgv
 }
 
@@ -151,6 +158,10 @@ func New(d Deps) http.Handler {
 	stdinRunner := d.StdinRunner
 	if stdinRunner == nil {
 		stdinRunner = wexec.RealRunnerStdin
+	}
+	nowFunc := d.Now
+	if nowFunc == nil {
+		nowFunc = time.Now
 	}
 	s := &Server{
 		version:      d.Version,
@@ -166,6 +177,7 @@ func New(d Deps) http.Handler {
 		runner:       runner,
 		stdinRunner:  stdinRunner,
 		schema:       d.Schema,
+		nowFunc:      nowFunc,
 		priv:         d.Privileged,
 	}
 

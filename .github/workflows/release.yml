@@ -53,21 +53,15 @@ jobs:
           fi
 
   build:
-    name: build airplanes-webconfig-${{ matrix.arch }}
+    name: cross-compile + package release assets
     needs: [classify]
     runs-on: ubuntu-24.04
     timeout-minutes: 15
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - { arch: arm64, goarch: arm64, goarm: "" }
-          - { arch: armhf, goarch: arm,   goarm: "7" }
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
         with:
           persist-credentials: false
-      - uses: actions/setup-go@d35c59abb061a4a6fb18e82ac0862c26744d6ab5  # v5.5.0
+      - uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c  # v6.4.0
         with:
           go-version-file: go.mod
       - name: resolve commit sha
@@ -77,106 +71,31 @@ jobs:
         # commit SHA explicitly so the manifest and ldflags both agree with
         # the cloned source HEAD.
         run: echo "commit=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
-      - name: cross-compile
-        env:
-          GOOS: linux
-          GOARCH: ${{ matrix.goarch }}
-          GOARM: ${{ matrix.goarm }}
-          CGO_ENABLED: "0"
-          TAG: ${{ needs.classify.outputs.tag }}
-          COMMIT_SHA: ${{ steps.sha.outputs.commit }}
-        run: |
-          go build -trimpath -buildvcs=false \
-            -ldflags "-s -w -X main.version=$TAG -X main.commitSha=$COMMIT_SHA" \
-            -o "airplanes-webconfig-${{ matrix.arch }}" \
-            ./cmd/webconfig
-          file "airplanes-webconfig-${{ matrix.arch }}"
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
-        with:
-          name: bin-${{ matrix.arch }}
-          path: airplanes-webconfig-${{ matrix.arch }}
-          retention-days: 7
-
-  package:
-    name: assemble rootfs + manifest + SHA256SUMS
-    needs: [classify, build]
-    runs-on: ubuntu-24.04
-    timeout-minutes: 5
-    steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
-        with:
-          persist-credentials: false
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4.3.0
-        with:
-          path: artifacts
-          merge-multiple: true
-      - name: stage installer in rootfs payload
-        # Ship install.sh, update.sh, and the lib inside the rootfs tarball so
-        # extraction lands them at /usr/local/share/airplanes-webconfig/. The
-        # on-device self-update helper invokes the installed copy, so each
-        # release includes the installer needed to apply the NEXT release.
-        run: |
-          install -d -m 0755 files/usr/local/share/airplanes-webconfig
-          install -d -m 0755 files/usr/local/share/airplanes-webconfig/scripts/lib
-          install -m 0755 install.sh files/usr/local/share/airplanes-webconfig/install.sh
-          install -m 0755 update.sh files/usr/local/share/airplanes-webconfig/update.sh
-          install -m 0644 scripts/lib/install-common.sh files/usr/local/share/airplanes-webconfig/scripts/lib/install-common.sh
-      - name: enforce sudoers mode in payload
-        # sudo refuses to load a sudoers file whose mode is not 0440. Encode
-        # the right mode in the tarball so on-device extraction lands it
-        # ready-to-use without an extra chmod step.
-        run: chmod 0440 files/etc/sudoers.d/*
-      - name: assemble rootfs.tar.gz
-        run: |
-          tar -C files \
-              --owner=0 --group=0 --numeric-owner \
-              --mtime='2024-01-01 00:00:00 UTC' \
-              --sort=name \
-              -czf rootfs.tar.gz .
-      - name: resolve commit sha
-        id: sha
-        run: echo "commit=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
-      - name: write manifest.json
+      - name: assemble release (binaries + rootfs.tar.gz + manifest + SHA256SUMS)
         env:
           TAG: ${{ needs.classify.outputs.tag }}
           KIND: ${{ needs.classify.outputs.kind }}
           COMMIT_SHA: ${{ steps.sha.outputs.commit }}
         run: |
-          BUILD_DATE="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-          cat > manifest.json <<MANIFEST
-          {
-            "version": "$TAG",
-            "kind": "$KIND",
-            "commit_sha": "$COMMIT_SHA",
-            "build_date": "$BUILD_DATE",
-            "arches": ["arm64", "armhf"]
-          }
-          MANIFEST
-      - name: SHA256SUMS
-        run: |
-          mv artifacts/airplanes-webconfig-arm64 .
-          mv artifacts/airplanes-webconfig-armhf .
-          sha256sum \
-            airplanes-webconfig-arm64 \
-            airplanes-webconfig-armhf \
-            rootfs.tar.gz \
-            manifest.json \
-            > SHA256SUMS
-          cat SHA256SUMS
+          bash scripts/lib/build-release.sh \
+            --version "$TAG" \
+            --kind "$KIND" \
+            --commit-sha "$COMMIT_SHA" \
+            --output "$RUNNER_TEMP/release"
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
         with:
           name: release-assets
           path: |
-            airplanes-webconfig-arm64
-            airplanes-webconfig-armhf
-            rootfs.tar.gz
-            manifest.json
-            SHA256SUMS
+            ${{ runner.temp }}/release/airplanes-webconfig-arm64
+            ${{ runner.temp }}/release/airplanes-webconfig-armhf
+            ${{ runner.temp }}/release/rootfs.tar.gz
+            ${{ runner.temp }}/release/manifest.json
+            ${{ runner.temp }}/release/SHA256SUMS
           retention-days: 7
 
   publish:
     name: publish GitHub Release
-    needs: [classify, package]
+    needs: [classify, build]
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:
