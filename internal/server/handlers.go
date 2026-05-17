@@ -663,8 +663,8 @@ func (s *Server) handleSystemUpgrade(w http.ResponseWriter, r *http.Request) {
 
 // /api/webconfig-update (POST): kicks off a transient
 // airplanes-webconfig-update.service that downloads the latest webconfig
-// release for the device's channel, verifies SHA256, atomic-swaps the
-// binary, extracts the new rootfs payload, restarts this service, and
+// release for the device's channel, verifies SHA256, extracts the new
+// rootfs payload, atomic-swaps the binary, restarts this service, and
 // rolls back if /health fails after the restart. Same 202 + unit-name
 // shape as /api/update — the SPA streams /api/log/webconfig-update for
 // live output and then polls /health to detect the restart.

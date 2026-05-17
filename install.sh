@@ -15,10 +15,11 @@
 #   --runtime  (or AIRPLANES_BUILD_MODE not set)
 #       Invoked by the on-device self-update helper. Reads
 #       /etc/airplanes/release-channel to pick stable or dev. Downloads
-#       the resolved release, verifies SHA256, keeps the existing binary
-#       as .prev for rollback, atomic-rename-swaps in the new one,
-#       extracts the rootfs payload, writes the manifest. Caller handles
-#       systemctl daemon-reload + restart.
+#       the resolved release, verifies SHA256, extracts the rootfs
+#       payload, keeps the existing binary as .prev for rollback,
+#       atomic-rename-swaps in the new one, writes the manifest. Caller
+#       handles systemctl daemon-reload + restart. The rootfs-before-
+#       binary order is deliberate — see .claude/rules/architecture.md.
 
 set -euo pipefail
 

@@ -591,3 +591,164 @@ STUB
     [ "$file_mode" = "644" ] || { echo "file_mode=$file_mode"; false; }
     [ "$file_owner" = "root:root" ] || { echo "file_owner=$file_owner"; false; }
 }
+
+@test "stale \${BIN}.prev from a prior cleanup-rm-failure does not downgrade on pre-mutation install failure" {
+    # Scenario: the prior upgrade succeeded (marker=clean) but the
+    # happy-path `rm -f ${BIN}.prev` failed (ENOSPC at the time). A
+    # stale ${BIN}.prev now lingers on disk pointing at an OLDER binary
+    # than the current live one. On the next upgrade attempt, install.sh
+    # fails before its atomic-swap step (e.g., SHA256 rejects the
+    # downloaded binary). Without the entry-time cleanup, the helper's
+    # post-mutation classifier (`${BIN}.prev exists`) would mistakenly
+    # restore the stale .prev — a silent downgrade. With the cleanup,
+    # the classifier correctly sees pre-mutation and leaves live alone.
+    printf 'version=v0.0.9 stale-prev-from-prior-cleanup-rm-failure\n' \
+        > /usr/local/bin/airplanes-webconfig.prev
+    chmod 0755 /usr/local/bin/airplanes-webconfig.prev
+
+    # Trigger pre-mutation install failure: SHA256 rejects the binary.
+    printf 'tampered\n' > /var/test-releases/v9.9.9/airplanes-webconfig-arm64
+
+    run run_helper
+    [ "$status" -ne 0 ]
+    echo "$output" | grep -qE 'installer failed.*before binary swap|SHA256|sha256'
+
+    # Critical: the live binary must remain v0.1.0 baseline, NOT the
+    # stale v0.0.9 from the cleanup-failure leftover.
+    grep -q 'version=v0.1.0 baseline binary' /usr/local/bin/airplanes-webconfig
+    ! grep -q 'stale-prev-from-prior-cleanup-rm-failure' /usr/local/bin/airplanes-webconfig
+    [ ! -f /usr/local/bin/airplanes-webconfig.prev ]
+
+    # Live state is back to its pre-upgrade form; next run can retry.
+    [ "$(read_state)" = clean ]
+}
+
+@test "stale \${BIN}.prev rm failure at entry: marker advances to 'failed'" {
+    # If the entry-time cleanup of a stale ${BIN}.prev fails (FS error,
+    # read-only mount, etc.) the heuristic is broken and the helper must
+    # abort. Marker → failed so the next run forces operator triage.
+    install -m 0755 /usr/local/bin/airplanes-webconfig /usr/local/bin/airplanes-webconfig.prev
+
+    # Stub /usr/bin/rm to fail on the binary .prev (the entry-time
+    # cleanup target) so we exercise the failure branch without disk-
+    # full setup. /usr/bin/rm.real preserves teardown rm calls.
+    mv /usr/bin/rm /usr/local/bin/rm.real
+    cat > /usr/bin/rm <<'STUB'
+#!/bin/bash
+for arg in "$@"; do
+    case "$arg" in
+        /usr/local/bin/airplanes-webconfig.prev)
+            echo "rm: simulated FS failure" >&2
+            exit 1
+            ;;
+    esac
+done
+exec /usr/local/bin/rm.real "$@"
+STUB
+    chmod 0755 /usr/bin/rm
+
+    run run_helper
+    rc="$status"
+    mv /usr/local/bin/rm.real /usr/bin/rm
+
+    [ "$rc" -eq 1 ]
+    echo "$output" | grep -qE 'could not remove stale.*airplanes-webconfig\.prev'
+
+    # Marker must be `failed` so the next helper invocation triages.
+    [ "$(read_state)" = failed ]
+    # Installer was NOT invoked (we aborted at entry).
+    ! grep -q '^systemctl' /tmp/airplanes-test/systemctl-calls.log
+}
+
+@test "post-mutation installer failure rolls back binary, unit, manifest; marker failed" {
+    # Stub the wrapper update.sh to mimic install.sh failing AFTER the
+    # atomic binary swap: cp -a current binary → .prev (matches what
+    # install_binary's two-step rename does), write a "new" binary,
+    # write a failed-release manifest, then exit non-zero. This is the
+    # branch covered by webconfig-self-update.sh's `${BIN}.prev` post-
+    # mutation classifier — Codex's review of #18 noted the test gap.
+    cat > /usr/local/share/airplanes-webconfig/update.sh <<'WRAPPER'
+#!/bin/bash
+set -euo pipefail
+LOCK_DIR="${AIRPLANES_WEBCONFIG_LOCK_DIR:-/run/airplanes}"
+LOCK_FILE="$LOCK_DIR/webconfig-update.lock"
+install -d -m 0755 "$LOCK_DIR"
+exec 9>"$LOCK_FILE"
+if ! flock -n 9; then exit 75; fi
+
+# Simulate install_binary's atomic swap.
+cp -a /usr/local/bin/airplanes-webconfig /usr/local/bin/airplanes-webconfig.prev
+printf 'version=v9.9.9 post-mutation-fake\n' > /usr/local/bin/airplanes-webconfig
+chmod 0755 /usr/local/bin/airplanes-webconfig
+# Simulate install_manifest writing the failed-release version.
+cat > /etc/airplanes/webconfig-release.json <<MANIFEST
+{"version":"v9.9.9","kind":"stable","commit_sha":"fake","build_date":"2024-01-01T00:00:00Z","arches":["arm64","armhf"]}
+MANIFEST
+
+# Now fail — simulating e.g. a manifest cross-check that rejects after
+# the live state has been touched.
+exit 5
+WRAPPER
+    chmod 0755 /usr/local/share/airplanes-webconfig/update.sh
+
+    run run_helper
+    [ "$status" -eq 5 ]
+    echo "$output" | grep -qE 'installer failed.*after binary swap; rolling back'
+    echo "$output" | grep -q 'restoring /usr/local/bin/airplanes-webconfig.prev'
+
+    # Live state rolled back to baseline.
+    grep -q 'version=v0.1.0 baseline binary' /usr/local/bin/airplanes-webconfig
+    [ ! -f /usr/local/bin/airplanes-webconfig.prev ]
+    grep -q '"version":"v0.1.0"' /etc/airplanes/webconfig-release.json
+    [ ! -f /etc/airplanes/webconfig-release.json.prev ]
+    grep -q 'test baseline v0.1.0' /etc/systemd/system/airplanes-webconfig.service
+    [ ! -f /etc/systemd/system/airplanes-webconfig.service.prev ]
+
+    # Post-mutation failure → marker `failed` even though rollback
+    # itself succeeded (the rootfs payload definitively touched live
+    # state; next run must triage).
+    [ "$(read_state)" = failed ]
+}
+
+@test "pre-mutation restore failure marks 'failed' instead of 'clean'" {
+    # Codex review of #18: if rootfs extract touched the unit/manifest
+    # and the helper's restore mv fails, the live state is partially
+    # corrupt but the previous code wrote clean unconditionally. Fix:
+    # bubble restore_helper_backups's status up to the marker write.
+    #
+    # Trigger pre-mutation install failure (SHA tampering) plus a
+    # restore mv failure (stub /usr/bin/mv for the unit-file restore).
+    printf 'tampered\n' > /var/test-releases/v9.9.9/airplanes-webconfig-arm64
+
+    mv /usr/bin/mv /usr/local/bin/mv.real
+    cat > /usr/bin/mv <<'STUB'
+#!/bin/bash
+# Fail only when restoring the unit-file .prev (the restore_helper_backups
+# call). state_write's mv (to the upgrade-state file) and install.sh's
+# atomic-rename of the binary are unaffected — both go through.
+for arg in "$@"; do
+    case "$arg" in
+        /etc/systemd/system/airplanes-webconfig.service)
+            # This is the destination of restore_helper_backups's mv.
+            echo "mv: simulated restore failure" >&2
+            exit 1
+            ;;
+    esac
+done
+exec /usr/local/bin/mv.real "$@"
+STUB
+    chmod 0755 /usr/bin/mv
+
+    run run_helper
+    rc="$status"
+    mv /usr/local/bin/mv.real /usr/bin/mv
+
+    [ "$rc" -ne 0 ]
+    echo "$output" | grep -q 'installer failed.*before binary swap'
+    echo "$output" | grep -q 'restore_helper_backups: mv'
+    echo "$output" | grep -q 'pre-mutation backup restore failed'
+
+    # Marker must be `failed` so the next helper invocation triages —
+    # not `clean`, because we couldn't undo the rootfs touch.
+    [ "$(read_state)" = failed ]
+}

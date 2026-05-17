@@ -16,8 +16,8 @@
 #   4. Mark the upgrade `in-progress` immediately before crossing the
 #      live-state boundary (`/usr/local/share/airplanes-webconfig/update.sh`).
 #   5. Run /usr/local/share/airplanes-webconfig/update.sh, which locks,
-#      downloads and verifies the release, atomic-renames the binary
-#      (saving the previous as .prev), and extracts the rootfs payload.
+#      downloads and verifies the release, extracts the rootfs payload,
+#      and atomic-renames the binary (saving the previous as .prev).
 #      Distinguish pre-mutation failures (no ${BIN}.prev → mark clean,
 #      live state untouched) from post-mutation failures (${BIN}.prev
 #      exists → roll everything back, mark failed).
@@ -131,15 +131,32 @@ state_write() {
 # and .prev are byte-identical (e.g. rc=75 where install.sh never ran)
 # and undoes a partial rootfs extract that overwrote the unit file when
 # install.sh failed mid-extract.
+#
+# Returns 0 if every restore step succeeded (or had no work to do), 1 if
+# any step failed. Caller decides whether to escalate to `failed` — for
+# rc=75 (live state untouched) a failure is informational; for a pre-
+# mutation install error (rootfs extract may have run) a failure means
+# the live state is partially corrupt and the marker must reflect that.
 restore_helper_backups() {
+    local rc=0
     if [ -f "${UNIT_FILE}.prev" ]; then
-        mv -f "${UNIT_FILE}.prev" "$UNIT_FILE" 2>/dev/null || true
+        if ! mv -f "${UNIT_FILE}.prev" "$UNIT_FILE" 2>/dev/null; then
+            echo "ERROR: restore_helper_backups: mv ${UNIT_FILE}.prev -> $UNIT_FILE failed" >&2
+            rc=1
+        fi
     fi
     if [ "$MANIFEST_EXISTED" -eq 1 ] && [ -f "${MANIFEST}.prev" ]; then
-        mv -f "${MANIFEST}.prev" "$MANIFEST" 2>/dev/null || true
+        if ! mv -f "${MANIFEST}.prev" "$MANIFEST" 2>/dev/null; then
+            echo "ERROR: restore_helper_backups: mv ${MANIFEST}.prev -> $MANIFEST failed" >&2
+            rc=1
+        fi
     elif [ "$MANIFEST_EXISTED" -eq 0 ] && [ -f "$MANIFEST" ]; then
-        rm -f "$MANIFEST" 2>/dev/null || true
+        if ! rm -f "$MANIFEST" 2>/dev/null; then
+            echo "ERROR: restore_helper_backups: rm $MANIFEST failed" >&2
+            rc=1
+        fi
     fi
+    return $rc
 }
 
 # Restores the previous binary, unit file, and manifest, then restarts the
@@ -208,8 +225,19 @@ rollback_and_exit() {
 case "$(state_read)" in
     clean)
         # Stable. Any .prev files on disk are leftover from a happy-path
-        # cleanup whose `rm -f` failed; the upcoming cp -a overwrites them.
-        :
+        # cleanup whose `rm -f` failed. ${UNIT_FILE}.prev and
+        # ${MANIFEST}.prev get overwritten by the helper's upcoming cp -a,
+        # but ${BIN}.prev is created by install.sh (atomic-swap step) and
+        # is NOT touched until then — a stale ${BIN}.prev would later be
+        # mis-classified as a post-mutation rollback target on a pre-swap
+        # install failure, restoring the older binary. Clean it up now.
+        if [ -f "${BIN}.prev" ]; then
+            if ! rm -f "${BIN}.prev"; then
+                echo "WARN: could not remove stale ${BIN}.prev from a prior cleanup-rm-failure; refusing to proceed" >&2
+                state_write failed || true
+                exit 1
+            fi
+        fi
         ;;
     absent)
         # No marker file ever written. Two sub-cases:
@@ -308,9 +336,11 @@ if [ "$rc" -ne 0 ]; then
         # Lock contention — wrapper update.sh exits 75 before invoking
         # install.sh, so live state is untouched. Restore our backups
         # (no-op against unchanged live state) and mark `clean` for a
-        # benign retry-later.
+        # benign retry-later. Even if the restore mv internally fails,
+        # live state was never mutated, so .prev stragglers are harmless
+        # and the next cp -a overwrites them.
         echo "webconfig-self-update: another update in progress (rc=75); retry later" >&2
-        restore_helper_backups
+        restore_helper_backups || true
         state_write clean || true
         exit 75
     fi
@@ -318,12 +348,21 @@ if [ "$rc" -ne 0 ]; then
         # Pre-mutation install failure: download / SHA / manifest-verify
         # rejected, or extract_rootfs failed before the atomic binary
         # swap. Restore unit + manifest (rootfs extract may have
-        # partially overwritten them) and mark `clean` — live state is
-        # back to its pre-upgrade form, modulo any partial rootfs files
-        # we cannot un-extract (documented v1 limit).
+        # partially overwritten them).
         echo "webconfig-self-update: installer failed (rc=$rc) before binary swap" >&2
-        restore_helper_backups
-        state_write clean || true
+        if restore_helper_backups; then
+            # Live state is back to its pre-upgrade form, modulo any
+            # partial rootfs files we cannot un-extract (documented v1
+            # limit). Safe for the next helper invocation to retry.
+            state_write clean || true
+        else
+            # The unit or manifest restore mv failed. Rootfs extract may
+            # have touched live state and we couldn't undo it — the
+            # device is partially corrupt and the next run must triage
+            # before retrying.
+            echo "webconfig-self-update: pre-mutation backup restore failed; marking 'failed'" >&2
+            state_write failed || true
+        fi
         exit "$rc"
     fi
 
