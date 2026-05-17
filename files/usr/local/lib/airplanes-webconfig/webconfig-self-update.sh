@@ -112,24 +112,6 @@ if [ ! -x "$INSTALLER" ]; then
     exit 1
 fi
 
-# Clear any stale ${BIN}.prev left from a previous run's happy-path cleanup
-# failure. install.sh manages ${BIN}.prev as part of its own atomic swap;
-# a pre-existing .prev here means a prior upgrade succeeded but the rm -f
-# cleanup didn't. If we left it, an install.sh failure that exits BEFORE
-# the binary-swap step (download fail, SHA mismatch, manifest cross-check
-# fail) would route through the installer-fail branch below and restore
-# a binary from a long-ago run — an unintended downgrade unrelated to
-# this invocation. Unit and manifest .prev are protected because the
-# helper overwrites them via cp -a below; the binary .prev is the only
-# one that's owned by the installer.
-if [ -f "${BIN}.prev" ]; then
-    if ! rm -f "${BIN}.prev"; then
-        echo "ERROR: stale ${BIN}.prev from prior run cannot be removed; manual recovery needed" >&2
-        exit 1
-    fi
-    echo "webconfig-self-update: cleared stale ${BIN}.prev from prior run"
-fi
-
 # Back up the unit file and manifest so we can roll them back together
 # with the binary. The installer rolls back the binary on its own
 # failures; the helper additionally restores the unit (rewritten by
