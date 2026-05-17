@@ -11,16 +11,29 @@
 # Runner: test/bats/dockerized-bats.sh (debian:trixie-slim).
 #
 # What's covered:
-#   * happy path — install + restart + cleanup
-#   * /health probe exhaustion → rollback of binary + unit + manifest
-#   * systemctl restart failure → rollback
-#   * systemctl daemon-reload failure → rollback
-#   * installer (install.sh) failure before binary swap → unit rollback only
+#   * happy path — install + restart + cleanup; marker advances clean→clean
+#   * /health probe exhaustion → rollback of binary + unit + manifest; marker → failed
+#   * systemctl restart failure → rollback; marker → failed
+#   * systemctl daemon-reload failure → rollback; marker → failed
+#   * installer (install.sh) failure before binary swap → unit rollback only; marker → clean
 #   * env -i scrub — caller env cannot redirect downloads
-#   * concurrent-update guard — second invocation while a lock is held → exit 75
+#   * concurrent-update guard — second invocation while a lock is held → exit 75; marker → clean
+#   * upgrade-state machine entry guards: clean / absent / in-progress / failed / malformed
+#   * absent marker + stray .prev files → migration fail-closed
+#   * post-mutation installer failure (${BIN}.prev present) → marker → failed
+#   * pre-mutation installer failure (no ${BIN}.prev) → marker → clean
+#   * happy-path .prev cleanup failure → marker still advances to clean
+#   * cp-backup failure → marker → failed before exit
+#   * rollback-time state_write failure → marker stays at in-progress, WARN logged
+#   * state-file + parent-dir ownership/mode after a happy-path run
 
 # shellcheck source=lib/release_fixture.bash
 load lib/release_fixture.bash
+
+# Production paths the state machine writes. Read-only constants — every
+# test reaches the same on-disk locations.
+STATE_DIR=/var/lib/airplanes-webconfig-upgrade
+STATE_FILE=${STATE_DIR}/upgrade-state
 
 setup() {
     # The bats mutate /usr/local/bin, /etc/systemd, /etc/airplanes, etc.
@@ -60,6 +73,13 @@ setup() {
     rm -f /usr/local/bin/airplanes-webconfig.prev \
           /etc/systemd/system/airplanes-webconfig.service.prev \
           /etc/airplanes/webconfig-release.json.prev
+
+    # Provision the upgrade-state directory and write a `clean` marker so
+    # each test starts in a known-good state. Tests that need a different
+    # starting marker overwrite or remove $STATE_FILE.
+    install -d -m 0755 "$STATE_DIR"
+    printf 'clean\n' > "$STATE_FILE"
+    chmod 0644 "$STATE_FILE"
 
     # Stage the previous (currently-running) install at production paths.
     install -d -m 0755 /usr/local/bin
@@ -118,10 +138,23 @@ teardown() {
           /etc/systemd/system/airplanes-webconfig.service.prev \
           /etc/airplanes/webconfig-release.json.prev \
           /run/airplanes/webconfig-update.lock
+    rm -rf /tmp/airplanes-test/fault-injection
+    rm -f /tmp/airplanes-test/mktemp-state-count
 }
 
 run_helper() {
     bash /usr/local/lib/airplanes-webconfig/webconfig-self-update.sh
+}
+
+# read_state echoes the current marker contents (stripped of whitespace)
+# or 'absent' when the file is missing. Used by assertions across all
+# tests so the read mirrors the helper's state_read semantics.
+read_state() {
+    if [ ! -e "$STATE_FILE" ]; then
+        echo absent
+        return
+    fi
+    head -n1 "$STATE_FILE" | tr -d '[:space:]'
 }
 
 @test "happy path: swap binary, restart, clean .prev, manifest reports new version" {
@@ -137,9 +170,12 @@ run_helper() {
 
     grep -q '^systemctl daemon-reload$' /tmp/airplanes-test/systemctl-calls.log
     grep -q '^systemctl restart airplanes-webconfig.service$' /tmp/airplanes-test/systemctl-calls.log
+
+    # State machine: clean → clean (transition via in-progress).
+    [ "$(read_state)" = clean ]
 }
 
-@test "rollback when /health probe exhausts: binary, unit, manifest restored" {
+@test "rollback when /health probe exhausts: binary, unit, manifest restored; marker failed" {
     printf 'fail' > /tmp/airplanes-test/health-mode
 
     run run_helper
@@ -157,9 +193,13 @@ run_helper() {
 
     # restart is called twice: once post-install, once during rollback.
     [ "$(grep -c '^systemctl restart airplanes-webconfig.service$' /tmp/airplanes-test/systemctl-calls.log)" -eq 2 ]
+
+    # State machine: clean → in-progress → failed (rollback succeeded but
+    # the device went through a failed upgrade — next helper run must triage).
+    [ "$(read_state)" = failed ]
 }
 
-@test "rollback when systemctl restart fails on first call" {
+@test "rollback when systemctl restart fails on first call; marker failed" {
     printf 'restart-fails-first' > /tmp/airplanes-test/systemctl-mode
 
     run run_helper
@@ -172,9 +212,11 @@ run_helper() {
 
     # No /health probe is reached when restart fails (the probe loop only
     # runs after a successful restart). The stub records nothing for /health.
+
+    [ "$(read_state)" = failed ]
 }
 
-@test "rollback when systemctl daemon-reload fails" {
+@test "rollback when systemctl daemon-reload fails; marker failed" {
     printf 'daemon-reload-fails' > /tmp/airplanes-test/systemctl-mode
 
     run run_helper
@@ -184,9 +226,11 @@ run_helper() {
     grep -q 'version=v0.1.0 baseline binary' /usr/local/bin/airplanes-webconfig
     grep -q 'test baseline v0.1.0' /etc/systemd/system/airplanes-webconfig.service
     grep -q '"version":"v0.1.0"' /etc/airplanes/webconfig-release.json
+
+    [ "$(read_state)" = failed ]
 }
 
-@test "rollback unit + manifest when installer fails before binary swap" {
+@test "rollback unit + manifest when installer fails before binary swap; marker clean" {
     # Tamper with the release binary so install.sh's SHA256 check rejects it
     # BEFORE writing .prev. The helper still has its own unit + manifest
     # backups from before invoking the installer, and must restore them.
@@ -206,6 +250,10 @@ run_helper() {
 
     # restart is NOT called when install.sh fails.
     ! grep -q '^systemctl restart' /tmp/airplanes-test/systemctl-calls.log
+
+    # Pre-mutation failure: live state is back to its pre-upgrade form,
+    # so the next helper invocation may safely proceed. clean → clean.
+    [ "$(read_state)" = clean ]
 }
 
 @test "env -i scrubs caller AIRPLANES_* vars before invoking installer" {
@@ -248,9 +296,11 @@ STUB
     grep -q 'version=v0.1.0 baseline binary' /usr/local/bin/airplanes-webconfig
     [ ! -f /etc/airplanes/webconfig-release.json ]
     [ ! -f /etc/airplanes/webconfig-release.json.prev ]
+
+    [ "$(read_state)" = failed ]
 }
 
-@test "exits 75 when another update is already running" {
+@test "exits 75 when another update is already running; marker clean" {
     # Hold the lock on a DIFFERENT FD (8) than the wrapper uses (9). The
     # wrapper's `exec 9>"$LOCK_FILE"` would close an inherited FD 9 and
     # implicitly release a lock held there; holding on FD 8 keeps the
@@ -276,4 +326,268 @@ STUB
     # during the unit-rollback path even on installer-fail; that's a wasted
     # no-op but not a correctness bug, so we only assert no `restart`.)
     ! grep -q '^systemctl restart' /tmp/airplanes-test/systemctl-calls.log
+
+    # rc=75 is a benign "retry later" — marker advances clean → in-progress
+    # → clean (restored after the installer signals lock contention).
+    [ "$(read_state)" = clean ]
+}
+
+# --- State machine entry guard cases ---
+
+@test "absent marker + no .prev files: proceeds as clean" {
+    # Wipe the marker that setup() wrote. With no .prev files on disk, the
+    # absent state is treated as a first-flash device — proceed normally.
+    rm -f "$STATE_FILE"
+
+    run run_helper
+    [ "$status" -eq 0 ] || { echo "$output"; false; }
+
+    grep -q 'fake-arm64-binary version=v9.9.9' /usr/local/bin/airplanes-webconfig
+    [ "$(read_state)" = clean ]
+}
+
+@test "absent marker + .prev files present: fail-closed with migration message" {
+    # Simulate a pre-state-machine feeder that carries .prev files from a
+    # prior run we cannot reason about. Helper must refuse rather than
+    # overwrite (cp -a $UNIT_FILE → $UNIT_FILE.prev could destroy the
+    # only good copy on a wedged device).
+    rm -f "$STATE_FILE"
+    install -m 0755 /usr/local/bin/airplanes-webconfig /usr/local/bin/airplanes-webconfig.prev
+
+    run run_helper
+    [ "$status" -eq 1 ]
+    echo "$output" | grep -q 'absent but .prev files exist'
+    echo "$output" | grep -q "echo clean | sudo tee $STATE_FILE"
+
+    # Helper did not touch anything: .prev remains, marker remains absent.
+    [ -f /usr/local/bin/airplanes-webconfig.prev ]
+    [ ! -e "$STATE_FILE" ]
+    ! grep -q '^systemctl' /tmp/airplanes-test/systemctl-calls.log
+}
+
+@test "existing 'clean' marker + stale .prev: helper overwrites them and proceeds" {
+    # `clean` means the prior upgrade succeeded but its rm cleanup may have
+    # failed — .prev files are stale leftovers, safe to overwrite.
+    install -m 0755 /usr/local/bin/airplanes-webconfig /usr/local/bin/airplanes-webconfig.prev
+
+    run run_helper
+    [ "$status" -eq 0 ] || { echo "$output"; false; }
+
+    # Helper completed cleanly; the happy-path rm cleared the .prev files
+    # the bats seeded (plus any the install created).
+    grep -q 'fake-arm64-binary version=v9.9.9' /usr/local/bin/airplanes-webconfig
+    [ ! -f /usr/local/bin/airplanes-webconfig.prev ]
+    [ "$(read_state)" = clean ]
+}
+
+@test "existing 'in-progress' marker: fail-closed with operator-recovery message" {
+    printf 'in-progress\n' > "$STATE_FILE"
+
+    run run_helper
+    [ "$status" -eq 1 ]
+    echo "$output" | grep -q "marker is 'in-progress'"
+    echo "$output" | grep -q "echo clean | sudo tee $STATE_FILE"
+
+    # Helper did not invoke the installer.
+    ! grep -q '^systemctl' /tmp/airplanes-test/systemctl-calls.log
+    grep -q 'version=v0.1.0 baseline binary' /usr/local/bin/airplanes-webconfig
+
+    # Marker untouched.
+    [ "$(read_state)" = in-progress ]
+}
+
+@test "existing 'failed' marker: fail-closed with operator-recovery message" {
+    printf 'failed\n' > "$STATE_FILE"
+
+    run run_helper
+    [ "$status" -eq 1 ]
+    echo "$output" | grep -q "marker is 'failed'"
+    echo "$output" | grep -q "echo clean | sudo tee $STATE_FILE"
+
+    ! grep -q '^systemctl' /tmp/airplanes-test/systemctl-calls.log
+    grep -q 'version=v0.1.0 baseline binary' /usr/local/bin/airplanes-webconfig
+    [ "$(read_state)" = failed ]
+}
+
+@test "malformed marker: fail-closed" {
+    printf 'garbage\n' > "$STATE_FILE"
+
+    run run_helper
+    [ "$status" -eq 1 ]
+    echo "$output" | grep -qE 'malformed or unreadable'
+
+    ! grep -q '^systemctl' /tmp/airplanes-test/systemctl-calls.log
+    grep -q 'version=v0.1.0 baseline binary' /usr/local/bin/airplanes-webconfig
+}
+
+@test "empty marker: fail-closed" {
+    : > "$STATE_FILE"
+
+    run run_helper
+    [ "$status" -eq 1 ]
+    echo "$output" | grep -qE 'malformed or unreadable'
+
+    ! grep -q '^systemctl' /tmp/airplanes-test/systemctl-calls.log
+}
+
+@test "installer-missing preflight does NOT advance marker past clean" {
+    # Remove the wrapper so the helper's pre-preflight check fails. The
+    # state machine writes `in-progress` AFTER preflight + backups, so a
+    # missing installer must NOT leave the marker at in-progress for the
+    # next run to fail-closed on.
+    rm -f /usr/local/share/airplanes-webconfig/update.sh
+
+    run run_helper
+    [ "$status" -eq 1 ]
+    echo "$output" | grep -qE 'missing or not executable'
+
+    # State machine did not transition: marker is still clean.
+    [ "$(read_state)" = clean ]
+    # Helper did not even reach the cp-backup phase.
+    [ ! -f /etc/systemd/system/airplanes-webconfig.service.prev ]
+    [ ! -f /etc/airplanes/webconfig-release.json.prev ]
+}
+
+@test "cp-backup failure writes 'failed' marker before exit" {
+    # Make /etc/systemd/system/ read-only so cp -a UNIT_FILE → UNIT_FILE.prev
+    # fails. We expect the helper to mark the upgrade `failed` before
+    # exiting so the next run triages instead of treating partial .prev
+    # leftovers as the prior good state.
+    #
+    # In the test container the bats run as root and bypass DAC. Switch
+    # to chattr +i if the host kernel supports it; otherwise stub `cp`.
+    # Use a `cp` override via PATH because the helper's env -i sets
+    # PATH=/usr/sbin:/usr/bin:/sbin:/bin and /usr/bin/cp is the first
+    # match. We replace /usr/bin/cp with a stub that fails ONLY for the
+    # unit-file backup pattern, preserving cp for install.sh internals.
+    mv /usr/bin/cp /usr/local/bin/cp.real
+    cat > /usr/bin/cp <<'STUB'
+#!/bin/bash
+for arg in "$@"; do
+    case "$arg" in
+        /etc/systemd/system/airplanes-webconfig.service.prev)
+            echo "cp: simulated failure" >&2
+            exit 1
+            ;;
+    esac
+done
+exec /usr/local/bin/cp.real "$@"
+STUB
+    chmod 0755 /usr/bin/cp
+
+    run run_helper
+    rc="$status"
+    # Restore real cp before any further bats assertion uses cp internally.
+    mv /usr/local/bin/cp.real /usr/bin/cp
+
+    [ "$rc" -eq 1 ]
+    echo "$output" | grep -q 'cp -a /etc/systemd/system/airplanes-webconfig.service'
+
+    # Marker must be `failed` so the next helper invocation triages.
+    [ "$(read_state)" = failed ]
+    # No installer invocation happened.
+    ! grep -q '^systemctl' /tmp/airplanes-test/systemctl-calls.log
+}
+
+@test "happy-path cleanup rm failure still marks clean (upgrade succeeded)" {
+    # Replace /usr/bin/rm with a stub that fails on /usr/local/bin/airplanes-webconfig.prev
+    # to simulate ENOSPC during the post-/health cleanup. The upgrade
+    # succeeded; the marker must reflect that even though the rm warned.
+    mv /usr/bin/rm /usr/local/bin/rm.real
+    cat > /usr/bin/rm <<'STUB'
+#!/bin/bash
+for arg in "$@"; do
+    case "$arg" in
+        /usr/local/bin/airplanes-webconfig.prev)
+            echo "rm: simulated cleanup failure" >&2
+            exit 1
+            ;;
+    esac
+done
+exec /usr/local/bin/rm.real "$@"
+STUB
+    chmod 0755 /usr/bin/rm
+
+    run run_helper
+    rc="$status"
+    mv /usr/local/bin/rm.real /usr/bin/rm
+
+    [ "$rc" -eq 0 ] || { echo "$output"; false; }
+    echo "$output" | grep -q 'WARN: failed to clean up .prev markers'
+
+    # Marker must be `clean` — the upgrade reached /health OK, which is
+    # the contract the state machine cares about, not cleanup hygiene.
+    [ "$(read_state)" = clean ]
+}
+
+@test "rollback-time state_write failure leaves marker at 'in-progress'" {
+    # Stage a PATH-pinned mktemp stub that succeeds for the first
+    # state_write call (in-progress, before installer) and fails for
+    # every subsequent state_file mktemp. The /health-exhaust path then
+    # invokes rollback_and_exit, whose `state_write failed` cannot
+    # overwrite the in-progress marker — exactly the failure mode we
+    # want to catch.
+    #
+    # This test deliberately bypasses the env -i re-exec by setting the
+    # REEXEC sentinel before invoking the helper, so the PATH override
+    # propagates through. The env-i scrub is covered separately by the
+    # 'env -i scrubs caller AIRPLANES_* vars' test.
+    install -d -m 0755 /tmp/airplanes-test/fault-injection
+    cat > /tmp/airplanes-test/fault-injection/mktemp <<'STUB'
+#!/bin/bash
+is_state_file=0
+for arg in "$@"; do
+    case "$arg" in
+        */airplanes-webconfig-upgrade/upgrade-state.*) is_state_file=1 ;;
+    esac
+done
+if [ "$is_state_file" -eq 1 ]; then
+    COUNT_FILE=/tmp/airplanes-test/mktemp-state-count
+    if [ ! -f "$COUNT_FILE" ]; then echo 0 > "$COUNT_FILE"; fi
+    count=$(cat "$COUNT_FILE")
+    count=$((count + 1))
+    echo "$count" > "$COUNT_FILE"
+    if [ "$count" -le 1 ]; then
+        exec /usr/bin/mktemp "$@"
+    fi
+    exit 1
+fi
+exec /usr/bin/mktemp "$@"
+STUB
+    chmod 0755 /tmp/airplanes-test/fault-injection/mktemp
+
+    printf 'fail' > /tmp/airplanes-test/health-mode
+
+    AIRPLANES_WEBCONFIG_SELF_UPDATE_REEXEC=1 \
+    PATH=/tmp/airplanes-test/fault-injection:/usr/sbin:/usr/bin:/sbin:/bin \
+        run bash /usr/local/lib/airplanes-webconfig/webconfig-self-update.sh
+
+    [ "$status" -ne 0 ]
+    echo "$output" | grep -q 'health probe exhausted'
+    echo "$output" | grep -qE 'WARN.*cannot persist upgrade state'
+
+    # First state_write (in-progress) succeeded; second one (failed from
+    # rollback_and_exit) did not. Marker still carries in-progress, which
+    # fail-closes the next helper invocation — the contract.
+    [ "$(read_state)" = in-progress ]
+}
+
+@test "state-file + parent-dir ownership and mode after happy path" {
+    run run_helper
+    [ "$status" -eq 0 ] || { echo "$output"; false; }
+
+    # Parent dir: 0755 root:root. The helper's state_write only mv's into
+    # this dir; never chmod's the dir itself. install.sh's
+    # airplanes_webconfig_ensure_upgrade_state_dir provisioned it at 0755.
+    parent_mode="$(stat -c '%a' "$STATE_DIR")"
+    parent_owner="$(stat -c '%U:%G' "$STATE_DIR")"
+    [ "$parent_mode" = "755" ] || { echo "parent_mode=$parent_mode"; false; }
+    [ "$parent_owner" = "root:root" ] || { echo "parent_owner=$parent_owner"; false; }
+
+    # State file: 0644 root:root. state_write applies chmod 0644 to the
+    # tempfile before mv, so the mode survives the atomic rename.
+    file_mode="$(stat -c '%a' "$STATE_FILE")"
+    file_owner="$(stat -c '%U:%G' "$STATE_FILE")"
+    [ "$file_mode" = "644" ] || { echo "file_mode=$file_mode"; false; }
+    [ "$file_owner" = "root:root" ] || { echo "file_owner=$file_owner"; false; }
 }

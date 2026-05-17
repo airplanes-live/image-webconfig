@@ -170,9 +170,22 @@ type writeHarness struct {
 	runnerResultFor func(argv []string) wexec.Result // optional: per-argv canned Result (stdout+stderr); falls back to zero value
 	stdinErr        error
 	stdinResult     wexec.Result
+	// upgradeStatePath is wired into Deps.UpgradeStatePath. Set via
+	// withUpgradeStatePath() before harness construction; defaults to
+	// the production path (which doesn't exist in tests, surfacing
+	// "unknown" — matches what an un-upgraded feeder would report).
+	upgradeStatePath string
 }
 
-func newWriteHarness(t *testing.T) *writeHarness {
+// harnessOption mutates a writeHarness BEFORE Deps is constructed, so
+// option-set fields are visible to the deps wiring.
+type harnessOption func(*writeHarness)
+
+func withUpgradeStatePath(p string) harnessOption {
+	return func(h *writeHarness) { h.upgradeStatePath = p }
+}
+
+func newWriteHarness(t *testing.T, opts ...harnessOption) *writeHarness {
 	t.Helper()
 	dir := t.TempDir()
 	hashPath := filepath.Join(dir, "password.hash")
@@ -195,6 +208,9 @@ func newWriteHarness(t *testing.T) *writeHarness {
 		// override h.stdinResult / h.stdinErr to exercise rejected,
 		// lock_timeout, filesystem_error, etc.
 		stdinResult: wexec.Result{Stdout: []byte(`{"status":"applied","changed":[],"pending_restart":[]}`)},
+	}
+	for _, o := range opts {
+		o(h)
 	}
 	captureRunner := func(_ context.Context, argv []string) (wexec.Result, error) {
 		h.mu.Lock()
@@ -257,9 +273,10 @@ func newWriteHarness(t *testing.T) *writeHarness {
 			[]string{"LATITUDE", "LONGITUDE", "ALTITUDE", "GEO_CONFIGURED", "MLAT_USER", "MLAT_ENABLED", "MLAT_PRIVATE", "REPORT_STATUS", "REMOTE_CONFIG_ENABLED", "GAIN", "UAT_INPUT", "DUMP978_SDR_SERIAL", "DUMP978_GAIN"},
 			[]string{"LATITUDE", "LONGITUDE", "ALTITUDE", "GEO_CONFIGURED", "MLAT_USER", "MLAT_ENABLED", "MLAT_PRIVATE", "REPORT_STATUS", "REMOTE_CONFIG_ENABLED", "INPUT", "INPUT_TYPE", "GAIN", "UAT_INPUT", "DUMP978_SDR_SERIAL", "DUMP978_GAIN"},
 		),
-		Runner:      captureRunner,
-		StdinRunner: captureStdinRunner,
-		Privileged:  priv,
+		Runner:           captureRunner,
+		StdinRunner:      captureStdinRunner,
+		Privileged:       priv,
+		UpgradeStatePath: h.upgradeStatePath,
 	}
 	h.ts = httptest.NewServer(New(deps))
 	t.Cleanup(h.ts.Close)

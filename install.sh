@@ -59,6 +59,7 @@ fi
 airplanes_webconfig_extract_rootfs "$WORK_DIR/rootfs.tar.gz" "${TARGET_ROOT:-/}"
 airplanes_webconfig_install_binary "$WORK_DIR/airplanes-webconfig-$ARCH_NAME" "${TARGET_ROOT:-/}"
 airplanes_webconfig_install_manifest "$WORK_DIR/manifest.json" "${TARGET_ROOT:-/}"
+airplanes_webconfig_ensure_upgrade_state_dir "${TARGET_ROOT:-/}"
 
 # The release tarball already ships install.sh, update.sh, and
 # scripts/lib/install-common.sh under /usr/local/share/airplanes-webconfig/.

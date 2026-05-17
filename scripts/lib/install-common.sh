@@ -309,3 +309,26 @@ airplanes_webconfig_install_manifest() {
     install -d -m 0755 "$dest_dir"
     install -m 0644 "$src" "$dest_dir/webconfig-release.json"
 }
+
+# Ensures the upgrade-state directory exists with the right ownership and
+# mode. The self-update helper persists a `clean`/`in-progress`/`failed`
+# marker here to distinguish stale .prev cleanup leftovers from real
+# rollback targets across helper invocations.
+#
+# Why a separate root-owned dir (and not /var/lib/airplanes-webconfig):
+# the existing webconfig state dir is 0700 owned by the service account,
+# so the account can unlink any file inside it regardless of file
+# ownership — defeating the marker as a privilege boundary. A separate
+# 0755 root:root parent keeps the marker readable by the service account
+# (for the /api/status/upgrade endpoint) but unforgeable.
+#
+# Idempotent: the rootfs tarball also ships this directory via
+# files/var/lib/airplanes-webconfig-upgrade/.gitkeep, so this call is
+# usually a no-op after extract_rootfs. Both paths exist so an install
+# that bypasses extract (legacy build-mode flow, manual ops) still
+# provisions the dir correctly.
+airplanes_webconfig_ensure_upgrade_state_dir() {
+    local target_root="$1"
+    local dir="${target_root}/var/lib/airplanes-webconfig-upgrade"
+    install -d -m 0755 "$dir"
+}

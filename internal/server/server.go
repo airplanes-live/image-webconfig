@@ -34,8 +34,12 @@ type Server struct {
 	schema        *schemacache.Cache
 	priv          PrivilegedArgv
 	nowFunc       func() time.Time // injected for tests; defaults to time.Now
-	configMu      sync.Mutex       // serializes POST /api/config transactions
-	maintenanceMu sync.Mutex       // serializes the is-active guard + transient-unit kickoff
+	// upgradeStatePath is the on-disk file the self-update helper writes
+	// with "clean" / "in-progress" / "failed". Defaults to
+	// DefaultUpgradeStatePath; tests override via Deps.UpgradeStatePath.
+	upgradeStatePath string
+	configMu         sync.Mutex // serializes POST /api/config transactions
+	maintenanceMu    sync.Mutex // serializes the is-active guard + transient-unit kickoff
 }
 
 // now returns the current time via the injected clock so tests can pin
@@ -147,6 +151,9 @@ type Deps struct {
 	StdinRunner  wexec.CommandRunnerStdin // ditto; piped variant for apl-feed apply
 	Now          func() time.Time         // override for tests; nil → time.Now
 	Privileged   PrivilegedArgv
+	// UpgradeStatePath is the path the GET /api/status/upgrade handler
+	// reads. Defaults to DefaultUpgradeStatePath; tests inject a tempfile.
+	UpgradeStatePath string
 }
 
 // New returns the top-level HTTP handler.
@@ -163,22 +170,27 @@ func New(d Deps) http.Handler {
 	if nowFunc == nil {
 		nowFunc = time.Now
 	}
+	upgradeStatePath := d.UpgradeStatePath
+	if upgradeStatePath == "" {
+		upgradeStatePath = DefaultUpgradeStatePath
+	}
 	s := &Server{
-		version:      d.Version,
-		store:        d.Store,
-		sessions:     d.Sessions,
-		lockout:      d.Lockout,
-		guard:        d.Guard,
-		argon2Params: d.Argon2Params,
-		identity:     d.Identity,
-		feedEnv:      d.FeedEnv,
-		status:       d.Status,
-		logs:         d.Logs,
-		runner:       runner,
-		stdinRunner:  stdinRunner,
-		schema:       d.Schema,
-		nowFunc:      nowFunc,
-		priv:         d.Privileged,
+		version:          d.Version,
+		store:            d.Store,
+		sessions:         d.Sessions,
+		lockout:          d.Lockout,
+		guard:            d.Guard,
+		argon2Params:     d.Argon2Params,
+		identity:         d.Identity,
+		feedEnv:          d.FeedEnv,
+		status:           d.Status,
+		logs:             d.Logs,
+		runner:           runner,
+		stdinRunner:      stdinRunner,
+		schema:           d.Schema,
+		nowFunc:          nowFunc,
+		priv:             d.Privileged,
+		upgradeStatePath: upgradeStatePath,
 	}
 
 	mux := http.NewServeMux()
@@ -197,6 +209,7 @@ func New(d Deps) http.Handler {
 	mux.HandleFunc("POST /api/identity/secret", s.requireSession(s.handleIdentitySecret))
 	mux.HandleFunc("GET /api/config", s.requireSession(s.handleConfigGet))
 	mux.HandleFunc("GET /api/status", s.requireSession(s.handleStatus))
+	mux.HandleFunc("GET /api/status/upgrade", s.requireSession(s.handleUpgradeStatus))
 	mux.HandleFunc("GET /api/log/{unit}", s.requireSession(s.handleLog))
 	mux.HandleFunc("POST /api/config", s.requireSession(s.handleConfigPost))
 	mux.HandleFunc("POST /api/update", s.requireSession(s.handleUpdate))
