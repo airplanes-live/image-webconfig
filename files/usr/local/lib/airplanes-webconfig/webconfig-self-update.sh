@@ -59,20 +59,50 @@ MANIFEST_EXISTED=0
 rollback_and_exit() {
     local rc="$1"
     local restored=0
+    local rollback_failed=0
     if [ -f "${BIN}.prev" ]; then
-        mv -f "${BIN}.prev" "$BIN" && restored=1
+        if mv -f "${BIN}.prev" "$BIN"; then
+            restored=1
+        else
+            echo "ERROR: rollback could not restore $BIN from .prev; manual recovery needed" >&2
+            rollback_failed=1
+        fi
     fi
     if [ -f "${UNIT_FILE}.prev" ]; then
-        mv -f "${UNIT_FILE}.prev" "$UNIT_FILE" && restored=1
+        if mv -f "${UNIT_FILE}.prev" "$UNIT_FILE"; then
+            restored=1
+        else
+            echo "ERROR: rollback could not restore $UNIT_FILE from .prev; manual recovery needed" >&2
+            rollback_failed=1
+        fi
     fi
     if [ "$MANIFEST_EXISTED" -eq 1 ] && [ -f "${MANIFEST}.prev" ]; then
-        mv -f "${MANIFEST}.prev" "$MANIFEST" && restored=1
+        if mv -f "${MANIFEST}.prev" "$MANIFEST"; then
+            restored=1
+        else
+            echo "ERROR: rollback could not restore $MANIFEST from .prev; device manifest reports failed release" >&2
+            rollback_failed=1
+        fi
     elif [ "$MANIFEST_EXISTED" -eq 0 ] && [ -f "$MANIFEST" ]; then
-        rm -f "$MANIFEST" && restored=1
+        if rm -f "$MANIFEST"; then
+            restored=1
+        else
+            echo "ERROR: rollback could not remove failed-install $MANIFEST; device manifest reports failed release" >&2
+            rollback_failed=1
+        fi
+    fi
+    # Log the rollback summary BEFORE the restart — the restart kills the
+    # webconfig service and with it the SSE log stream the SPA is reading,
+    # so anything logged after the restart never reaches the user.
+    if [ "$rollback_failed" -eq 1 ]; then
+        echo "ERROR: rollback completed with errors; device may need manual intervention" >&2
     fi
     if [ "$restored" -eq 1 ]; then
         systemctl daemon-reload || true
         systemctl restart "$SERVICE" || true
+    fi
+    if [ "$rollback_failed" -eq 1 ]; then
+        exit 2
     fi
     exit "$rc"
 }
@@ -89,10 +119,17 @@ fi
 # /health and the SPA both report the rolled-back release rather than
 # the failed one after a /health-exhaustion rollback.
 if [ -f "$UNIT_FILE" ]; then
-    cp -a "$UNIT_FILE" "${UNIT_FILE}.prev"
+    if ! cp -a "$UNIT_FILE" "${UNIT_FILE}.prev"; then
+        echo "ERROR: cp -a $UNIT_FILE -> ${UNIT_FILE}.prev failed; refusing to start upgrade without rollback safety" >&2
+        exit 1
+    fi
 fi
 if [ -f "$MANIFEST" ]; then
-    cp -a "$MANIFEST" "${MANIFEST}.prev"
+    if ! cp -a "$MANIFEST" "${MANIFEST}.prev"; then
+        echo "ERROR: cp -a $MANIFEST -> ${MANIFEST}.prev failed; refusing to start upgrade without rollback safety" >&2
+        rm -f "${UNIT_FILE}.prev"
+        exit 1
+    fi
     MANIFEST_EXISTED=1
 fi
 
@@ -102,19 +139,37 @@ rc=$?
 if [ "$rc" -ne 0 ]; then
     echo "webconfig-self-update: installer failed (rc=$rc)" >&2
     # The installer's own rollback may have run; we additionally restore
-    # the unit file we backed up.
+    # the unit file and manifest we backed up.
+    rollback_failed=0
     if [ -f "${BIN}.prev" ]; then
         echo "webconfig-self-update: restoring ${BIN}.prev"
-        mv -f "${BIN}.prev" "$BIN"
+        if ! mv -f "${BIN}.prev" "$BIN"; then
+            echo "ERROR: could not restore $BIN from .prev; manual recovery needed" >&2
+            rollback_failed=1
+        fi
     fi
     if [ -f "${UNIT_FILE}.prev" ]; then
-        mv -f "${UNIT_FILE}.prev" "$UNIT_FILE"
-        systemctl daemon-reload || true
+        if mv -f "${UNIT_FILE}.prev" "$UNIT_FILE"; then
+            systemctl daemon-reload || true
+        else
+            echo "ERROR: could not restore $UNIT_FILE from .prev; manual recovery needed" >&2
+            rollback_failed=1
+        fi
     fi
     if [ "$MANIFEST_EXISTED" -eq 1 ] && [ -f "${MANIFEST}.prev" ]; then
-        mv -f "${MANIFEST}.prev" "$MANIFEST"
+        if ! mv -f "${MANIFEST}.prev" "$MANIFEST"; then
+            echo "ERROR: could not restore $MANIFEST from .prev; device manifest reports failed release" >&2
+            rollback_failed=1
+        fi
     elif [ "$MANIFEST_EXISTED" -eq 0 ] && [ -f "$MANIFEST" ]; then
-        rm -f "$MANIFEST"
+        if ! rm -f "$MANIFEST"; then
+            echo "ERROR: could not remove failed-install $MANIFEST; device manifest reports failed release" >&2
+            rollback_failed=1
+        fi
+    fi
+    if [ "$rollback_failed" -eq 1 ]; then
+        echo "ERROR: installer-fail rollback completed with errors; device may need manual intervention" >&2
+        exit 2
     fi
     exit "$rc"
 fi
@@ -134,7 +189,9 @@ while [ "$attempt" -lt "$HEALTH_MAX_ATTEMPTS" ]; do
     attempt=$((attempt + 1))
     sleep "$HEALTH_SLEEP_SECONDS"
     if curl -fsS -o /dev/null --max-time 2 "$HEALTH_URL"; then
-        rm -f "${BIN}.prev" "${UNIT_FILE}.prev" "${MANIFEST}.prev"
+        if ! rm -f "${BIN}.prev" "${UNIT_FILE}.prev" "${MANIFEST}.prev"; then
+            echo "WARN: failed to clean up .prev markers after successful upgrade; non-fatal, may require cleanup before the next update" >&2
+        fi
         echo "webconfig-self-update: /health OK after restart (attempt=$attempt)"
         exit 0
     fi
