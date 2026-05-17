@@ -38,6 +38,11 @@ type Server struct {
 	// with "clean" / "in-progress" / "failed". Defaults to
 	// DefaultUpgradeStatePath; tests override via Deps.UpgradeStatePath.
 	upgradeStatePath string
+	// assetsFS, when non-nil, overrides the embedded web/assets used for
+	// GET / and GET /static/*. Default (nil) keeps production behavior:
+	// assets are served from the binary's go:embed FS. cmd/devserver sets
+	// this to a disk-backed os.DirFS so UI edits don't require a rebuild.
+	assetsFS         fs.FS
 	configMu         sync.Mutex // serializes POST /api/config transactions
 	maintenanceMu    sync.Mutex // serializes the is-active guard + transient-unit kickoff
 }
@@ -154,6 +159,11 @@ type Deps struct {
 	// UpgradeStatePath is the path the GET /api/status/upgrade handler
 	// reads. Defaults to DefaultUpgradeStatePath; tests inject a tempfile.
 	UpgradeStatePath string
+	// AssetsFS, when non-nil, overrides the embedded web/assets used for
+	// GET / and GET /static/*. Default (nil) keeps production behavior:
+	// assets are served from the binary's go:embed FS. cmd/devserver sets
+	// this to a disk-backed os.DirFS so UI edits don't require a rebuild.
+	AssetsFS fs.FS
 }
 
 // New returns the top-level HTTP handler.
@@ -191,6 +201,7 @@ func New(d Deps) http.Handler {
 		nowFunc:          nowFunc,
 		priv:             d.Privileged,
 		upgradeStatePath: upgradeStatePath,
+		assetsFS:         d.AssetsFS,
 	}
 
 	mux := http.NewServeMux()
@@ -235,12 +246,11 @@ func New(d Deps) http.Handler {
 	// Static assets at /static/*; the SPA shell is served by the GET /
 	// handler below. no-store cache policy: assets are embedded in the
 	// binary and a binary update is the only way they change, so a stale
-	// cached copy after rollout would mask the new UI.
-	staticFS, err := fs.Sub(webassets.FS, "assets")
-	if err != nil {
-		panic(err) // compile-time guarantee — embed.FS always has this dir
-	}
-	mux.Handle("GET /static/", http.StripPrefix("/static/", noStore(http.FileServer(http.FS(staticFS)))))
+	// cached copy after rollout would mask the new UI. cmd/devserver
+	// overrides s.assetsFS with a disk-backed os.DirFS so UI iterations
+	// don't require a rebuild — the same no-store policy means a browser
+	// reload always picks up the edit.
+	mux.Handle("GET /static/", http.StripPrefix("/static/", noStore(http.FileServer(http.FS(s.assets())))))
 
 	// SPA shell: serve index.html on the root and reject anything else that
 	// fell through to /-prefix matching.
@@ -264,9 +274,19 @@ func (s *Server) handleHealth(w http.ResponseWriter, _ *http.Request) {
 	_, _ = w.Write([]byte("ok " + s.version + "\n"))
 }
 
+// assets returns the FS that backs GET / and GET /static/*. Defaults to
+// the embedded web/assets subtree; cmd/devserver overrides it with a
+// disk-backed os.DirFS via Deps.AssetsFS.
+func (s *Server) assets() fs.FS {
+	if s.assetsFS != nil {
+		return s.assetsFS
+	}
+	sub, _ := fs.Sub(webassets.FS, "assets")
+	return sub
+}
+
 func (s *Server) handleIndex(w http.ResponseWriter, r *http.Request) {
-	staticFS, _ := fs.Sub(webassets.FS, "assets")
-	body, err := fs.ReadFile(staticFS, "index.html")
+	body, err := fs.ReadFile(s.assets(), "index.html")
 	if err != nil {
 		http.NotFound(w, r)
 		return
