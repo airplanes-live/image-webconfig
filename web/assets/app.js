@@ -267,6 +267,20 @@
     function render(...nodes) { clear(); for (const n of nodes) app.appendChild(n); }
     function errorEl() { return el("div", { class: "error", role: "alert" }); }
 
+    // Mirror parse_report_status in feed/scripts/airplanes-diagnostics.sh:
+    // accept true|yes|1|on as true and false|no|0|off as false, case-insensitive.
+    // Unrecognised values (including empty) fall back to the supplied default,
+    // so unmodified-but-non-canonical operator edits don't get silently coerced
+    // when they save the form.
+    function parseBoolish(value, defaultValue) {
+        if (value === undefined || value === null) return defaultValue;
+        const s = String(value).trim().toLowerCase();
+        if (s === "") return defaultValue;
+        if (s === "true" || s === "yes" || s === "1" || s === "on") return true;
+        if (s === "false" || s === "no" || s === "0" || s === "off") return false;
+        return defaultValue;
+    }
+
     // Hidden username so password managers can save credentials against the implicit "admin" account.
     function hiddenUsernameField() {
         return el("input", { type: "text", name: "username", value: "admin", autocomplete: "username", readonly: true, hidden: true, "aria-hidden": "true", tabindex: "-1" });
@@ -1150,7 +1164,7 @@
         // to unchecked (remote-config opt-in). Both keys must be in the
         // "always send" list at submit time so unchecking still POSTs
         // the literal "false" rather than being stripped as an empty key.
-        const reportStatusOn = (values["REPORT_STATUS"] || "true") === "true";
+        const reportStatusOn = parseBoolish(values["REPORT_STATUS"], true);
         const reportStatusId = fieldId("REPORT_STATUS");
         const reportStatus = el("input", {
             id: reportStatusId,
@@ -1160,7 +1174,7 @@
         });
         inputs["REPORT_STATUS"] = reportStatus;
 
-        const remoteConfigOn = (values["REMOTE_CONFIG_ENABLED"] || "false") === "true";
+        const remoteConfigOn = parseBoolish(values["REMOTE_CONFIG_ENABLED"], false);
         const remoteConfigId = fieldId("REMOTE_CONFIG_ENABLED");
         const remoteConfig = el("input", {
             id: remoteConfigId,
