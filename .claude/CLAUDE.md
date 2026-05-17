@@ -99,3 +99,14 @@ shellcheck install.sh update.sh scripts/lib/install-common.sh files/usr/local/li
 ```
 
 To exercise `install.sh --build-mode` locally against a synthetic rootfs, point `ROOTFS_DIR` at a writable temp dir and set `AIRPLANES_WEBCONFIG_BRANCH` to a concrete tag that has a published release. The script will try to reach GitHub; offline dev is not supported.
+
+### Local UI dev
+
+`cmd/devserver` wires the SPA + JSON API against in-memory fakes for every system touchpoint (apl-feed, apl-wifi, systemctl, journalctl, /run/airplanes-* state, Pi-health, Wi-Fi). No Pi required.
+
+```
+go run ./cmd/devserver
+# → http://127.0.0.1:8080 — first visit triggers password setup (≥12 chars)
+```
+
+Defaults serve `web/assets/` from disk when run from the repo root, so edits to `index.html` / `app.js` / `style.css` show up on the next browser refresh without rebuilding. Mutations (config save, Wi-Fi add/delete/activate, claim register) round-trip against backing temp files so the production `feedenv.Reader` / `status.Reader` / `identity.Reader` see a coherent view. State resets on every binary restart. The production binary `cmd/webconfig` is untouched — `internal/devfakes` is only imported by `cmd/devserver`.

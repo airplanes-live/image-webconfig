@@ -17,6 +17,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"testing/fstest"
 	"time"
 
 	"github.com/airplanes-live/image-webconfig/internal/auth"
@@ -1573,6 +1574,51 @@ func TestDefaultPrivilegedArgv_SudoersParity(t *testing.T) {
 	)
 	if err != nil {
 		t.Fatal(err)
+	}
+}
+
+// TestAssetsFS_OverrideServesIndexAndStatic asserts the Deps.AssetsFS hook
+// used by cmd/devserver routes both `GET /` (index.html) and `GET /static/*`
+// through the override FS rather than the embedded web/assets tree. Without
+// this check, future refactors of server.New could silently leave one of the
+// two callsites pointing at the embedded FS, which would still pass every
+// other test (they all see the embedded copy).
+func TestAssetsFS_OverrideServesIndexAndStatic(t *testing.T) {
+	t.Parallel()
+	override := fstest.MapFS{
+		"index.html": &fstest.MapFile{Data: []byte("DEV-INDEX")},
+		"app.js":     &fstest.MapFile{Data: []byte("DEV-APP")},
+	}
+	handler := New(Deps{
+		Version:    "assets-test",
+		Privileged: DefaultPrivilegedArgv(),
+		AssetsFS:   override,
+	})
+	ts := httptest.NewServer(handler)
+	t.Cleanup(ts.Close)
+
+	for _, tc := range []struct {
+		path string
+		want string
+	}{
+		{"/", "DEV-INDEX"},
+		{"/static/app.js", "DEV-APP"},
+	} {
+		resp, err := http.Get(ts.URL + tc.path)
+		if err != nil {
+			t.Fatalf("GET %s: %v", tc.path, err)
+		}
+		body, _ := io.ReadAll(resp.Body)
+		_ = resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("GET %s: status=%d body=%q", tc.path, resp.StatusCode, body)
+		}
+		if string(body) != tc.want {
+			t.Fatalf("GET %s: body=%q want %q (override not threaded through)", tc.path, body, tc.want)
+		}
+		if got := resp.Header.Get("Cache-Control"); got != "no-store" {
+			t.Errorf("GET %s: Cache-Control=%q want no-store", tc.path, got)
+		}
 	}
 }
 

@@ -1,0 +1,519 @@
+package devfakes
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"log"
+	"strings"
+	"time"
+
+	wexec "github.com/airplanes-live/image-webconfig/internal/exec"
+	"github.com/airplanes-live/image-webconfig/internal/server"
+)
+
+// StubPrivilegedArgv returns a PrivilegedArgv that the fake runners
+// can dispatch on without colliding with anything a developer might
+// have on $PATH. The leading "dev-stub" sentinel makes it obvious in
+// stderr logs which call hit the dev path, and the second token is
+// the verb the fake dispatches on. Production sudoers parity does
+// NOT apply to this argv set; the parity test runs against
+// DefaultPrivilegedArgv().
+func StubPrivilegedArgv() server.PrivilegedArgv {
+	return server.PrivilegedArgv{
+		ApplyFeed:            []string{"dev-stub", "apl-feed", "apply"},
+		SchemaFeed:           []string{"dev-stub", "apl-feed", "schema"},
+		Reboot:               []string{"dev-stub", "systemctl", "reboot"},
+		Poweroff:             []string{"dev-stub", "systemctl", "poweroff"},
+		StartUpdate:          []string{"dev-stub", "systemd-run", "airplanes-update"},
+		StartSystemUpgrade:   []string{"dev-stub", "systemd-run", "airplanes-system-upgrade"},
+		StartWebconfigUpdate: []string{"dev-stub", "systemd-run", "airplanes-webconfig-update"},
+		RegisterClaim:        []string{"dev-stub", "systemctl", "claim-register"},
+		WifiList:             []string{"dev-stub", "apl-wifi", "list"},
+		WifiAdd:              []string{"dev-stub", "apl-wifi", "add"},
+		WifiUpdate:           []string{"dev-stub", "apl-wifi", "update"},
+		WifiDelete:           []string{"dev-stub", "apl-wifi", "delete"},
+		WifiTest:             []string{"dev-stub", "apl-wifi", "test"},
+		WifiActivate:         []string{"dev-stub", "apl-wifi", "activate"},
+		WifiStatus:           []string{"dev-stub", "apl-wifi", "status"},
+	}
+}
+
+// Runner returns a fake wexec.CommandRunner that dispatches the
+// non-stdin subprocess calls the webconfig handlers issue. Concretely:
+//
+//   - /usr/bin/systemctl is-active <unit>... — used by status.Reader
+//     (single-unit, per-service) and by handlers.maintenanceUnitActive
+//     (multi-unit, single call). The fake returns one state line per
+//     trailing argv element drawn from State.ServiceState.
+//   - /usr/bin/systemctl show --property=ExecMainStatus --value <unit>
+//     — used by status.Reader.execMainStatus when the unit is failed.
+//     The fake returns "0" so the dashboard never renders an exit-status
+//     warning over the simulated feed.
+//   - dev-stub systemctl {reboot,poweroff} — log the intent and exit 0.
+//   - dev-stub systemd-run airplanes-{update,system-upgrade,webconfig-update}
+//     — log the intent and exit 0. The HTTP handler writes 202.
+//   - dev-stub systemctl claim-register — calls state.RegisterClaim()
+//     so the next GET /api/identity reports claim_secret_present=true.
+//
+// argv[0] is always either the real systemctl binary path or the
+// stub sentinel "dev-stub". Other shapes fall through to a log line
+// and a zero Result; they should not happen in the wired-up devserver.
+func Runner(state *State, priv server.PrivilegedArgv) wexec.CommandRunner {
+	return func(ctx context.Context, argv []string) (wexec.Result, error) {
+		if len(argv) == 0 {
+			return wexec.Result{}, errors.New("devfakes: empty argv")
+		}
+		// Real systemctl shapes from status.Reader.
+		if strings.HasSuffix(argv[0], "/systemctl") || argv[0] == "systemctl" {
+			return dispatchSystemctl(state, argv)
+		}
+		// Stub argv from PrivilegedArgv. "dev-stub" sentinel keeps the
+		// fake out of the way of any real binary on PATH.
+		if argv[0] == "dev-stub" {
+			return dispatchStub(state, priv, argv, nil)
+		}
+		log.Printf("devfakes.Runner: unhandled argv %v", argv)
+		return wexec.Result{}, nil
+	}
+}
+
+// StdinRunner returns the piped variant. apl-feed apply and every
+// apl-wifi subcommand flow through here in production
+// (internal/server/wifi_handlers.go:invokeWifi uses s.stdinRunner for
+// every wifi subcommand, including read-only list/status). The fake
+// reads the payload, mutates State, and returns the wire envelope the
+// SPA expects.
+func StdinRunner(state *State, priv server.PrivilegedArgv) wexec.CommandRunnerStdin {
+	return func(ctx context.Context, argv []string, stdin io.Reader) (wexec.Result, error) {
+		body, _ := io.ReadAll(stdin)
+		if len(argv) == 0 {
+			return wexec.Result{}, errors.New("devfakes: empty argv")
+		}
+		if argv[0] == "dev-stub" {
+			return dispatchStub(state, priv, argv, body)
+		}
+		log.Printf("devfakes.StdinRunner: unhandled argv %v", argv)
+		return wexec.Result{}, nil
+	}
+}
+
+// dispatchSystemctl handles `/usr/bin/systemctl <verb> <args...>` from
+// status.Reader. is-active is the only verb that comes through with
+// units to look up; show emits a numeric value that status.Reader
+// trims for ExecMainStatus.
+func dispatchSystemctl(state *State, argv []string) (wexec.Result, error) {
+	if len(argv) < 2 {
+		return wexec.Result{}, nil
+	}
+	switch argv[1] {
+	case "is-active":
+		var b strings.Builder
+		for _, unit := range argv[2:] {
+			b.WriteString(state.ServiceState(unit))
+			b.WriteByte('\n')
+		}
+		return wexec.Result{Stdout: []byte(b.String())}, nil
+	case "show":
+		// Only ExecMainStatus is asked for in this codepath.
+		return wexec.Result{Stdout: []byte("0\n")}, nil
+	}
+	log.Printf("devfakes: unhandled systemctl verb %v", argv)
+	return wexec.Result{}, nil
+}
+
+// dispatchStub handles every argv whose first token is "dev-stub".
+// The second token is the binary identifier; the third is the
+// subcommand. body is the stdin bytes for the apply/wifi paths; nil
+// for the non-stdin variants.
+func dispatchStub(state *State, priv server.PrivilegedArgv, argv []string, body []byte) (wexec.Result, error) {
+	if len(argv) < 3 {
+		log.Printf("devfakes: malformed stub argv %v", argv)
+		return wexec.Result{}, nil
+	}
+	switch argv[1] {
+	case "apl-feed":
+		switch argv[2] {
+		case "apply":
+			return applyFeed(state, body)
+		case "schema":
+			return schemaFeed(state)
+		}
+	case "apl-wifi":
+		return wifiCmd(state, argv[2], body)
+	case "systemctl":
+		switch argv[2] {
+		case "reboot":
+			log.Printf("devfakes: would reboot")
+		case "poweroff":
+			log.Printf("devfakes: would poweroff")
+		case "claim-register":
+			log.Printf("devfakes: would register claim secret")
+			if err := state.RegisterClaim(); err != nil {
+				log.Printf("devfakes: RegisterClaim: %v", err)
+			}
+		}
+		return wexec.Result{}, nil
+	case "systemd-run":
+		log.Printf("devfakes: would systemd-run %s", argv[2])
+		return wexec.Result{}, nil
+	}
+	log.Printf("devfakes: unhandled stub argv %v", argv)
+	return wexec.Result{}, nil
+}
+
+// applyFeedPayload mirrors the wire shape `handleConfigPost` builds:
+//
+//	{"updates": {"KEY": <bare string OR {"value": "...", "edited_at":...,
+//	                                     "edited_by":"..."}>}}
+//
+// We accept either form because the production server emits both
+// (tracked + changed → object, everything else → string). The fake
+// extracts string values and feeds them into State.ApplyFeedEnv.
+type applyFeedPayload struct {
+	Updates map[string]json.RawMessage `json:"updates"`
+}
+
+func applyFeed(state *State, body []byte) (wexec.Result, error) {
+	var p applyFeedPayload
+	if err := json.Unmarshal(body, &p); err != nil {
+		env := map[string]any{
+			"status":  "parse_error",
+			"message": fmt.Sprintf("payload not valid JSON: %v", err),
+		}
+		b, _ := json.Marshal(env)
+		return wexec.Result{Stdout: b}, nil
+	}
+	updates := make(map[string]string, len(p.Updates))
+	for k, raw := range p.Updates {
+		s, ok := extractApplyValue(raw)
+		if !ok {
+			env := map[string]any{
+				"status":  "parse_error",
+				"message": fmt.Sprintf("key %q has unsupported value shape", k),
+			}
+			b, _ := json.Marshal(env)
+			return wexec.Result{Stdout: b}, nil
+		}
+		updates[k] = s
+	}
+	changed, err := state.ApplyFeedEnv(updates)
+	if err != nil {
+		env := map[string]any{
+			"status":  "filesystem_error",
+			"message": err.Error(),
+		}
+		b, _ := json.Marshal(env)
+		return wexec.Result{Stdout: b}, nil
+	}
+	env := map[string]any{
+		"status":          "applied",
+		"changed":         changed,
+		"pending_restart": []string{},
+	}
+	b, _ := json.Marshal(env)
+	return wexec.Result{Stdout: b}, nil
+}
+
+// extractApplyValue unwraps both legs of feedmeta's heterogeneous
+// payload: a bare JSON string OR an object with a "value" field.
+func extractApplyValue(raw json.RawMessage) (string, bool) {
+	if len(raw) == 0 {
+		return "", false
+	}
+	if raw[0] == '"' {
+		var s string
+		if err := json.Unmarshal(raw, &s); err != nil {
+			return "", false
+		}
+		return s, true
+	}
+	if raw[0] == '{' {
+		var obj struct {
+			Value string `json:"value"`
+		}
+		if err := json.Unmarshal(raw, &obj); err != nil {
+			return "", false
+		}
+		return obj.Value, true
+	}
+	// Allow bare numbers / bools so the SPA's coercion-shy fields
+	// (priority etc.) don't blow up. Json-encoded numbers come back
+	// as their text rep, which matches what feed.env expects.
+	return strings.Trim(string(raw), `"`), true
+}
+
+func schemaFeed(state *State) (wexec.Result, error) {
+	// Not called by the running server (schemacache.NewPrepopulated
+	// skips this), but emit a valid envelope for symmetry. Mirrors
+	// internal/configspec/configspec.go AllReadKeys + the writable set
+	// the schemacache tests use.
+	writable := []string{
+		"LATITUDE", "LONGITUDE", "ALTITUDE", "GEO_CONFIGURED",
+		"MLAT_USER", "MLAT_ENABLED", "MLAT_PRIVATE",
+		"REPORT_STATUS", "REMOTE_CONFIG_ENABLED",
+		"GAIN", "UAT_INPUT", "DUMP978_SDR_SERIAL", "DUMP978_GAIN",
+	}
+	readable := append(append([]string{}, writable...), "INPUT", "INPUT_TYPE")
+	env := map[string]any{
+		"version":       1,
+		"writable_keys": writable,
+		"readable_keys": readable,
+	}
+	b, _ := json.Marshal(env)
+	return wexec.Result{Stdout: b}, nil
+}
+
+// --- apl-wifi -------------------------------------------------------------
+
+func wifiCmd(state *State, sub string, body []byte) (wexec.Result, error) {
+	switch sub {
+	case "list":
+		return wifiList(state)
+	case "status":
+		return wifiStatus(state)
+	case "add":
+		return wifiAdd(state, body)
+	case "update":
+		return wifiUpdate(state, body)
+	case "delete":
+		return wifiDelete(state, body)
+	case "test":
+		return wifiTest(state, body)
+	case "activate":
+		return wifiActivate(state, body)
+	}
+	env := map[string]any{"status": "usage_error", "message": "unknown subcommand " + sub}
+	b, _ := json.Marshal(env)
+	return wexec.Result{Stdout: b}, nil
+}
+
+func wifiList(state *State) (wexec.Result, error) {
+	nets, active := state.WifiList()
+	env := map[string]any{
+		"status":                   "ok",
+		"active_connection":        active,
+		"non_wifi_uplinks":         []any{},
+		"networks":                 nets,
+		"networkmanager_available": true,
+	}
+	b, _ := json.Marshal(env)
+	return wexec.Result{Stdout: b}, nil
+}
+
+func wifiStatus(state *State) (wexec.Result, error) {
+	active, dev := state.WifiStatus()
+	env := map[string]any{
+		"status":                   "ok",
+		"active_connection":        active,
+		"wifi_device":              dev,
+		"non_wifi_uplinks":         []any{},
+		"networkmanager_available": true,
+	}
+	b, _ := json.Marshal(env)
+	return wexec.Result{Stdout: b}, nil
+}
+
+// wifiInput captures the subset of the apl-wifi {add,update,test,delete,activate}
+// body fields the fake needs. The helper accepts more, but the SPA only
+// posts these.
+type wifiInput struct {
+	ID       string `json:"id"`
+	SSID     string `json:"ssid"`
+	PSK      string `json:"psk"`
+	Country  string `json:"country"`
+	Hidden   bool   `json:"hidden"`
+	Priority int    `json:"priority"`
+}
+
+func parseWifiInput(body []byte) (wifiInput, error) {
+	var in wifiInput
+	if len(body) == 0 {
+		return in, nil
+	}
+	if err := json.Unmarshal(body, &in); err != nil {
+		return in, err
+	}
+	return in, nil
+}
+
+func wifiAdd(state *State, body []byte) (wexec.Result, error) {
+	in, err := parseWifiInput(body)
+	if err != nil {
+		env := map[string]any{"status": "parse_error", "message": err.Error()}
+		b, _ := json.Marshal(env)
+		return wexec.Result{Stdout: b}, nil
+	}
+	if in.SSID == "" {
+		env := map[string]any{"status": "rejected", "reason": "ssid_required"}
+		b, _ := json.Marshal(env)
+		return wexec.Result{Stdout: b}, nil
+	}
+	id, _ := state.WifiAdd(in.SSID, in.PSK, in.Country, in.Hidden, in.Priority)
+	env := map[string]any{"status": "applied", "id": id}
+	b, _ := json.Marshal(env)
+	return wexec.Result{Stdout: b}, nil
+}
+
+func wifiUpdate(state *State, body []byte) (wexec.Result, error) {
+	in, err := parseWifiInput(body)
+	if err != nil {
+		env := map[string]any{"status": "parse_error", "message": err.Error()}
+		b, _ := json.Marshal(env)
+		return wexec.Result{Stdout: b}, nil
+	}
+	if !state.WifiUpdate(in.ID, in.SSID, in.PSK, in.Country, in.Hidden, in.Priority) {
+		env := map[string]any{"status": "rejected", "reason": "unknown_id", "id": in.ID}
+		b, _ := json.Marshal(env)
+		return wexec.Result{Stdout: b}, nil
+	}
+	env := map[string]any{"status": "applied", "id": in.ID}
+	b, _ := json.Marshal(env)
+	return wexec.Result{Stdout: b}, nil
+}
+
+func wifiDelete(state *State, body []byte) (wexec.Result, error) {
+	in, _ := parseWifiInput(body)
+	if !state.WifiDelete(in.ID) {
+		env := map[string]any{"status": "rejected", "reason": "unknown_id", "id": in.ID}
+		b, _ := json.Marshal(env)
+		return wexec.Result{Stdout: b}, nil
+	}
+	env := map[string]any{"status": "applied", "id": in.ID}
+	b, _ := json.Marshal(env)
+	return wexec.Result{Stdout: b}, nil
+}
+
+func wifiTest(state *State, body []byte) (wexec.Result, error) {
+	in, err := parseWifiInput(body)
+	if err != nil {
+		env := map[string]any{"status": "parse_error", "message": err.Error()}
+		b, _ := json.Marshal(env)
+		return wexec.Result{Stdout: b}, nil
+	}
+	if in.SSID == "" {
+		env := map[string]any{"status": "rejected", "reason": "ssid_required"}
+		b, _ := json.Marshal(env)
+		return wexec.Result{Stdout: b}, nil
+	}
+	env := map[string]any{"status": "test_passed", "ssid": in.SSID}
+	b, _ := json.Marshal(env)
+	return wexec.Result{Stdout: b}, nil
+}
+
+func wifiActivate(state *State, body []byte) (wexec.Result, error) {
+	in, _ := parseWifiInput(body)
+	if !state.WifiActivate(in.ID) {
+		env := map[string]any{"status": "rejected", "reason": "unknown_id", "id": in.ID}
+		b, _ := json.Marshal(env)
+		return wexec.Result{Stdout: b}, nil
+	}
+	env := map[string]any{"status": "applied", "id": in.ID}
+	b, _ := json.Marshal(env)
+	return wexec.Result{Stdout: b}, nil
+}
+
+// --- journalctl streamer --------------------------------------------------
+
+// unitLogLines maps the slug → unit name the logs.Whitelist exposes
+// to per-unit canned content. Each entry is a short loop the streamer
+// rotates through, prefixed with a fresh timestamp on every line.
+var unitLogLines = map[string][]string{
+	"airplanes-feed.service": {
+		"feed: tail-uplink connected",
+		"feed: 4218 msgs/s, 34 aircraft",
+		"feed: heartbeat ok",
+	},
+	"airplanes-mlat.service": {
+		"mlat: 12 peers, sync ok",
+		"mlat: clock drift +0.4 ms",
+		"mlat: solved 8 positions",
+	},
+	"readsb.service": {
+		"readsb: 32 aircraft, 4 with positions",
+		"readsb: rate=4200 msg/s gain=auto",
+	},
+	"dump978-fa.service": {
+		"dump978-fa: no UAT frames",
+		"dump978-fa: SDR idle (UAT_INPUT empty)",
+	},
+	"airplanes-978.service": {
+		"airplanes-978: consumer idle",
+	},
+	"airplanes-claim.service": {
+		"claim: registering with feed.airplanes.live",
+		"claim: 200 OK, secret materialised",
+	},
+	"airplanes-webconfig.service": {
+		"webconfig: dev-mode active",
+		"webconfig: /api/status served in 1.2ms",
+	},
+	"airplanes-update.service": {
+		"update: would clone feed scripts",
+		"update: would systemctl restart airplanes-feed",
+	},
+	"airplanes-system-upgrade.service": {
+		"system-upgrade: apt-get update (simulated)",
+		"system-upgrade: 0 packages to upgrade",
+	},
+	"airplanes-webconfig-update.service": {
+		"webconfig-update: resolving latest tag",
+		"webconfig-update: would download release",
+	},
+}
+
+// StreamRunner returns a wexec.StreamRunner that emits one canned
+// line per second to w until ctx is cancelled. The unit name is
+// recovered from `-u <name>` in argv (logs.go's invocation shape).
+func StreamRunner(state *State) wexec.StreamRunner {
+	return func(ctx context.Context, w io.Writer, argv []string) error {
+		_ = state // reserved for future per-unit state-driven lines
+		unit := unitFromJournalctlArgv(argv)
+		lines := unitLogLines[unit]
+		if len(lines) == 0 {
+			lines = []string{"(no canned log content for unit)"}
+		}
+		i := 0
+		tick := time.NewTicker(time.Second)
+		defer tick.Stop()
+		// Emit one line right away so the SSE viewer doesn't sit
+		// blank for a second on open.
+		if err := emitLogLine(w, unit, lines[i]); err != nil {
+			return err
+		}
+		i = (i + 1) % len(lines)
+		for {
+			select {
+			case <-ctx.Done():
+				return nil
+			case <-tick.C:
+				if err := emitLogLine(w, unit, lines[i]); err != nil {
+					return err
+				}
+				i = (i + 1) % len(lines)
+			}
+		}
+	}
+}
+
+func emitLogLine(w io.Writer, unit, msg string) error {
+	stamp := time.Now().UTC().Format("Jan 02 15:04:05")
+	line := fmt.Sprintf("%s feeder-dev %s: %s\n", stamp, unit, msg)
+	_, err := io.Copy(w, bytes.NewReader([]byte(line)))
+	return err
+}
+
+func unitFromJournalctlArgv(argv []string) string {
+	for i, a := range argv {
+		if a == "-u" && i+1 < len(argv) {
+			return argv[i+1]
+		}
+		if strings.HasPrefix(a, "--unit=") {
+			return strings.TrimPrefix(a, "--unit=")
+		}
+	}
+	return "unknown.service"
+}
