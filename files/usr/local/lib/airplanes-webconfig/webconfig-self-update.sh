@@ -190,7 +190,7 @@ while [ "$attempt" -lt "$HEALTH_MAX_ATTEMPTS" ]; do
     sleep "$HEALTH_SLEEP_SECONDS"
     if curl -fsS -o /dev/null --max-time 2 "$HEALTH_URL"; then
         if ! rm -f "${BIN}.prev" "${UNIT_FILE}.prev" "${MANIFEST}.prev"; then
-            echo "WARN: failed to clean up .prev markers after successful upgrade; benign but worth noting" >&2
+            echo "WARN: failed to clean up .prev markers after successful upgrade; non-fatal, may require cleanup before the next update" >&2
         fi
         echo "webconfig-self-update: /health OK after restart (attempt=$attempt)"
         exit 0
