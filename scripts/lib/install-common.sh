@@ -330,9 +330,11 @@ airplanes_webconfig_install_manifest() {
 airplanes_webconfig_ensure_upgrade_state_dir() {
     local target_root="$1"
     local dir="${target_root}/var/lib/airplanes-webconfig-upgrade"
-    # -o 0 -g 0 makes the invariant explicit. install.sh always runs as
-    # root (pi-gen chroot in build-mode, sudo-pinned helper in runtime),
-    # so the explicit owner flags don't need extra privilege — they just
-    # guarantee root:root regardless of any future non-root caller.
-    install -d -o 0 -g 0 -m 0755 "$dir"
+    # No explicit -o/-g: install.sh always runs as root in production
+    # (pi-gen chroot in build-mode, sudo-pinned helper in runtime), so
+    # the dir is root:root by virtue of the caller's identity — same
+    # convention as install_manifest / install_binary above. Adding
+    # -o 0 -g 0 here would break the test suite, which runs install.sh
+    # as a non-root user (CI runner) against tmpfs ROOTFS_DIRs.
+    install -d -m 0755 "$dir"
 }

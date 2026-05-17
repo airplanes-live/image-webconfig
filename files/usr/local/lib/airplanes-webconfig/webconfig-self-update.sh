@@ -16,8 +16,8 @@
 #   4. Mark the upgrade `in-progress` immediately before crossing the
 #      live-state boundary (`/usr/local/share/airplanes-webconfig/update.sh`).
 #   5. Run /usr/local/share/airplanes-webconfig/update.sh, which locks,
-#      downloads and verifies the release, atomic-renames the binary
-#      (saving the previous as .prev), and extracts the rootfs payload.
+#      downloads and verifies the release, extracts the rootfs payload,
+#      and atomic-renames the binary (saving the previous as .prev).
 #      Distinguish pre-mutation failures (no ${BIN}.prev → mark clean,
 #      live state untouched) from post-mutation failures (${BIN}.prev
 #      exists → roll everything back, mark failed).
