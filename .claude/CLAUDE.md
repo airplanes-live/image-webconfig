@@ -9,7 +9,7 @@ Source for the `airplanes-webconfig` Go service and its on-device deployment art
 Two install paths share one script (`install.sh`):
 
 - **Build mode** — pi-gen `stage-airplanes/05-install-webconfig` in `airplanes-live/image` clones this repo at a config-pinned ref and runs `install.sh --build-mode`. `ARCH` and `ROOTFS_DIR` are set by pi-gen. The script downloads the matching GitHub Release, verifies SHA256, cross-checks `manifest.json.commit_sha` against the cloned source HEAD, and lays binary + `rootfs.tar.gz` payload into `ROOTFS_DIR`.
-- **Runtime mode** — the on-device self-update helper runs `install.sh --runtime`. The script reads `/etc/airplanes/release-channel` to resolve `stable` (highest semver tag) or `dev` (the moving `dev-latest` tag), downloads the release, verifies SHA256, atomic-swaps the binary, and extracts the rootfs payload. The helper handles `systemctl daemon-reload + restart + /health probe + rollback`.
+- **Runtime mode** — the on-device self-update helper runs `install.sh --runtime`. The script reads `/etc/airplanes/release-channel` to resolve `stable` (highest semver tag) or `dev` (the moving `dev-latest` tag), downloads the release, verifies SHA256, extracts the rootfs payload, and atomic-swaps the binary (in that order — see `rules/architecture.md` for the rationale). The helper handles `systemctl daemon-reload + restart + /health probe + rollback`.
 
 ## Build
 

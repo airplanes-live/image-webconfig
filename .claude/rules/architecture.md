@@ -33,7 +33,7 @@ The Go test `TestDefaultPrivilegedArgv_SudoersParity` enforces this from the bin
 `install.sh` has two modes:
 
 - `--build-mode` (or `AIRPLANES_BUILD_MODE=1`): runs from a cloned source tree at pi-gen's build host. `ROOTFS_DIR` is the pi-gen staging rootfs; `ARCH` is set to `arm64` or `armhf`; `AIRPLANES_WEBCONFIG_BRANCH` is the concrete tag (stable) or branch (dev) the image config pinned. **Does not read `/etc/airplanes/release-channel`** — that file is written by pi-gen `stage 06`, which runs AFTER `stage 05`. Cross-checks `manifest.json.commit_sha` against `git rev-parse HEAD` of the cloned tree and hard-fails on mismatch.
-- `--runtime`: runs on a booted feeder, invoked by the sudoers-pinned self-update helper. Reads `/etc/airplanes/release-channel`, resolves `stable` (highest semver tag) or `dev` (`dev-latest` moving tag), saves the previous binary as `.prev` for rollback, atomic-renames in the new one, extracts the rootfs payload, writes the manifest. Caller restarts the service and probes `/health`.
+- `--runtime`: runs on a booted feeder, invoked by the sudoers-pinned self-update helper. Reads `/etc/airplanes/release-channel`, resolves `stable` (highest semver tag) or `dev` (`dev-latest` moving tag), extracts the rootfs payload, saves the previous binary as `.prev` for rollback, atomic-renames in the new one, writes the manifest. Caller restarts the service and probes `/health`. The rootfs-before-binary order is deliberate: a partial extract leaves the old binary still running (recoverable on next upgrade) rather than the new binary against an old rootfs payload.
 
 **Don't**:
 
@@ -92,13 +92,15 @@ Auto-cleanup at startup corrupts case 2; fail-closed on any `.prev` corrupts cas
 
 Three states:
 
-- `clean` — written after `/health` OK + cleanup, OR after a pre-mutation installer failure (rc=75, download/SHA/preflight, partial-rootfs-no-binary-swap) where the helper restored its backups and live state was untouched.
+- `clean` — written after `/health` OK + cleanup, OR after a pre-mutation installer failure (rc=75, download/SHA/preflight, partial-rootfs-no-binary-swap) where the helper successfully restored its backups and live state was untouched.
 - `in-progress` — written AFTER preflight + backups succeed, IMMEDIATELY before invoking the installer. The window in which the helper observes live state crossing the mutation boundary.
-- `failed` — written on post-mutation install failures (the helper observed `${BIN}.prev` exists at installer exit, so the binary swap was attempted) OR after `rollback_and_exit` for any reason, even when each restore step succeeded. The narrow signal is `${BIN}.prev` existence after install.sh exit — `install.sh` only creates `.prev` at the atomic-swap step, so its presence after rc!=0 means live state may be inconsistent.
+- `failed` — written on post-mutation install failures (the helper observed `${BIN}.prev` exists at installer exit, so the binary swap was attempted) OR after `rollback_and_exit` for any reason, even when each restore step succeeded. Also written when a pre-mutation install failure's backup restore (`restore_helper_backups`) itself fails — live state may be partially corrupt because rootfs extract may have run but we couldn't undo it. The narrow signal is `${BIN}.prev` existence after install.sh exit — `install.sh` only creates `.prev` at the atomic-swap step, so its presence after rc!=0 means live state may be inconsistent.
 
 The state-write happens before `exit` at every termination path; see `webconfig-self-update.sh` for the exact write points.
 
-`failed` is deliberately narrow. rc=75 (lock contention) and pre-mutation install failures route to `clean` so flaky-network upgrades don't wedge the device.
+`failed` is deliberately narrow. rc=75 (lock contention) and pre-mutation install failures with successful restore route to `clean` so flaky-network upgrades don't wedge the device.
+
+Entry-time cleanup: when the marker is `clean`, the helper `rm -f ${BIN}.prev` before doing anything else. The helper's own backup phase overwrites `${UNIT_FILE}.prev` and `${MANIFEST}.prev` via `cp -a`, but `${BIN}.prev` is created by `install.sh` (atomic-swap step) and is never overwritten otherwise — a stale `${BIN}.prev` left over from a prior `clean`'s failed `rm` cleanup would later be mis-classified as a post-mutation rollback target on a pre-swap install failure, restoring the older binary as a silent downgrade. The entry cleanup keeps the post-mutation heuristic honest. If the cleanup `rm` itself fails, the helper marks `failed` and exits — the heuristic is unsalvageable and operator triage is required.
 
 Migration rule: absent marker is NOT uniformly treated as `clean`. Absent + no `.prev` is `clean` (first flash). Absent + any `.prev` is fail-closed with a migration-recovery message — pre-state-machine feeders may silently carry rollback markers from a prior failed run; overwriting their `.prev` on the next upgrade would lose the only good copy.
 
