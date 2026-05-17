@@ -81,6 +81,49 @@ When the on-device self-update helper invokes `update.sh` via the sudoers-pinned
 
 The script files themselves still accept the env-var overrides because the bats tests rely on them — that's safe as long as the sudo-pinned helper scrubs the environment before invocation. The test suite covers the env-override path; the production privilege boundary is the helper's responsibility.
 
+### Upgrade state machine
+
+The helper writes a persistent marker at `/var/lib/airplanes-webconfig-upgrade/upgrade-state` so that a subsequent helper invocation can distinguish two indistinguishable on-disk states a `.prev` file alone cannot:
+
+1. *Stale-from-cleanup-failure*: prior upgrade succeeded, happy-path `rm -f ${BIN}.prev` failed (ENOSPC). `.prev` reflects the binary BEFORE the prior successful upgrade — safe to overwrite.
+2. *Real rollback-marker*: prior upgrade failed AND rollback also failed (`mv -f ${BIN}.prev $BIN` failed). `.prev` is the ONLY good copy — live `$BIN`/`$UNIT`/`$MANIFEST` is the failed-release contents.
+
+Auto-cleanup at startup corrupts case 2; fail-closed on any `.prev` corrupts case 1's UX. The marker records which case produced the `.prev` files.
+
+Three states:
+
+- `clean` — written after `/health` OK + cleanup, OR after a pre-mutation installer failure (rc=75, download/SHA/preflight, partial-rootfs-no-binary-swap) where the helper restored its backups and live state was untouched.
+- `in-progress` — written AFTER preflight + backups succeed, IMMEDIATELY before invoking the installer. The window in which the helper observes live state crossing the mutation boundary.
+- `failed` — written on post-mutation install failures (the helper observed `${BIN}.prev` exists at installer exit, so the binary swap was attempted) OR after `rollback_and_exit` for any reason, even when each restore step succeeded. The narrow signal is `${BIN}.prev` existence after install.sh exit — `install.sh` only creates `.prev` at the atomic-swap step, so its presence after rc!=0 means live state may be inconsistent.
+
+The state-write happens before `exit` at every termination path; see `webconfig-self-update.sh` for the exact write points.
+
+`failed` is deliberately narrow. rc=75 (lock contention) and pre-mutation install failures route to `clean` so flaky-network upgrades don't wedge the device.
+
+Migration rule: absent marker is NOT uniformly treated as `clean`. Absent + no `.prev` is `clean` (first flash). Absent + any `.prev` is fail-closed with a migration-recovery message — pre-state-machine feeders may silently carry rollback markers from a prior failed run; overwriting their `.prev` on the next upgrade would lose the only good copy.
+
+Operator recovery for fail-closed devices, surfaced in the helper's log line:
+
+```
+echo clean | sudo tee /var/lib/airplanes-webconfig-upgrade/upgrade-state
+```
+
+No `--reset-upgrade-state` subcommand or production sudoers grant in v1 — the privilege surface stays minimal. The QEMU probe in `airplanes-live/image`'s boot-smoke exercises the recovery path via a test-only sudoers-pinned helper.
+
+### Upgrade-state HTTP surface
+
+`GET /api/status/upgrade` returns `{"state": "clean" | "in-progress" | "failed" | "unknown"}`. `unknown` covers every operationally-indistinct case the caller cannot triage from the SPA: missing file, empty, malformed, unparseable, read error. The SPA polls this after `POST /api/webconfig-update` to render "rolling back" or "wedged — manual recovery required" without grepping the SSE log.
+
+`/health` stays plain-text `ok <version>` — the SPA captures it as raw text and treats any change as "update applied". JSON-ifying `/health` would misreport a rolled-back-with-`failed`-marker device as a successful upgrade because the version byte-changes after a partial extract. Upgrade state belongs on a dedicated status endpoint, not a health probe.
+
+### Upgrade-state file ownership
+
+Parent dir `/var/lib/airplanes-webconfig-upgrade/` is `0755 root:root`. File `/var/lib/airplanes-webconfig-upgrade/upgrade-state` is `0644 root:root`. The unprivileged `airplanes-webconfig` service account can read but cannot unlink/replace — intentionally NOT `/var/lib/airplanes-webconfig/`, which is `0700 airplanes-webconfig:airplanes-webconfig` and would let the account replace the marker regardless of file ownership.
+
+The directory is provisioned in two places (idempotent):
+- `install.sh` calls `airplanes_webconfig_ensure_upgrade_state_dir` (mode 0755) in both `--build-mode` and `--runtime` paths.
+- The rootfs tarball includes `files/var/lib/airplanes-webconfig-upgrade/.gitkeep` so `tar --owner=0 --group=0` lays the dir down as `root:root` during extract.
+
 ## Accepted v1 limitations
 
 These are known, deferred to a follow-up rather than fixed in the install/update pipeline:
