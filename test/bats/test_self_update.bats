@@ -103,22 +103,15 @@ JSON
     stage_release_fixture /var/test-releases v9.9.9
     init_release_remote   /var/test-releases v9.9.9
 
-    # Test wrapper update.sh: helper hardcodes this path. The wrapper mirrors
-    # production update.sh's flock + install.sh chain (so test case 7's
-    # concurrency guard exercises the same code path a real on-device update
-    # would), then exports the file:// URLs that the helper's env -i would
-    # otherwise scrub before exec'ing install.sh.
+    # Test wrapper update.sh: helper hardcodes this path. The helper owns
+    # the upgrade flock at /run/airplanes/webconfig-update.lock for the
+    # whole protocol — production update.sh has no flock of its own and
+    # neither does this test wrapper. The wrapper just exports the
+    # file:// URLs that the helper's env -i would otherwise scrub, then
+    # execs install.sh.
     cat > /usr/local/share/airplanes-webconfig/update.sh <<'WRAPPER'
 #!/bin/bash
 set -euo pipefail
-LOCK_DIR="${AIRPLANES_WEBCONFIG_LOCK_DIR:-/run/airplanes}"
-LOCK_FILE="$LOCK_DIR/webconfig-update.lock"
-install -d -m 0755 "$LOCK_DIR"
-exec 9>"$LOCK_FILE"
-if ! flock -n 9; then
-    echo "ERROR: another webconfig update is in progress (lock held: $LOCK_FILE)" >&2
-    exit 75
-fi
 export AIRPLANES_WEBCONFIG_REPO=file:///var/test-releases/image-webconfig.git
 export AIRPLANES_WEBCONFIG_DOWNLOAD_BASE=file:///var/test-releases
 export AIRPLANES_BUILD_MODE=
@@ -300,12 +293,12 @@ STUB
     [ "$(read_state)" = failed ]
 }
 
-@test "exits 75 when another update is already running; marker clean" {
-    # Hold the lock on a DIFFERENT FD (8) than the wrapper uses (9). The
-    # wrapper's `exec 9>"$LOCK_FILE"` would close an inherited FD 9 and
-    # implicitly release a lock held there; holding on FD 8 keeps the
-    # bats shell's OFD distinct so the wrapper's flock(LOCK_NB) actually
-    # contends with it.
+@test "exits 75 when another update is already running; marker untouched" {
+    # Hold the lock on a DIFFERENT fd (8) than the helper uses (9). The
+    # helper's `exec 9>"$LOCK_FILE"` would close an inherited fd-9 (and
+    # implicitly release a lock held there); keeping the bats shell's
+    # OFD on fd 8 makes flock(LOCK_NB) inside the helper actually contend
+    # against the bats shell's lock.
     install -d -m 0755 /run/airplanes
     exec 8>/run/airplanes/webconfig-update.lock
     flock -n 8
@@ -317,18 +310,18 @@ STUB
     flock -u 8
     exec 8>&-
 
-    # Binary untouched; installer never reached the swap.
+    # Binary untouched; the helper exited at the flock check, before
+    # state_read / backups / installer.
     grep -q 'version=v0.1.0 baseline binary' /usr/local/bin/airplanes-webconfig
     [ ! -f /usr/local/bin/airplanes-webconfig.prev ]
 
-    # No `systemctl restart` — the main path's restart only runs after a
-    # successful installer. (The helper does call `systemctl daemon-reload`
-    # during the unit-rollback path even on installer-fail; that's a wasted
-    # no-op but not a correctness bug, so we only assert no `restart`.)
-    ! grep -q '^systemctl restart' /tmp/airplanes-test/systemctl-calls.log
+    # No systemctl call at all — the helper exited before reaching either
+    # the installer's restart or the rollback's daemon-reload.
+    [ ! -s /tmp/airplanes-test/systemctl-calls.log ]
 
-    # rc=75 is a benign "retry later" — marker advances clean → in-progress
-    # → clean (restored after the installer signals lock contention).
+    # Marker is untouched at its setup() value (clean) — the helper exits
+    # 75 BEFORE state_read/state_write. The losing invocation cannot race
+    # the winner's marker writes, which is the whole point of #19.
     [ "$(read_state)" = clean ]
 }
 
@@ -670,11 +663,8 @@ STUB
     cat > /usr/local/share/airplanes-webconfig/update.sh <<'WRAPPER'
 #!/bin/bash
 set -euo pipefail
-LOCK_DIR="${AIRPLANES_WEBCONFIG_LOCK_DIR:-/run/airplanes}"
-LOCK_FILE="$LOCK_DIR/webconfig-update.lock"
-install -d -m 0755 "$LOCK_DIR"
-exec 9>"$LOCK_FILE"
-if ! flock -n 9; then exit 75; fi
+# The helper owns the upgrade flock — this wrapper runs inside it and
+# does not need its own. See production update.sh.
 
 # Simulate install_binary's atomic swap.
 cp -a /usr/local/bin/airplanes-webconfig /usr/local/bin/airplanes-webconfig.prev

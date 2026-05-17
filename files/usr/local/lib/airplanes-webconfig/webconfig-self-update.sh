@@ -6,23 +6,28 @@
 #
 # Steps:
 #   1. Scrub the environment — never trust env from the webconfig caller.
-#   2. Read /var/lib/airplanes-webconfig-upgrade/upgrade-state. Fail-closed
+#   2. Take the upgrade flock at /run/airplanes/webconfig-update.lock.
+#      The lock covers the WHOLE protocol — state read/write, backups,
+#      installer, restart, /health probe, rollback. A losing concurrent
+#      invocation exits 75 before touching any marker or backup file.
+#   3. Read /var/lib/airplanes-webconfig-upgrade/upgrade-state. Fail-closed
 #      on `in-progress`, `failed`, malformed, or `absent` when any .prev
 #      files exist (an unmarked feeder may carry stale or real rollback
 #      markers — we cannot distinguish them, so triage is required).
-#   3. Back up the live unit file and manifest alongside the binary so a
+#   4. Back up the live unit file and manifest alongside the binary so a
 #      unit-file or manifest change in the new release can be rolled back
 #      together with the binary if /health fails after the restart.
-#   4. Mark the upgrade `in-progress` immediately before crossing the
+#   5. Mark the upgrade `in-progress` immediately before crossing the
 #      live-state boundary (`/usr/local/share/airplanes-webconfig/update.sh`).
-#   5. Run /usr/local/share/airplanes-webconfig/update.sh, which locks,
-#      downloads and verifies the release, extracts the rootfs payload,
-#      and atomic-renames the binary (saving the previous as .prev).
-#      Distinguish pre-mutation failures (no ${BIN}.prev → mark clean,
-#      live state untouched) from post-mutation failures (${BIN}.prev
-#      exists → roll everything back, mark failed).
-#   6. systemctl daemon-reload + restart airplanes-webconfig.service.
-#   7. Poll /health for up to ~10s. On success, drop the .prev markers
+#   6. Run /usr/local/share/airplanes-webconfig/update.sh, which downloads
+#      and verifies the release, extracts the rootfs payload, and atomic-
+#      renames the binary (saving the previous as .prev). Distinguish
+#      pre-mutation failures (no ${BIN}.prev → mark clean, live state
+#      untouched) from post-mutation failures (${BIN}.prev exists → roll
+#      everything back, mark failed). The lock is held by THIS helper so
+#      update.sh does not need its own flock.
+#   7. systemctl daemon-reload + restart airplanes-webconfig.service.
+#   8. Poll /health for up to ~10s. On success, drop the .prev markers
 #      and mark clean. On failure, restore .prev for the binary, unit,
 #      and manifest, restart, mark failed, and exit non-zero so the SSE
 #      log stream the SPA is reading shows the rollback.
@@ -55,6 +60,26 @@ SERVICE=airplanes-webconfig.service
 HEALTH_URL=http://127.0.0.1:8080/health
 HEALTH_MAX_ATTEMPTS=10
 HEALTH_SLEEP_SECONDS=1
+LOCK_FILE=/run/airplanes/webconfig-update.lock
+
+# Take the upgrade lock as the FIRST thing after env-i re-exec, before
+# reading the state marker or touching any backup files. This is the
+# single gate covering the whole upgrade protocol — state read/write,
+# backups, installer invocation, daemon-reload + restart, /health probe,
+# rollback. A concurrent invocation hits this flock and exits 75 BEFORE
+# writing the in-progress marker, so the loser cannot race the winner's
+# state writes or pull the shared .prev backups out from under it.
+#
+# fd 9 is just convention; the process-exit close releases the lock
+# automatically. /run/airplanes may not exist on a fresh feeder until
+# feed scripts run, so create it with install -d.
+install -d -m 0755 "$(dirname "$LOCK_FILE")"
+exec 9>"$LOCK_FILE"
+if ! flock -n 9; then
+    echo "ERROR: another webconfig update is in progress (lock held: $LOCK_FILE)" >&2
+    # No marker write — we have not read or written anything yet.
+    exit 75
+fi
 
 # Upgrade state machine: a persistent marker that distinguishes stale
 # .prev files (a successful upgrade whose happy-path cleanup failed) from
@@ -125,18 +150,19 @@ state_write() {
     return 0
 }
 
-# Restore the helper's unit + manifest backups. Used by both pre-mutation
-# rollback (installer rc!=0 with no ${BIN}.prev) and rc=75 lock-contention
-# paths. Safe to call when no .prev exists. The mv is a no-op when live
-# and .prev are byte-identical (e.g. rc=75 where install.sh never ran)
-# and undoes a partial rootfs extract that overwrote the unit file when
-# install.sh failed mid-extract.
+# Restore the helper's unit + manifest backups. Used by both the pre-
+# mutation install-failure path (installer rc!=0 with no ${BIN}.prev)
+# and the defense-in-depth installer-EX_TEMPFAIL path. Safe to call when
+# no .prev exists. The mv is a no-op when live and .prev are byte-
+# identical and undoes a partial rootfs extract that overwrote the unit
+# file when install.sh failed mid-extract.
 #
 # Returns 0 if every restore step succeeded (or had no work to do), 1 if
 # any step failed. Caller decides whether to escalate to `failed` — for
-# rc=75 (live state untouched) a failure is informational; for a pre-
-# mutation install error (rootfs extract may have run) a failure means
-# the live state is partially corrupt and the marker must reflect that.
+# an installer EX_TEMPFAIL (no install.sh mutation observed) a failure
+# is informational; for a pre-mutation install error (rootfs extract may
+# have run) a failure means the live state is partially corrupt and the
+# marker must reflect that.
 restore_helper_backups() {
     local rc=0
     if [ -f "${UNIT_FILE}.prev" ]; then
@@ -333,13 +359,13 @@ rc=$?
 
 if [ "$rc" -ne 0 ]; then
     if [ "$rc" -eq 75 ]; then
-        # Lock contention — wrapper update.sh exits 75 before invoking
-        # install.sh, so live state is untouched. Restore our backups
-        # (no-op against unchanged live state) and mark `clean` for a
-        # benign retry-later. Even if the restore mv internally fails,
-        # live state was never mutated, so .prev stragglers are harmless
-        # and the next cp -a overwrites them.
-        echo "webconfig-self-update: another update in progress (rc=75); retry later" >&2
+        # rc=75 from install.sh is unreachable in the normal flow now
+        # that the helper owns the upgrade flock — install.sh + update.sh
+        # have no flock of their own. Kept as defense-in-depth: if a
+        # future install.sh path returns EX_TEMPFAIL, treat live state
+        # as untouched (no .prev created), restore our backups, and mark
+        # clean for a benign retry-later.
+        echo "webconfig-self-update: installer returned EX_TEMPFAIL (rc=75); retry later" >&2
         restore_helper_backups || true
         state_write clean || true
         exit 75
