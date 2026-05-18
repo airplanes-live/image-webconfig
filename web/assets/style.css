@@ -996,6 +996,31 @@ textarea:focus {
   transform: none;
 }
 
+/* ========== Identity import form ========== */
+
+.identity-import {
+  margin-top: 0.75rem;
+  padding: 0.75rem;
+  border: 1px solid var(--wc-line-soft);
+  border-radius: var(--wc-radius-sm);
+  background: var(--wc-surface-2);
+}
+.identity-import[hidden] { display: none; }
+.identity-import .field { margin: 0.5rem 0; }
+.identity-import textarea {
+  width: 100%;
+  padding: 0.55rem 0.65rem;
+  font-family: var(--wc-font-mono);
+  font-size: 0.85rem;
+  background: var(--wc-surface-3);
+  color: var(--wc-ink-1);
+  border: 1px solid var(--wc-line-strong);
+  border-radius: var(--wc-radius-sm);
+  resize: vertical;
+  min-height: 4.5rem;
+}
+.identity-import__form .actions { margin-top: 0.5rem; }
+
 /* ========== Reduced motion ========== */
 
 @media (prefers-reduced-motion: reduce) {

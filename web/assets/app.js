@@ -1064,6 +1064,7 @@
             }, "Claim activity");
             parent.appendChild(el("div", { class: "actions" }, registerBtn, claimLog));
             parent.appendChild(registerErr);
+            appendIdentityImportRow(parent);
             return;
         }
         const claimLog = el("button", {
@@ -1097,7 +1098,166 @@
                 );
             },
         }, "Show claim secret");
-        parent.appendChild(el("div", { class: "actions" }, reveal, claimLog));
+        const exportBtn = el("button", {
+            class: "wc-btn-ghost",
+            type: "button",
+            onclick: async () => {
+                exportBtn.disabled = true;
+                try {
+                    const resp = await fetch("/api/identity/export", {
+                        method: "POST",
+                        credentials: "same-origin",
+                        headers: { "Content-Type": "application/json" },
+                    });
+                    if (resp.status === 401) {
+                        navigate(() => loginPanel("Session expired — log in again."), {});
+                        return;
+                    }
+                    if (!resp.ok) {
+                        let msg = "export failed";
+                        try { const j = await resp.json(); if (j && j.error) msg = j.error; } catch (_) {}
+                        alert(msg);
+                        return;
+                    }
+                    const text = await resp.text();
+                    let env;
+                    try { env = JSON.parse(text); } catch (_) {
+                        alert("export produced invalid JSON");
+                        return;
+                    }
+                    const fid = (env && env.feeder_uuid) || "feeder";
+                    const stamp = new Date().toISOString().slice(0, 10);
+                    const filename = "airplanes-live-feeder-" + String(fid).slice(0, 8) + "-" + stamp + ".json";
+                    const blob = new Blob([text], { type: "application/json" });
+                    const url = URL.createObjectURL(blob);
+                    const a = document.createElement("a");
+                    a.href = url;
+                    a.download = filename;
+                    document.body.appendChild(a);
+                    a.click();
+                    document.body.removeChild(a);
+                    setTimeout(() => URL.revokeObjectURL(url), 0);
+                } finally {
+                    exportBtn.disabled = false;
+                }
+            },
+        }, "Export");
+        parent.appendChild(el("div", { class: "actions" }, reveal, claimLog, exportBtn));
+        appendIdentityImportRow(parent);
+    }
+
+    // appendIdentityImportRow renders an Import button + a collapsed
+    // form that the user expands to paste an exported JSON backup or
+    // type the UUID/secret pair manually. On submit it POSTs the
+    // canonical { schema_version, feeder_uuid, claim:{secret, version} }
+    // envelope to /api/identity/import; the backend re-validates and
+    // pipes it to apl-feed restore via the privileged wrapper.
+    function appendIdentityImportRow(parent) {
+        const importBtn = el("button", {
+            class: "wc-btn-ghost",
+            type: "button",
+        }, "Import identity…");
+
+        const form = el("div", { class: "identity-import" });
+        form.hidden = true;
+
+        const pasteTa = el("textarea", {
+            rows: "4",
+            placeholder: "Paste exported JSON, or fill in the fields below",
+            class: "identity-import__paste",
+        });
+        const uuidIn = el("input", {
+            type: "text",
+            autocomplete: "off",
+            placeholder: "11111111-2222-3333-4444-555555555555",
+        });
+        const secretIn = el("input", {
+            type: "text",
+            autocomplete: "off",
+            placeholder: "ABCD-EFGH-IJKL-MNOP",
+        });
+        const inlineErr = el("p", { class: "error", role: "alert" });
+        const submit = el("button", { class: "wc-btn-primary", type: "submit" }, "Import");
+        const cancel = el("button", { class: "wc-btn-ghost", type: "button" }, "Cancel");
+
+        // Live-parse pasted JSON: if valid, populate the field inputs so
+        // the user sees what we'll send.
+        pasteTa.addEventListener("input", () => {
+            const t = pasteTa.value.trim();
+            if (t === "") return;
+            try {
+                const obj = JSON.parse(t);
+                if (obj && typeof obj.feeder_uuid === "string") uuidIn.value = obj.feeder_uuid;
+                if (obj && obj.claim && typeof obj.claim.secret === "string") secretIn.value = obj.claim.secret;
+            } catch (_) { /* invalid JSON yet — leave fields alone */ }
+        });
+
+        const formEl = el("form", {
+            class: "identity-import__form",
+            onsubmit: async (e) => {
+                e.preventDefault();
+                inlineErr.textContent = "";
+                const uuid = uuidIn.value.trim();
+                const secret = secretIn.value.trim();
+                if (!uuid || !secret) {
+                    inlineErr.textContent = "Feeder ID and claim secret are both required.";
+                    return;
+                }
+                if (!confirm("Importing replaces this feeder's identity with the supplied UUID and claim secret. Continue?")) {
+                    return;
+                }
+                let versionFromPaste = null;
+                const paste = pasteTa.value.trim();
+                if (paste !== "") {
+                    try {
+                        const obj = JSON.parse(paste);
+                        if (obj && obj.claim && Number.isInteger(obj.claim.version)) {
+                            versionFromPaste = obj.claim.version;
+                        }
+                    } catch (_) { /* fall through — handler validates */ }
+                }
+                const body = {
+                    schema_version: 1,
+                    feeder_uuid: uuid,
+                    claim: { secret: secret, version: versionFromPaste },
+                };
+                submit.disabled = true;
+                cancel.disabled = true;
+                submit.textContent = "Importing…";
+                const r = await postJSON("/api/identity/import", body);
+                submit.disabled = false;
+                cancel.disabled = false;
+                submit.textContent = "Import";
+                if (handleAuthFailure(r)) return;
+                if (!r.ok) {
+                    inlineErr.textContent = (r.payload && r.payload.error) || "import failed";
+                    return;
+                }
+                navigateDashboard({ flash: { text: "Identity imported. Reloading…", level: "ok" } });
+            },
+        },
+            el("div", { class: "field" }, el("label", {}, "Paste exported JSON"), pasteTa),
+            el("div", { class: "field" }, el("label", {}, "Feeder ID"), uuidIn),
+            el("div", { class: "field" }, el("label", {}, "Claim secret"), secretIn),
+            inlineErr,
+            el("div", { class: "actions" }, submit, cancel),
+        );
+
+        cancel.onclick = () => {
+            pasteTa.value = "";
+            uuidIn.value = "";
+            secretIn.value = "";
+            inlineErr.textContent = "";
+            form.hidden = true;
+        };
+        importBtn.onclick = () => {
+            form.hidden = !form.hidden;
+            if (!form.hidden) setTimeout(() => pasteTa.focus(), 0);
+        };
+
+        form.appendChild(formEl);
+        parent.appendChild(el("div", { class: "actions" }, importBtn));
+        parent.appendChild(form);
     }
 
     function identityChanged(prev, next) {

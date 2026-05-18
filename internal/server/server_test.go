@@ -111,6 +111,8 @@ func newTestServer(t *testing.T) (*httptest.Server, *Server) {
 		WifiTest:             []string{"sudo-stub", "apl-wifi", "test", "--json"},
 		WifiActivate:         []string{"sudo-stub", "apl-wifi", "activate", "--json"},
 		WifiStatus:           []string{"sudo-stub", "apl-wifi", "status", "--json"},
+		ExportIdentity:       []string{"sudo-stub", "identity-export"},
+		ImportIdentity:       []string{"sudo-stub", "identity-import"},
 	}
 
 	deps := Deps{
@@ -255,6 +257,8 @@ func newWriteHarness(t *testing.T, opts ...harnessOption) *writeHarness {
 		WifiTest:             []string{"sudo-stub", "apl-wifi", "test", "--json"},
 		WifiActivate:         []string{"sudo-stub", "apl-wifi", "activate", "--json"},
 		WifiStatus:           []string{"sudo-stub", "apl-wifi", "status", "--json"},
+		ExportIdentity:       []string{"sudo-stub", "identity-export"},
+		ImportIdentity:       []string{"sudo-stub", "identity-import"},
 	}
 
 	deps := Deps{
