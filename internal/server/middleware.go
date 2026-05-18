@@ -3,6 +3,7 @@ package server
 import (
 	"encoding/json"
 	"errors"
+	"log"
 	"net"
 	"net/http"
 	"net/url"
@@ -187,4 +188,51 @@ func (s *Server) requireSession(next http.HandlerFunc) http.HandlerFunc {
 		setSessionCookie(w, token, expires)
 		next.ServeHTTP(w, r)
 	}
+}
+
+// statusRecorder wraps http.ResponseWriter so requestLogger can recover the
+// final status code at the end of the handler chain. Only the first
+// WriteHeader is recorded — net/http itself only sends the first call and
+// warns about subsequent ones, so the log line stays truthful when a buggy
+// handler accidentally calls WriteHeader twice.
+type statusRecorder struct {
+	http.ResponseWriter
+	status      int
+	wroteHeader bool
+}
+
+func (s *statusRecorder) WriteHeader(code int) {
+	if s.wroteHeader {
+		s.ResponseWriter.WriteHeader(code)
+		return
+	}
+	s.wroteHeader = true
+	s.status = code
+	s.ResponseWriter.WriteHeader(code)
+}
+
+// requestLogger emits one structured line per state-changing HTTP request,
+// at the end of the handler chain. GET / HEAD / OPTIONS stay silent — the
+// SPA polls /api/state every few seconds and the journal would otherwise
+// drown in heartbeat traffic.
+//
+// Format: airplanes-webconfig method=POST path="/api/config" status=200 dur_ms=42
+//
+// The path is %q-quoted so operator-controlled URL segments (e.g. the
+// {id} in PUT /api/wifi/{id}) can't inject newlines or other control
+// characters into the journal stream. Values only — no headers, no body,
+// no query string ever reach this line.
+func requestLogger(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodGet, http.MethodHead, http.MethodOptions:
+			next.ServeHTTP(w, r)
+			return
+		}
+		sw := &statusRecorder{ResponseWriter: w, status: http.StatusOK}
+		start := time.Now()
+		next.ServeHTTP(sw, r)
+		log.Printf("airplanes-webconfig method=%s path=%q status=%d dur_ms=%d",
+			r.Method, r.URL.Path, sw.status, time.Since(start).Milliseconds())
+	})
 }

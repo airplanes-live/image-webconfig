@@ -257,8 +257,10 @@ func New(d Deps) http.Handler {
 	mux.HandleFunc("GET /{$}", s.handleIndex)
 
 	// Compose middleware: security headers on every response; Origin/Host
-	// check on every mutating method.
-	return securityHeaders(requireOriginMatchesHost(mux))
+	// check on every mutating method. requestLogger sits above the origin
+	// check so 403s from origin-check rejections still appear in the
+	// journal — a suspicious request is exactly what we want to see.
+	return securityHeaders(requestLogger(requireOriginMatchesHost(mux)))
 }
 
 func noStore(h http.Handler) http.Handler {
