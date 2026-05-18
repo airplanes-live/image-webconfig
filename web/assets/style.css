@@ -491,6 +491,35 @@ main {
    styling needed at the wrapper level. */
 .wc-tiles-stack { display: contents; }
 
+/* When .wc-tile is rendered as a <button> (the navigable Wi-Fi tile),
+   the global button rule would add an accent background, full-width
+   sizing, and centred content. Reset to the anchor-tile appearance. */
+button.wc-tile {
+  width: 100%;
+  min-height: 0;
+  background: var(--wc-surface-1);
+  color: var(--wc-ink-1);
+  border: 1px solid var(--wc-line-soft);
+  font-weight: inherit;
+  text-align: left;
+  justify-content: flex-start;
+  cursor: pointer;
+}
+button.wc-tile--wifi {
+  border-left: 3px solid var(--wc-accent);
+}
+button.wc-tile:hover {
+  background: var(--wc-surface-3);
+  border-color: var(--wc-line-strong);
+}
+
+/* Nav tiles (app tiles and the Wi-Fi tile) share the chevron pop on
+   hover/focus. */
+.wc-tile--nav:hover .wc-tile__chev,
+.wc-tile--nav:focus-visible .wc-tile__chev {
+  color: var(--wc-accent);
+}
+
 /* ========== Service-state legacy badge (kept for the intermediate
    state where app.js still emits .service-list / .service-state). The
    tile UI above replaces this once app.js is updated. ========== */
@@ -749,14 +778,49 @@ textarea:focus {
 
 .location-card {
   display: flex;
-  align-items: center;
+  align-items: flex-start;
   justify-content: space-between;
-  gap: 0.5rem;
+  gap: 0.75rem;
   margin-bottom: 0.25rem;
 }
-.location-card .location-summary {
-  font-family: var(--wc-font-mono);
+.location-summary {
+  flex: 1 1 auto;
+  display: grid;
+  grid-template-columns: auto 1fr;
+  column-gap: 0.75rem;
+  row-gap: 0.2rem;
+  margin: 0;
   color: var(--wc-ink-1);
+}
+.location-summary dt {
+  color: var(--wc-ink-3);
+  font-size: 0.85rem;
+  font-weight: 500;
+  margin: 0;
+}
+.location-summary dd {
+  margin: 0;
+  font-family: var(--wc-font-mono);
+  font-size: 0.95rem;
+  color: var(--wc-ink-1);
+}
+.location-summary__value {
+  display: inline-block;
+}
+.location-summary__note {
+  display: block;
+  font-family: var(--wc-font-sans);
+  color: var(--wc-ink-3);
+  font-size: 0.75rem;
+  margin-top: 0.1rem;
+}
+.location-card__edit {
+  flex: 0 0 auto;
+  width: auto;
+  min-width: auto;
+  min-height: 0;
+  padding: 0.3rem 0.7rem;
+  font-size: 0.85rem;
 }
 
 /* ========== Logs ========== */
@@ -869,6 +933,68 @@ textarea:focus {
 .wifi-flash-ok    { background: #e3f1e6; color: #14441f; }
 .wifi-flash-warn  { background: #fdecc8; color: #5e3a00; }
 .wifi-flash-error { background: #fbdcdc; color: #6a1b1b; }
+
+/* ========== Management card ========== */
+
+/* The Management card renders form rows directly (no inner fieldset),
+   so the muted help paragraph style that .config-fieldset .help used
+   to provide has to live on the card itself. */
+.management-card .help {
+  margin: 0 0 0.75rem;
+  color: var(--wc-ink-3);
+  font-size: 0.85rem;
+}
+.management-card .help a { color: var(--wc-ink-2); }
+.management-card .help code {
+  font-family: var(--wc-font-mono);
+  color: var(--wc-ink-2);
+}
+.management-body .field { margin: 0.5rem 0 0.35rem; }
+
+/* ========== Header user menu ========== */
+
+.wc-user-menu {
+  position: relative;
+  display: inline-flex;
+}
+.wc-user-menu[hidden] { display: none; }
+.wc-user-menu > summary {
+  list-style: none;
+}
+.wc-user-menu > summary::-webkit-details-marker { display: none; }
+.wc-user-menu > summary::marker { content: ""; }
+.wc-user-menu__panel {
+  position: absolute;
+  top: calc(100% + 0.35rem);
+  right: 0;
+  min-width: 12rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.15rem;
+  padding: 0.35rem;
+  background: var(--wc-surface-1);
+  border: 1px solid var(--wc-line-soft);
+  border-radius: var(--wc-radius-sm);
+  box-shadow: 0 6px 18px rgba(0, 0, 0, 0.18);
+  z-index: 50;
+}
+.wc-user-menu__panel button {
+  width: 100%;
+  min-height: 0;
+  padding: 0.5rem 0.75rem;
+  background: transparent;
+  color: var(--wc-ink-1);
+  border: 1px solid transparent;
+  justify-content: flex-start;
+  font-size: 0.9rem;
+  font-weight: 500;
+  text-align: left;
+}
+.wc-user-menu__panel button:hover {
+  background: var(--wc-surface-3);
+  border-color: var(--wc-line-soft);
+  transform: none;
+}
 
 /* ========== Reduced motion ========== */
 
