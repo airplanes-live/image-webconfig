@@ -1133,24 +1133,32 @@
 
         formEl.addEventListener("submit", async (e) => {
             e.preventDefault();
-            if (configState.inFlight) return;
+            // Snapshot the configState reference at submit time so a
+            // dashboard re-mount mid-await (e.g. user clicked Refresh)
+            // doesn't let this in-flight save mutate the new mount's
+            // state. Every step after an await checks `state ===
+            // configState` and bails if it diverged.
+            const state = configState;
+            if (state.inFlight) return;
             if (!isDirty()) return; // defensive: button shouldn't show
             err.textContent = "";
             pending.hidden = true;
             pending.textContent = "";
-            configState.inFlight = name;
+            state.inFlight = name;
             btn.disabled = true;
             btn.textContent = "Saving…";
             // Disable other groups' buttons while in-flight by firing
             // every group's recheck via the shared callback channel.
-            for (const cb of configState.recheckAll) cb();
+            for (const cb of state.recheckAll) cb();
 
             const body = payload();
             const r = await postJSON("/api/config", { updates: body });
 
+            if (state !== configState) return; // dashboard re-mounted
+
             btn.textContent = "Save changes";
             if (handleAuthFailure(r)) {
-                configState.inFlight = null;
+                state.inFlight = null;
                 return;
             }
             if (!r.ok) {
@@ -1160,8 +1168,8 @@
                 // for now.
                 err.textContent = (r.payload && (r.payload.error || r.payload.message))
                     || "save failed";
-                configState.inFlight = null;
-                for (const cb of configState.recheckAll) cb();
+                state.inFlight = null;
+                for (const cb of state.recheckAll) cb();
                 return;
             }
 
@@ -1182,23 +1190,24 @@
             // derive) land back in configState.savedValues. Trusting
             // the submitted body would diverge from disk on those keys.
             const refreshed = await getJSON("/api/config");
+            if (state !== configState) return; // dashboard re-mounted
             if (handleAuthFailure(refreshed)) {
-                configState.inFlight = null;
+                state.inFlight = null;
                 return;
             }
             if (refreshed.ok) {
-                configState.savedValues = (refreshed.payload && refreshed.payload.values) || {};
-                if (dashboardCtx) dashboardCtx.configValues = configState.savedValues;
+                state.savedValues = normaliseSavedValues((refreshed.payload && refreshed.payload.values) || {});
+                if (dashboardCtx) dashboardCtx.configValues = state.savedValues;
             }
-            configState.inFlight = null;
+            state.inFlight = null;
 
             // Recompute dirty for every group: Location may have moved,
             // MLAT's geo gate may have unblocked, Privacy may be clean
             // again if the server canonicalised an equal value. Then
             // fire the onSaved hooks (e.g. MLAT recheck after Location
             // save).
-            for (const cb of configState.recheckAll) cb();
-            for (const cb of configState.onSaved) {
+            for (const cb of state.recheckAll) cb();
+            for (const cb of state.onSaved) {
                 try { cb(name); } catch (_) {}
             }
             if (onSavedHook) {
@@ -1219,9 +1228,24 @@
     // dashboardCtx.
     let configState;
 
+    // normaliseSavedValues fills in the defaults the form inputs use
+    // for explicit toggle keys, so the dirty comparator never compares
+    // a literal "true"/"false" against undefined. The production
+    // feed.env always carries these keys, but normalising defensively
+    // keeps the comparator behaviour identical whether the backend
+    // omits them or not.
+    function normaliseSavedValues(values) {
+        return Object.assign({
+            MLAT_ENABLED: "true",
+            MLAT_PRIVATE: "false",
+            REPORT_STATUS: "true",
+            REMOTE_CONFIG_ENABLED: "false",
+        }, values || {});
+    }
+
     function resetConfigState(values) {
         configState = {
-            savedValues: values || {},
+            savedValues: normaliseSavedValues(values),
             dirtyGroups: new Set(),
             inFlight: null,
             recheckAll: new Set(),   // recheck() of every mounted group
@@ -1583,13 +1607,22 @@
             name: "uat",
             formEl: uatG.form,
             footerEl: uatG.footer,
-            // DUMP978_* keys only contribute to dirty when UAT is on —
-            // hidden sub-fields aren't part of the decision. UAT_INPUT
-            // is always considered.
-            keys: ["UAT_INPUT"],
-            readInputs: () => ({
-                UAT_INPUT: uatInput.checked ? "127.0.0.1:30978" : "",
-            }),
+            // All three keys are in scope. `readInputs` only emits the
+            // DUMP978_* keys when UAT is on, so the keys-in-cur check
+            // in mountGroup.isDirty naturally ignores hidden sub-fields
+            // — toggling UAT off after editing a sub-field returns the
+            // group to clean. When UAT is on, sub-field edits bubble
+            // through the form's "input" listener and recheck the
+            // group, surfacing the Save button.
+            keys: ["UAT_INPUT", "DUMP978_SDR_SERIAL", "DUMP978_GAIN"],
+            readInputs: () => {
+                const out = { UAT_INPUT: uatInput.checked ? "127.0.0.1:30978" : "" };
+                if (uatInput.checked) {
+                    out.DUMP978_SDR_SERIAL = sdrSerialInput.value;
+                    out.DUMP978_GAIN = dump978GainInput.value;
+                }
+                return out;
+            },
             isValid: () => true,
             payload: () => {
                 const out = {};
@@ -1608,35 +1641,6 @@
                 return out;
             },
         });
-        // Sub-field changes need to participate in dirty tracking when
-        // UAT is on. The group's default keys-based check only watches
-        // UAT_INPUT; force a recheck on sub-input edits so the Save
-        // button surfaces when the user edits SDR serial / gain alone.
-        const uatRecheck = () => {
-            // Just request the group helper recompute — mountGroup
-            // wired this via the recheckAll set.
-            for (const cb of configState.recheckAll) cb();
-        };
-        // We have to extend the dirty check for UAT to include sub
-        // fields when the toggle is on. Replace the generic check
-        // by adding a synthetic key into readInputs whose comparison
-        // shape is bespoke: instead of a clean abstraction, wire a
-        // small input listener that bumps dirtyGroups directly.
-        const uatDirtySnoop = () => {
-            if (!uatInput.checked) {
-                // UAT off — hidden sub-fields don't contribute. The
-                // keys-based check on UAT_INPUT is authoritative.
-                return;
-            }
-            // UAT on — surface sub-field dirt by forcing recompute via
-            // the standard channel. mountGroup's isDirty/recheck will
-            // see UAT_INPUT clean but we set the dirty bit ourselves.
-            const dirty = !sameValue("DUMP978_SDR_SERIAL", sdrSerialInput.value, configState.savedValues.DUMP978_SDR_SERIAL)
-                || !sameValue("DUMP978_GAIN", dump978GainInput.value, configState.savedValues.DUMP978_GAIN);
-            if (dirty) configState.dirtyGroups.add("uat");
-        };
-        sdrSerialInput.addEventListener("input", () => { uatDirtySnoop(); uatRecheck(); });
-        dump978GainInput.addEventListener("input", () => { uatDirtySnoop(); uatRecheck(); });
 
         // Assemble
         parent.appendChild(loc.fieldset);
@@ -2187,7 +2191,7 @@
         if (ctx !== dashboardCtx) return;
         if (handleAuthFailure(identity) || handleAuthFailure(status) || handleAuthFailure(config)) return;
 
-        const cfgValues = (config && config.payload && config.payload.values) || {};
+        const cfgValues = normaliseSavedValues((config && config.payload && config.payload.values) || {});
         ctx.configValues = cfgValues;
         configState.savedValues = cfgValues;
         ctx.lastIdentity = identity && identity.payload ? identity.payload : null;
