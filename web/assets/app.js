@@ -16,10 +16,12 @@
     //   - airplanes-webconfig.service: if the page loaded, this is up.
     // Showing tiles for those is just systemctl repeating what the user
     // already verified by being on the page.
+    // Order mirrors the dashboard layout: row 2 is the 1090 stack
+    // (feed → readsb → mlat), row 3 is the 978 UAT stack.
     const MONITORED_SERVICES = [
         "airplanes-feed.service",
-        "airplanes-mlat.service",
         "readsb.service",
+        "airplanes-mlat.service",
         "dump978-fa.service",
         "airplanes-978.service",
     ];
@@ -93,6 +95,9 @@
     const backBtn = document.getElementById("wc-back-btn");
     const themeBtn = document.getElementById("wc-theme-btn");
     const refreshBtn = document.getElementById("wc-refresh-btn");
+    const userMenu = document.getElementById("wc-user-menu");
+    const userMenuChangePw = document.getElementById("wc-user-change-pw");
+    const userMenuLogout = document.getElementById("wc-user-logout");
 
     let activeStream = null;       // current EventSource (log viewer)
     let statusTimer = null;        // setInterval handle for status poll
@@ -130,6 +135,51 @@
         if (headerTitleEl) headerTitleEl.textContent = o.title ? "/ " + o.title : "";
         if (backBtn) backBtn.hidden = !o.showBack;
         if (refreshBtn) refreshBtn.hidden = !o.showRefresh;
+        if (userMenu) {
+            userMenu.hidden = !o.showUserMenu;
+            if (!o.showUserMenu) closeUserMenu();
+        }
+    }
+
+    // closeUserMenu collapses the <details> menu and tears down its
+    // outside-click / Escape listeners. Safe to call when the menu is
+    // already closed (no-op).
+    let userMenuOutsideHandler = null;
+    let userMenuKeyHandler = null;
+    function closeUserMenu() {
+        if (!userMenu) return;
+        if (userMenu.open) userMenu.open = false;
+        if (userMenuOutsideHandler) {
+            document.removeEventListener("pointerdown", userMenuOutsideHandler, true);
+            userMenuOutsideHandler = null;
+        }
+        if (userMenuKeyHandler) {
+            document.removeEventListener("keydown", userMenuKeyHandler, true);
+            userMenuKeyHandler = null;
+        }
+    }
+    function openUserMenuHooks() {
+        if (!userMenu) return;
+        // Defer attaching so the click that opened the menu doesn't
+        // immediately close it. The opening event is already in flight
+        // when we get here; the next pointerdown is a genuine outside
+        // (or inside) interaction.
+        setTimeout(() => {
+            if (!userMenu.open) return;
+            userMenuOutsideHandler = (e) => {
+                if (!userMenu.contains(e.target)) closeUserMenu();
+            };
+            userMenuKeyHandler = (e) => {
+                if (e.key === "Escape") {
+                    e.preventDefault();
+                    closeUserMenu();
+                    const summary = userMenu.querySelector("summary");
+                    if (summary) summary.focus();
+                }
+            };
+            document.addEventListener("pointerdown", userMenuOutsideHandler, true);
+            document.addEventListener("keydown", userMenuKeyHandler, true);
+        }, 0);
     }
 
     // ===== Navigation (one cleanup point) =====
@@ -168,7 +218,8 @@
     // initial fetch and toggle the spinner around it.
     function navigateDashboard(extraOpts) {
         return navigate(dashboard, Object.assign(
-            { title: null, showBack: false, showRefresh: true }, extraOpts || {}));
+            { title: null, showBack: false, showRefresh: true, showUserMenu: true },
+            extraOpts || {}));
     }
 
     // ===== HTTP helpers =====
@@ -812,13 +863,13 @@
     }
 
     // classifyWifi projects the /api/status.wifi payload into a tile
-    // {dot, meta}. Returns null when there's no payload — the tile is
-    // hidden in that case (Ethernet-only hosts have no WiFi field at
-    // all). A connected interface with unparseable signal renders as
-    // warn with just the SSID (conservative — we know it's up but
-    // can't grade it).
+    // {dot, meta}. Returns a "not detected" classification when the
+    // payload omits wifi entirely (Ethernet-only hosts) so the tile
+    // stays in the layout as a navigable entry point. A connected
+    // interface with unparseable signal renders as warn with just the
+    // SSID (conservative — we know it's up but can't grade it).
     function classifyWifi(w) {
-        if (!w) return null;
+        if (!w) return { dot: "na", meta: "not detected" };
         if (!w.connected) return { dot: "na", meta: "not connected" };
         const displaySSID = (w.ssid && w.ssid.length) ? w.ssid : "(hidden)";
         if (typeof w.signal_pct !== "number") {
@@ -836,21 +887,16 @@
         const titleEl  = el("span", { class: "wc-tile__title" }, "Wi-Fi");
         const metaEl   = el("span", { class: "wc-tile__meta" }, "—");
         const dotEl    = el("span", { class: "wc-tile__dot wc-tile__dot--na" });
-        // Hidden until the first payload arrives — avoids a flash on
-        // Ethernet-only hosts where the field is omitted entirely.
-        const root = el("a", {
-            class: "wc-tile wc-tile--wifi",
+        const chev     = el("span", { class: "wc-tile__chev", "aria-hidden": "true" }, "›");
+        const root = el("button", {
+            type: "button",
+            class: "wc-tile wc-tile--wifi wc-tile--nav",
             "data-state": "unknown",
-            href: "#",
-            role: "button",
-            hidden: true,
-            onclick: (e) => {
-                e.preventDefault();
-                navigate(wifiPanel, { title: "Wi-Fi networks", showBack: true });
-            },
+            onclick: () => navigate(wifiPanel, { title: "Wi-Fi networks", showBack: true }),
         },
             iconNode,
             el("span", { class: "wc-tile__body" }, titleEl, metaEl),
+            chev,
             dotEl,
         );
         return { root, titleEl, metaEl, dotEl };
@@ -858,11 +904,6 @@
 
     function updateWifiTile(tile, payload) {
         const c = classifyWifi(payload && payload.wifi);
-        if (!c) {
-            tile.root.hidden = true;
-            return;
-        }
-        tile.root.hidden = false;
         tile.dotEl.className = "wc-tile__dot wc-tile__dot--" + c.dot;
         tile.metaEl.textContent = c.meta;
         tile.root.title = c.meta || "";
@@ -870,31 +911,35 @@
     }
 
     function buildTileGrid() {
-        const services = el("div", { class: "wc-grid--tiles" });
-        const apps = el("div", { class: "wc-grid--tiles" });
         const tiles = {};
         const appTiles = {};
-        // Hardware tile leads the services grid — the .wc-tile--hardware
-        // class differentiates it visually without needing a separate row.
+
+        // Row 1: hardware + Wi-Fi. Two tiles on a 3-col grid; the
+        // third cell is intentionally empty at desktop width.
         const piHealth = buildPiHealthTile();
-        services.appendChild(piHealth.root);
-        // WiFi tile follows, hidden by default until /api/status confirms
-        // there is a WiFi adapter at all.
         const wifi = buildWifiTile();
-        services.appendChild(wifi.root);
+        const row1 = el("div", { class: "wc-grid--tiles" }, piHealth.root, wifi.root);
+
+        // Row 2: 1090 stack (feed → readsb → mlat).
+        // Row 3: 978 UAT stack (dump978 + airplanes-978).
+        const row2 = el("div", { class: "wc-grid--tiles" });
+        const row3 = el("div", { class: "wc-grid--tiles" });
+        const ROW3_UNITS = new Set(["dump978-fa.service", "airplanes-978.service"]);
         for (const unit of MONITORED_SERVICES) {
             const t = buildTile(unit);
             tiles[unit] = t;
-            services.appendChild(t.root);
+            (ROW3_UNITS.has(unit) ? row3 : row2).appendChild(t.root);
         }
+
+        // App tiles (tar1090, graphs1090) keep their own grid row below.
+        const apps = el("div", { class: "wc-grid--tiles" });
         for (const app of APP_TILES) {
             const t = buildAppTile(app);
             appTiles[app.id] = t;
             apps.appendChild(t.root);
         }
-        // Wrap both grids in a fragment-like container so the dashboard
-        // render() call gets a single root.
-        const root = el("div", { class: "wc-tiles-stack" }, services, apps);
+
+        const root = el("div", { class: "wc-tiles-stack" }, row1, row2, row3, apps);
         return { root, tiles, appTiles, piHealth, wifi };
     }
 
@@ -1332,12 +1377,28 @@
             placeholder: "120m",
         });
 
-        const summarise = () => {
+        const latValEl = el("span", { class: "location-summary__value" });
+        const lonValEl = el("span", { class: "location-summary__value" });
+        const altValEl = el("span", { class: "location-summary__value" });
+        const updateSummaryValues = () => {
             const sv = configState.savedValues;
-            return (sv.LATITUDE || "?") + ", " + (sv.LONGITUDE || "?") + ", " + (sv.ALTITUDE || "?");
+            latValEl.textContent = sv.LATITUDE || "—";
+            lonValEl.textContent = sv.LONGITUDE || "—";
+            altValEl.textContent = sv.ALTITUDE || "—";
         };
-        const summaryEl = el("div", { class: "location-summary" }, summarise());
-        const editBtn = el("button", { type: "button", class: "wc-btn-ghost" }, "Edit");
+        updateSummaryValues();
+        const summaryEl = el("dl", { class: "location-summary" },
+            el("dt", {}, "Latitude"),
+            el("dd", {}, latValEl),
+            el("dt", {}, "Longitude"),
+            el("dd", {}, lonValEl),
+            el("dt", {}, "Altitude"),
+            el("dd", {},
+                altValEl,
+                el("span", { class: "location-summary__note" }, "above mean sea level (AMSL)"),
+            ),
+        );
+        const editBtn = el("button", { type: "button", class: "wc-btn-ghost location-card__edit" }, "Edit");
         const locationSummary = el("div", { class: "location-card" }, summaryEl, editBtn);
 
         const locationEditor = el("div", { class: "location-inputs" },
@@ -1447,7 +1508,7 @@
                 return out;
             },
             onSavedHook: () => {
-                summaryEl.textContent = summarise();
+                updateSummaryValues();
                 setEditing(false);
             },
         });
@@ -1684,7 +1745,7 @@
         parent.replaceChildren();
         if (!resp || !resp.ok) {
             parent.appendChild(el("p", { class: "error", role: "alert" },
-                (resp && resp.payload && resp.payload.error) || "could not load privacy settings"));
+                (resp && resp.payload && resp.payload.error) || "could not load management settings"));
             return;
         }
         const values = configState.savedValues;
@@ -1704,29 +1765,25 @@
         if (parseBoolish(values.REMOTE_CONFIG_ENABLED, false)) remoteInput.checked = true;
 
         const footer = el("div", { class: "config-fieldset__footer" });
-        const body = el("div");
+        const body = el("div", { class: "management-body" });
         const form = el("form", { class: "config-form" }, body, footer);
-        const fieldset = el("fieldset", { class: "config-fieldset" },
-            el("legend", {}, "Privacy & remote management"),
-            form,
-        );
 
         body.appendChild(el("div", { class: "field" },
-            el("label", { for: reportId }, reportInput, " Share feeder health with airplanes.live"),
+            el("label", { for: reportId }, reportInput, " Diagnostics & stats"),
         ));
         body.appendChild(el("p", { class: "help" },
             "Sends CPU, memory, disk and temperature readings so you can see this feeder's status on your dashboard ",
             "at airplanes.live and get notified when something goes wrong. Off means no dashboard or alerts for this feeder.",
         ));
         body.appendChild(el("div", { class: "field" },
-            el("label", { for: remoteId }, remoteInput, " Manage this feeder from the website"),
+            el("label", { for: remoteId }, remoteInput, " Remote configuration"),
         ));
         body.appendChild(el("p", { class: "help" },
             "Lets you change position, altitude and MLAT name from your account at airplanes.live, ",
             "without opening this page. You can still edit everything here either way.",
         ));
 
-        parent.appendChild(fieldset);
+        parent.appendChild(form);
 
         mountGroup({
             name: "privacy",
@@ -1777,7 +1834,7 @@
         )), { title: "Rebooting", showBack: false });
     }
 
-    function buildActionsRow() {
+    function buildUpdatesCard() {
         const updateBtn = el("button", {
             type: "button", class: "wc-btn-ghost",
             onclick: async () => {
@@ -1848,11 +1905,15 @@
             onclick: () => navigate(() => logViewer("webconfig-update"), { title: "Web UI update log", showBack: true }),
         }, "Web UI update log");
 
-        const change = el("button", {
-            type: "button", class: "wc-btn-ghost",
-            onclick: () => navigate(changePasswordPanel, { title: "Change password", showBack: true }),
-        }, "Change password");
+        return el("section", { class: "wc-card" },
+            el("h2", {}, "Updates"),
+            el("div", { class: "actions" }, updateBtn, updateLog),
+            el("div", { class: "actions" }, sysUpgradeBtn, sysUpgradeLog),
+            el("div", { class: "actions" }, webUiUpdateBtn, webUiUpdateLog),
+        );
+    }
 
+    function buildPowerCard() {
         const rebootBtn = el("button", {
             type: "button", class: "wc-btn-danger",
             onclick: () => requestReboot(rebootBtn, true),
@@ -1863,21 +1924,9 @@
             onclick: () => navigate(confirmPowerOffPanel, { title: "Power off", showBack: true }),
         }, "Power off");
 
-        const logout = el("button", {
-            type: "button", class: "wc-btn-ghost",
-            onclick: async () => { await postJSON("/api/auth/logout", {}); await boot(); },
-        }, "Log out");
-
-        const wifiBtn = el("button", {
-            type: "button", class: "wc-btn-ghost",
-            onclick: () => navigate(wifiPanel, { title: "Wi-Fi networks", showBack: true }),
-        }, "Wi-Fi networks");
-
-        return el("div", { class: "actions" },
-            updateBtn, updateLog,
-            sysUpgradeBtn, sysUpgradeLog,
-            webUiUpdateBtn, webUiUpdateLog,
-            wifiBtn, change, rebootBtn, poweroffBtn, logout,
+        return el("section", { class: "wc-card" },
+            el("h2", {}, "Power"),
+            el("div", { class: "actions" }, rebootBtn, poweroffBtn),
         );
     }
 
@@ -2173,7 +2222,7 @@
         const configBody = el("div", {}, el("p", { class: "muted" }, "loading…"));
 
         const identityCard = el("section", { class: "wc-card" }, el("h2", {}, "Identity"), identityBody);
-        const privacyCard = el("section", { class: "wc-card" }, el("h2", {}, "Privacy & remote management"), privacyBody);
+        const privacyCard = el("section", { class: "wc-card management-card" }, el("h2", {}, "Management"), privacyBody);
         const configCard = el("section", { class: "wc-card" }, el("h2", {}, "Configuration"), configBody);
 
         // Left column stacks Identity + Privacy; right column holds
@@ -2190,7 +2239,7 @@
             heroEl.root,
             tileGrid.root,
             el("div", { class: "wc-split" }, leftColumn, configCard),
-            buildActionsRow(),
+            el("div", { class: "wc-stack" }, buildUpdatesCard(), buildPowerCard()),
         );
         render.apply(null, renderArgs);
 
@@ -2672,6 +2721,21 @@
 
     if (themeBtn) themeBtn.addEventListener("click", toggleTheme);
     if (backBtn) backBtn.addEventListener("click", () => navigateDashboard());
+    if (userMenu) {
+        userMenu.addEventListener("toggle", () => {
+            if (userMenu.open) openUserMenuHooks();
+            else closeUserMenu();
+        });
+    }
+    if (userMenuChangePw) userMenuChangePw.addEventListener("click", () => {
+        closeUserMenu();
+        navigate(changePasswordPanel, { title: "Change password", showBack: true });
+    });
+    if (userMenuLogout) userMenuLogout.addEventListener("click", async () => {
+        closeUserMenu();
+        await postJSON("/api/auth/logout", {});
+        await boot();
+    });
     if (refreshBtn) refreshBtn.addEventListener("click", async () => {
         if (refreshBtn.disabled) return;
         if (dashboardCtx && dashboardCtx.configDirty
