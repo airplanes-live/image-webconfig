@@ -707,9 +707,12 @@
         // Meta line: webconfig version. Per-service rates are owned by
         // the readsb tile (computeMsgRate has side effects, so it runs
         // exactly once per poll, not twice).
+        // /api/status emits the field as `webconfig_version` (status.go);
+        // stable tags already carry a leading `v` and dev builds carry
+        // their tag verbatim (`dev-latest+abc1234`), so render as-is.
         const parts = [];
-        const v = payload.version;
-        if (v) parts.push("v" + v);
+        const v = payload.webconfig_version;
+        if (v) parts.push(v);
         heroEl.metaEl.textContent = parts.join(" · ");
     }
 
