@@ -133,6 +133,43 @@ func TestRequestLogger_QuotesPathToBlockControlChars(t *testing.T) {
 	}
 }
 
+// flushRecorder lets us prove statusRecorder forwards Flush() calls.
+type flushRecorder struct {
+	http.ResponseWriter
+	flushed int
+}
+
+func (f *flushRecorder) Flush() { f.flushed++ }
+
+func TestRequestLogger_PreservesFlusherForReboot(t *testing.T) {
+	_ = captureLog(t) // silence the log line
+
+	// Inner handler asserts the wrapped writer is an http.Flusher and
+	// calls Flush — mirrors handleReboot / handlePoweroff at handlers.go.
+	innerCalledFlush := false
+	inner := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusAccepted)
+		f, ok := w.(http.Flusher)
+		if !ok {
+			t.Errorf("expected wrapped writer to implement http.Flusher")
+			return
+		}
+		f.Flush()
+		innerCalledFlush = true
+	})
+
+	flusher := &flushRecorder{ResponseWriter: httptest.NewRecorder()}
+	h := requestLogger(inner)
+	h.ServeHTTP(flusher, httptest.NewRequest(http.MethodPost, "/api/reboot", nil))
+
+	if !innerCalledFlush {
+		t.Fatalf("inner handler did not run the flush branch")
+	}
+	if flusher.flushed != 1 {
+		t.Errorf("expected exactly 1 Flush on the underlying writer, got %d", flusher.flushed)
+	}
+}
+
 func TestRequestLogger_CapturesOriginRejection(t *testing.T) {
 	buf := captureLog(t)
 

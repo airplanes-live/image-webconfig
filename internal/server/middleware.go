@@ -211,6 +211,25 @@ func (s *statusRecorder) WriteHeader(code int) {
 	s.ResponseWriter.WriteHeader(code)
 }
 
+// Flush forwards to the underlying ResponseWriter when it supports
+// http.Flusher. handleReboot / handlePoweroff rely on `w.(http.Flusher)` to
+// push the 202 response before the system call kicks in — without this
+// method the wrapper would mask the optional interface and the early-flush
+// would silently no-op. (Go 1.22's http.NewResponseController also picks
+// this up via the Unwrap() method below.)
+func (s *statusRecorder) Flush() {
+	if f, ok := s.ResponseWriter.(http.Flusher); ok {
+		f.Flush()
+	}
+}
+
+// Unwrap exposes the wrapped writer so callers can use
+// http.NewResponseController(w) to access optional interfaces we don't
+// explicitly forward (Hijacker, deadlines, etc.).
+func (s *statusRecorder) Unwrap() http.ResponseWriter {
+	return s.ResponseWriter
+}
+
 // requestLogger emits one structured line per state-changing HTTP request,
 // at the end of the handler chain. GET / HEAD / OPTIONS stay silent — the
 // SPA polls /api/state every few seconds and the journal would otherwise
