@@ -27,8 +27,33 @@ import (
 	"github.com/airplanes-live/image-webconfig/internal/wifi"
 )
 
-// version is overridden via -ldflags "-X main.version=<sha>".
-var version = "dev"
+// version and commitSha are stamped by the release pipeline via
+// -ldflags "-X main.version=<tag> -X main.commitSha=<sha>". The runtime
+// version surfaced on /health and /api/status is composed by resolveVersion:
+// for stable releases the tag alone is unique enough (v0.1.2 differs from
+// v0.1.3), but the moving "dev-latest" tag is reused across consecutive dev
+// builds, so we append a short SHA suffix (semver +build metadata) so
+// /health byte-changes after a dev→dev self-update — that byte change is
+// what the SPA's post-update poller in web/assets/app.js uses to detect that
+// the new binary is online and reload.
+var (
+	version   = "dev"
+	commitSha = ""
+)
+
+// resolveVersion returns the runtime version string. When commitSha is set
+// (release builds) it appends "+<short-sha>" to disambiguate consecutive
+// dev-latest builds; when unset (local `go build`) it returns version as-is.
+func resolveVersion() string {
+	if commitSha == "" {
+		return version
+	}
+	short := commitSha
+	if len(short) > 7 {
+		short = short[:7]
+	}
+	return version + "+" + short
+}
 
 func main() {
 	listen := flag.String("listen", "127.0.0.1:8080", "address to listen on")
@@ -108,10 +133,11 @@ func main() {
 	}
 	loadCancel()
 
+	effectiveVersion := resolveVersion()
 	srv := &http.Server{
 		Addr: *listen,
 		Handler: server.New(server.Deps{
-			Version:      version,
+			Version:      effectiveVersion,
 			Store:        auth.NewPasswordStore(*hashPath),
 			Sessions:     auth.NewSessions(*sessionTTL),
 			Lockout:      auth.NewLockout(*lockoutThreshold, *lockoutWindow, *lockoutDuration),
@@ -119,7 +145,7 @@ func main() {
 			Argon2Params: params,
 			Identity:     identity.NewReader(identity.DefaultPaths()),
 			FeedEnv:      feedenv.New(),
-			Status: status.NewReader(version, status.DefaultPaths(), nil,
+			Status: status.NewReader(effectiveVersion, status.DefaultPaths(), nil,
 				status.WithPiHealth(pihealth.NewReader(
 					pihealth.DefaultPaths(),
 					pihealth.DefaultThresholds(),
@@ -159,7 +185,7 @@ func main() {
 	}()
 
 	go func() {
-		log.Printf("airplanes-webconfig %s listening on %s", version, *listen)
+		log.Printf("airplanes-webconfig %s listening on %s", effectiveVersion, *listen)
 		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			log.Fatalf("listen: %v", err)
 		}
