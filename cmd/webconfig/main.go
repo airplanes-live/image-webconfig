@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -41,18 +42,26 @@ var (
 	commitSha = ""
 )
 
-// resolveVersion returns the runtime version string. When commitSha is set
-// (release builds) it appends "+<short-sha>" to disambiguate consecutive
-// dev-latest builds; when unset (local `go build`) it returns version as-is.
+// resolveVersion returns the runtime version string by composing the package
+// vars stamped at link time.
 func resolveVersion() string {
-	if commitSha == "" {
-		return version
+	return composeVersion(version, commitSha)
+}
+
+// composeVersion is the pure form of resolveVersion: given a tag and a commit
+// SHA, return the runtime version string. When commitSha is empty it returns
+// the tag as-is (local `go build`); otherwise it appends a 7-char short SHA
+// using semver +build metadata. Whitespace in commitSha is trimmed so a stray
+// newline in the ldflag never leaks into /health or log output.
+func composeVersion(tag, sha string) string {
+	sha = strings.TrimSpace(sha)
+	if sha == "" {
+		return tag
 	}
-	short := commitSha
-	if len(short) > 7 {
-		short = short[:7]
+	if len(sha) > 7 {
+		sha = sha[:7]
 	}
-	return version + "+" + short
+	return tag + "+" + sha
 }
 
 func main() {
