@@ -1038,6 +1038,227 @@
 
     // ===== Configuration card =====
 
+    // canonicaliseAltitude mirrors internal/feedmeta/feedmeta.go's
+    // canonicalizeForCompare for ALTITUDE: bare numerics get an "m"
+    // suffix appended; anything already ending in "m" or "ft" is
+    // returned as-is; empty stays empty. Used in the dirty comparator
+    // so a saved "120m" and a user-typed bare "120" don't show as
+    // dirty when the backend would canonicalise them to the same
+    // value.
+    function canonicaliseAltitude(v) {
+        const t = (v || "").trim();
+        if (t === "") return "";
+        if (/m$/i.test(t) || /ft$/i.test(t)) return t;
+        if (!isNaN(Number(t))) return t + "m";
+        return t;
+    }
+
+    // sameValue compares an input value to a saved value applying the
+    // canonicaliser appropriate for the key (today: altitude only).
+    function sameValue(key, a, b) {
+        if (key === "ALTITUDE") return canonicaliseAltitude(a) === canonicaliseAltitude(b);
+        return (a || "") === (b || "");
+    }
+
+    // mountGroup wires up a single per-group form within a config tile.
+    // It owns: dirty tracking against configState.savedValues, the
+    // group's Save button visibility/disabled state, the in-flight
+    // save lock, and the post-save refresh + cross-group recheck loop.
+    //
+    // Callers supply group-specific glue via the options:
+    //   name        — string key into configState.dirtyGroups.
+    //   formEl      — the <form> element that owns onsubmit.
+    //   footerEl    — the .config-fieldset__footer that hosts the
+    //                 button + inline error + pending-restart line.
+    //   keys        — array of feed.env keys this group owns; used by
+    //                 the default dirty check.
+    //   readInputs  — () => { KEY: rawValue } current state from the
+    //                 group's DOM. Plain values, not trimmed; the
+    //                 dirty comparator handles canonical equality.
+    //   isValid     — () => bool. Preflight gate, e.g. MLAT/geo. When
+    //                 false: button is visible-but-disabled.
+    //   payload     — () => { KEY: value }. The dirty-only payload to
+    //                 POST. The helper passes it through verbatim.
+    //   onSavedHook — optional () => void after a successful save +
+    //                 global refresh. MLAT registers one here to
+    //                 re-evaluate its geo gate when Location saves.
+    //
+    // The returned object exposes a recheck() the caller wires to
+    // every input event in the group, so dirty-state and validation
+    // update live without re-render.
+    function mountGroup(opts) {
+        const {
+            name, formEl, footerEl,
+            keys, readInputs, isValid, payload,
+            onSavedHook,
+        } = opts;
+
+        const btn = el("button", {
+            type: "submit",
+            class: "wc-btn-primary",
+        }, "Save changes");
+        btn.hidden = true;
+        const err = errorEl();
+        const pending = el("p", { class: "config-fieldset__pending" });
+        pending.hidden = true;
+        footerEl.appendChild(btn);
+        footerEl.appendChild(err);
+        footerEl.appendChild(pending);
+
+        const isDirty = () => {
+            const cur = readInputs();
+            for (const k of keys) {
+                if (Object.prototype.hasOwnProperty.call(cur, k)) {
+                    if (!sameValue(k, cur[k], configState.savedValues[k])) return true;
+                }
+            }
+            return false;
+        };
+
+        const recheck = () => {
+            if (isDirty()) {
+                configState.dirtyGroups.add(name);
+            } else {
+                configState.dirtyGroups.delete(name);
+            }
+            const dirty = configState.dirtyGroups.has(name);
+            btn.hidden = !dirty;
+            const valid = !isValid || isValid();
+            btn.disabled = !!configState.inFlight || !valid;
+            updateDashboardDirtyFlag();
+        };
+
+        formEl.addEventListener("input", recheck);
+        formEl.addEventListener("change", recheck);
+
+        formEl.addEventListener("submit", async (e) => {
+            e.preventDefault();
+            // Snapshot the configState reference at submit time so a
+            // dashboard re-mount mid-await (e.g. user clicked Refresh)
+            // doesn't let this in-flight save mutate the new mount's
+            // state. Every step after an await checks `state ===
+            // configState` and bails if it diverged.
+            const state = configState;
+            if (state.inFlight) return;
+            if (!isDirty()) return; // defensive: button shouldn't show
+            err.textContent = "";
+            pending.hidden = true;
+            pending.textContent = "";
+            state.inFlight = name;
+            btn.disabled = true;
+            btn.textContent = "Saving…";
+            // Disable other groups' buttons while in-flight by firing
+            // every group's recheck via the shared callback channel.
+            for (const cb of state.recheckAll) cb();
+
+            const body = payload();
+            const r = await postJSON("/api/config", { updates: body });
+
+            if (state !== configState) return; // dashboard re-mounted
+
+            btn.textContent = "Save changes";
+            if (handleAuthFailure(r)) {
+                state.inFlight = null;
+                return;
+            }
+            if (!r.ok) {
+                // Forward apl-feed's structured error envelope. The
+                // per-field map shape lands as a one-line summary —
+                // good enough; we don't render field-by-field decor
+                // for now.
+                err.textContent = (r.payload && (r.payload.error || r.payload.message))
+                    || "save failed";
+                state.inFlight = null;
+                for (const cb of state.recheckAll) cb();
+                return;
+            }
+
+            // pending_restart is per-group news — surface inline rather
+            // than via a navigateDashboard flash so the user stays on
+            // their current view and sees the warning attached to the
+            // change that caused it.
+            const pendingRestart = (r.payload && r.payload.pending_restart) || [];
+            if (pendingRestart.length > 0) {
+                pending.hidden = false;
+                pending.textContent = "Saved, but restart failed for: "
+                    + pendingRestart.join(", ")
+                    + ". Changes take effect after manual restart.";
+            }
+
+            // Authoritative refresh: GET /api/config so the server's
+            // canonicalisations (ALTITUDE suffix, GEO_CONFIGURED auto-
+            // derive) land back in configState.savedValues. Trusting
+            // the submitted body would diverge from disk on those keys.
+            const refreshed = await getJSON("/api/config");
+            if (state !== configState) return; // dashboard re-mounted
+            if (handleAuthFailure(refreshed)) {
+                state.inFlight = null;
+                return;
+            }
+            if (refreshed.ok) {
+                state.savedValues = normaliseSavedValues((refreshed.payload && refreshed.payload.values) || {});
+                if (dashboardCtx) dashboardCtx.configValues = state.savedValues;
+            }
+            state.inFlight = null;
+
+            // Recompute dirty for every group: Location may have moved,
+            // MLAT's geo gate may have unblocked, Privacy may be clean
+            // again if the server canonicalised an equal value. Then
+            // fire the onSaved hooks (e.g. MLAT recheck after Location
+            // save).
+            for (const cb of state.recheckAll) cb();
+            for (const cb of state.onSaved) {
+                try { cb(name); } catch (_) {}
+            }
+            if (onSavedHook) {
+                try { onSavedHook(); } catch (_) {}
+            }
+        });
+
+        configState.recheckAll.add(recheck);
+        recheck();
+        return { recheck };
+    }
+
+    // configState is the dashboard-scoped shared model for the
+    // Configuration tile + Privacy tile. Owns the last-seen-saved
+    // snapshot, which groups are dirty, the in-flight lock, and the
+    // recheck/onSaved callback fanouts. Reset on every dashboard
+    // mount; teardown happens implicitly via navigate() dropping
+    // dashboardCtx.
+    let configState;
+
+    // normaliseSavedValues fills in the defaults the form inputs use
+    // for explicit toggle keys, so the dirty comparator never compares
+    // a literal "true"/"false" against undefined. The production
+    // feed.env always carries these keys, but normalising defensively
+    // keeps the comparator behaviour identical whether the backend
+    // omits them or not.
+    function normaliseSavedValues(values) {
+        return Object.assign({
+            MLAT_ENABLED: "true",
+            MLAT_PRIVATE: "false",
+            REPORT_STATUS: "true",
+            REMOTE_CONFIG_ENABLED: "false",
+        }, values || {});
+    }
+
+    function resetConfigState(values) {
+        configState = {
+            savedValues: normaliseSavedValues(values),
+            dirtyGroups: new Set(),
+            inFlight: null,
+            recheckAll: new Set(),   // recheck() of every mounted group
+            onSaved: new Set(),      // (savedGroupName) => void
+        };
+    }
+
+    function updateDashboardDirtyFlag() {
+        if (dashboardCtx) {
+            dashboardCtx.configDirty = configState && configState.dirtyGroups.size > 0;
+        }
+    }
+
     function renderConfigCard(parent, resp) {
         parent.replaceChildren();
         if (!resp || !resp.ok) {
@@ -1045,355 +1266,462 @@
                 (resp && resp.payload && resp.payload.error) || "could not load config"));
             return;
         }
-        const values = resp.payload.values || {};
-        const inputs = {};
-        const loc = locationSaved(values);
+        configState.savedValues = resp.payload.values || {};
 
         const fieldId = (key) => "config-" + key.toLowerCase().replace(/_/g, "-");
 
-        // field() builds a "Label" + input row. No env-key code: those env
-        // names belong on the wire / in feed.env, not in the user-facing UI.
-        const field = (key, label, attrs) => {
-            const id = fieldId(key);
-            const a = Object.assign({ id, name: key, value: values[key] || "", type: "text" }, attrs || {});
-            const input = el("input", a);
-            inputs[key] = input;
-            return el("div", { class: "field" },
-                el("label", { for: id }, label),
-                input,
+        // Builds a <fieldset><legend>...</legend> with a footer slot the
+        // group helper fills in. Returns { fieldset, body, footer, form }.
+        // Each group is its own <form> so Enter-in-an-input submits the
+        // owning group only, not anything else.
+        const buildGroup = (legendText) => {
+            const footer = el("div", { class: "config-fieldset__footer" });
+            const body = el("div");
+            const form = el("form", { class: "config-form" }, body, footer);
+            const fieldset = el("fieldset", { class: "config-fieldset" },
+                el("legend", {}, legendText),
+                form,
             );
+            return { fieldset, body, footer, form };
         };
 
-        // ===== Location: collapsed card when saved, inputs otherwise =====
-        const latRow = field("LATITUDE", "Latitude", { inputmode: "decimal", placeholder: "51.5" });
-        const lonRow = field("LONGITUDE", "Longitude", { inputmode: "decimal", placeholder: "-0.1" });
-        const altRow = field("ALTITUDE", "Altitude", { placeholder: "120m" });
-        const locationInputs = el("div", { class: "location-inputs" }, latRow, lonRow, altRow);
+        // ===== Location =====
+        const loc = buildGroup("Location");
 
-        const editLocation = el("button", { type: "button", class: "wc-btn-ghost" }, "Edit");
-        const locationCard = el("div", { class: "location-card" },
-            el("div", { class: "location-summary" },
-                (values.LATITUDE || "?") + ", " + (values.LONGITUDE || "?") + ", " + (values.ALTITUDE || "?"),
-            ),
-            editLocation,
-        );
-        // Both subtrees always exist; toggle visibility via the hidden
-        // attribute so the global form submit always reads from inputs.
-        locationCard.hidden = !loc;
-        locationInputs.hidden = loc;
-        editLocation.addEventListener("click", () => {
-            locationCard.hidden = true;
-            locationInputs.hidden = false;
+        const latId = fieldId("LATITUDE");
+        const latInput = el("input", {
+            id: latId, name: "LATITUDE", type: "text",
+            value: configState.savedValues.LATITUDE || "",
+            inputmode: "decimal", placeholder: "51.5",
+        });
+        const lonId = fieldId("LONGITUDE");
+        const lonInput = el("input", {
+            id: lonId, name: "LONGITUDE", type: "text",
+            value: configState.savedValues.LONGITUDE || "",
+            inputmode: "decimal", placeholder: "-0.1",
+        });
+        const altId = fieldId("ALTITUDE");
+        const altInput = el("input", {
+            id: altId, name: "ALTITUDE", type: "text",
+            value: configState.savedValues.ALTITUDE || "",
+            placeholder: "120m",
         });
 
-        const locationFieldset = el("fieldset", { class: "config-fieldset" },
-            el("legend", {}, "Location"),
-            locationCard,
-            locationInputs,
+        const summarise = () => {
+            const sv = configState.savedValues;
+            return (sv.LATITUDE || "?") + ", " + (sv.LONGITUDE || "?") + ", " + (sv.ALTITUDE || "?");
+        };
+        const summaryEl = el("div", { class: "location-summary" }, summarise());
+        const editBtn = el("button", { type: "button", class: "wc-btn-ghost" }, "Edit");
+        const locationSummary = el("div", { class: "location-card" }, summaryEl, editBtn);
+
+        const locationEditor = el("div", { class: "location-inputs" },
+            el("div", { class: "field" },
+                el("label", { for: latId }, "Latitude"),
+                el("p", { class: "field-help" },
+                    "Decimal degrees, North-positive (e.g. ",
+                    el("code", {}, "51.5074"),
+                    "). MLAT needs ~10 m accuracy — use as many decimals as you can.",
+                ),
+                latInput,
+            ),
+            el("div", { class: "field" },
+                el("label", { for: lonId }, "Longitude"),
+                el("p", { class: "field-help" },
+                    "Decimal degrees, East-positive (e.g. ",
+                    el("code", {}, "-0.1278"),
+                    " for London).",
+                ),
+                lonInput,
+            ),
+            el("div", { class: "field" },
+                el("label", { for: altId }, "Altitude"),
+                el("p", { class: "field-help" },
+                    "Antenna height above sea level, in metres — not the building height. ",
+                    "Used together with latitude/longitude to triangulate aircraft positions. ",
+                    "Append ", el("code", {}, "ft"), " if you prefer feet.",
+                ),
+                altInput,
+            ),
         );
 
-        // ===== MLAT: gated on locationSaved =====
-        // Force unchecked when !loc: a stale MLAT_ENABLED=true with no geo
-        // would otherwise be posted on save and apl-feed apply would reject
-        // the whole request via the MLAT-vs-geo consistency check.
-        const mlatOn = loc && ((values["MLAT_ENABLED"] || "true") === "true");
+        loc.body.appendChild(locationSummary);
+        loc.body.appendChild(locationEditor);
+
+        // Cancel must be declared before setEditing because the
+        // setter toggles its visibility alongside the editor's. Save
+        // visibility is owned by mountGroup (dirty-driven); Cancel
+        // visibility is owned here (edit-mode-driven).
+        const cancelBtn = el("button", {
+            type: "button", class: "wc-btn-ghost",
+            onclick: () => {
+                latInput.value = configState.savedValues.LATITUDE || "";
+                lonInput.value = configState.savedValues.LONGITUDE || "";
+                altInput.value = configState.savedValues.ALTITUDE || "";
+                locGroup.recheck();   // forward-reference; assigned below
+                // Clear any group error & pending restart from a prior
+                // failed save attempt before collapsing.
+                const errEl = loc.footer.querySelector(".error");
+                if (errEl) errEl.textContent = "";
+                const pendEl = loc.footer.querySelector(".config-fieldset__pending");
+                if (pendEl) { pendEl.hidden = true; pendEl.textContent = ""; }
+                setEditing(false);
+            },
+        }, "Cancel");
+        // Cancel lives in the per-group footer alongside the Save
+        // button mountGroup will append. Its visibility tracks edit
+        // mode independently of the dirty state managed by mountGroup.
+        loc.footer.appendChild(cancelBtn);
+
+        // Editing state lives in DOM hidden flags, not in JS — the
+        // body is always mounted so input events work whether collapsed
+        // or expanded. setEditing also syncs Cancel since they share
+        // the same edit-mode lifecycle.
+        const setEditing = (editing) => {
+            locationSummary.hidden = editing;
+            locationEditor.hidden = !editing;
+            cancelBtn.hidden = !editing;
+            if (editing) setTimeout(() => latInput.focus(), 0);
+        };
+        // Initial state: edit mode iff Location isn't saved
+        // (uninitialised feeder) so the user gets straight to setting
+        // coords on first boot. Otherwise stay collapsed.
+        setEditing(!locationSaved(configState.savedValues));
+
+        editBtn.addEventListener("click", () => setEditing(true));
+
+        const locGroup = mountGroup({
+            name: "location",
+            formEl: loc.form,
+            footerEl: loc.footer,
+            keys: ["LATITUDE", "LONGITUDE", "ALTITUDE"],
+            readInputs: () => ({
+                LATITUDE: latInput.value,
+                LONGITUDE: lonInput.value,
+                ALTITUDE: altInput.value,
+            }),
+            isValid: () => {
+                return isValidLatitude(latInput.value)
+                    && isValidLongitude(lonInput.value)
+                    && isValidAltitude(altInput.value);
+            },
+            payload: () => {
+                // Send only dirty keys, with the lat+lon pair rule so
+                // backend GEO derivation gets both axes. ALTITUDE only
+                // when it actually changed.
+                const out = {};
+                const latDirty = !sameValue("LATITUDE", latInput.value, configState.savedValues.LATITUDE);
+                const lonDirty = !sameValue("LONGITUDE", lonInput.value, configState.savedValues.LONGITUDE);
+                if (latDirty || lonDirty) {
+                    out.LATITUDE = latInput.value.trim();
+                    out.LONGITUDE = lonInput.value.trim();
+                }
+                if (!sameValue("ALTITUDE", altInput.value, configState.savedValues.ALTITUDE)) {
+                    out.ALTITUDE = altInput.value.trim();
+                }
+                return out;
+            },
+            onSavedHook: () => {
+                summaryEl.textContent = summarise();
+                setEditing(false);
+            },
+        });
+
+        // ===== MLAT =====
+        const mlatG = buildGroup("MLAT");
         const mlatId = fieldId("MLAT_ENABLED");
-        const mlat = el("input", {
-            id: mlatId,
-            type: "checkbox",
-            name: "MLAT_ENABLED",
-            checked: mlatOn ? "" : null,
-            disabled: loc ? null : "",
+        const mlatInput = el("input", {
+            id: mlatId, type: "checkbox", name: "MLAT_ENABLED",
         });
-        inputs["MLAT_ENABLED"] = mlat;
+        if ((configState.savedValues.MLAT_ENABLED || "true") === "true") mlatInput.checked = true;
 
-        const mlatPrivateOn = (values["MLAT_PRIVATE"] || "false") === "true";
+        const mlatUserId = fieldId("MLAT_USER");
+        const mlatUserInput = el("input", {
+            id: mlatUserId, name: "MLAT_USER", type: "text",
+            value: configState.savedValues.MLAT_USER || "",
+            placeholder: "alice",
+        });
+
         const mlatPrivateId = fieldId("MLAT_PRIVATE");
-        const mlatPrivate = el("input", {
-            id: mlatPrivateId,
-            type: "checkbox",
-            name: "MLAT_PRIVATE",
-            checked: mlatPrivateOn ? "" : null,
+        const mlatPrivateInput = el("input", {
+            id: mlatPrivateId, type: "checkbox", name: "MLAT_PRIVATE",
         });
-        inputs["MLAT_PRIVATE"] = mlatPrivate;
+        if ((configState.savedValues.MLAT_PRIVATE || "false") === "true") mlatPrivateInput.checked = true;
 
-        const mlatToggleRow = el("div", { class: "field" },
-            el("label", { for: mlatId }, mlat, " Enable MLAT"),
-        );
-        const mlatHelp = el("p", { class: "help" }, "Set your location first to enable MLAT.");
-        mlatHelp.hidden = loc;
+        const mlatGateMsg = el("p", { class: "help mlat-gate" });
+        const setLocationLink = el("button", {
+            type: "button", class: "wc-btn-ghost",
+            onclick: () => {
+                setEditing(true);
+                mlatG.fieldset.scrollIntoView({ behavior: "smooth", block: "nearest" });
+                loc.fieldset.scrollIntoView({ behavior: "smooth", block: "start" });
+            },
+        }, "Set location");
+        mlatGateMsg.appendChild(document.createTextNode("Location is required before enabling MLAT. "));
+        mlatGateMsg.appendChild(setLocationLink);
+        mlatGateMsg.hidden = true;
 
-        const mlatUserRow = field("MLAT_USER", "MLAT name", { placeholder: "alice" });
-        const mlatPrivateRow = el("div", { class: "field" },
-            el("label", { for: mlatPrivateId }, mlatPrivate, " Hide MLAT name on public map"),
-        );
-        const mlatSubFields = el("div", { class: "mlat-sub" }, mlatUserRow, mlatPrivateRow);
-        mlatSubFields.hidden = !(loc && mlat.checked);
-        mlat.addEventListener("change", () => {
-            mlatSubFields.hidden = !(loc && mlat.checked);
-        });
-
-        const mlatFieldset = el("fieldset", { class: "config-fieldset" },
-            el("legend", {}, "MLAT"),
-            mlatToggleRow,
-            mlatHelp,
-            mlatSubFields,
-        );
-
-        // ===== Gain: own fieldset with description + external doc link =====
-        const gainRow = field("GAIN", "Gain", { placeholder: "auto" });
-        const gainFieldset = el("fieldset", { class: "config-fieldset" },
-            el("legend", {}, "Gain"),
-            el("p", { class: "help" },
-                "RTL-SDR gain in dB, or ",
-                el("code", {}, "auto"),
-                " for adaptive control. See ",
-                el("a", {
-                    href: "https://github.com/wiedehopf/adsb-wiki/wiki/Optimizing-gain",
-                    target: "_blank",
-                    rel: "noopener noreferrer",
-                }, "wiedehopf's gain guide"),
-                ".",
-            ),
-            gainRow,
-        );
-
-        // ===== Privacy & remote control =====
-        // Two bare-string passthrough toggles. REPORT_STATUS defaults to
-        // checked (diagnostics opt-out); REMOTE_CONFIG_ENABLED defaults
-        // to unchecked (remote-config opt-in). Both keys must be in the
-        // "always send" list at submit time so unchecking still POSTs
-        // the literal "false" rather than being stripped as an empty key.
-        const reportStatusOn = parseBoolish(values["REPORT_STATUS"], true);
-        const reportStatusId = fieldId("REPORT_STATUS");
-        const reportStatus = el("input", {
-            id: reportStatusId,
-            type: "checkbox",
-            name: "REPORT_STATUS",
-            checked: reportStatusOn ? "" : null,
-        });
-        inputs["REPORT_STATUS"] = reportStatus;
-
-        const remoteConfigOn = parseBoolish(values["REMOTE_CONFIG_ENABLED"], false);
-        const remoteConfigId = fieldId("REMOTE_CONFIG_ENABLED");
-        const remoteConfig = el("input", {
-            id: remoteConfigId,
-            type: "checkbox",
-            name: "REMOTE_CONFIG_ENABLED",
-            checked: remoteConfigOn ? "" : null,
-        });
-        inputs["REMOTE_CONFIG_ENABLED"] = remoteConfig;
-
-        const privacyFieldset = el("fieldset", { class: "config-fieldset" },
-            el("legend", {}, "Privacy & remote control"),
+        const mlatSubFields = el("div", { class: "mlat-sub" },
             el("div", { class: "field" },
-                el("label", { for: reportStatusId }, reportStatus, " Send feeder diagnostics to airplanes.live"),
-            ),
-            el("p", { class: "help" },
-                "Reports CPU, memory, disk, temperature, Pi health and service state to airplanes.live. ",
-                "Only the feeder's owner can see them. Turning this off sends one final muted signal, then the feeder goes quiet.",
+                el("label", { for: mlatUserId }, "MLAT name"),
+                mlatUserInput,
             ),
             el("div", { class: "field" },
-                el("label", { for: remoteConfigId }, remoteConfig, " Allow airplanes.live to edit this feeder remotely"),
-            ),
-            el("p", { class: "help" },
-                "Lets the website change position, altitude and MLAT identity for this feeder. ",
-                "Local edits here keep working either way. Leaving this off means the feeder doesn't poll airplanes.live for config at all.",
+                el("label", { for: mlatPrivateId }, mlatPrivateInput, " Hide MLAT name on public map"),
             ),
         );
 
-        // ===== 978 UAT: toggle + collapsed sub-fields =====
-        const dump978On = (values["UAT_INPUT"] || "") !== "";
+        mlatG.body.appendChild(el("div", { class: "field" },
+            el("label", { for: mlatId }, mlatInput, " Enable MLAT"),
+        ));
+        mlatG.body.appendChild(mlatGateMsg);
+        mlatG.body.appendChild(mlatSubFields);
+
+        const updateMlatVisibility = () => {
+            const geoOk = locationSaved(configState.savedValues);
+            // Sub-fields only meaningful when MLAT is on AND geo is set.
+            mlatSubFields.hidden = !(mlatInput.checked && geoOk);
+            // Show the gate message ONLY when the user is trying to
+            // enable MLAT without saved geo. Disabling MLAT is always
+            // allowed (the user must be able to turn it off even with
+            // bad on-disk geo).
+            mlatGateMsg.hidden = !(mlatInput.checked && !geoOk);
+        };
+        mlatInput.addEventListener("change", updateMlatVisibility);
+        updateMlatVisibility();
+
+        const mlatGroup = mountGroup({
+            name: "mlat",
+            formEl: mlatG.form,
+            footerEl: mlatG.footer,
+            keys: ["MLAT_ENABLED", "MLAT_USER", "MLAT_PRIVATE"],
+            readInputs: () => ({
+                MLAT_ENABLED: mlatInput.checked ? "true" : "false",
+                MLAT_USER: mlatUserInput.value,
+                MLAT_PRIVATE: mlatPrivateInput.checked ? "true" : "false",
+            }),
+            isValid: () => {
+                // Always allow saving when MLAT is being disabled. Only
+                // gate on saved geo when the submission would enable
+                // MLAT.
+                if (!mlatInput.checked) return true;
+                return locationSaved(configState.savedValues);
+            },
+            payload: () => {
+                const out = {};
+                const enabled = mlatInput.checked ? "true" : "false";
+                if (enabled !== (configState.savedValues.MLAT_ENABLED || "true")) {
+                    out.MLAT_ENABLED = enabled;
+                }
+                if (!sameValue("MLAT_USER", mlatUserInput.value, configState.savedValues.MLAT_USER)) {
+                    out.MLAT_USER = mlatUserInput.value.trim();
+                }
+                const priv = mlatPrivateInput.checked ? "true" : "false";
+                if (priv !== (configState.savedValues.MLAT_PRIVATE || "false")) {
+                    out.MLAT_PRIVATE = priv;
+                }
+                return out;
+            },
+        });
+        // After any save lands, re-evaluate MLAT visibility (Location
+        // may have just saved valid geo, unblocking the gate).
+        configState.onSaved.add(() => {
+            updateMlatVisibility();
+            mlatGroup.recheck();
+        });
+
+        // ===== Gain =====
+        const gainG = buildGroup("Gain");
+        const gainId = fieldId("GAIN");
+        const gainInput = el("input", {
+            id: gainId, name: "GAIN", type: "text",
+            value: configState.savedValues.GAIN || "",
+            placeholder: "auto",
+        });
+        gainG.body.appendChild(el("p", { class: "help" },
+            "RTL-SDR gain in dB, or ", el("code", {}, "auto"),
+            " for adaptive control. See ",
+            el("a", {
+                href: "https://github.com/wiedehopf/adsb-wiki/wiki/Optimizing-gain",
+                target: "_blank",
+                rel: "noopener noreferrer",
+            }, "wiedehopf's gain guide"),
+            ".",
+        ));
+        gainG.body.appendChild(el("div", { class: "field" },
+            el("label", { for: gainId }, "Gain"),
+            gainInput,
+        ));
+        mountGroup({
+            name: "gain",
+            formEl: gainG.form,
+            footerEl: gainG.footer,
+            keys: ["GAIN"],
+            readInputs: () => ({ GAIN: gainInput.value }),
+            isValid: () => true,
+            payload: () => ({ GAIN: gainInput.value.trim() }),
+        });
+
+        // ===== 978 UAT =====
+        const uatG = buildGroup("978 UAT");
         const uatId = fieldId("UAT_INPUT");
-        const uat = el("input", {
-            id: uatId,
-            type: "checkbox",
-            name: "UAT_INPUT",
-            checked: dump978On ? "" : null,
+        const uatInput = el("input", {
+            id: uatId, type: "checkbox", name: "UAT_INPUT",
         });
-        inputs["UAT_INPUT"] = uat;
+        if ((configState.savedValues.UAT_INPUT || "") !== "") uatInput.checked = true;
 
-        // 978 dependent fields. Defaults mirror dump978-fa.sh's wrapper
-        // fallback ("978" / "42.1") so the form pre-renders the same value
-        // the daemon would use if the user simply toggles UAT on.
         const sdrSerialId = fieldId("DUMP978_SDR_SERIAL");
-        const dump978Serial = el("input", {
-            id: sdrSerialId,
-            type: "text",
-            name: "DUMP978_SDR_SERIAL",
-            value: values["DUMP978_SDR_SERIAL"] || "978",
+        const sdrSerialInput = el("input", {
+            id: sdrSerialId, name: "DUMP978_SDR_SERIAL", type: "text",
+            value: configState.savedValues.DUMP978_SDR_SERIAL || "978",
             placeholder: "978",
         });
-        inputs["DUMP978_SDR_SERIAL"] = dump978Serial;
-
         const dump978GainId = fieldId("DUMP978_GAIN");
-        const dump978Gain = el("input", {
-            id: dump978GainId,
-            type: "text",
-            name: "DUMP978_GAIN",
-            value: values["DUMP978_GAIN"] || "42.1",
-            placeholder: "42.1",
-            inputmode: "decimal",
+        const dump978GainInput = el("input", {
+            id: dump978GainId, name: "DUMP978_GAIN", type: "text",
+            value: configState.savedValues.DUMP978_GAIN || "42.1",
+            placeholder: "42.1", inputmode: "decimal",
         });
-        inputs["DUMP978_GAIN"] = dump978Gain;
 
-        const dump978Sub = el("div", { class: "dump978-sub" },
+        const uatSub = el("div", { class: "dump978-sub" },
             el("div", { class: "field" },
                 el("label", { for: sdrSerialId }, "978 SDR serial"),
-                dump978Serial,
+                sdrSerialInput,
             ),
             el("div", { class: "field" },
                 el("label", { for: dump978GainId }, "978 gain"),
-                dump978Gain,
+                dump978GainInput,
             ),
         );
-        dump978Sub.hidden = !uat.checked;
-        uat.addEventListener("change", () => {
-            dump978Sub.hidden = !uat.checked;
+        uatSub.hidden = !uatInput.checked;
+        uatInput.addEventListener("change", () => {
+            uatSub.hidden = !uatInput.checked;
         });
 
-        const uatFieldset = el("fieldset", { class: "config-fieldset" },
-            el("legend", {}, "978 UAT"),
-            el("div", { class: "field" },
-                el("label", { for: uatId }, uat, " Enable 978 UAT"),
-            ),
-            dump978Sub,
-        );
+        uatG.body.appendChild(el("div", { class: "field" },
+            el("label", { for: uatId }, uatInput, " Enable 978 UAT"),
+        ));
+        uatG.body.appendChild(uatSub);
 
-        // ===== Submit + form =====
-        const err = errorEl();
-        const submit = el("button", { type: "submit", class: "wc-btn-primary" }, "Save & apply");
-
-        // Gate Save on the same MLAT → geo requirement that
-        // configspec.ValidateConsistency enforces server-side. Reading
-        // the inputs directly (rather than capturing the saved values)
-        // means flipping the checkbox or editing a coord live-updates
-        // the inline error and the Save button.
-        const recheck = () => {
-            const lat = inputs.LATITUDE.value;
-            const lon = inputs.LONGITUDE.value;
-            const alt = inputs.ALTITUDE.value;
-            if (!mlat.checked) {
-                err.textContent = "";
-                submit.disabled = false;
-                return;
-            }
-            // mlat is on — every coord must parse to the same strict shape
-            // configspec.go requires AND not be the (0,0) placeholder pair.
-            const latOk = isValidLatitude(lat);
-            const lonOk = isValidLongitude(lon);
-            const altOk = isValidAltitude(alt);
-            const isPlaceholder = latOk && lonOk
-                && Number(lat.trim()) === 0 && Number(lon.trim()) === 0;
-            if (!latOk || !lonOk || !altOk || isPlaceholder) {
-                const missing = [];
-                if (!latOk) missing.push("latitude");
-                else if (!lonOk) missing.push("longitude");
-                else if (isPlaceholder) missing.push("non-(0,0) coordinates");
-                if (!altOk) missing.push("altitude");
-                err.textContent = "Set valid " + missing.join(", ") + " to enable MLAT.";
-                submit.disabled = true;
-            } else {
-                err.textContent = "";
-                submit.disabled = false;
-            }
-        };
-
-        const form = el("form", {
-            class: "config-form",
-            onsubmit: async (e) => {
-                e.preventDefault();
-                err.textContent = "";
-                submit.disabled = true;
-                submit.textContent = "Saving…";
-                // When location isn't saved, force MLAT_ENABLED=false: the
-                // disabled checkbox would otherwise carry a stale "true" and
-                // apl-feed apply would reject every save (including a Gain-
-                // only edit) via the GEO_CONFIGURED consistency check.
-                const mlatEnabled = (loc && mlat.checked) ? "true" : "false";
-                const updates = {
-                    LATITUDE: inputs.LATITUDE.value.trim(),
-                    LONGITUDE: inputs.LONGITUDE.value.trim(),
-                    ALTITUDE: inputs.ALTITUDE.value.trim(),
-                    MLAT_USER: inputs.MLAT_USER.value.trim(),
-                    MLAT_ENABLED: mlatEnabled,
-                    MLAT_PRIVATE: mlatPrivate.checked ? "true" : "false",
-                    REPORT_STATUS: reportStatus.checked ? "true" : "false",
-                    REMOTE_CONFIG_ENABLED: remoteConfig.checked ? "true" : "false",
-                    GAIN: inputs.GAIN.value.trim(),
-                    UAT_INPUT: uat.checked ? "127.0.0.1:30978" : "",
-                    DUMP978_SDR_SERIAL: dump978Serial.value.trim(),
-                    DUMP978_GAIN: dump978Gain.value.trim(),
-                };
-                // Don't write DUMP978_* keys when UAT is toggled off — they
-                // would be no-ops the daemon never reads. The wrapper falls
-                // back to compiled-in defaults (978 / 42.1) on next enable.
-                // Note: existing values already in feed.env are retained;
-                // toggling UAT off does not clear them.
-                if (!uat.checked) {
-                    delete updates.DUMP978_SDR_SERIAL;
-                    delete updates.DUMP978_GAIN;
+        mountGroup({
+            name: "uat",
+            formEl: uatG.form,
+            footerEl: uatG.footer,
+            // All three keys are in scope. `readInputs` only emits the
+            // DUMP978_* keys when UAT is on, so the keys-in-cur check
+            // in mountGroup.isDirty naturally ignores hidden sub-fields
+            // — toggling UAT off after editing a sub-field returns the
+            // group to clean. When UAT is on, sub-field edits bubble
+            // through the form's "input" listener and recheck the
+            // group, surfacing the Save button.
+            keys: ["UAT_INPUT", "DUMP978_SDR_SERIAL", "DUMP978_GAIN"],
+            readInputs: () => {
+                const out = { UAT_INPUT: uatInput.checked ? "127.0.0.1:30978" : "" };
+                if (uatInput.checked) {
+                    out.DUMP978_SDR_SERIAL = sdrSerialInput.value;
+                    out.DUMP978_GAIN = dump978GainInput.value;
                 }
-                // Always send MLAT_ENABLED, MLAT_PRIVATE, UAT_INPUT,
-                // REPORT_STATUS and REMOTE_CONFIG_ENABLED — they're
-                // explicit toggles whose "false"/"" form is meaningful.
-                // Strip other keys when empty so the user can leave a
-                // field unchanged from the current value rather than
-                // blanking it.
-                const alwaysSend = new Set([
-                    "UAT_INPUT",
-                    "MLAT_ENABLED",
-                    "MLAT_PRIVATE",
-                    "MLAT_USER",
-                    "REPORT_STATUS",
-                    "REMOTE_CONFIG_ENABLED",
-                ]);
-                for (const k of Object.keys(updates)) {
-                    if (!alwaysSend.has(k) && updates[k] === "") delete updates[k];
-                }
-                const r = await postJSON("/api/config", { updates });
-                submit.disabled = false;
-                submit.textContent = "Save & apply";
-                if (handleAuthFailure(r)) return;
-                if (!r.ok) {
-                    err.textContent = (r.payload && r.payload.error) || "save failed";
-                    return;
-                }
-                // Reload the dashboard so the new values + restart show up.
-                // If the server reported a restart failure, pass a one-shot
-                // flash through navigate options — without this, the warning
-                // would clear immediately when navigate() rerenders.
-                const pending = (r.payload && r.payload.pending_restart) || [];
-                const opts = {};
-                if (pending.length > 0) {
-                    opts.flash = {
-                        level: "warn",
-                        text: "Saved, but service restart failed: " + pending.join(", ")
-                            + ". The dashboard reflects the previously running service "
-                            + "until you restart manually: sudo systemctl restart "
-                            + pending.join(" "),
-                    };
-                }
-                navigateDashboard(opts);
+                return out;
             },
-        },
-            locationFieldset,
-            mlatFieldset,
-            gainFieldset,
-            privacyFieldset,
-            uatFieldset,
-            submit,
-            err,
-        );
-        parent.appendChild(form);
+            isValid: () => true,
+            payload: () => {
+                const out = {};
+                const want = uatInput.checked ? "127.0.0.1:30978" : "";
+                if (want !== (configState.savedValues.UAT_INPUT || "")) {
+                    out.UAT_INPUT = want;
+                }
+                if (uatInput.checked) {
+                    if (!sameValue("DUMP978_SDR_SERIAL", sdrSerialInput.value, configState.savedValues.DUMP978_SDR_SERIAL)) {
+                        out.DUMP978_SDR_SERIAL = sdrSerialInput.value.trim();
+                    }
+                    if (!sameValue("DUMP978_GAIN", dump978GainInput.value, configState.savedValues.DUMP978_GAIN)) {
+                        out.DUMP978_GAIN = dump978GainInput.value.trim();
+                    }
+                }
+                return out;
+            },
+        });
 
-        // Wire the gate listeners now that the form is in the DOM. Each
-        // input edit and the MLAT toggle re-run the same check.
-        inputs.LATITUDE.addEventListener("input", recheck);
-        inputs.LONGITUDE.addEventListener("input", recheck);
-        inputs.ALTITUDE.addEventListener("input", recheck);
-        mlat.addEventListener("change", recheck);
-        recheck();
+        // Assemble
+        parent.appendChild(loc.fieldset);
+        parent.appendChild(mlatG.fieldset);
+        parent.appendChild(gainG.fieldset);
+        parent.appendChild(uatG.fieldset);
+    }
+
+    // ===== Privacy & remote management tile =====
+
+    function buildPrivacyCardBody() {
+        return el("div", {}, el("p", { class: "muted" }, "loading…"));
+    }
+
+    function renderPrivacyCard(parent, resp) {
+        parent.replaceChildren();
+        if (!resp || !resp.ok) {
+            parent.appendChild(el("p", { class: "error", role: "alert" },
+                (resp && resp.payload && resp.payload.error) || "could not load privacy settings"));
+            return;
+        }
+        const values = configState.savedValues;
+
+        const fieldId = (key) => "privacy-" + key.toLowerCase().replace(/_/g, "-");
+
+        const reportId = fieldId("REPORT_STATUS");
+        const reportInput = el("input", {
+            id: reportId, type: "checkbox", name: "REPORT_STATUS",
+        });
+        if (parseBoolish(values.REPORT_STATUS, true)) reportInput.checked = true;
+
+        const remoteId = fieldId("REMOTE_CONFIG_ENABLED");
+        const remoteInput = el("input", {
+            id: remoteId, type: "checkbox", name: "REMOTE_CONFIG_ENABLED",
+        });
+        if (parseBoolish(values.REMOTE_CONFIG_ENABLED, false)) remoteInput.checked = true;
+
+        const footer = el("div", { class: "config-fieldset__footer" });
+        const body = el("div");
+        const form = el("form", { class: "config-form" }, body, footer);
+        const fieldset = el("fieldset", { class: "config-fieldset" },
+            el("legend", {}, "Privacy & remote management"),
+            form,
+        );
+
+        body.appendChild(el("div", { class: "field" },
+            el("label", { for: reportId }, reportInput, " Share feeder health with airplanes.live"),
+        ));
+        body.appendChild(el("p", { class: "help" },
+            "Sends CPU, memory, disk and temperature readings so you can see this feeder's status on your dashboard ",
+            "at airplanes.live and get notified when something goes wrong. Off means no dashboard or alerts for this feeder.",
+        ));
+        body.appendChild(el("div", { class: "field" },
+            el("label", { for: remoteId }, remoteInput, " Manage this feeder from the website"),
+        ));
+        body.appendChild(el("p", { class: "help" },
+            "Lets you change position, altitude and MLAT name from your account at airplanes.live, ",
+            "without opening this page. You can still edit everything here either way.",
+        ));
+
+        parent.appendChild(fieldset);
+
+        mountGroup({
+            name: "privacy",
+            formEl: form,
+            footerEl: footer,
+            keys: ["REPORT_STATUS", "REMOTE_CONFIG_ENABLED"],
+            readInputs: () => ({
+                REPORT_STATUS: reportInput.checked ? "true" : "false",
+                REMOTE_CONFIG_ENABLED: remoteInput.checked ? "true" : "false",
+            }),
+            isValid: () => true,
+            payload: () => {
+                const out = {};
+                const rs = reportInput.checked ? "true" : "false";
+                const rc = remoteInput.checked ? "true" : "false";
+                if (rs !== (configState.savedValues.REPORT_STATUS || "true")) out.REPORT_STATUS = rs;
+                if (rc !== (configState.savedValues.REMOTE_CONFIG_ENABLED || "false")) out.REMOTE_CONFIG_ENABLED = rc;
+                return out;
+            },
+        });
     }
 
     // ===== Action row =====
@@ -1816,10 +2144,17 @@
         const heroEl = buildHero();
         const tileGrid = buildTileGrid();
         const identityBody = buildIdentityCardBody();
+        const privacyBody = buildPrivacyCardBody();
         const configBody = el("div", {}, el("p", { class: "muted" }, "loading…"));
 
         const identityCard = el("section", { class: "wc-card" }, el("h2", {}, "Identity"), identityBody);
+        const privacyCard = el("section", { class: "wc-card" }, el("h2", {}, "Privacy & remote management"), privacyBody);
         const configCard = el("section", { class: "wc-card" }, el("h2", {}, "Configuration"), configBody);
+
+        // Left column stacks Identity + Privacy; right column holds
+        // Configuration. .wc-split has align-items: start so the left
+        // column doesn't stretch when Configuration is taller.
+        const leftColumn = el("div", { class: "wc-stack" }, identityCard, privacyCard);
 
         const flashNode = buildFlashNode(consumePendingFlash());
         const rebootBanner = buildRebootBannerSlot();
@@ -1829,18 +2164,23 @@
             rebootBanner,
             heroEl.root,
             tileGrid.root,
-            el("div", { class: "wc-split" }, identityCard, configCard),
+            el("div", { class: "wc-split" }, leftColumn, configCard),
             buildActionsRow(),
         );
         render.apply(null, renderArgs);
 
         const ctx = {
-            heroEl, tileGrid, identityBody, configBody, rebootBanner,
+            heroEl, tileGrid, identityBody, privacyBody, configBody, rebootBanner,
             configValues: {},
             lastIdentity: null,
             configDirty: false,
         };
         dashboardCtx = ctx;
+
+        // Reset shared config state for this dashboard mount. Privacy
+        // and Configuration both read from configState.savedValues, so
+        // it must exist before either render runs.
+        resetConfigState({});
 
         // Initial fetch.
         const [identity, status, config] = await Promise.all([
@@ -1851,26 +2191,27 @@
         if (ctx !== dashboardCtx) return;
         if (handleAuthFailure(identity) || handleAuthFailure(status) || handleAuthFailure(config)) return;
 
-        ctx.configValues = (config && config.payload && config.payload.values) || {};
+        const cfgValues = normaliseSavedValues((config && config.payload && config.payload.values) || {});
+        ctx.configValues = cfgValues;
+        configState.savedValues = cfgValues;
         ctx.lastIdentity = identity && identity.payload ? identity.payload : null;
 
         renderIdentityCard(identityBody, identity);
         renderConfigCard(configBody, config);
+        renderPrivacyCard(privacyBody, config);
         updateHero(heroEl, status, ctx.configValues);
         updateTiles(tileGrid, status, ctx.configValues);
         updateAppTiles(tileGrid);
         updateRebootBanner(rebootBanner, !!(status && status.payload && status.payload.reboot_required));
 
-        // Track unsaved config edits so the header refresh button can
-        // prompt before discarding them. Initial-render value attributes
-        // don't fire `input`, so this only flips on actual typing.
-        const configForm = configBody.querySelector("form.config-form");
-        if (configForm) {
-            configForm.addEventListener("input", () => { ctx.configDirty = true; });
-        }
+        // ctx.configDirty is maintained by updateDashboardDirtyFlag()
+        // inside the per-group mount helper — every recheck() call
+        // refreshes it from configState.dirtyGroups.size > 0. No
+        // separate form-level input listener needed.
 
         // Start partial-refresh poll. Hero + tiles + identity update;
-        // config card stays put.
+        // config card + privacy card stay put (their state is
+        // managed by per-group saves, not by status polling).
         statusTimer = setInterval(renderStatusSnapshot, STATUS_REFRESH_MS);
     }
 
@@ -1878,11 +2219,13 @@
         const ctx = dashboardCtx;
         if (!ctx) return;
 
-        // Pause polling while user is typing in config form. Belt-and-
-        // braces: nothing in the snapshot path mutates the form, but the
-        // fetch is still wasted work if the user is mid-edit.
-        const formEl = ctx.configBody && ctx.configBody.querySelector("form.config-form");
-        if (formEl && document.activeElement && formEl.contains(document.activeElement)) return;
+        // Pause polling while the user is typing in any config or
+        // privacy input. Each group is its own <form>, so check the
+        // whole tile body rather than a single form. Belt-and-braces:
+        // nothing in the snapshot path mutates these tiles, but the
+        // fetch is still wasted work mid-edit.
+        const editingIn = (host) => host && document.activeElement && host.contains(document.activeElement);
+        if (editingIn(ctx.configBody) || editingIn(ctx.privacyBody)) return;
 
         const [identity, status] = await Promise.all([
             getJSON("/api/identity"),

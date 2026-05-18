@@ -683,7 +683,37 @@ textarea:focus {
   font-family: var(--wc-font-mono);
   font-size: 0.95rem;
 }
-.config-form button[type="submit"] { width: 100%; margin-top: 0.5rem; }
+
+/* Per-group save footer: confirm button + inline error sit together at
+   the bottom of a fieldset. Hidden when the group has no pending change. */
+.config-fieldset__footer {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+  margin-top: 0.5rem;
+}
+.config-fieldset__footer[hidden] { display: none; }
+.config-fieldset__footer .error { margin: 0; min-height: 0; flex: 1 1 auto; }
+.config-fieldset__footer .config-fieldset__pending {
+  margin: 0;
+  flex-basis: 100%;
+  color: var(--wc-warn, var(--wc-ink-2));
+  font-size: 0.85rem;
+}
+.config-fieldset__footer .wc-btn-primary,
+.config-fieldset__footer .wc-btn-ghost { width: auto; margin: 0; }
+
+/* Help text below a field label — smaller and quieter than .help, which
+   sits between fieldsets. .field-help renders inside a .field, between
+   the <label> and the <input>. */
+.field-help {
+  margin: 0.15rem 0 0.35rem;
+  color: var(--wc-ink-3);
+  font-size: 0.8rem;
+  line-height: 1.35;
+}
+
 
 .config-fieldset {
   border: 1px solid var(--wc-line-soft);
@@ -743,9 +773,22 @@ textarea:focus {
   gap: 1rem;
   margin-bottom: 1.25rem;
   grid-template-columns: 1fr;
+  /* Don't stretch a short left column to match a tall right column —
+     Identity + Privacy stack only as tall as their content while
+     Configuration may be much taller. */
+  align-items: start;
 }
 @media (min-width: 768px) {
   .wc-split { grid-template-columns: 1fr 1fr; }
+}
+
+/* Vertical stack of cards within one grid cell. Used to put Identity
+   and Privacy in the left column of .wc-split, gap-matched to the
+   grid's own gap. */
+.wc-stack {
+  display: flex;
+  flex-direction: column;
+  gap: 1rem;
 }
 
 /* ========== Wi-Fi panel ========== */
