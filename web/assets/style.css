@@ -199,6 +199,16 @@ code {
   text-transform: uppercase;
 }
 
+.wc-brand__version {
+  /* Version strings carry `+` and lowercase hex (e.g. `dev-latest+abc1234`).
+     Inherit colour from .wc-brand__meta but drop uppercase + letter-spacing
+     so the suffix stays readable. */
+  margin-left: 0.5em;
+  letter-spacing: 0;
+  text-transform: none;
+}
+.wc-brand__version::before { content: "· "; }
+
 .wc-header__title {
   color: var(--wc-ink-2);
   font-size: 0.95rem;

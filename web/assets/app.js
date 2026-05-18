@@ -89,6 +89,7 @@
 
     const app = document.getElementById("app");
     const headerTitleEl = document.getElementById("wc-header-title");
+    const brandVersionEl = document.getElementById("wc-brand-version");
     const backBtn = document.getElementById("wc-back-btn");
     const themeBtn = document.getElementById("wc-theme-btn");
     const refreshBtn = document.getElementById("wc-refresh-btn");
@@ -314,7 +315,26 @@
 
     // ===== Status / tile classification =====
 
+    // Msg-rate baseline advances on every poll. computeMsgRate has the same
+    // semantics as before (side-effecting; second call inside one poll burns
+    // the baseline and returns null), so the dashboard poll calls it exactly
+    // once per cycle and stashes the value in lastMsgRate for the hero meta
+    // line and the readsb tile to read independently. updateMsgRateFromStatus
+    // is the single entry point — it gates on readsb being active (matches
+    // the pre-refactor behaviour) and clears the baseline on inactivity so
+    // recovery starts clean rather than averaging across the outage.
     let rateBaseline = null;
+    let lastMsgRate = null;
+    function updateMsgRateFromStatus(status) {
+        const payload = (status && status.payload) || {};
+        const services = payload.services || {};
+        if (services["readsb.service"] !== "active") {
+            rateBaseline = null;
+            lastMsgRate = null;
+            return;
+        }
+        lastMsgRate = computeMsgRate(payload.feed || null);
+    }
     function computeMsgRate(feed) {
         if (!feed || typeof feed.now !== "number" || typeof feed.messages_counter !== "number") {
             rateBaseline = null;
@@ -552,10 +572,12 @@
             case "readsb.service": {
                 if (state === "active") {
                     const n = feed && typeof feed.aircraft_count === "number" ? feed.aircraft_count : null;
-                    const rate = computeMsgRate(feed);
+                    // lastMsgRate is computed once per poll by the dashboard
+                    // loop; reading the cached value avoids double-calling
+                    // computeMsgRate, which would burn its own baseline.
                     let parts = [];
                     if (n !== null) parts.push(n + " aircraft");
-                    if (rate !== null) parts.push(rate.toFixed(0) + " msg/s");
+                    if (lastMsgRate !== null) parts.push(lastMsgRate.toFixed(0) + " msg/s");
                     else if (n !== null) parts.push("rate pending");
                     return { dot: "ok", meta: parts.join(" · ") || "active" };
                 }
@@ -704,15 +726,15 @@
             heroEl.titleEl.textContent = "Not feeding";
         }
 
-        // Meta line: webconfig version. Per-service rates are owned by
-        // the readsb tile (computeMsgRate has side effects, so it runs
-        // exactly once per poll, not twice).
-        // /api/status emits the field as `webconfig_version` (status.go);
-        // stable tags already carry a leading `v` and dev builds carry
-        // their tag verbatim (`dev-latest+abc1234`), so render as-is.
+        // Meta line: live message rate from the readsb feed counter. This
+        // is the canonical "is the feeder actually feeding" signal for a
+        // user, so it earns the hero slot. The webconfig version is in the
+        // header brand strip instead. lastMsgRate is set by the dashboard
+        // poll exactly once per cycle (see renderStatusSnapshot); during
+        // the first poll after a (re)load it's null until the baseline has
+        // two samples.
         const parts = [];
-        const v = payload.webconfig_version;
-        if (v) parts.push(v);
+        if (lastMsgRate !== null) parts.push(lastMsgRate.toFixed(0) + " msg/s");
         heroEl.metaEl.textContent = parts.join(" · ");
     }
 
@@ -2185,6 +2207,13 @@
         // it must exist before either render runs.
         resetConfigState({});
 
+        // Reset the msg-rate baseline so returning to the dashboard after
+        // navigating away doesn't compute a rate over the gap (the gap-time
+        // average is meaningless to the user; "rate pending" for one poll
+        // is honest).
+        rateBaseline = null;
+        lastMsgRate = null;
+
         // Initial fetch.
         const [identity, status, config] = await Promise.all([
             getJSON("/api/identity"),
@@ -2202,6 +2231,10 @@
         renderIdentityCard(identityBody, identity);
         renderConfigCard(configBody, config);
         renderPrivacyCard(privacyBody, config);
+        // computeMsgRate is side-effecting (advances its baseline on every
+        // call), so route through updateMsgRateFromStatus exactly once per
+        // poll cycle and let updateHero + the readsb tile read lastMsgRate.
+        updateMsgRateFromStatus(status);
         updateHero(heroEl, status, ctx.configValues);
         updateTiles(tileGrid, status, ctx.configValues);
         updateAppTiles(tileGrid);
@@ -2218,9 +2251,16 @@
         statusTimer = setInterval(renderStatusSnapshot, STATUS_REFRESH_MS);
     }
 
+    // pollInFlight serialises status polls. setInterval doesn't await, so
+    // under network pressure a slow poll could land AFTER a newer one; the
+    // out-of-order older response would feed an older feed.now into
+    // computeMsgRate, blanking the baseline for the next cycle. Dropping
+    // overlapping polls keeps the baseline monotonic.
+    let pollInFlight = false;
     async function renderStatusSnapshot() {
         const ctx = dashboardCtx;
         if (!ctx) return;
+        if (pollInFlight) return;
 
         // Pause polling while the user is typing in any config or
         // privacy input. Each group is its own <form>, so check the
@@ -2230,22 +2270,29 @@
         const editingIn = (host) => host && document.activeElement && host.contains(document.activeElement);
         if (editingIn(ctx.configBody) || editingIn(ctx.privacyBody)) return;
 
-        const [identity, status] = await Promise.all([
-            getJSON("/api/identity"),
-            getJSON("/api/status"),
-        ]);
-        if (ctx !== dashboardCtx) return;
-        if (handleAuthFailure(identity) || handleAuthFailure(status)) return;
+        pollInFlight = true;
+        try {
+            const [identity, status] = await Promise.all([
+                getJSON("/api/identity"),
+                getJSON("/api/status"),
+            ]);
+            if (ctx !== dashboardCtx) return;
+            if (handleAuthFailure(identity) || handleAuthFailure(status)) return;
 
-        updateHero(ctx.heroEl, status, ctx.configValues);
-        updateTiles(ctx.tileGrid, status, ctx.configValues);
-        updateAppTiles(ctx.tileGrid);
-        updateRebootBanner(ctx.rebootBanner, !!(status && status.payload && status.payload.reboot_required));
+            // See the initial-render call site above.
+            updateMsgRateFromStatus(status);
+            updateHero(ctx.heroEl, status, ctx.configValues);
+            updateTiles(ctx.tileGrid, status, ctx.configValues);
+            updateAppTiles(ctx.tileGrid);
+            updateRebootBanner(ctx.rebootBanner, !!(status && status.payload && status.payload.reboot_required));
 
-        const idPayload = identity && identity.payload ? identity.payload : null;
-        if (idPayload && identityChanged(ctx.lastIdentity, idPayload)) {
-            renderIdentityCard(ctx.identityBody, identity);
-            ctx.lastIdentity = idPayload;
+            const idPayload = identity && identity.payload ? identity.payload : null;
+            if (idPayload && identityChanged(ctx.lastIdentity, idPayload)) {
+                renderIdentityCard(ctx.identityBody, identity);
+                ctx.lastIdentity = idPayload;
+            }
+        } finally {
+            pollInFlight = false;
         }
     }
 
@@ -2582,7 +2629,27 @@
 
     // ===== Bootstrap =====
 
+    // populateBrandVersion fetches /health (public, no auth) once on boot and
+    // writes the running version into the header brand strip. The body is
+    // `ok <version>\n`; failures are silently swallowed — the brand strip
+    // just stays without a version suffix.
+    async function populateBrandVersion() {
+        if (!brandVersionEl) return;
+        try {
+            const r = await fetch("/health", { cache: "no-store" });
+            if (!r.ok) return;
+            const body = await r.text();
+            const m = body.match(/^ok\s+(\S+)/);
+            if (!m) return;
+            brandVersionEl.textContent = m[1];
+            brandVersionEl.hidden = false;
+        } catch (_) { /* ignore — header just stays version-less */ }
+    }
+
     async function boot() {
+        // Fire-and-forget; populating the brand version is independent of
+        // the auth/setup boot flow.
+        populateBrandVersion();
         navigate(() => loadingPanel("Loading…"), {});
         const stateResp = await getJSON("/api/state");
         if (!stateResp.ok) {
