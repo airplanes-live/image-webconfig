@@ -36,3 +36,10 @@ airplanes-webconfig ALL=(root) NOPASSWD: /usr/bin/systemctl poweroff
 airplanes-webconfig ALL=(root) NOPASSWD: /usr/bin/systemctl start --no-block airplanes-claim.service
 airplanes-webconfig ALL=(root) NOPASSWD: /usr/bin/systemd-run --unit=airplanes-update --collect --property=ExecStopPost=/usr/bin/systemctl kill -s HUP airplanes-webconfig.service /usr/local/share/airplanes/update.sh
 airplanes-webconfig ALL=(root) NOPASSWD: /usr/bin/systemd-run --unit=airplanes-system-upgrade --collect /usr/local/lib/airplanes-webconfig/system-upgrade.sh
+
+# Feeder identity export/import. Wrapper scripts call apl-feed backup -
+# (export → stdout) and apl-feed restore /dev/stdin --force (import).
+# Wrappers exist instead of bare apl-feed argv so the grant cannot drift
+# across apl-feed subcommands.
+airplanes-webconfig ALL=(root) NOPASSWD: /usr/local/lib/airplanes-webconfig/identity-export.sh
+airplanes-webconfig ALL=(root) NOPASSWD: /usr/local/lib/airplanes-webconfig/identity-import.sh

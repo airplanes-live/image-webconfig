@@ -104,10 +104,14 @@ type State struct {
 	feedEnv   map[string]string
 	networks  []WifiNetwork
 	services  map[string]string // unit name → "active"|"inactive"|"failed"
-	claim     string            // 16-char A-Z0-9 secret; empty until RegisterClaim
+	uuid      string            // feeder UUID; seeded with a dev value, replaceable via ImportIdentity
+	claim     string            // 16-char A-Z0-9 secret; empty until RegisterClaim or ImportIdentity
+	version   *int              // claim.version (nil unless ImportIdentity supplied one)
 	feedStart time.Time
 	tickStart time.Time
 }
+
+const devFakeFeederUUID = "11111111-2222-3333-4444-555555555555"
 
 // NewState constructs a state with sensible seed values for first-load
 // rendering. The on-disk projection is NOT written yet — callers must
@@ -117,6 +121,7 @@ func NewState(p Paths) *State {
 	now := time.Now()
 	return &State{
 		Paths: p,
+		uuid:  devFakeFeederUUID,
 		feedEnv: map[string]string{
 			"LATITUDE":              "51.5",
 			"LONGITUDE":             "-0.1",
@@ -311,6 +316,37 @@ func (s *State) ClaimSecret() string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.claim
+}
+
+// Identity returns the current feeder UUID, claim secret (empty if not
+// yet registered), and claim version (nil if not set). Tests use this;
+// the production server reads the files directly.
+func (s *State) Identity() (uuid, secret string, version *int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var v *int
+	if s.version != nil {
+		copyV := *s.version
+		v = &copyV
+	}
+	return s.uuid, s.claim, v
+}
+
+// ImportIdentity replaces the in-memory UUID + secret + version and
+// re-syncs the on-disk projection. Mirrors what apl-feed restore would
+// do on a real feeder: overwrite both files atomically.
+func (s *State) ImportIdentity(uuid, secret string, version *int) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.uuid = uuid
+	s.claim = secret
+	if version != nil {
+		v := *version
+		s.version = &v
+	} else {
+		s.version = nil
+	}
+	return s.syncIdentityLocked()
 }
 
 // networksSnapshot returns a defensive copy of the network list. Used
@@ -515,7 +551,7 @@ func (s *State) syncFeedEnvLocked() error {
 }
 
 func (s *State) syncIdentityLocked() error {
-	if err := writeAtomic(s.Paths.FeederID, []byte("dev-feeder-01\n"), 0o644); err != nil {
+	if err := writeAtomic(s.Paths.FeederID, []byte(s.uuid+"\n"), 0o644); err != nil {
 		return err
 	}
 	if s.claim == "" {

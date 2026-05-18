@@ -81,6 +81,8 @@ type PrivilegedArgv struct {
 	WifiTest           []string
 	WifiActivate       []string
 	WifiStatus         []string
+	ExportIdentity     []string // sudo -n /usr/local/lib/airplanes-webconfig/identity-export.sh
+	ImportIdentity     []string // sudo -n /usr/local/lib/airplanes-webconfig/identity-import.sh
 }
 
 // DefaultPrivilegedArgv returns the production argv shapes for the
@@ -136,6 +138,12 @@ func DefaultPrivilegedArgv() PrivilegedArgv {
 		WifiTest:      sudo("/usr/local/bin/apl-wifi", "test", "--json"),
 		WifiActivate:  sudo("/usr/local/bin/apl-wifi", "activate", "--json"),
 		WifiStatus:    sudo("/usr/local/bin/apl-wifi", "status", "--json"),
+		// Identity export/import call wrapper scripts (not bare apl-feed)
+		// so each surface is its own fixed argv in sudoers. The wrappers
+		// invoke `apl-feed backup -` and `apl-feed restore /dev/stdin
+		// --force` internally.
+		ExportIdentity: sudo("/usr/local/lib/airplanes-webconfig/identity-export.sh"),
+		ImportIdentity: sudo("/usr/local/lib/airplanes-webconfig/identity-import.sh"),
 	}
 }
 
@@ -218,6 +226,8 @@ func New(d Deps) http.Handler {
 	mux.HandleFunc("GET /api/auth/whoami", s.requireSession(s.handleWhoami))
 	mux.HandleFunc("GET /api/identity", s.requireSession(s.handleIdentity))
 	mux.HandleFunc("POST /api/identity/secret", s.requireSession(s.handleIdentitySecret))
+	mux.HandleFunc("POST /api/identity/export", s.requireSession(s.handleIdentityExport))
+	mux.HandleFunc("POST /api/identity/import", s.requireSession(s.handleIdentityImport))
 	mux.HandleFunc("GET /api/config", s.requireSession(s.handleConfigGet))
 	mux.HandleFunc("GET /api/status", s.requireSession(s.handleStatus))
 	mux.HandleFunc("GET /api/status/upgrade", s.requireSession(s.handleUpgradeStatus))

@@ -320,6 +320,150 @@ func (s *Server) handleIdentitySecret(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, http.StatusOK, got)
 }
 
+// identityBackoutTimeout caps the per-call budget for the export and
+// import wrappers. apl-feed backup + restore both touch the secret
+// flock and (for restore on UUID change) the feed/mlat restart — 15s
+// is generous headroom for either.
+const identityBackoutTimeout = 15 * time.Second
+
+// identityBackupEnvelope is the canonical JSON shape apl-feed backup
+// emits and apl-feed restore consumes. Both endpoints below read and
+// write only this envelope.
+type identityBackupEnvelope struct {
+	SchemaVersion int    `json:"schema_version"`
+	CreatedAt     string `json:"created_at,omitempty"`
+	FeederUUID    string `json:"feeder_uuid"`
+	Claim         struct {
+		Secret  string `json:"secret"`
+		Version *int   `json:"version"`
+	} `json:"claim"`
+}
+
+// /api/identity/export (POST): pipes apl-feed backup -'s stdout straight
+// back to the client. POST (not GET) so the response stays uncacheable
+// and the route never lands in browser history.
+func (s *Server) handleIdentityExport(w http.ResponseWriter, r *http.Request) {
+	cctx, cancel := context.WithTimeout(r.Context(), identityBackoutTimeout)
+	defer cancel()
+	res, err := s.runner(cctx, s.priv.ExportIdentity)
+	if err != nil {
+		log.Printf("identity export: %v stderr=%q", err, strings.TrimSpace(string(res.Stderr)))
+		writeJSONError(w, http.StatusInternalServerError, "identity export failed")
+		return
+	}
+	// Validate the wrapper output is parseable canonical JSON before
+	// returning it — the SPA blob-downloads this verbatim, and a
+	// corrupted file would only surface much later on an import retry.
+	var probe identityBackupEnvelope
+	if perr := json.Unmarshal(res.Stdout, &probe); perr != nil || probe.SchemaVersion != 1 {
+		log.Printf("identity export: wrapper stdout not canonical JSON (schema=%d err=%v stderr=%q)",
+			probe.SchemaVersion, perr, strings.TrimSpace(string(res.Stderr)))
+		writeJSONError(w, http.StatusInternalServerError, "identity export produced invalid payload")
+		return
+	}
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-store")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(res.Stdout)
+}
+
+// /api/identity/import (POST): pipes the supplied apl-feed backup
+// envelope through apl-feed restore /dev/stdin --force. Validates the
+// envelope shape client-side before invocation to surface obvious
+// errors (wrong schema, missing fields, malformed UUID/secret) with a
+// 400 rather than burning a privileged call.
+func (s *Server) handleIdentityImport(w http.ResponseWriter, r *http.Request) {
+	var req identityBackupEnvelope
+	if err := readJSON(w, r, &req); err != nil {
+		writeJSONError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if req.SchemaVersion != 1 {
+		writeJSONError(w, http.StatusBadRequest, "unsupported schema_version (expected 1)")
+		return
+	}
+	if !isCanonicalUUID(req.FeederUUID) {
+		writeJSONError(w, http.StatusBadRequest, "feeder_uuid must be canonical 8-4-4-4-12 hex")
+		return
+	}
+	if !isCanonicalClaimSecret(req.Claim.Secret) {
+		writeJSONError(w, http.StatusBadRequest, "claim.secret must be 16 chars A-Z 0-9 (hyphens/spaces tolerated)")
+		return
+	}
+
+	// Re-serialize so the wrapper receives a normalized payload (and so
+	// we don't pipe the raw request body, which may include trailing
+	// whitespace the helper's jq calls would otherwise see).
+	body, err := json.Marshal(req)
+	if err != nil {
+		log.Printf("identity import: re-marshal: %v", err)
+		writeJSONError(w, http.StatusInternalServerError, "identity import failed")
+		return
+	}
+
+	cctx, cancel := context.WithTimeout(r.Context(), identityBackoutTimeout)
+	defer cancel()
+	res, runErr := s.stdinRunner(cctx, s.priv.ImportIdentity, bytes.NewReader(body))
+	if runErr != nil {
+		// Log the wrapper's stderr (which carries apl-feed's diagnostic
+		// reason) so operators have something to grep journalctl for,
+		// but don't echo it back to the client verbatim — apl-feed
+		// occasionally includes path or environment details.
+		log.Printf("identity import: %v stderr=%q", runErr, strings.TrimSpace(string(res.Stderr)))
+		writeJSONError(w, http.StatusInternalServerError, "identity import failed (see webconfig logs)")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"status": "imported"})
+}
+
+// isCanonicalUUID matches feed's read_backup_file regex
+// (^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$) after
+// canonicalisation: strip braces / brackets / whitespace, downcase hex.
+// Symmetrical with backup.sh's canonicalize_uuid so a webconfig accept
+// matches an apl-feed accept.
+func isCanonicalUUID(s string) bool {
+	if len(s) != 36 {
+		return false
+	}
+	for i, c := range s {
+		if i == 8 || i == 13 || i == 18 || i == 23 {
+			if c != '-' {
+				return false
+			}
+			continue
+		}
+		switch {
+		case c >= '0' && c <= '9':
+		case c >= 'a' && c <= 'f':
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+// isCanonicalClaimSecret tolerates the same input shapes apl-feed's
+// canonicalize_secret + validate_secret accept (uppercase letters and
+// digits after stripping whitespace and hyphens). 16 chars A-Z 0-9
+// canonical, but the input may be the human-friendly XXXX-XXXX-XXXX-XXXX
+// form.
+func isCanonicalClaimSecret(s string) bool {
+	count := 0
+	for _, c := range s {
+		switch {
+		case c == '-' || c == ' ' || c == '\t' || c == '\n' || c == '\r':
+			continue
+		case c >= 'A' && c <= 'Z':
+		case c >= 'a' && c <= 'z':
+		case c >= '0' && c <= '9':
+		default:
+			return false
+		}
+		count++
+	}
+	return count == 16
+}
+
 // /api/config (GET): feed.env values filtered against the schema-cached
 // readable_keys set. Returns 503 when the schema cache is unavailable
 // (boot-time apl-feed schema --json fetch failed and no SIGHUP has

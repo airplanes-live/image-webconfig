@@ -39,6 +39,8 @@ func StubPrivilegedArgv() server.PrivilegedArgv {
 		WifiTest:             []string{"dev-stub", "apl-wifi", "test"},
 		WifiActivate:         []string{"dev-stub", "apl-wifi", "activate"},
 		WifiStatus:           []string{"dev-stub", "apl-wifi", "status"},
+		ExportIdentity:       []string{"dev-stub", "identity", "export"},
+		ImportIdentity:       []string{"dev-stub", "identity", "import"},
 	}
 }
 
@@ -149,6 +151,13 @@ func dispatchStub(state *State, priv server.PrivilegedArgv, argv []string, body 
 			return applyFeed(state, body)
 		case "schema":
 			return schemaFeed(state)
+		}
+	case "identity":
+		switch argv[2] {
+		case "export":
+			return identityExport(state)
+		case "import":
+			return identityImport(state, body)
 		}
 	case "apl-wifi":
 		return wifiCmd(state, argv[2], body)
@@ -264,6 +273,62 @@ func extractApplyValue(raw json.RawMessage) (string, bool) {
 	// (priority etc.) don't blow up. Json-encoded numbers come back
 	// as their text rep, which matches what feed.env expects.
 	return strings.Trim(string(raw), `"`), true
+}
+
+// identityExport mirrors `apl-feed backup -`: emit the canonical backup
+// envelope on stdout. The handler relays this verbatim to the SPA.
+func identityExport(state *State) (wexec.Result, error) {
+	uuid, secret, version := state.Identity()
+	if secret == "" {
+		// Match apl-feed backup's failure shape — the binary exits
+		// non-zero with stderr when no claim secret is registered. The
+		// handler maps any non-nil error to a 500.
+		return wexec.Result{
+			Stderr:   []byte("no claim secret registered\n"),
+			ExitCode: 1,
+		}, errors.New("no claim secret registered")
+	}
+	envelope := map[string]any{
+		"schema_version": 1,
+		"created_at":     time.Now().UTC().Format("2006-01-02T15:04:05Z"),
+		"feeder_uuid":    uuid,
+		"claim": map[string]any{
+			"secret":  secret,
+			"version": version, // nil → JSON null
+		},
+	}
+	b, err := json.Marshal(envelope)
+	if err != nil {
+		return wexec.Result{ExitCode: 1, Stderr: []byte(err.Error())}, err
+	}
+	return wexec.Result{Stdout: append(b, '\n')}, nil
+}
+
+// identityImport mirrors `apl-feed restore /dev/stdin --force`: parse
+// the canonical backup envelope from stdin and overwrite the on-disk
+// identity files via the State helper.
+func identityImport(state *State, body []byte) (wexec.Result, error) {
+	var env struct {
+		SchemaVersion int    `json:"schema_version"`
+		FeederUUID    string `json:"feeder_uuid"`
+		Claim         struct {
+			Secret  string `json:"secret"`
+			Version *int   `json:"version"`
+		} `json:"claim"`
+	}
+	if err := json.Unmarshal(body, &env); err != nil {
+		return wexec.Result{ExitCode: 1, Stderr: []byte(err.Error())}, err
+	}
+	if env.SchemaVersion != 1 || env.FeederUUID == "" || env.Claim.Secret == "" {
+		return wexec.Result{
+			ExitCode: 1,
+			Stderr:   []byte("malformed backup envelope (post-validation)\n"),
+		}, errors.New("malformed backup envelope")
+	}
+	if err := state.ImportIdentity(env.FeederUUID, env.Claim.Secret, env.Claim.Version); err != nil {
+		return wexec.Result{ExitCode: 1, Stderr: []byte(err.Error())}, err
+	}
+	return wexec.Result{Stdout: []byte("Restored feeder config for Feeder ID " + env.FeederUUID + "\n")}, nil
 }
 
 func schemaFeed(state *State) (wexec.Result, error) {
