@@ -417,7 +417,7 @@
 
     /* @validator-parity start */
     const latLonRE = /^[+-]?\d+(?:\.\d+)?$/;
-    const altitudeRE = /^(-?\d+(?:\.\d+)?)(?:m|ft)?$/;
+    const altitudeShapeRE = /^(-?\d+(?:\.\d+)?)(m|ft)?$/;
 
     function isValidLatitude(v) {
         const s = (v || "").trim();
@@ -433,12 +433,46 @@
         if (!Number.isFinite(f)) return false;
         return f >= -180 && f <= 180;
     }
+
+    // altitudeToBareMetres mirrors AltitudeToBareMetres in
+    // internal/feedmeta/feedmeta.go and altitude_to_bare_metres in
+    // feed/scripts/lib/configure-validators.sh. Returns the
+    // bare-metres canonical string for the input, or null if the
+    // input fails the suffix-tolerant regex OR the post-conversion
+    // metres value is outside [-1000, 10000].
+    //
+    //   ""        → ""           (tombstone passthrough)
+    //   "<n>"     → "<n>"        (already bare)
+    //   "<n>m"    → "<n>"        (strip metre suffix)
+    //   "<n>ft"   → "<n>×0.3048" (convert feet)
+    //
+    // Fixed-point output: ten fractional digits before trimming
+    // trailing zeros and a bare decimal point. Never emits
+    // scientific notation. The shared fixture at
+    // feed/test/fixtures/altitude-canonicalization.json (vendored
+    // into image-webconfig at
+    // internal/feedmeta/testdata/altitude-canonicalization.json)
+    // pins the byte-exact expected outputs.
+    function altitudeToBareMetres(input) {
+        const s = (input == null ? "" : String(input)).trim();
+        if (s === "") return "";
+        const m = altitudeShapeRE.exec(s);
+        if (!m) return null;
+        const num = Number(m[1]);
+        if (!Number.isFinite(num)) return null;
+        const metres = (m[2] === "ft") ? num * 0.3048 : num;
+        if (metres < -1000 || metres > 10000) return null;
+        let out = metres.toFixed(10);
+        if (out.indexOf(".") !== -1) {
+            out = out.replace(/0+$/, "").replace(/\.$/, "");
+        }
+        return out;
+    }
+
     function isValidAltitude(v) {
-        const s = (v || "").trim();
-        const m = altitudeRE.exec(s);
-        if (!m) return false;
-        const f = Number(m[1]);
-        return Number.isFinite(f) && f >= -1000 && f <= 10000;
+        const s = (v == null ? "" : String(v)).trim();
+        if (s === "") return true;
+        return altitudeToBareMetres(s) !== null;
     }
 
     // Wi-Fi validators — bash twin lives at
@@ -1279,18 +1313,21 @@
     // ===== Configuration card =====
 
     // canonicaliseAltitude mirrors internal/feedmeta/feedmeta.go's
-    // canonicalizeForCompare for ALTITUDE: bare numerics get an "m"
-    // suffix appended; anything already ending in "m" or "ft" is
-    // returned as-is; empty stays empty. Used in the dirty comparator
-    // so a saved "120m" and a user-typed bare "120" don't show as
-    // dirty when the backend would canonicalise them to the same
-    // value.
+    // canonicalizeForCompare for ALTITUDE: delegate to
+    // altitudeToBareMetres so any input that parses converges to its
+    // bare-metres canonical string (the form feed's apply layer now
+    // stores on disk). Used in the dirty comparator so a saved
+    // "121.92" and a user-typed "400ft" don't show as dirty.
+    //
+    // On parse failure (out-of-range or regex mismatch) return the
+    // original input so the dirty-state comparator can still tell
+    // them apart — silently collapsing unparseable input to the
+    // empty/equal branch would mask a real change the validator
+    // (and downstream apply layer) needs to surface.
     function canonicaliseAltitude(v) {
-        const t = (v || "").trim();
-        if (t === "") return "";
-        if (/m$/i.test(t) || /ft$/i.test(t)) return t;
-        if (!isNaN(Number(t))) return t + "m";
-        return t;
+        const result = altitudeToBareMetres(v);
+        if (result === null) return v == null ? "" : String(v);
+        return result;
     }
 
     // sameValue compares an input value to a saved value applying the
@@ -1544,8 +1581,31 @@
         const altInput = el("input", {
             id: altId, name: "ALTITUDE", type: "text",
             value: configState.savedValues.ALTITUDE || "",
-            placeholder: "120m",
+            placeholder: "120",
         });
+        // Static "m" indicator next to the altitude input. The
+        // canonical on-disk form is bare metres now (apl-feed
+        // canonicalises ft→m on apply), so the indicator tells the
+        // operator that a bare number is interpreted as metres. The
+        // indicator hides when the operator typed an explicit unit
+        // suffix (ft / m) so the rendered field doesn't read "400ft m".
+        const altUnitIndicator = el("span", {
+            class: "wc-unit-indicator",
+            "aria-hidden": "true",
+        }, "m");
+        const altInputWrap = el("div", { class: "wc-input-with-unit" },
+            altInput,
+            altUnitIndicator,
+        );
+        const refreshAltUnitIndicator = () => {
+            const v = (altInput.value || "").trim();
+            // Hide when the user already typed an explicit unit
+            // suffix; otherwise show. Empty input gets the indicator
+            // too because the input is "asking for metres".
+            altUnitIndicator.hidden = /(ft|m)$/i.test(v);
+        };
+        refreshAltUnitIndicator();
+        altInput.addEventListener("input", refreshAltUnitIndicator);
 
         const latValEl = el("span", { class: "location-summary__value" });
         const lonValEl = el("span", { class: "location-summary__value" });
@@ -1593,11 +1653,11 @@
             el("div", { class: "field" },
                 el("label", { for: altId }, "Altitude"),
                 el("p", { class: "field-help" },
-                    "Antenna height above sea level, in metres — not the building height. ",
-                    "Used together with latitude/longitude to triangulate aircraft positions. ",
-                    "Append ", el("code", {}, "ft"), " if you prefer feet.",
+                    "Antenna height above sea level. Stored as metres; append ",
+                    el("code", {}, "ft"),
+                    " if you prefer feet.",
                 ),
-                altInput,
+                altInputWrap,
             ),
         );
 
@@ -1614,6 +1674,7 @@
                 latInput.value = configState.savedValues.LATITUDE || "";
                 lonInput.value = configState.savedValues.LONGITUDE || "";
                 altInput.value = configState.savedValues.ALTITUDE || "";
+                refreshAltUnitIndicator();
                 locGroup.recheck();   // forward-reference; assigned below
                 // Clear any group error & pending restart from a prior
                 // failed save attempt before collapsing.

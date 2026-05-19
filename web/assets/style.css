@@ -840,6 +840,38 @@ textarea:focus {
   font-size: 0.85rem;
 }
 
+/* ========== Unit-suffixed input ========== */
+
+/* Altitude and any future unit-bearing field render the input
+   alongside a fixed-width unit indicator so the operator can tell at
+   a glance whether the value is interpreted as metres / feet / etc.
+   The indicator hides when the user has already typed an explicit
+   suffix; the fixed indicator width keeps the layout stable between
+   the "bare numeric, indicator visible" and "ft typed, indicator
+   hidden" states so the input doesn't reflow as the operator types. */
+.wc-input-with-unit {
+  display: flex;
+  align-items: stretch;
+  gap: 0.4rem;
+}
+.wc-input-with-unit > input {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+.wc-unit-indicator {
+  flex: 0 0 1.5rem;
+  display: inline-flex;
+  align-items: center;
+  justify-content: flex-start;
+  color: var(--wc-ink-3);
+  font-family: var(--wc-font-mono);
+  font-size: 0.95rem;
+  line-height: 1;
+}
+.wc-unit-indicator[hidden] {
+  display: none;
+}
+
 /* ========== Logs ========== */
 
 .log-output {
