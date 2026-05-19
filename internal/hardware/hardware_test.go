@@ -975,3 +975,66 @@ func TestSystem_EmptyMarshalsToEmptyObject(t *testing.T) {
 		t.Errorf("empty System marshaled to %q, want \"{}\"", blob)
 	}
 }
+
+// Uptime is now a standalone sub-probe (no longer gated on timedatectl).
+// Asserts a wedged time-sync setup doesn't suppress an otherwise-readable
+// uptime signal.
+func TestProbe_UptimeReadableWhenTimedatectlFails(t *testing.T) {
+	t.Parallel()
+	f := &fixture{
+		t:       t,
+		thermal: "60000\n",
+		meminfo: "MemTotal: 4000000 kB\nMemAvailable: 2000000 kB\n",
+		uptime:  "12345.67 9876.54\n",
+		canned: canned{
+			vcgencmdErr: errors.New("not a Pi"),
+			timeErr:     errors.New("timedatectl missing"),
+		},
+		disk: fixedDiskProber(40),
+	}
+	snap := f.reader().Probe(context.Background())
+	if snap.System.UptimeSeconds == nil {
+		t.Fatal("UptimeSeconds = nil; uptime probe should succeed independently of timedatectl")
+	}
+	if *snap.System.UptimeSeconds < 12345 || *snap.System.UptimeSeconds > 12346 {
+		t.Errorf("UptimeSeconds = %v, want ≈12345.67", *snap.System.UptimeSeconds)
+	}
+	if snap.System.NTPSynchronized != nil {
+		t.Errorf("NTPSynchronized should be nil when timedatectl failed, got %v",
+			*snap.System.NTPSynchronized)
+	}
+}
+
+// Asserts the eight server-canonical pi_throttle keys all appear in the
+// marshaled JSON regardless of their values (all-false stays all-false-
+// emitted, no `omitempty` smuggling them out). Sentinel against a
+// pointer-field migration that accidentally hides false-valued bits.
+func TestThrottle_AllEightBoolKeysMarshaled(t *testing.T) {
+	t.Parallel()
+	tr := &Throttle{}
+	blob, err := json.Marshal(tr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantKeys := []string{
+		`"undervoltage_now":false`,
+		`"undervoltage_ever":false`,
+		`"freq_capped_now":false`,
+		`"freq_capped_ever":false`,
+		`"throttled_now":false`,
+		`"throttled_ever":false`,
+		`"soft_temp_limit_now":false`,
+		`"soft_temp_limit_ever":false`,
+	}
+	for _, k := range wantKeys {
+		if !strings.Contains(string(blob), k) {
+			t.Errorf("marshaled JSON missing %s: %s", k, blob)
+		}
+	}
+	// PSU pointer fields are nil → omitempty hides them.
+	for _, k := range []string{"psu_max_current_ma", "psu_expected_ma"} {
+		if strings.Contains(string(blob), k) {
+			t.Errorf("nil PSU pointer leaked to JSON: %s", blob)
+		}
+	}
+}

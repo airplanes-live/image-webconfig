@@ -256,14 +256,18 @@ func (r *Reader) probePSU(ctx context.Context, t *Throttle, model []byte) {
 	}
 }
 
-// probeSystem runs the universal sub-probes (CPU temp, time, memory,
-// disk) and returns a populated System. Sub-probe failure leaves the
-// corresponding pointer field nil; success populates it via the
-// fooPtr helpers so a zero value (e.g. 0% disk free) is preserved.
+// probeSystem runs the universal sub-probes (CPU temp, time, uptime,
+// memory, disk) and returns a populated System. Sub-probe failure
+// leaves the corresponding pointer field nil; success populates it
+// via the fooPtr helpers so a zero value (e.g. 0% disk free) is
+// preserved. Uptime is its own sub-probe — reading /proc/uptime
+// doesn't depend on timedatectl, so a wedged time-sync setup
+// shouldn't suppress an otherwise-readable uptime signal.
 func (r *Reader) probeSystem(ctx context.Context) System {
 	var s System
 	r.probeTemp(&s)
 	r.probeTime(ctx, &s)
+	r.probeUptime(&s)
 	r.probeMem(&s)
 	r.probeDisk(&s)
 	return s
@@ -293,10 +297,15 @@ func (r *Reader) probeTime(ctx context.Context, s *System) {
 		return
 	}
 	s.NTPSynchronized = boolPtr(synced)
-	if b, err := os.ReadFile(r.paths.UptimeFile); err == nil {
-		if u, ok := parseUptime(b); ok {
-			s.UptimeSeconds = float64Ptr(u)
-		}
+}
+
+func (r *Reader) probeUptime(s *System) {
+	b, err := os.ReadFile(r.paths.UptimeFile)
+	if err != nil {
+		return
+	}
+	if u, ok := parseUptime(b); ok {
+		s.UptimeSeconds = float64Ptr(u)
 	}
 }
 

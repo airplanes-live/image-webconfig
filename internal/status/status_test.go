@@ -597,6 +597,27 @@ func TestRead_NoHardwareOption_EmitsEmptySystem(t *testing.T) {
 	}
 }
 
+// HardwareProbe is wired but returns nil (e.g. a transient construction
+// failure or a stub that's intentionally empty). The Read() path must
+// not panic and must omit pi_throttle + hardware_health while still
+// emitting `system: {}`.
+func TestRead_HardwareProbeReturnsNil_NoPanic(t *testing.T) {
+	t.Parallel()
+	p, _ := newTestPaths(t)
+	r := NewReader("v", p, fixedRunner("active", nil), WithHardware(stubHardwareProbe{nil}))
+	got, _ := r.Read(context.Background())
+	if got.PiThrottle != nil {
+		t.Errorf("PiThrottle should be nil when probe returned nil, got %+v", got.PiThrottle)
+	}
+	if got.HardwareHealth != nil {
+		t.Errorf("HardwareHealth should be nil when probe returned nil, got %+v", got.HardwareHealth)
+	}
+	blob, _ := json.Marshal(got)
+	if !strings.Contains(string(blob), `"system":{}`) {
+		t.Errorf("system key must remain present as {} even with nil probe: %s", blob)
+	}
+}
+
 // Codex sentinel: non-Pi feeder. PiThrottle absent, system present,
 // hardware_health.is_raspberry_pi false. Pi_throttle key must not leak.
 func TestRead_NonPi_OmitsPiThrottle(t *testing.T) {
