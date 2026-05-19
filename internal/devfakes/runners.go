@@ -694,7 +694,10 @@ func StreamRunner(state *State) wexec.StreamRunner {
 }
 
 func emitLogLine(w io.Writer, unit, msg string) error {
-	stamp := time.Now().UTC().Format("Jan 02 15:04:05")
+	// Format matches journalctl --output=short: local time, space-padded
+	// day (e.g. "May  9 14:23:45"). Production lines go through the same
+	// hostname-strip path in internal/logs as fake ones do here.
+	stamp := time.Now().Format("Jan _2 15:04:05")
 	line := fmt.Sprintf("%s feeder-dev %s: %s\n", stamp, unit, msg)
 	_, err := io.Copy(w, bytes.NewReader([]byte(line)))
 	return err

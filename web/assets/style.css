@@ -924,6 +924,11 @@ textarea:focus {
   word-break: break-all;
 }
 
+.log-ts {
+  color: var(--wc-ink-3);
+  white-space: nowrap;
+}
+
 /* ========== Two-column responsive split (identity + config) ========== */
 
 .wc-split {

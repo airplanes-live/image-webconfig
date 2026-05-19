@@ -14,6 +14,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -39,6 +40,31 @@ var Whitelist = map[string]string{
 
 // JournalctlBinary is overridable for tests.
 var JournalctlBinary = "/usr/bin/journalctl"
+
+// shortFormatLine matches journalctl's --output=short layout:
+//
+//	MMM DD HH:MM:SS hostname syslog-id[pid]: message
+//
+// Day is space-padded for single digits (e.g. "May  9 14:23:45"). The
+// hostname is a single non-space token; the syslog identifier ends in
+// ":" (with or without "[pid]"). Lines that don't match (boot
+// separators like "-- Boot abc --", continuation lines starting with
+// whitespace, anything unexpected) are passed through unchanged.
+var shortFormatLine = regexp.MustCompile(`^([A-Z][a-z]{2} [ 0-9][0-9] [0-9]{2}:[0-9]{2}:[0-9]{2}) \S+ (\S+:) (.*)$`)
+
+// stripHostname removes the hostname token between the timestamp and
+// the syslog identifier in a journalctl --output=short line. The
+// hostname is redundant — every line came from this feeder — and the
+// repetition crowds the message column. Lines that don't match the
+// short format are returned unchanged so boot separators and any
+// future format quirks survive intact.
+func stripHostname(line string) string {
+	m := shortFormatLine.FindStringSubmatch(line)
+	if m == nil {
+		return line
+	}
+	return m[1] + " " + m[2] + " " + m[3]
+}
 
 // streamMaxLifetime caps how long any single SSE stream stays open. The
 // global http.Server.WriteTimeout is disabled for this handler via
@@ -126,7 +152,7 @@ func (s *Streamer) ServeSSE(ctx context.Context, w http.ResponseWriter, slug str
 		"--follow",
 		"--no-pager",
 		"--lines=100",
-		"--output=cat",
+		"--output=short",
 	}
 	go func() {
 		err := s.streamer(ctx, pw, argv)
@@ -184,7 +210,7 @@ func (s *Streamer) ServeSSE(ctx context.Context, w http.ResponseWriter, slug str
 				}
 				return nil
 			}
-			if err := write("data: %s\n\n", strings.ReplaceAll(line, "\n", "\\n")); err != nil {
+			if err := write("data: %s\n\n", strings.ReplaceAll(stripHostname(line), "\n", "\\n")); err != nil {
 				closeOnce(err)
 				return err
 			}

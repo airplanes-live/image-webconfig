@@ -3547,12 +3547,11 @@
         activeStream = es;
         es.onmessage = (ev) => {
             clearPlaceholder();
-            pre.appendChild(document.createTextNode(ev.data + "\n"));
-            pre.scrollTop = pre.scrollHeight;
+            appendLogLine(pre, ev.data);
         };
         es.onerror = () => {
             clearPlaceholder();
-            pre.appendChild(document.createTextNode("[restart in progress]\n"));
+            appendLogLine(pre, "[restart in progress]");
             try { es.close(); } catch (_) {}
             if (activeStream === es) activeStream = null;
             if (cancelled) return;
@@ -3572,7 +3571,7 @@
                     if (cancelled) return;
                     if (t && (baselineHealth === null || t !== baselineHealth)) {
                         status.textContent = "Update applied — reloading…";
-                        pre.appendChild(document.createTextNode("[restart complete: " + t.trim() + "]\n"));
+                        appendLogLine(pre, "[restart complete: " + t.trim() + "]");
                         pollTimer = setTimeout(() => { if (!cancelled) window.location.reload(); }, 500);
                         return;
                     }
@@ -3588,6 +3587,30 @@
             }
             pollTimer = setTimeout(pollForRestart, POLL_INTERVAL_MS);
         }
+    }
+
+    // LOG_TS_RE matches the journalctl --output=short timestamp prefix
+    // that the backend forwards. The day field is space-padded for
+    // single digits (e.g. "May  9 14:23:45"). Lines that don't match
+    // (boot separators, client-side status markers like "[stream
+    // closed]") are rendered without a muted timestamp prefix.
+    const LOG_TS_RE = /^([A-Z][a-z]{2} [ 0-9][0-9] [0-9]{2}:[0-9]{2}:[0-9]{2}) (.*)$/;
+
+    // appendLogLine renders a single log line into the given <pre>, wrapping
+    // the timestamp prefix (when present) in a muted span so the message
+    // column is visually dominant. Each line ends in an explicit "\n" text
+    // node so the <pre>'s native text flow handles wrapping and copy-paste.
+    function appendLogLine(pre, line) {
+        const m = LOG_TS_RE.exec(line);
+        if (m) {
+            pre.appendChild(el("span", { class: "log-ts" }, m[1]));
+            pre.appendChild(document.createTextNode(" "));
+            pre.appendChild(el("span", { class: "log-msg" }, m[2]));
+        } else {
+            pre.appendChild(el("span", { class: "log-msg" }, line));
+        }
+        pre.appendChild(document.createTextNode("\n"));
+        pre.scrollTop = pre.scrollHeight;
     }
 
     // streamLog wires an SSE stream from /api/log/<slug> into a fresh
@@ -3606,12 +3629,11 @@
         activeStream = es;
         es.onmessage = (ev) => {
             clearPlaceholder();
-            pre.appendChild(document.createTextNode(ev.data + "\n"));
-            pre.scrollTop = pre.scrollHeight;
+            appendLogLine(pre, ev.data);
         };
         es.onerror = () => {
             clearPlaceholder();
-            pre.appendChild(document.createTextNode("[stream closed]\n"));
+            appendLogLine(pre, "[stream closed]");
             try { es.close(); } catch (_) {}
             if (activeStream === es) activeStream = null;
         };
