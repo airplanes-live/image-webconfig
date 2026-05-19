@@ -668,6 +668,23 @@ button.secondary:hover,
   white-space: nowrap;
 }
 
+/* Symmetric 2-column action grid used by the Identity, Updates and
+   Power cards. Every cell is the same width (minmax(0, 1fr) ignores
+   intrinsic min-content widths so per-row content can't push column
+   tracks apart); row gap matches column gap, so vertical and horizontal
+   whitespace read as a single rhythm. Buttons stretch to fill their
+   cell, overriding .actions button's flex sizing. */
+.wc-action-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 0.5rem;
+}
+.wc-action-grid > button {
+  width: 100%;
+  min-width: 0;
+}
+.wc-action-grid__spacer { display: block; }
+
 /* Top-level action rows that follow a card need separation; intra-card
    .actions inherit the card's own padding so they don't get this. */
 .wc-card + .actions,
