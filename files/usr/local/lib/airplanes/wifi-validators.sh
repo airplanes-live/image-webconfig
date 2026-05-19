@@ -3,8 +3,8 @@
 # flow) and apl-wifi (webconfig flow). Both must agree on what counts as a
 # valid SSID/PSK/country/priority/hidden so an input the operator tested via
 # airplanes-config.txt isn't later rejected by the UI (or vice versa). The JS
-# twins in webconfig/web/assets/app.js are kept in sync by
-# test/test_validator_parity.sh.
+# twins in web/assets/app.js (inside the /* @validator-parity */ block) are
+# pinned against this file by internal/clientvalidators/parity_test.go.
 #
 # Predicates only: return 0 on accept, non-zero on reject, write nothing to
 # stdout. Mirrors feed/scripts/lib/configure-validators.sh.

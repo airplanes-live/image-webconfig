@@ -81,7 +81,7 @@ Build-mode reads `AIRPLANES_WEBCONFIG_BRANCH` from the pi-gen config (a concrete
 ## Cross-repo coupling
 
 - **`airplanes-live/image`** — pi-gen consumer. `stage-airplanes/05-install-webconfig/00-run.sh` clones this repo and invokes `install.sh --build-mode`. The image bakes a frozen release; on-device updates replace it.
-- **`airplanes-live/feed`** — the webconfig writes feed.env via `sudo -n /usr/local/bin/apl-feed apply --json --lock-timeout 5`. That argv is pinned in `files/etc/sudoers.d/010_airplanes-webconfig` and must stay in sync with feed's `apl-feed` CLI. Validator parity between `web/assets/app.js` (JS validators) and feed's `scripts/lib/configure-validators.sh` (bash) is enforced by `test/test_validator_parity.sh` (moves into this repo as part of the extraction).
+- **`airplanes-live/feed`** — the webconfig writes feed.env via `sudo -n /usr/local/bin/apl-feed apply --json --lock-timeout 5`. That argv is pinned in `files/etc/sudoers.d/010_airplanes-webconfig` and must stay in sync with feed's `apl-feed` CLI. Validator parity between `web/assets/app.js` (JS validators, inside the `@validator-parity` block) and feed's `scripts/lib/configure-validators.sh` (bash) is enforced by `internal/clientvalidators/parity_test.go`, which executes the actual shipped JS in a Node subprocess and the actual shipped bash functions in a subprocess against a shared input-vector table. Wi-Fi validator parity against `files/usr/local/lib/airplanes/wifi-validators.sh` is enforced by the same test.
 - **`/etc/airplanes/release-channel`** — same file feed reads. One device-wide channel knob.
 
 ## Rules
