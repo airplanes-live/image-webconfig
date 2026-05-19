@@ -1777,12 +1777,18 @@
                 return;
             }
             if (!r.ok) {
-                // Forward apl-feed's structured error envelope. The
-                // per-field map shape lands as a one-line summary —
-                // good enough; we don't render field-by-field decor
-                // for now.
-                err.textContent = (r.payload && (r.payload.error || r.payload.message))
-                    || "save failed";
+                // Forward apl-feed's structured error envelope. When the
+                // helper rejects per-field (typical for apply: bad
+                // LATITUDE, MLAT_USER, etc.) it returns a `errors` map of
+                // `KEY → message`; flatten that into the summary so the
+                // user can see exactly which field tripped server-side
+                // rather than a generic "save failed".
+                const p = r.payload || {};
+                const summary = p.error || p.message || "save failed";
+                const errs = (p.errors && typeof p.errors === "object" && !Array.isArray(p.errors))
+                    ? p.errors : null;
+                const fields = errs ? Object.keys(errs).map(k => k + ": " + errs[k]) : [];
+                err.textContent = fields.length ? summary + " — " + fields.join("; ") : summary;
                 state.inFlight = null;
                 for (const cb of state.recheckAll) cb();
                 return;
