@@ -12,6 +12,7 @@ import (
 	"time"
 
 	wexec "github.com/airplanes-live/image-webconfig/internal/exec"
+	"github.com/airplanes-live/image-webconfig/internal/feedmeta"
 	"github.com/airplanes-live/image-webconfig/internal/server"
 )
 
@@ -228,6 +229,24 @@ func applyFeed(state *State, body []byte) (wexec.Result, error) {
 			return wexec.Result{Stdout: b}, nil
 		}
 		updates[k] = s
+	}
+	// Mirror feed's apply-layer validator: ALTITUDE that fails the
+	// suffix-tolerant regex or the post-conversion metres range is
+	// rejected before any disk mutation. Production feed returns a
+	// `rejected` envelope with a per-key error; the dev-fake does
+	// the same so the SPA's rejected-envelope branch is exercised
+	// against bad altitude input.
+	if alt, present := updates["ALTITUDE"]; present {
+		if _, ok := feedmeta.AltitudeToBareMetres(alt); !ok {
+			env := map[string]any{
+				"status": "rejected",
+				"errors": map[string]string{
+					"ALTITUDE": "must parse as a metric or imperial altitude in [-1000, 10000] metres (e.g. 120m, 400ft, 0)",
+				},
+			}
+			b, _ := json.Marshal(env)
+			return wexec.Result{Stdout: b}, nil
+		}
 	}
 	changed, err := state.ApplyFeedEnv(updates)
 	if err != nil {

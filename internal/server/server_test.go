@@ -14,6 +14,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"sort"
 	"strings"
 	"sync"
 	"testing"
@@ -23,6 +24,7 @@ import (
 	"github.com/airplanes-live/image-webconfig/internal/auth"
 	wexec "github.com/airplanes-live/image-webconfig/internal/exec"
 	"github.com/airplanes-live/image-webconfig/internal/feedenv"
+	"github.com/airplanes-live/image-webconfig/internal/feedmeta"
 	"github.com/airplanes-live/image-webconfig/internal/identity"
 	"github.com/airplanes-live/image-webconfig/internal/logs"
 	"github.com/airplanes-live/image-webconfig/internal/schemacache"
@@ -1646,3 +1648,157 @@ func TestAssetsFS_OverrideServesIndexAndStatic(t *testing.T) {
 }
 
 // --- pending_restart surfacing (PR 3) ---
+
+// TestConfigPost_AltitudeFtRoundTripsAsBareMetres exercises the full
+// SPA → server → fake apl-feed → feedenv.Reader chain for the
+// altitude bare-metres contract. The operator posts "400ft", the
+// fake apl-feed canonicalises it on apply (mirroring feed's
+// _apl_feed_apply_canonicalize_altitude → altitude_to_bare_metres),
+// the GET that follows reads the canonicalised value back from
+// feed.env. Without this end-to-end test, the JS / Go / fake-apply
+// layers could each pass their own unit test while still drifting.
+func TestConfigPost_AltitudeFtRoundTripsAsBareMetres(t *testing.T) {
+	dir := t.TempDir()
+	hashPath := filepath.Join(dir, "password.hash")
+	guard, err := auth.NewHashGuard(2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	feedEnvPath := filepath.Join(dir, "feed.env")
+	// Seed with an existing ALTITUDE so the GET path has something
+	// to compare against before the POST mutates it.
+	if err := os.WriteFile(feedEnvPath,
+		[]byte(`ALTITUDE="12"`+"\n"+`LATITUDE="51.5"`+"\n"+`LONGITUDE="-0.1"`+"\n"),
+		0o644,
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	// Canonicalising stdin runner: parses the JSON payload feed
+	// expects, mirrors feedmeta.AltitudeToBareMetres on every
+	// ALTITUDE value, and rewrites feed.env with the merged result.
+	// This is the minimum production-shaped behaviour the parity
+	// contract relies on; we deliberately do NOT call into devfakes
+	// here because that package imports server (circular).
+	stdinRunner := func(_ context.Context, _ []string, stdin io.Reader) (wexec.Result, error) {
+		raw, _ := io.ReadAll(stdin)
+		var payload struct {
+			Updates map[string]json.RawMessage `json:"updates"`
+		}
+		if err := json.Unmarshal(raw, &payload); err != nil {
+			return wexec.Result{Stdout: []byte(`{"status":"parse_error"}`)}, nil
+		}
+		// Reuse the existing feed.env so unchanged keys survive.
+		rd := &feedenv.Reader{Path: feedEnvPath}
+		current, _ := rd.ReadAll()
+		merged := make(map[string]string, len(current)+len(payload.Updates))
+		for k, v := range current {
+			merged[k] = v
+		}
+		for k, rawVal := range payload.Updates {
+			value, ok := extractValueFromApplyPayload(rawVal)
+			if !ok {
+				continue
+			}
+			if k == "ALTITUDE" {
+				canon, _ := feedmeta.AltitudeToBareMetres(value)
+				value = canon
+			}
+			merged[k] = value
+		}
+		// Atomic write of the merged env.
+		var buf bytes.Buffer
+		keys := make([]string, 0, len(merged))
+		for k := range merged {
+			keys = append(keys, k)
+		}
+		// Stable order keeps the file diffable in failure messages.
+		sort.Strings(keys)
+		for _, k := range keys {
+			fmt.Fprintf(&buf, "%s=%q\n", k, merged[k])
+		}
+		if err := os.WriteFile(feedEnvPath, buf.Bytes(), 0o644); err != nil {
+			return wexec.Result{}, err
+		}
+		return wexec.Result{Stdout: []byte(`{"status":"applied","changed":["ALTITUDE"],"pending_restart":[]}`)}, nil
+	}
+
+	deps := Deps{
+		Version:      "test-sha",
+		Store:        auth.NewPasswordStore(hashPath),
+		Sessions:     auth.NewSessions(time.Hour),
+		Lockout:      auth.NewLockout(5, time.Minute, 15*time.Minute),
+		Guard:        guard,
+		Argon2Params: fastTestParams,
+		Identity:     identity.NewReader(identity.Paths{FeederIDFile: filepath.Join(dir, "feeder-id")}),
+		FeedEnv:      &feedenv.Reader{Path: feedEnvPath},
+		Status: status.NewReader("test-sha", status.Paths{
+			SystemctlBinary: "/bin/true", IsActiveTimeout: time.Second,
+		}, func(_ context.Context, _ []string) (wexec.Result, error) { return wexec.Result{}, nil }),
+		Logs: logs.NewStreamer(nil),
+		Schema: schemacache.NewPrepopulated(
+			[]string{"LATITUDE", "LONGITUDE", "ALTITUDE", "GEO_CONFIGURED", "MLAT_USER", "MLAT_ENABLED", "MLAT_PRIVATE", "REPORT_STATUS", "REMOTE_CONFIG_ENABLED", "GAIN", "UAT_INPUT", "DUMP978_SDR_SERIAL", "DUMP978_GAIN"},
+			[]string{"LATITUDE", "LONGITUDE", "ALTITUDE", "GEO_CONFIGURED", "MLAT_USER", "MLAT_ENABLED", "MLAT_PRIVATE", "REPORT_STATUS", "REMOTE_CONFIG_ENABLED", "INPUT", "INPUT_TYPE", "GAIN", "UAT_INPUT", "DUMP978_SDR_SERIAL", "DUMP978_GAIN"},
+		),
+		Runner: func(_ context.Context, _ []string) (wexec.Result, error) {
+			return wexec.Result{}, nil
+		},
+		StdinRunner: stdinRunner,
+		Privileged: PrivilegedArgv{
+			ApplyFeed:  []string{"sudo-stub", "apl-feed", "apply", "--json", "--lock-timeout", "5"},
+			SchemaFeed: []string{"apl-feed", "schema", "--json"},
+		},
+	}
+	ts := httptest.NewServer(New(deps))
+	defer ts.Close()
+
+	c := httpClient(t)
+	r := postJSON(t, c, ts.URL+"/api/setup", map[string]string{"password": testPassword})
+	r.Body.Close()
+	if r.StatusCode != http.StatusOK {
+		t.Fatalf("setup status = %d", r.StatusCode)
+	}
+
+	// POST raw operator input — the SPA forwards 400ft verbatim.
+	r = postJSON(t, c, ts.URL+"/api/config",
+		map[string]any{"updates": map[string]string{"ALTITUDE": "400ft"}})
+	defer r.Body.Close()
+	if r.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(r.Body)
+		t.Fatalf("POST /api/config status=%d body=%q", r.StatusCode, body)
+	}
+
+	// GET must now return the canonicalised bare-metres value.
+	resp := mustGet(t, c, ts.URL+"/api/config")
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("GET /api/config status=%d", resp.StatusCode)
+	}
+	var got struct {
+		Values map[string]string `json:"values"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&got); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if got.Values["ALTITUDE"] != "121.92" {
+		t.Errorf("ALTITUDE round-trip: got %q, want 121.92 (400ft canonicalised to bare metres)", got.Values["ALTITUDE"])
+	}
+}
+
+// extractValueFromApplyPayload mirrors what apl-feed's --json handler
+// does to the heterogeneous payload value: a bare JSON string is the
+// value; an object form `{"value": "...", "edited_at": ..., "edited_by": ...}`
+// has its .value field as the value.
+func extractValueFromApplyPayload(raw json.RawMessage) (string, bool) {
+	var s string
+	if err := json.Unmarshal(raw, &s); err == nil {
+		return s, true
+	}
+	var obj struct {
+		Value string `json:"value"`
+	}
+	if err := json.Unmarshal(raw, &obj); err == nil {
+		return obj.Value, true
+	}
+	return "", false
+}

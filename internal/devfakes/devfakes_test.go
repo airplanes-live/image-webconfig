@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -13,6 +14,36 @@ import (
 	wexec "github.com/airplanes-live/image-webconfig/internal/exec"
 	"github.com/airplanes-live/image-webconfig/internal/feedenv"
 )
+
+// altitudeFixtureCase mirrors a single entry in the shared canonical
+// fixture vendored from feed. We load it relative to the feedmeta
+// package's testdata dir so the bash / Go / JS / devfakes parity all
+// derive from the same source of truth.
+type altitudeFixtureCase struct {
+	Input          string `json:"input"`
+	ExpectedOutput string `json:"expected_output"`
+	ExpectedOK     bool   `json:"expected_ok"`
+	Note           string `json:"note,omitempty"`
+}
+
+func loadAltitudeFixture(t *testing.T) []altitudeFixtureCase {
+	t.Helper()
+	path := filepath.Join("..", "feedmeta", "testdata", "altitude-canonicalization.json")
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read altitude fixture (%s): %v", path, err)
+	}
+	var doc struct {
+		Cases []altitudeFixtureCase `json:"cases"`
+	}
+	if err := json.Unmarshal(raw, &doc); err != nil {
+		t.Fatalf("decode altitude fixture: %v", err)
+	}
+	if len(doc.Cases) == 0 {
+		t.Fatal("altitude fixture: zero cases")
+	}
+	return doc.Cases
+}
 
 func mustNewState(t *testing.T) *State {
 	t.Helper()
@@ -149,6 +180,84 @@ func TestApplyFeed_ExplicitGeoOverrideWins(t *testing.T) {
 	}
 	if s.FeedEnvSnapshot()["GEO_CONFIGURED"] != "false" {
 		t.Fatalf("explicit GEO_CONFIGURED=false was overridden, snapshot=%v", s.FeedEnvSnapshot())
+	}
+}
+
+func TestApplyFeed_AltitudeCanonicalisedToBareMetres(t *testing.T) {
+	t.Parallel()
+	// Sanity case: 400ft must land on disk as "121.92" (the
+	// post-conversion bare-metres canonical) regardless of the
+	// operator's input suffix. This is the parity case feed's apply
+	// layer covers; without canonicalisation here, the dev-server
+	// would diverge from production behaviour and the SPA's
+	// dirty-state comparator would thrash.
+	s := mustNewState(t)
+	priv := StubPrivilegedArgv()
+	runner := StdinRunner(s, priv)
+	payload := `{"updates":{"ALTITUDE":"400ft"}}`
+	if _, err := runner(context.Background(), priv.ApplyFeed, strings.NewReader(payload)); err != nil {
+		t.Fatalf("runner: %v", err)
+	}
+	if got := s.FeedEnvSnapshot()["ALTITUDE"]; got != "121.92" {
+		t.Fatalf("ALTITUDE=%q want 121.92", got)
+	}
+}
+
+func TestApplyFeed_AltitudeFixtureParity(t *testing.T) {
+	// Drives the shared canonical fixture through the fake apply
+	// path. Valid inputs land on disk as the fixture's
+	// expected_output (the bare-metres canonical form). Invalid
+	// inputs (expected_ok=false) must produce a rejected envelope
+	// AND leave the prior on-disk value untouched — matching what
+	// feed's apply-layer validator does to garbage before its
+	// canonicaliser ever runs.
+	t.Parallel()
+	priv := StubPrivilegedArgv()
+	for _, tc := range loadAltitudeFixture(t) {
+		tc := tc
+		t.Run("input="+tc.Input, func(t *testing.T) {
+			s := mustNewState(t)
+			before := s.FeedEnvSnapshot()["ALTITUDE"]
+			runner := StdinRunner(s, priv)
+			body, _ := json.Marshal(map[string]any{
+				"updates": map[string]any{"ALTITUDE": tc.Input},
+			})
+			res, err := runner(context.Background(), priv.ApplyFeed, bytes.NewReader(body))
+			if err != nil {
+				t.Fatalf("runner: %v", err)
+			}
+			var env struct {
+				Status string            `json:"status"`
+				Errors map[string]string `json:"errors"`
+			}
+			if jerr := json.Unmarshal(res.Stdout, &env); jerr != nil {
+				t.Fatalf("envelope decode: %v (body=%q)", jerr, res.Stdout)
+			}
+			got := s.FeedEnvSnapshot()["ALTITUDE"]
+			if !tc.ExpectedOK {
+				if env.Status != "rejected" {
+					t.Errorf("input=%q expected_ok=false: status=%q, want rejected (body=%q)",
+						tc.Input, env.Status, res.Stdout)
+				}
+				if env.Errors["ALTITUDE"] == "" {
+					t.Errorf("input=%q: rejected envelope missing per-key error (body=%q)",
+						tc.Input, res.Stdout)
+				}
+				if got != before {
+					t.Errorf("input=%q (rejected): ALTITUDE on disk = %q, want unchanged %q",
+						tc.Input, got, before)
+				}
+				return
+			}
+			if env.Status != "applied" {
+				t.Errorf("input=%q expected_ok=true: status=%q, want applied (body=%q)",
+					tc.Input, env.Status, res.Stdout)
+			}
+			if got != tc.ExpectedOutput {
+				t.Errorf("ALTITUDE on disk after apply(%q) = %q, want %q (note=%s)",
+					tc.Input, got, tc.ExpectedOutput, tc.Note)
+			}
+		})
 	}
 }
 
