@@ -98,6 +98,8 @@
     const userMenu = document.getElementById("wc-user-menu");
     const userMenuChangePw = document.getElementById("wc-user-change-pw");
     const userMenuLogout = document.getElementById("wc-user-logout");
+    const userMenuReboot = document.getElementById("wc-user-reboot");
+    const userMenuPoweroff = document.getElementById("wc-user-poweroff");
 
     let activeStream = null;       // current EventSource (log viewer)
     let statusTimer = null;        // setInterval handle for status poll
@@ -892,9 +894,16 @@
         const titleEl  = el("span", { class: "wc-tile__title" }, "Raspberry Pi");
         const metaEl   = el("span", { class: "wc-tile__meta" }, "—");
         const dotEl    = el("span", { class: "wc-tile__dot wc-tile__dot--na" });
-        const root = el("div", { class: "wc-tile wc-tile--hardware", "data-state": "unknown" },
+        const chev     = el("span", { class: "wc-tile__chev", "aria-hidden": "true" }, "›");
+        const root = el("button", {
+            type: "button",
+            class: "wc-tile wc-tile--hardware wc-tile--nav",
+            "data-state": "unknown",
+            onclick: () => navigate(piHealthPanel, { title: "System metrics", showBack: true }),
+        },
             iconNode,
             el("span", { class: "wc-tile__body" }, titleEl, metaEl),
+            chev,
             dotEl,
         );
         return { root, titleEl, metaEl, dotEl };
@@ -1583,6 +1592,75 @@
             return { fieldset, body, footer, form };
         };
 
+        // buildEditableField wraps a per-group set of inputs in a
+        // read-only summary that an Edit button swaps to the editor.
+        // The caller still owns mountGroup wiring (dirty/save), payload
+        // shape, and any gating; this helper owns the visibility toggle,
+        // summary refresh, focus management, the Cancel button (with
+        // input-reset + footer-error-clear), and exposes `setEditing` /
+        // `refreshSummary` so the per-group onSavedHook can collapse
+        // back to read-only after a save lands.
+        //
+        // The Cancel button is appended to footerEl BEFORE mountGroup()
+        // runs, so the footer DOM order matches Location's:
+        // [Cancel, Save, error, pending-restart].
+        //
+        // opts:
+        //   summarise()        -> string displayed when collapsed
+        //   inputsWrapper      element that becomes hidden in read mode
+        //   resetInputs()      restore inputs to saved (or default) values
+        //   focusInput         element to focus when entering edit mode
+        //   footerEl           the per-group footer (for Cancel + error reset)
+        //   afterCancel()      optional extra cleanup after reset (e.g. recheck)
+        const buildEditableField = (opts) => {
+            const valueEl = el("span", { class: "wc-editable__value" });
+            const editBtn = el("button", {
+                type: "button", class: "wc-btn-ghost wc-editable__edit",
+            }, "Edit");
+            const summaryEl = el("div", { class: "wc-editable" }, valueEl, editBtn);
+
+            const refreshSummary = () => {
+                const v = opts.summarise();
+                if (v == null || v === "") {
+                    valueEl.textContent = "—";
+                    valueEl.classList.add("wc-editable__value--placeholder");
+                } else {
+                    valueEl.textContent = v;
+                    valueEl.classList.remove("wc-editable__value--placeholder");
+                }
+            };
+
+            const setEditing = (editing) => {
+                summaryEl.hidden = editing;
+                opts.inputsWrapper.hidden = !editing;
+                cancelBtn.hidden = !editing;
+                if (editing && opts.focusInput) {
+                    setTimeout(() => opts.focusInput.focus(), 0);
+                }
+            };
+
+            const cancelBtn = el("button", {
+                type: "button", class: "wc-btn-ghost",
+                onclick: () => {
+                    opts.resetInputs();
+                    const errEl = opts.footerEl.querySelector(".error");
+                    if (errEl) errEl.textContent = "";
+                    const pendEl = opts.footerEl.querySelector(".config-fieldset__pending");
+                    if (pendEl) { pendEl.hidden = true; pendEl.textContent = ""; }
+                    setEditing(false);
+                    if (opts.afterCancel) opts.afterCancel();
+                },
+            }, "Cancel");
+            opts.footerEl.appendChild(cancelBtn);
+
+            editBtn.addEventListener("click", () => setEditing(true));
+
+            refreshSummary();
+            setEditing(false);
+
+            return { summaryEl, setEditing, refreshSummary, cancelBtn };
+        };
+
         // ===== Location =====
         const loc = buildGroup("Location");
 
@@ -1809,10 +1887,21 @@
         mlatGateMsg.appendChild(setLocationLink);
         mlatGateMsg.hidden = true;
 
+        const mlatUserEditor = el("div", {}, mlatUserInput);
+        const mlatUserEdit = buildEditableField({
+            summarise: () => configState.savedValues.MLAT_USER || "",
+            inputsWrapper: mlatUserEditor,
+            resetInputs: () => { mlatUserInput.value = configState.savedValues.MLAT_USER || ""; },
+            focusInput: mlatUserInput,
+            footerEl: mlatG.footer,
+            afterCancel: () => { mlatGroup.recheck(); },
+        });
+
         const mlatSubFields = el("div", { class: "mlat-sub" },
             el("div", { class: "field" },
                 el("label", { for: mlatUserId }, "MLAT name"),
-                mlatUserInput,
+                mlatUserEdit.summaryEl,
+                mlatUserEditor,
             ),
             el("div", { class: "field" },
                 el("label", { for: mlatPrivateId }, mlatPrivateInput, " Hide MLAT name on public map"),
@@ -1827,13 +1916,19 @@
 
         const updateMlatVisibility = () => {
             const geoOk = locationSaved(configState.savedValues);
+            const visible = mlatInput.checked && geoOk;
             // Sub-fields only meaningful when MLAT is on AND geo is set.
-            mlatSubFields.hidden = !(mlatInput.checked && geoOk);
+            mlatSubFields.hidden = !visible;
             // Show the gate message ONLY when the user is trying to
             // enable MLAT without saved geo. Disabling MLAT is always
             // allowed (the user must be able to turn it off even with
             // bad on-disk geo).
             mlatGateMsg.hidden = !(mlatInput.checked && !geoOk);
+            // Re-collapse the MLAT name editor whenever the gate closes
+            // so the next reveal starts from a known read-only state
+            // (also drops any half-typed value into the discard path
+            // via the readInputs/payload hidden-skip).
+            if (!visible) mlatUserEdit.setEditing(false);
         };
         mlatInput.addEventListener("change", updateMlatVisibility);
         updateMlatVisibility();
@@ -1843,15 +1938,21 @@
             formEl: mlatG.form,
             footerEl: mlatG.footer,
             keys: ["MLAT_ENABLED", "MLAT_USER", "MLAT_PRIVATE"],
-            readInputs: () => ({
-                MLAT_ENABLED: mlatInput.checked ? "true" : "false",
-                MLAT_USER: mlatUserInput.value,
-                MLAT_PRIVATE: mlatPrivateInput.checked ? "true" : "false",
-            }),
+            // Hidden MLAT_USER edits must not silently save. When the
+            // sub-fields are collapsed (MLAT disabled or geo missing)
+            // omit MLAT_USER from the dirty comparator entirely so any
+            // half-typed value the user abandoned stays out of payload.
+            readInputs: () => {
+                const out = {
+                    MLAT_ENABLED: mlatInput.checked ? "true" : "false",
+                    MLAT_PRIVATE: mlatPrivateInput.checked ? "true" : "false",
+                };
+                if (!mlatSubFields.hidden) {
+                    out.MLAT_USER = mlatUserInput.value;
+                }
+                return out;
+            },
             isValid: () => {
-                // Always allow saving when MLAT is being disabled. Only
-                // gate on saved geo when the submission would enable
-                // MLAT.
                 if (!mlatInput.checked) return true;
                 return locationSaved(configState.savedValues);
             },
@@ -1861,7 +1962,8 @@
                 if (enabled !== (configState.savedValues.MLAT_ENABLED || "true")) {
                     out.MLAT_ENABLED = enabled;
                 }
-                if (!sameValue("MLAT_USER", mlatUserInput.value, configState.savedValues.MLAT_USER)) {
+                if (!mlatSubFields.hidden
+                    && !sameValue("MLAT_USER", mlatUserInput.value, configState.savedValues.MLAT_USER)) {
                     out.MLAT_USER = mlatUserInput.value.trim();
                 }
                 const priv = mlatPrivateInput.checked ? "true" : "false";
@@ -1869,6 +1971,14 @@
                     out.MLAT_PRIVATE = priv;
                 }
                 return out;
+            },
+            onSavedHook: () => {
+                // Rebase the input to the canonical saved value (apl-feed
+                // trims) so a "bob " save isn't stuck dirty against "bob".
+                mlatUserInput.value = configState.savedValues.MLAT_USER || "";
+                mlatUserEdit.refreshSummary();
+                mlatUserEdit.setEditing(false);
+                mlatGroup.recheck();
             },
         });
         // After any save lands, re-evaluate MLAT visibility (Location
@@ -1896,11 +2006,21 @@
             }, "wiedehopf's gain guide"),
             ".",
         ));
+        const gainEditor = el("div", {}, gainInput);
+        const gainEdit = buildEditableField({
+            summarise: () => configState.savedValues.GAIN || "auto",
+            inputsWrapper: gainEditor,
+            resetInputs: () => { gainInput.value = configState.savedValues.GAIN || ""; },
+            focusInput: gainInput,
+            footerEl: gainG.footer,
+            afterCancel: () => { gainGroup.recheck(); },
+        });
         gainG.body.appendChild(el("div", { class: "field" },
             el("label", { for: gainId }, "Gain"),
-            gainInput,
+            gainEdit.summaryEl,
+            gainEditor,
         ));
-        mountGroup({
+        const gainGroup = mountGroup({
             name: "gain",
             formEl: gainG.form,
             footerEl: gainG.footer,
@@ -1908,6 +2028,12 @@
             readInputs: () => ({ GAIN: gainInput.value }),
             isValid: () => true,
             payload: () => ({ GAIN: gainInput.value.trim() }),
+            onSavedHook: () => {
+                gainInput.value = configState.savedValues.GAIN || "";
+                gainEdit.refreshSummary();
+                gainEdit.setEditing(false);
+                gainGroup.recheck();
+            },
         });
 
         // ===== 978 UAT =====
@@ -1931,7 +2057,7 @@
             placeholder: "42.1", inputmode: "decimal",
         });
 
-        const uatSub = el("div", { class: "dump978-sub" },
+        const uatEditor = el("div", {},
             el("div", { class: "field" },
                 el("label", { for: sdrSerialId }, "978 SDR serial"),
                 sdrSerialInput,
@@ -1941,9 +2067,30 @@
                 dump978GainInput,
             ),
         );
+        const uatEdit = buildEditableField({
+            summarise: () => {
+                const ser = configState.savedValues.DUMP978_SDR_SERIAL || "978";
+                const g = configState.savedValues.DUMP978_GAIN || "42.1";
+                return "serial " + ser + " · gain " + g;
+            },
+            inputsWrapper: uatEditor,
+            resetInputs: () => {
+                sdrSerialInput.value = configState.savedValues.DUMP978_SDR_SERIAL || "978";
+                dump978GainInput.value = configState.savedValues.DUMP978_GAIN || "42.1";
+            },
+            focusInput: sdrSerialInput,
+            footerEl: uatG.footer,
+            afterCancel: () => { uatGroup.recheck(); },
+        });
+
+        const uatSub = el("div", { class: "dump978-sub" },
+            uatEdit.summaryEl,
+            uatEditor,
+        );
         uatSub.hidden = !uatInput.checked;
         uatInput.addEventListener("change", () => {
             uatSub.hidden = !uatInput.checked;
+            if (!uatInput.checked) uatEdit.setEditing(false);
         });
 
         uatG.body.appendChild(el("div", { class: "field" },
@@ -1951,7 +2098,7 @@
         ));
         uatG.body.appendChild(uatSub);
 
-        mountGroup({
+        const uatGroup = mountGroup({
             name: "uat",
             formEl: uatG.form,
             footerEl: uatG.footer,
@@ -1987,6 +2134,13 @@
                     }
                 }
                 return out;
+            },
+            onSavedHook: () => {
+                sdrSerialInput.value = configState.savedValues.DUMP978_SDR_SERIAL || "978";
+                dump978GainInput.value = configState.savedValues.DUMP978_GAIN || "42.1";
+                uatEdit.refreshSummary();
+                uatEdit.setEditing(false);
+                uatGroup.recheck();
             },
         });
 
@@ -2177,23 +2331,6 @@
                 feedUpdateBtn, feedUpdateLog,
                 sysUpdateBtn,  sysUpdateLog,
             ),
-        );
-    }
-
-    function buildPowerCard() {
-        const rebootBtn = el("button", {
-            type: "button", class: "wc-btn-danger",
-            onclick: () => requestReboot(rebootBtn, true),
-        }, "Reboot");
-
-        const poweroffBtn = el("button", {
-            type: "button", class: "wc-btn-danger",
-            onclick: () => navigate(confirmPowerOffPanel, { title: "Power off", showBack: true }),
-        }, "Power off");
-
-        return el("section", { class: "wc-card" },
-            el("h2", {}, "Power"),
-            el("div", { class: "wc-action-grid" }, rebootBtn, poweroffBtn),
         );
     }
 
@@ -2452,6 +2589,116 @@
         );
     }
 
+    // ===== System metrics panel (pi_health subpage) =====
+
+    function formatUptime(seconds) {
+        if (!seconds || seconds <= 0) return null;
+        const d = Math.floor(seconds / 86400);
+        const h = Math.floor((seconds % 86400) / 3600);
+        const m = Math.floor((seconds % 3600) / 60);
+        if (d > 0) return d + " d " + h + " h";
+        if (h > 0) return h + " h " + m + " m";
+        return m + " m";
+    }
+
+    function metricCell(label, value, opts) {
+        const o = opts || {};
+        const cls = "wc-metrics__cell" + (o.full ? " wc-metrics__cell--full" : "");
+        return el("div", { class: cls },
+            el("dt", {}, label),
+            el("dd", {}, value),
+        );
+    }
+
+    async function piHealthPanel() {
+        render(el("div", { class: "wc-card" }, el("p", { class: "muted" }, "loading metrics…")));
+        const r = await getJSON("/api/status");
+        if (handleAuthFailure(r)) return;
+        if (!r.ok) {
+            render(el("div", { class: "wc-card" },
+                el("h2", {}, "System metrics"),
+                el("p", { class: "error", role: "alert" },
+                    (r.payload && r.payload.error) || "Could not load system metrics."),
+            ));
+            return;
+        }
+
+        const ph = (r.payload && r.payload.pi_health) || null;
+        const anyProbed = ph && (ph.throttle_probed || ph.temp_probed || ph.time_probed
+            || ph.mem_probed || ph.disk_probed || ph.psu_probed);
+        if (!ph || !anyProbed) {
+            render(el("section", { class: "wc-card" },
+                el("h2", {}, "System metrics"),
+                el("p", { class: "muted" },
+                    ph && !ph.is_raspberry_pi
+                        ? "This device isn't a Raspberry Pi — no hardware metrics to show."
+                        : "No metrics available — the hardware probes did not return data."),
+            ));
+            return;
+        }
+
+        const severity = ph.severity || "na";
+        const summaryBanner = el("div", { class: "wc-metrics__summary" },
+            el("span", { class: "wc-metrics__summary-dot wc-metrics__summary-dot--" + severity }),
+            el("span", {}, ph.summary || "Status unknown"),
+        );
+
+        const cells = [];
+
+        if (ph.temp_probed) {
+            cells.push(metricCell("CPU temperature",
+                typeof ph.cpu_temp_c === "number" ? ph.cpu_temp_c.toFixed(1) + " °C" : "—"));
+        }
+        if (ph.mem_probed) {
+            cells.push(metricCell("Memory free",
+                typeof ph.mem_avail_pct === "number" ? ph.mem_avail_pct.toFixed(0) + " %" : "—"));
+        }
+        if (ph.disk_probed) {
+            cells.push(metricCell("Disk free",
+                typeof ph.disk_free_pct === "number" ? ph.disk_free_pct.toFixed(0) + " %" : "—"));
+        }
+        const upStr = formatUptime(ph.uptime_s);
+        if (upStr) {
+            cells.push(metricCell("Uptime", upStr));
+        }
+        if (ph.time_probed) {
+            cells.push(metricCell("NTP synchronised", ph.ntp_synchronized ? "Yes" : "No"));
+        }
+        if (ph.psu_probed) {
+            const maxMA = ph.psu_max_current_ma || 0;
+            const expMA = ph.psu_expected_ma || 0;
+            const val = expMA > 0
+                ? maxMA + " / " + expMA + " mA"
+                : maxMA + " mA";
+            cells.push(metricCell("PSU current capability", val));
+        }
+        if (ph.throttle_probed) {
+            const flags = [];
+            const addFlag = (label, now, ever) => {
+                if (!now && !ever) return;
+                flags.push(el("span", { class: "wc-metrics__flag" + (now ? " wc-metrics__flag--now" : "") },
+                    label + (now ? "" : " (since boot)")));
+            };
+            addFlag("Under-voltage", ph.undervoltage_now, ph.undervoltage_ever);
+            addFlag("Throttled", ph.throttled_now, ph.throttled_ever);
+            addFlag("Frequency capped", ph.freq_capped_now, ph.freq_capped_ever);
+            addFlag("Soft temp limit", ph.soft_temp_limit_now, ph.soft_temp_limit_ever);
+            const body = flags.length > 0
+                ? el("div", {}, ...flags)
+                : el("span", {}, "None reported");
+            cells.push(metricCell("Throttling", body, { full: true }));
+        }
+
+        render(el("section", { class: "wc-card" },
+            el("h2", {}, "System metrics"),
+            summaryBanner,
+            el("dl", { class: "wc-metrics" }, ...cells),
+            el("p", { class: "muted",
+                style: "margin-top: 0.75rem; font-size: 0.85rem;" },
+                "These are the same readings the feeder reports to airplanes.live when diagnostics are enabled."),
+        ));
+    }
+
     // buildRebootBannerSlot returns an empty container that the dashboard
     // mounts at the top of the render tree. updateRebootBanner toggles its
     // contents based on the /api/status reboot_required flag — invisible
@@ -2506,7 +2753,7 @@
             heroEl.root,
             tileGrid.root,
             el("div", { class: "wc-split" }, leftColumn, configCard),
-            el("div", { class: "wc-stack" }, buildUpdatesCard(), buildPowerCard()),
+            buildUpdatesCard(),
         );
         render.apply(null, renderArgs);
 
@@ -2760,7 +3007,7 @@
         const submit = el("button", { type: "submit", class: "wc-btn-danger", disabled: true }, "Power off");
         const cancel = el("button", {
             type: "button", class: "wc-btn-ghost",
-            onclick: () => navigate(dashboard, { title: null, showBack: false }),
+            onclick: () => navigateDashboard(),
         }, "Cancel");
 
         const matches = () => input.value.trim().toLowerCase() === PHRASE;
@@ -3123,6 +3370,14 @@
         closeUserMenu();
         await postJSON("/api/auth/logout", {});
         await boot();
+    });
+    if (userMenuReboot) userMenuReboot.addEventListener("click", () => {
+        closeUserMenu();
+        requestReboot(null, true);
+    });
+    if (userMenuPoweroff) userMenuPoweroff.addEventListener("click", () => {
+        closeUserMenu();
+        navigate(confirmPowerOffPanel, { title: "Power off", showBack: true });
     });
     if (refreshBtn) refreshBtn.addEventListener("click", async () => {
         if (refreshBtn.disabled) return;
