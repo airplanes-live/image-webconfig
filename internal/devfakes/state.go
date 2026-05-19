@@ -234,13 +234,16 @@ func (s *State) ApplyFeedEnv(updates map[string]string) ([]string, error) {
 		case "ALTITUDE":
 			// Mirror feed's apply-layer canonicalisation: store
 			// bare metres on disk regardless of the operator's
-			// input suffix. Unparseable input is tombstoned to
-			// "" because feed's apply layer rejects garbage at
-			// the prior _apl_feed_apply_validate_one step
-			// before this canonicaliser ever runs; matching
-			// that with an empty store keeps dev parity tight.
-			canon, _ := feedmeta.AltitudeToBareMetres(v)
-			v = canon
+			// input suffix. Production feed's apply validator
+			// rejects unparseable / out-of-range input BEFORE
+			// the canonicaliser ever runs, so the runner side
+			// (applyFeed in runners.go) is responsible for the
+			// rejected envelope; here we leave a value that
+			// fails canonicalisation untouched, matching what
+			// the bash side does if its validator is bypassed.
+			if canon, ok := feedmeta.AltitudeToBareMetres(v); ok {
+				v = canon
+			}
 		}
 		prev, existed := s.feedEnv[k]
 		if existed && prev == v {

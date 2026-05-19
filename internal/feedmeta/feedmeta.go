@@ -141,11 +141,20 @@ func AltitudeToBareMetres(value string) (string, bool) {
 	if m[2] == "ft" {
 		metres = num * 0.3048
 	}
-	if metres < -1000 || metres > 10000 {
+	// Bash mirrors: range-check happens AFTER the %.10f rounding so
+	// a value whose 11th-decimal slop pushes it just over a boundary
+	// (e.g. 10000.00000000004) rounds back inside before the check.
+	// Parse the rounded representation rather than the raw double
+	// to keep the four callers byte-identical at the boundary.
+	rounded := strconv.FormatFloat(metres, 'f', 10, 64)
+	cmp, err := strconv.ParseFloat(rounded, 64)
+	if err != nil {
 		return "", false
 	}
-	formatted := trimAltitudeFraction(strconv.FormatFloat(metres, 'f', 10, 64))
-	return formatted, true
+	if cmp < -1000 || cmp > 10000 {
+		return "", false
+	}
+	return trimAltitudeFraction(rounded), true
 }
 
 // canonicalizeForCompare returns a value normalised to the form the

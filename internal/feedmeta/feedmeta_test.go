@@ -307,6 +307,53 @@ func TestBuildApplyPayload_AltitudeRealChangeCarriesMetadata(t *testing.T) {
 	}
 }
 
+// TestAltitudeToBareMetres_BoundaryRoundingMatchesBash pins the
+// behaviour at "value whose 11th-decimal slop crosses the boundary":
+// bash's altitude_to_bare_metres formats with %.10f BEFORE the
+// range-check, so an input of e.g. 10000.00000000004 rounds back to
+// 10000 before the gate accepts it. Go must converge with that or
+// the cross-repo metadata sidecar would thrash on certain edges.
+func TestAltitudeToBareMetres_BoundaryRoundingMatchesBash(t *testing.T) {
+	// Just-inside upper bound after %.10f rounding: 11th-decimal
+	// noise rounds away. Accept.
+	for _, in := range []string{"10000.00000000004", "9999.99999999996"} {
+		got, ok := AltitudeToBareMetres(in)
+		if !ok {
+			t.Errorf("input=%q: rejected, want accepted (post-%%.10f rounds inside [-1000,10000])", in)
+		}
+		if got != "10000" {
+			t.Errorf("input=%q: got %q, want 10000 (rounded)", in, got)
+		}
+	}
+	// 10000.0001 has no 11th-decimal slop: %.10f preserves it as
+	// 10000.0001000000 > 10000 → reject. Matches fixture.
+	if _, ok := AltitudeToBareMetres("10000.0001"); ok {
+		t.Errorf("input=10000.0001: accepted, want rejected")
+	}
+}
+
+// TestAltitudeToBareMetres_NegativeZero pins the negative-zero
+// canonical so the JS / Go / bash sides converge. The fixture does
+// not cover -0 because the operator never enters it deliberately,
+// but a fleet-wide migrator that processes every value still has to
+// agree on how to format a `-0` it encounters in the wild.
+//
+// Bash awk emits "-0.0000000000" for `printf "%.10f" -0`; Go's
+// strconv.FormatFloat preserves the negative sign on a -0 input.
+// JS toFixed normalises -0 to "0.0000000000" — the SPA explicitly
+// re-attaches the sign via Object.is so the canonical matches.
+func TestAltitudeToBareMetres_NegativeZero(t *testing.T) {
+	for _, in := range []string{"-0", "-0m", "-0ft"} {
+		got, ok := AltitudeToBareMetres(in)
+		if !ok {
+			t.Errorf("AltitudeToBareMetres(%q): ok=false, want true", in)
+		}
+		if got != "-0" {
+			t.Errorf("AltitudeToBareMetres(%q) = %q, want %q", in, got, "-0")
+		}
+	}
+}
+
 // TestAltitudeToBareMetres_FromFixture exercises the exported helper
 // against the shared canonical fixture vendored from feed. The fixture
 // IS the contract — any divergence between bash/Go/JS surfaces here as

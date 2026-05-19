@@ -461,8 +461,22 @@
         const num = Number(m[1]);
         if (!Number.isFinite(num)) return null;
         const metres = (m[2] === "ft") ? num * 0.3048 : num;
-        if (metres < -1000 || metres > 10000) return null;
+        // Bash mirrors: range-check the %.10f-rounded value, not the
+        // raw double, so 11th-decimal slop on a boundary input
+        // rounds inside before the gate. Number.toFixed(10) is the
+        // JS equivalent rounding; parse it back for the comparison.
         let out = metres.toFixed(10);
+        // Preserve negative-zero sign so the canonical form matches
+        // bash awk's "-0.0000000000" and Go's strconv.FormatFloat
+        // output. Without this the JS canonical for "-0", "-0m", or
+        // any rounded-to-zero negative input would diverge as "0"
+        // while bash and Go emit "-0", causing the SPA's dirty
+        // comparator to thrash.
+        if (Object.is(metres, -0) && out[0] !== "-") {
+            out = "-" + out;
+        }
+        const rounded = Number(out);
+        if (!Number.isFinite(rounded) || rounded < -1000 || rounded > 10000) return null;
         if (out.indexOf(".") !== -1) {
             out = out.replace(/0+$/, "").replace(/\.$/, "");
         }
@@ -526,8 +540,15 @@
     // locationSaved — drives the form cascade. previewLatLonSet covers the
     // GEO_CONFIGURED-first check; altitude is separate because the daemon
     // classifies altitude_empty as its own MLAT misconfig reason.
+    //
+    // Empty altitude must NOT count as "location saved" here — the
+    // daemon will refuse to enable MLAT with ALTITUDE empty. The
+    // bare `isValidAltitude("")` returns true (tombstone-acceptance,
+    // matching feed's apply validator), so the explicit non-empty
+    // guard keeps the form-collapse logic honest.
     function locationSaved(values) {
-        return previewLatLonSet(values || {}) && isValidAltitude((values || {}).ALTITUDE || "");
+        const v = (values || {}).ALTITUDE || "";
+        return previewLatLonSet(values || {}) && v.trim() !== "" && isValidAltitude(v);
     }
 
     // previewMlatDisabled — same projection semantics: read MLAT_ENABLED
@@ -1739,6 +1760,16 @@
                 return out;
             },
             onSavedHook: () => {
+                // Rebase the inputs against savedValues post-refresh
+                // so an operator who typed `400ft` sees the canonical
+                // `121.92` next time they hit Edit. Without this the
+                // editor would still show the un-canonicalised input
+                // and the dirty comparator would re-flag the field
+                // on every input event.
+                latInput.value = configState.savedValues.LATITUDE || "";
+                lonInput.value = configState.savedValues.LONGITUDE || "";
+                altInput.value = configState.savedValues.ALTITUDE || "";
+                refreshAltUnitIndicator();
                 updateSummaryValues();
                 setEditing(false);
             },

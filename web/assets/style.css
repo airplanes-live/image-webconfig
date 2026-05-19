@@ -846,9 +846,9 @@ textarea:focus {
    alongside a fixed-width unit indicator so the operator can tell at
    a glance whether the value is interpreted as metres / feet / etc.
    The indicator hides when the user has already typed an explicit
-   suffix; the fixed indicator width keeps the layout stable between
-   the "bare numeric, indicator visible" and "ft typed, indicator
-   hidden" states so the input doesn't reflow as the operator types. */
+   suffix; the fixed-width slot stays in the flex layout (visibility
+   hidden, not display none) so the input doesn't reflow as the
+   operator types the trailing `ft` / `m`. */
 .wc-input-with-unit {
   display: flex;
   align-items: stretch;
@@ -868,8 +868,13 @@ textarea:focus {
   font-size: 0.95rem;
   line-height: 1;
 }
+/* Preserve layout slot when hidden: visibility-hidden keeps the
+   reserved 1.5rem flex basis, where the global [hidden] {display:none}
+   would collapse it and reflow the input. Override !important by
+   re-asserting display + visibility together. */
 .wc-unit-indicator[hidden] {
-  display: none;
+  display: inline-flex !important;
+  visibility: hidden;
 }
 
 /* ========== Logs ========== */
