@@ -1037,6 +1037,14 @@
             return;
         }
         parent.appendChild(el("p", {}, el("strong", {}, "Feeder ID: "), id.feeder_id));
+        const claimLog = el("button", {
+            class: "wc-btn-ghost",
+            type: "button",
+            onclick: () => navigate(() => claimActivityPanel(), { title: "Claim activity", showBack: true }),
+        }, "Claim activity");
+
+        const importControl = buildIdentityImportControl();
+
         if (!id.claim_secret_present) {
             parent.appendChild(el("p", { class: "muted" },
                 "Claim secret not yet registered. The feeder retries every 5 minutes; click below to attempt now."));
@@ -1057,21 +1065,17 @@
                     navigate(() => claimActivityPanel(), { title: "Claim activity", showBack: true });
                 },
             }, "Register now");
-            const claimLog = el("button", {
-                class: "wc-btn-ghost",
-                type: "button",
-                onclick: () => navigate(() => claimActivityPanel(), { title: "Claim activity", showBack: true }),
-            }, "Claim activity");
-            parent.appendChild(el("div", { class: "actions" }, registerBtn, claimLog));
+            // Row 1: Register now + Claim activity. Row 2: Import (col 1
+            // only; col 2 stays empty so column alignment matches the
+            // secret-present view).
+            parent.appendChild(el("div", { class: "wc-action-grid" },
+                registerBtn, claimLog,
+                importControl.btn, el("span", { class: "wc-action-grid__spacer", "aria-hidden": "true" }),
+            ));
             parent.appendChild(registerErr);
-            appendIdentityImportRow(parent);
+            parent.appendChild(importControl.form);
             return;
         }
-        const claimLog = el("button", {
-            class: "wc-btn-ghost",
-            type: "button",
-            onclick: () => navigate(() => claimActivityPanel(), { title: "Claim activity", showBack: true }),
-        }, "Claim activity");
 
         const reveal = el("button", {
             class: "wc-btn-ghost",
@@ -1094,10 +1098,11 @@
                     el("p", {}, el("strong", {}, "Feeder ID: "), r.payload.feeder_id),
                     el("p", {}, el("strong", {}, "Claim secret: "), el("code", {}, r.payload.claim_secret)),
                     el("p", {}, linkOrText),
-                    el("div", { class: "actions" }, claimLog),
+                    el("div", { class: "wc-action-grid" }, claimLog),
                 );
             },
         }, "Show claim secret");
+
         const exportBtn = el("button", {
             class: "wc-btn-ghost",
             type: "button",
@@ -1141,22 +1146,28 @@
                     exportBtn.disabled = false;
                 }
             },
-        }, "Export");
-        parent.appendChild(el("div", { class: "actions" }, reveal, claimLog, exportBtn));
-        appendIdentityImportRow(parent);
+        }, "Export identity");
+
+        // Row 1: Show claim secret + Claim activity.
+        // Row 2: Export identity + Import identity.
+        parent.appendChild(el("div", { class: "wc-action-grid" },
+            reveal, claimLog,
+            exportBtn, importControl.btn,
+        ));
+        parent.appendChild(importControl.form);
     }
 
-    // appendIdentityImportRow renders an Import button + a collapsed
-    // form that the user expands to paste an exported JSON backup or
-    // type the UUID/secret pair manually. On submit it POSTs the
+    // buildIdentityImportControl returns the Import button + its
+    // collapsed form panel as two separate nodes, so the caller can
+    // place the button inside an action grid and drop the form below.
+    // Clicking the button toggles the form; submitting POSTs the
     // canonical { schema_version, feeder_uuid, claim:{secret, version} }
-    // envelope to /api/identity/import; the backend re-validates and
-    // pipes it to apl-feed restore via the privileged wrapper.
-    function appendIdentityImportRow(parent) {
+    // envelope to /api/identity/import (apl-feed restore via wrapper).
+    function buildIdentityImportControl() {
         const importBtn = el("button", {
             class: "wc-btn-ghost",
             type: "button",
-        }, "Import identity…");
+        }, "Import identity");
 
         const form = el("div", { class: "identity-import" });
         form.hidden = true;
@@ -1256,8 +1267,7 @@
         };
 
         form.appendChild(formEl);
-        parent.appendChild(el("div", { class: "actions" }, importBtn));
-        parent.appendChild(form);
+        return { btn: importBtn, form };
     }
 
     function identityChanged(prev, next) {
@@ -1995,46 +2005,7 @@
     }
 
     function buildUpdatesCard() {
-        const updateBtn = el("button", {
-            type: "button", class: "wc-btn-ghost",
-            onclick: async () => {
-                updateBtn.disabled = true;
-                const r = await postJSON("/api/update", {});
-                updateBtn.disabled = false;
-                if (handleAuthFailure(r)) return;
-                if (!r.ok) {
-                    alert((r.payload && r.payload.error) || "update failed");
-                    return;
-                }
-                navigate(() => logViewer("update"), { title: "Update log", showBack: true });
-            },
-        }, "Run update");
-
-        const updateLog = el("button", {
-            type: "button", class: "wc-btn-ghost",
-            onclick: () => navigate(() => logViewer("update"), { title: "Update log", showBack: true }),
-        }, "Update log");
-
-        const sysUpgradeBtn = el("button", {
-            type: "button", class: "wc-btn-ghost",
-            onclick: async () => {
-                sysUpgradeBtn.disabled = true;
-                const r = await postJSON("/api/system-upgrade", {});
-                sysUpgradeBtn.disabled = false;
-                if (handleAuthFailure(r)) return;
-                if (!r.ok) {
-                    alert((r.payload && r.payload.error) || "system upgrade failed");
-                    return;
-                }
-                navigate(() => logViewer("system-upgrade"), { title: "System upgrade log", showBack: true });
-            },
-        }, "Update system packages");
-
-        const sysUpgradeLog = el("button", {
-            type: "button", class: "wc-btn-ghost",
-            onclick: () => navigate(() => logViewer("system-upgrade"), { title: "System upgrade log", showBack: true }),
-        }, "System upgrade log");
-
+        // Row 1: web UI — the outermost layer
         const webUiUpdateBtn = el("button", {
             type: "button", class: "wc-btn-ghost",
             onclick: async () => {
@@ -2065,11 +2036,55 @@
             onclick: () => navigate(() => logViewer("webconfig-update"), { title: "Web UI update log", showBack: true }),
         }, "Web UI update log");
 
+        // Row 2: feed scripts — the middle layer
+        const feedUpdateBtn = el("button", {
+            type: "button", class: "wc-btn-ghost",
+            onclick: async () => {
+                feedUpdateBtn.disabled = true;
+                const r = await postJSON("/api/update", {});
+                feedUpdateBtn.disabled = false;
+                if (handleAuthFailure(r)) return;
+                if (!r.ok) {
+                    alert((r.payload && r.payload.error) || "update failed");
+                    return;
+                }
+                navigate(() => logViewer("update"), { title: "Feed update log", showBack: true });
+            },
+        }, "Run feed update");
+
+        const feedUpdateLog = el("button", {
+            type: "button", class: "wc-btn-ghost",
+            onclick: () => navigate(() => logViewer("update"), { title: "Feed update log", showBack: true }),
+        }, "Feed update log");
+
+        // Row 3: system — the underlying OS, deepest layer
+        const sysUpdateBtn = el("button", {
+            type: "button", class: "wc-btn-ghost",
+            onclick: async () => {
+                sysUpdateBtn.disabled = true;
+                const r = await postJSON("/api/system-upgrade", {});
+                sysUpdateBtn.disabled = false;
+                if (handleAuthFailure(r)) return;
+                if (!r.ok) {
+                    alert((r.payload && r.payload.error) || "system update failed");
+                    return;
+                }
+                navigate(() => logViewer("system-upgrade"), { title: "Update system log", showBack: true });
+            },
+        }, "Update system");
+
+        const sysUpdateLog = el("button", {
+            type: "button", class: "wc-btn-ghost",
+            onclick: () => navigate(() => logViewer("system-upgrade"), { title: "Update system log", showBack: true }),
+        }, "Update system log");
+
         return el("section", { class: "wc-card" },
             el("h2", {}, "Updates"),
-            el("div", { class: "actions" }, updateBtn, updateLog),
-            el("div", { class: "actions" }, sysUpgradeBtn, sysUpgradeLog),
-            el("div", { class: "actions" }, webUiUpdateBtn, webUiUpdateLog),
+            el("div", { class: "wc-action-grid" },
+                webUiUpdateBtn, webUiUpdateLog,
+                feedUpdateBtn, feedUpdateLog,
+                sysUpdateBtn,  sysUpdateLog,
+            ),
         );
     }
 
@@ -2086,7 +2101,7 @@
 
         return el("section", { class: "wc-card" },
             el("h2", {}, "Power"),
-            el("div", { class: "actions" }, rebootBtn, poweroffBtn),
+            el("div", { class: "wc-action-grid" }, rebootBtn, poweroffBtn),
         );
     }
 
