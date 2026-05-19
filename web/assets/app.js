@@ -1054,13 +1054,13 @@
                         registerErr.textContent = (r.payload && r.payload.error) || "register failed";
                         return;
                     }
-                    navigate(() => logViewer("claim"), { title: "Claim activity", showBack: true });
+                    navigate(() => claimActivityPanel(), { title: "Claim activity", showBack: true });
                 },
             }, "Register now");
             const claimLog = el("button", {
                 class: "wc-btn-ghost",
                 type: "button",
-                onclick: () => navigate(() => logViewer("claim"), { title: "Claim activity", showBack: true }),
+                onclick: () => navigate(() => claimActivityPanel(), { title: "Claim activity", showBack: true }),
             }, "Claim activity");
             parent.appendChild(el("div", { class: "actions" }, registerBtn, claimLog));
             parent.appendChild(registerErr);
@@ -1070,7 +1070,7 @@
         const claimLog = el("button", {
             class: "wc-btn-ghost",
             type: "button",
-            onclick: () => navigate(() => logViewer("claim"), { title: "Claim activity", showBack: true }),
+            onclick: () => navigate(() => claimActivityPanel(), { title: "Claim activity", showBack: true }),
         }, "Claim activity");
 
         const reveal = el("button", {
@@ -2790,25 +2790,18 @@
         }
     }
 
-    function logViewer(slug) {
+    // streamLog wires an SSE stream from /api/log/<slug> into a fresh
+    // <pre>, with a "(no log entries yet)" placeholder that's cleared on
+    // the first arriving line. Returns the <pre> for the caller to embed
+    // in its own panel layout. The EventSource is installed as
+    // activeStream so navigate() tears it down on the next view change.
+    function streamLog(slug) {
         const pre = el("pre", { class: "log-output" });
-        const unit = LOG_SLUG_TO_UNIT[slug] || slug;
-        // Placeholder shown until the first event arrives (or the stream
-        // closes without one) — without it the <pre> is just an empty box,
-        // which looks broken on services that haven't run yet (e.g. the
-        // update log on a freshly booted feeder).
         const placeholder = el("span", { class: "muted" }, "(no log entries yet)");
         pre.appendChild(placeholder);
         const clearPlaceholder = () => {
             if (placeholder.parentNode === pre) pre.removeChild(placeholder);
         };
-        render(
-            el("section", { class: "wc-card" },
-                el("h2", {}, "journalctl -u " + unit),
-                el("p", { class: "muted" }, "Streaming live; close this view (use the Dashboard button above) to disconnect."),
-                pre,
-            ),
-        );
         const es = new EventSource("/api/log/" + encodeURIComponent(slug));
         activeStream = es;
         es.onmessage = (ev) => {
@@ -2822,6 +2815,134 @@
             try { es.close(); } catch (_) {}
             if (activeStream === es) activeStream = null;
         };
+        return pre;
+    }
+
+    function logViewer(slug) {
+        const unit = LOG_SLUG_TO_UNIT[slug] || slug;
+        const pre = streamLog(slug);
+        render(
+            el("section", { class: "wc-card" },
+                el("h2", {}, "journalctl -u " + unit),
+                el("p", { class: "muted" }, "Streaming live; close this view (use the Dashboard button above) to disconnect."),
+                pre,
+            ),
+        );
+    }
+
+    // claimActivityPanel renders the journal stream for
+    // airplanes-claim.service alongside a "Claim status" card sourced
+    // from GET /api/identity. The status card answers "is this feeder
+    // actually claimed?" without depending on what's still in the
+    // journal tail — once the image-side timer stops firing after
+    // first success, the journal becomes empty and the bare log view
+    // would mislead an operator into thinking nothing ever happened.
+    //
+    // Polls every 5s for the lifetime of the panel — no early-stop on
+    // first claimed response, because feed writes the version sidecar
+    // AFTER the secret file is renamed into place, and an early stop
+    // would freeze the display at "Claimed (no version)" until the
+    // user reopens the panel. 5s polls are trivial server load; the
+    // panel is short-lived.
+    //
+    // Lifecycle hazards (Codex 2026-05-19 review):
+    //   1. The 5s interval can fire while a previous fetch is still
+    //      pending. pollInFlight guards against overlap.
+    //   2. navigate() tears down statusTimer when the user leaves the
+    //      panel, but in-flight getJSON()s can still resolve after.
+    //      Capturing myTimer at panel-mount and comparing against the
+    //      current statusTimer post-await lets a stale resolver bail
+    //      before mutating DOM or — worse — calling handleAuthFailure
+    //      / clearInterval on the next panel's timer.
+    function claimActivityPanel() {
+        const statusCard = el("section", { class: "wc-card claim-status" },
+            el("p", { class: "muted" }, "Loading claim status…"));
+
+        let pollInFlight = false;
+        // myTimer is assigned by the setInterval call BELOW the
+        // fetchStatus definition; the first synchronous fetchStatus()
+        // is invoked AFTER that assignment, so by the time any await
+        // resumes the value is set. The capture is by closure, not
+        // value, so a future navigate() that nulls statusTimer is
+        // observable through this reference.
+        let myTimer = null;
+
+        const replaceCard = (...nodes) => {
+            while (statusCard.firstChild) statusCard.removeChild(statusCard.firstChild);
+            for (const n of nodes) statusCard.appendChild(n);
+        };
+
+        const renderStatus = (id) => {
+            if (!id || !id.claim_secret_present) {
+                replaceCard(
+                    el("h2", {}, "Not yet claimed"),
+                    el("p", { class: "muted" },
+                        "Press Register on the dashboard to attempt now. " +
+                        "The next attempt also runs automatically when the feeder reboots."),
+                );
+                return;
+            }
+            const parts = [];
+            if (id.claim_secret_updated_at) {
+                const d = new Date(id.claim_secret_updated_at);
+                // new Date(bad) returns Invalid Date which doesn't throw
+                // and toLocaleString()s to "Invalid Date" — guard explicitly.
+                if (!Number.isNaN(d.getTime())) {
+                    parts.push("Last updated: " + d.toLocaleString());
+                }
+            }
+            if (id.claim_secret_version > 0) {
+                parts.push("Version: v" + id.claim_secret_version);
+            }
+            const children = [el("h2", {}, "Claimed ✓")];
+            if (parts.length) {
+                children.push(el("p", { class: "muted" }, parts.join(" · ")));
+            }
+            replaceCard(...children);
+        };
+
+        const fetchStatus = async () => {
+            if (pollInFlight) return;
+            pollInFlight = true;
+            let r;
+            try {
+                r = await getJSON("/api/identity");
+            } finally {
+                pollInFlight = false;
+            }
+            // If our timer has been replaced or cleared, this panel was
+            // torn down via navigate(). Bail before mutating state that
+            // belongs to the new panel — clearing the dashboard's
+            // statusTimer or auth-redirecting from a stale poll would
+            // both be user-visible regressions.
+            if (statusTimer !== myTimer) return;
+            if (handleAuthFailure(r)) return;
+            if (!r.ok) {
+                replaceCard(el("p", { class: "error", role: "alert" },
+                    (r.payload && r.payload.error) || "Could not load claim status."));
+                return;
+            }
+            renderStatus(r.payload);
+        };
+
+        const logPre = streamLog("claim");
+        render(
+            el("div", {},
+                statusCard,
+                el("section", { class: "wc-card" },
+                    el("h2", {}, "journalctl -u airplanes-claim.service"),
+                    el("p", { class: "muted" }, "Streaming live; close this view (use the Dashboard button above) to disconnect."),
+                    logPre,
+                ),
+            ),
+        );
+
+        // Assign myTimer + statusTimer BEFORE kicking off the initial
+        // fetch so the post-await `statusTimer !== myTimer` check holds
+        // for the very first call too.
+        myTimer = setInterval(fetchStatus, 5000);
+        statusTimer = myTimer;
+        fetchStatus();
     }
 
     function loadingPanel(msg) {
