@@ -418,16 +418,20 @@
         return null;
     }
 
-    // Mirror the bash validators in feed/scripts/lib/configure-validators.sh.
-    // apl-feed apply is the authoritative server-side gate; the JS preview
-    // here only suppresses Save while the user is editing. A JS-vs-bash
-    // mismatch surfaces as "looks valid in the form but save failed", so
-    // these accept/reject the same inputs as the bash side. Different
-    // regex engines, semantically equivalent rules. Pinned by
-    // test/test_validator_parity.sh.
+    // Mirror the bash validators in feed/scripts/lib/configure-validators.sh
+    // (cross-repo) and files/usr/local/lib/airplanes/wifi-validators.sh
+    // (in-repo). apl-feed apply is the authoritative server-side gate; the
+    // JS preview here only suppresses Save while the user is editing. A
+    // JS-vs-bash mismatch surfaces as "looks valid in the form but save
+    // failed", so these accept/reject the same inputs as the bash side.
+    // Different regex engines, semantically equivalent rules. Pinned by
+    // internal/clientvalidators/parity_test.go, which runs the actual
+    // shipped JS in a Node subprocess against the actual shipped bash
+    // functions across a shared input-vector table.
     //
-    // The /* @validator-parity */ markers delimit the block exported to
-    // the parity test; keep them flanking exactly the shared symbols.
+    // The /* @validator-parity */ markers delimit the block extracted by
+    // the parity test's Node runner; keep them flanking exactly the
+    // shared symbols.
 
     /* @validator-parity start */
     const latLonRE = /^[+-]?\d+(?:\.\d+)?$/;
@@ -503,11 +507,61 @@
         return altitudeToBareMetres(s) !== null;
     }
 
+    // Shared numeric shape used by gain validators. Mirrors bash regex
+    // `^-?[0-9]+([.][0-9]+)?$` — rejects scientific notation (`1e1`),
+    // leading-dot (`.5`), trailing-dot (`1.`), explicit-plus (`+1`),
+    // and hex (`0x10`), all of which would round-trip via Number() but
+    // would be rejected server-side.
+    const gainNumericRE = /^-?[0-9]+(?:\.[0-9]+)?$/;
+
+    // isValidMlatUser mirrors feed/scripts/lib/configure-validators.sh:valid_mlat_user_strict
+    // (regex ^[A-Za-z0-9_-]{1,64}$) and feed/scripts/apl-feed/mlat.sh's
+    // _MLAT_USER_RE. Empty is valid on the JS side because the form posts
+    // MLAT_USER="" when no name is entered; apl-feed apply forwards bare
+    // empty and the mlat-client daemon falls back to "Anonymous-<short-id>".
+    // Bash valid_mlat_user_strict REJECTS empty (callers handle empty
+    // themselves) — the parity test pins this divergence per-side.
+    const mlatUserRE = /^[A-Za-z0-9_-]{1,64}$/;
+    function isValidMlatUser(v) {
+        const s = (v == null ? "" : String(v)).trim();
+        if (s === "") return true;
+        return mlatUserRE.test(s);
+    }
+
+    // isValidGain mirrors feed/scripts/lib/configure-validators.sh:valid_gain.
+    // Accepts auto|min|max, or a finite number in [0, 60]. Empty is NOT valid.
+    function isValidGain(v) {
+        const s = (v == null ? "" : String(v)).trim();
+        if (s === "auto" || s === "min" || s === "max") return true;
+        if (!gainNumericRE.test(s)) return false;
+        const n = Number(s);
+        return Number.isFinite(n) && n >= 0 && n <= 60;
+    }
+
+    // isValidDump978Serial mirrors valid_dump978_serial. Empty is valid
+    // (treated as "no SDR serial selected").
+    const dump978SerialRE = /^[0-9A-Za-z_-]{1,32}$/;
+    function isValidDump978Serial(v) {
+        const s = (v == null ? "" : String(v)).trim();
+        if (s === "") return true;
+        return dump978SerialRE.test(s);
+    }
+
+    // isValidDump978Gain mirrors valid_dump978_gain. dump978-fa rejects
+    // auto/min/max (unlike readsb), so this validator does too. Empty is
+    // NOT valid.
+    function isValidDump978Gain(v) {
+        const s = (v == null ? "" : String(v)).trim();
+        if (!gainNumericRE.test(s)) return false;
+        const n = Number(s);
+        return Number.isFinite(n) && n >= 0 && n <= 60;
+    }
+
     // Wi-Fi validators — bash twin lives at
     // /usr/local/lib/airplanes/wifi-validators.sh (apl_wifi_valid_*). Pinned
-    // by the same parity fixture. CRUCIAL: no trim. WPA passphrases and
-    // SSIDs can legitimately carry leading/trailing whitespace, so pass the
-    // value through verbatim — the form must not normalize.
+    // by the same parity test. CRUCIAL: no trim. WPA passphrases and SSIDs
+    // can legitimately carry leading/trailing whitespace, so pass the value
+    // through verbatim — the form must not normalize.
     const wifiSSIDControlsRE = /[\x00-\x1f\x7f]/;
     function isValidWifiSSID(v) {
         const s = String(v == null ? "" : v);
@@ -544,53 +598,6 @@
         if (dot === -1) return false;
         const frac = s.slice(dot + 1);
         return frac.length >= LATLON_MIN_DECIMALS;
-    }
-
-    // Shared numeric shape used by gain validators. Mirrors bash regex
-    // `^-?[0-9]+([.][0-9]+)?$` — rejects scientific notation (`1e1`),
-    // leading-dot (`.5`), trailing-dot (`1.`), explicit-plus (`+1`),
-    // and hex (`0x10`), all of which would round-trip via Number() but
-    // would be rejected server-side.
-    const gainNumericRE = /^-?[0-9]+(?:\.[0-9]+)?$/;
-
-    // isValidMlatUser mirrors feed/scripts/lib/configure-validators.sh:valid_mlat_user_strict
-    // (regex ^[A-Za-z0-9_-]{1,64}$) and feed/scripts/apl-feed/mlat.sh's
-    // _MLAT_USER_RE. Empty is valid: apl-feed accepts empty MLAT_USER and the
-    // daemon falls back to "Anonymous-<short-feeder-id>" when MLAT is enabled.
-    const mlatUserRE = /^[A-Za-z0-9_-]{1,64}$/;
-    function isValidMlatUser(v) {
-        const s = (v == null ? "" : String(v)).trim();
-        if (s === "") return true;
-        return mlatUserRE.test(s);
-    }
-
-    // isValidGain mirrors feed/scripts/lib/configure-validators.sh:valid_gain.
-    // Accepts auto|min|max, or a finite number in [0, 60]. Empty is NOT valid.
-    function isValidGain(v) {
-        const s = (v == null ? "" : String(v)).trim();
-        if (s === "auto" || s === "min" || s === "max") return true;
-        if (!gainNumericRE.test(s)) return false;
-        const n = Number(s);
-        return Number.isFinite(n) && n >= 0 && n <= 60;
-    }
-
-    // isValidDump978Serial mirrors valid_dump978_serial. Empty is valid
-    // (treated as "no SDR serial selected").
-    const dump978SerialRE = /^[0-9A-Za-z_-]{1,32}$/;
-    function isValidDump978Serial(v) {
-        const s = (v == null ? "" : String(v)).trim();
-        if (s === "") return true;
-        return dump978SerialRE.test(s);
-    }
-
-    // isValidDump978Gain mirrors valid_dump978_gain. dump978-fa rejects
-    // auto/min/max (unlike readsb), so this validator does too. Empty is
-    // NOT valid.
-    function isValidDump978Gain(v) {
-        const s = (v == null ? "" : String(v)).trim();
-        if (!gainNumericRE.test(s)) return false;
-        const n = Number(s);
-        return Number.isFinite(n) && n >= 0 && n <= 60;
     }
 
     // previewLatLonSet — projection of unsaved form values onto the
