@@ -24,9 +24,10 @@ func TestResolve_Whitelist(t *testing.T) {
 		"dump978":        "dump978-fa.service",
 		"uat":            "airplanes-978.service",
 		"claim":          "airplanes-claim.service",
-		"webconfig":      "airplanes-webconfig.service",
-		"update":         "airplanes-update.service",
-		"system-upgrade": "airplanes-system-upgrade.service",
+		"webconfig":        "airplanes-webconfig.service",
+		"update":           "airplanes-update.service",
+		"system-upgrade":   "airplanes-system-upgrade.service",
+		"webconfig-update": "airplanes-webconfig-update.service",
 	}
 	for slug, want := range cases {
 		got, err := Resolve(slug)
@@ -94,6 +95,122 @@ func TestServeSSE_StreamsLines(t *testing.T) {
 	}
 	if got, want := w.Header().Get("Cache-Control"), "no-cache"; got != want {
 		t.Errorf("Cache-Control = %q, want %q", got, want)
+	}
+}
+
+// TestServeSSE_ArgvUsesShortOutput locks in the journalctl output
+// format. --output=short is the contract the UI's per-line timestamp
+// parser depends on; a regression to --output=cat would silently
+// restore the "logs without timestamps" bug.
+func TestServeSSE_ArgvUsesShortOutput(t *testing.T) {
+	t.Parallel()
+	var captured []string
+	capture := func(_ context.Context, _ io.Writer, argv []string) error {
+		captured = argv
+		return nil
+	}
+	s := NewStreamer(capture)
+	w := httptest.NewRecorder()
+	if err := s.ServeSSE(context.Background(), w, "feed"); err != nil {
+		t.Fatal(err)
+	}
+	var has bool
+	for _, a := range captured {
+		if a == "--output=short" {
+			has = true
+			break
+		}
+	}
+	if !has {
+		t.Errorf("argv missing --output=short: %v", captured)
+	}
+}
+
+// TestServeSSE_StripsHostname asserts the end-to-end wire reformatting:
+// a real --output=short line goes in with hostname, it comes out
+// without hostname while preserving timestamp and syslog identifier.
+// Boot separators pass through unchanged.
+func TestServeSSE_StripsHostname(t *testing.T) {
+	t.Parallel()
+	s := NewStreamer(fakeStreamer([]string{
+		"May 19 14:23:45 raspberrypi airplanes-feed[1234]: connected",
+		"-- Boot 2c5f... --",
+	}, 50*time.Millisecond))
+
+	w := httptest.NewRecorder()
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+	if err := s.ServeSSE(ctx, w, "feed"); err != nil {
+		t.Fatal(err)
+	}
+	got := w.Body.String()
+	if !strings.Contains(got, "data: May 19 14:23:45 airplanes-feed[1234]: connected\n\n") {
+		t.Errorf("hostname not stripped from short-format line; body: %q", got)
+	}
+	if !strings.Contains(got, "data: -- Boot 2c5f... --\n\n") {
+		t.Errorf("boot separator not passed through unchanged; body: %q", got)
+	}
+}
+
+func TestStripHostname(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name string
+		in   string
+		want string
+	}{
+		{
+			name: "normal short-format line",
+			in:   "May 19 14:23:45 raspberrypi airplanes-feed[1234]: hello",
+			want: "May 19 14:23:45 airplanes-feed[1234]: hello",
+		},
+		{
+			name: "space-padded single-digit day",
+			in:   "May  9 14:23:45 raspberrypi systemd[1]: Started airplanes-feed.service.",
+			want: "May  9 14:23:45 systemd[1]: Started airplanes-feed.service.",
+		},
+		{
+			name: "syslog id without pid bracket",
+			in:   "Jan 02 03:04:05 pi-feeder kernel: USB disconnect",
+			want: "Jan 02 03:04:05 kernel: USB disconnect",
+		},
+		{
+			name: "boot separator passes through",
+			in:   "-- Boot 2c5f1e3c4abc... --",
+			want: "-- Boot 2c5f1e3c4abc... --",
+		},
+		{
+			name: "continuation line passes through",
+			in:   "    stack trace continued",
+			want: "    stack trace continued",
+		},
+		{
+			name: "too-short line passes through",
+			in:   "ok",
+			want: "ok",
+		},
+		{
+			name: "no syslog identifier passes through",
+			in:   "May 19 14:23:45 raspberrypi this-has-no-colon",
+			want: "May 19 14:23:45 raspberrypi this-has-no-colon",
+		},
+		{
+			name: "extra spaces in message preserved",
+			in:   "May 19 14:23:45 raspberrypi airplanes-feed[1]: aircraft   412   pending",
+			want: "May 19 14:23:45 airplanes-feed[1]: aircraft   412   pending",
+		},
+		{
+			name: "empty line passes through",
+			in:   "",
+			want: "",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := stripHostname(tc.in); got != tc.want {
+				t.Errorf("stripHostname(%q) = %q, want %q", tc.in, got, tc.want)
+			}
+		})
 	}
 }
 
