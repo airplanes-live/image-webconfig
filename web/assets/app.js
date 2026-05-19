@@ -519,6 +519,21 @@
     }
     /* @validator-parity end */
 
+    // hasLatLonPrecision counts decimal places in a trimmed numeric string.
+    // UI-only gate above isValidLatitude/isValidLongitude (which mirror the
+    // cross-repo validator-parity contract and only enforce range). MLAT
+    // triangulation degrades fast below ~10 m precision; 4 decimal places of
+    // latitude give ~11 m at the equator and less at higher latitudes, which
+    // is the floor we accept for both axes here.
+    const LATLON_MIN_DECIMALS = 4;
+    function hasLatLonPrecision(v) {
+        const s = (v == null ? "" : String(v)).trim();
+        const dot = s.indexOf(".");
+        if (dot === -1) return false;
+        const frac = s.slice(dot + 1);
+        return frac.length >= LATLON_MIN_DECIMALS;
+    }
+
     // previewLatLonSet — projection of unsaved form values onto the
     // daemon's "would MLAT be enabled?" rule. Used ONLY for the form-time
     // preview path and for the legacy fallback in classifyService when
@@ -1668,13 +1683,13 @@
         const latInput = el("input", {
             id: latId, name: "LATITUDE", type: "text",
             value: configState.savedValues.LATITUDE || "",
-            inputmode: "decimal", placeholder: "51.5",
+            inputmode: "decimal", placeholder: "51.5074",
         });
         const lonId = fieldId("LONGITUDE");
         const lonInput = el("input", {
             id: lonId, name: "LONGITUDE", type: "text",
             value: configState.savedValues.LONGITUDE || "",
-            inputmode: "decimal", placeholder: "-0.1",
+            inputmode: "decimal", placeholder: "-0.1278",
         });
         const altId = fieldId("ALTITUDE");
         const altInput = el("input", {
@@ -1734,27 +1749,27 @@
             el("div", { class: "field" },
                 el("label", { for: latId }, "Latitude"),
                 el("p", { class: "field-help" },
-                    "Decimal degrees, North-positive (e.g. ",
+                    "Decimal degrees, e.g. ",
                     el("code", {}, "51.5074"),
-                    "). MLAT needs ~10 m accuracy — use as many decimals as you can.",
+                    ". At least 4 decimals (MLAT needs precise coordinates).",
                 ),
                 latInput,
             ),
             el("div", { class: "field" },
                 el("label", { for: lonId }, "Longitude"),
                 el("p", { class: "field-help" },
-                    "Decimal degrees, East-positive (e.g. ",
+                    "Decimal degrees, East-positive, e.g. ",
                     el("code", {}, "-0.1278"),
-                    " for London).",
+                    ". At least 4 decimals.",
                 ),
                 lonInput,
             ),
             el("div", { class: "field" },
                 el("label", { for: altId }, "Altitude"),
                 el("p", { class: "field-help" },
-                    "Antenna height above sea level. Stored as metres; append ",
-                    el("code", {}, "ft"),
-                    " if you prefer feet.",
+                    "Antenna height above sea level, in metres. For example, ",
+                    el("code", {}, "20"),
+                    " for a typical rooftop.",
                 ),
                 altInputWrap,
             ),
@@ -1819,6 +1834,8 @@
             isValid: () => {
                 return isValidLatitude(latInput.value)
                     && isValidLongitude(lonInput.value)
+                    && hasLatLonPrecision(latInput.value)
+                    && hasLatLonPrecision(lonInput.value)
                     && isValidAltitude(altInput.value);
             },
             payload: () => {
