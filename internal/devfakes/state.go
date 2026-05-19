@@ -30,6 +30,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/airplanes-live/image-webconfig/internal/feedmeta"
 )
 
 // Paths bundles every on-disk file the production readers consult.
@@ -125,7 +127,7 @@ func NewState(p Paths) *State {
 		feedEnv: map[string]string{
 			"LATITUDE":              "51.5",
 			"LONGITUDE":             "-0.1",
-			"ALTITUDE":              "12",
+			"ALTITUDE":              "12", // bare metres — feed's apply layer canonicalises ft→m on write
 			"GEO_CONFIGURED":        "true",
 			"MLAT_USER":             "dev-feeder",
 			"MLAT_ENABLED":          "true",
@@ -229,6 +231,16 @@ func (s *State) ApplyFeedEnv(updates map[string]string) ([]string, error) {
 			touchedLon = true
 		case "GEO_CONFIGURED":
 			explicitGeo = true
+		case "ALTITUDE":
+			// Mirror feed's apply-layer canonicalisation: store
+			// bare metres on disk regardless of the operator's
+			// input suffix. Unparseable input is tombstoned to
+			// "" because feed's apply layer rejects garbage at
+			// the prior _apl_feed_apply_validate_one step
+			// before this canonicaliser ever runs; matching
+			// that with an empty store keeps dev parity tight.
+			canon, _ := feedmeta.AltitudeToBareMetres(v)
+			v = canon
 		}
 		prev, existed := s.feedEnv[k]
 		if existed && prev == v {

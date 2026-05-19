@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -13,6 +14,36 @@ import (
 	wexec "github.com/airplanes-live/image-webconfig/internal/exec"
 	"github.com/airplanes-live/image-webconfig/internal/feedenv"
 )
+
+// altitudeFixtureCase mirrors a single entry in the shared canonical
+// fixture vendored from feed. We load it relative to the feedmeta
+// package's testdata dir so the bash / Go / JS / devfakes parity all
+// derive from the same source of truth.
+type altitudeFixtureCase struct {
+	Input          string `json:"input"`
+	ExpectedOutput string `json:"expected_output"`
+	ExpectedOK     bool   `json:"expected_ok"`
+	Note           string `json:"note,omitempty"`
+}
+
+func loadAltitudeFixture(t *testing.T) []altitudeFixtureCase {
+	t.Helper()
+	path := filepath.Join("..", "feedmeta", "testdata", "altitude-canonicalization.json")
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read altitude fixture (%s): %v", path, err)
+	}
+	var doc struct {
+		Cases []altitudeFixtureCase `json:"cases"`
+	}
+	if err := json.Unmarshal(raw, &doc); err != nil {
+		t.Fatalf("decode altitude fixture: %v", err)
+	}
+	if len(doc.Cases) == 0 {
+		t.Fatal("altitude fixture: zero cases")
+	}
+	return doc.Cases
+}
 
 func mustNewState(t *testing.T) *State {
 	t.Helper()
@@ -149,6 +180,54 @@ func TestApplyFeed_ExplicitGeoOverrideWins(t *testing.T) {
 	}
 	if s.FeedEnvSnapshot()["GEO_CONFIGURED"] != "false" {
 		t.Fatalf("explicit GEO_CONFIGURED=false was overridden, snapshot=%v", s.FeedEnvSnapshot())
+	}
+}
+
+func TestApplyFeed_AltitudeCanonicalisedToBareMetres(t *testing.T) {
+	t.Parallel()
+	// Sanity case: 400ft must land on disk as "121.92" (the
+	// post-conversion bare-metres canonical) regardless of the
+	// operator's input suffix. This is the parity case feed's apply
+	// layer covers; without canonicalisation here, the dev-server
+	// would diverge from production behaviour and the SPA's
+	// dirty-state comparator would thrash.
+	s := mustNewState(t)
+	priv := StubPrivilegedArgv()
+	runner := StdinRunner(s, priv)
+	payload := `{"updates":{"ALTITUDE":"400ft"}}`
+	if _, err := runner(context.Background(), priv.ApplyFeed, strings.NewReader(payload)); err != nil {
+		t.Fatalf("runner: %v", err)
+	}
+	if got := s.FeedEnvSnapshot()["ALTITUDE"]; got != "121.92" {
+		t.Fatalf("ALTITUDE=%q want 121.92", got)
+	}
+}
+
+func TestApplyFeed_AltitudeFixtureParity(t *testing.T) {
+	// Drives the shared canonical fixture through the fake apply
+	// path. The on-disk projection must equal the fixture's
+	// expected_output for every parseable case; unparseable inputs
+	// land as empty (tombstone), matching what feed's apply layer
+	// stores after its validator rejects garbage at the prior step.
+	t.Parallel()
+	priv := StubPrivilegedArgv()
+	for _, tc := range loadAltitudeFixture(t) {
+		tc := tc
+		t.Run("input="+tc.Input, func(t *testing.T) {
+			s := mustNewState(t)
+			runner := StdinRunner(s, priv)
+			body, _ := json.Marshal(map[string]any{
+				"updates": map[string]any{"ALTITUDE": tc.Input},
+			})
+			if _, err := runner(context.Background(), priv.ApplyFeed, bytes.NewReader(body)); err != nil {
+				t.Fatalf("runner: %v", err)
+			}
+			got := s.FeedEnvSnapshot()["ALTITUDE"]
+			if got != tc.ExpectedOutput {
+				t.Errorf("ALTITUDE on disk after apply(%q) = %q, want %q (ok=%v, note=%s)",
+					tc.Input, got, tc.ExpectedOutput, tc.ExpectedOK, tc.Note)
+			}
+		})
 	}
 }
 
