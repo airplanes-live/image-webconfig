@@ -12,7 +12,7 @@ import (
 	"time"
 
 	wexec "github.com/airplanes-live/image-webconfig/internal/exec"
-	"github.com/airplanes-live/image-webconfig/internal/pihealth"
+	"github.com/airplanes-live/image-webconfig/internal/hardware"
 	"github.com/airplanes-live/image-webconfig/internal/wifi"
 )
 
@@ -527,50 +527,127 @@ func TestRead_RebootRequiredFlag(t *testing.T) {
 	}
 }
 
-// stubPiHealthProbe returns a fixed *pihealth.PiHealth.
-type stubPiHealthProbe struct{ payload *pihealth.PiHealth }
+// stubHardwareProbe returns a fixed *hardware.Snapshot.
+type stubHardwareProbe struct{ payload *hardware.Snapshot }
 
-func (s stubPiHealthProbe) Probe(_ context.Context) *pihealth.PiHealth { return s.payload }
+func (s stubHardwareProbe) Probe(_ context.Context) *hardware.Snapshot { return s.payload }
 
-func TestRead_PiHealthEmbedded(t *testing.T) {
+func float64Ptr(v float64) *float64 { return &v }
+
+func TestRead_HardwareEmbedded(t *testing.T) {
 	t.Parallel()
 	p, _ := newTestPaths(t)
-	payload := &pihealth.PiHealth{
-		Severity:       "ok",
-		Summary:        "healthy · 56°C",
-		IsRaspberryPi:  true,
-		ThrottleProbed: true,
-		TempProbed:     true,
-		CPUTempCelsius: 56,
+	payload := &hardware.Snapshot{
+		PiThrottle: &hardware.Throttle{},
+		System: hardware.System{
+			CPUTempCelsius: float64Ptr(56),
+		},
+		Health: hardware.Health{
+			Severity:      "ok",
+			Summary:       "healthy · 56°C",
+			IsRaspberryPi: true,
+		},
 	}
-	r := NewReader("v", p, fixedRunner("active", nil), WithPiHealth(stubPiHealthProbe{payload}))
+	r := NewReader("v", p, fixedRunner("active", nil), WithHardware(stubHardwareProbe{payload}))
 	got, err := r.Read(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got.PiHealth == nil {
-		t.Fatal("PiHealth = nil, want populated")
+	if got.PiThrottle == nil {
+		t.Fatal("PiThrottle = nil, want populated")
 	}
-	if got.PiHealth.Summary != "healthy · 56°C" {
-		t.Errorf("PiHealth.Summary = %q", got.PiHealth.Summary)
+	if got.HardwareHealth == nil || got.HardwareHealth.Summary != "healthy · 56°C" {
+		t.Errorf("HardwareHealth = %+v", got.HardwareHealth)
+	}
+	if got.System.CPUTempCelsius == nil || *got.System.CPUTempCelsius != 56 {
+		t.Errorf("System.CPUTempCelsius = %v, want 56", got.System.CPUTempCelsius)
 	}
 	blob, _ := json.Marshal(got)
-	if !strings.Contains(string(blob), `"pi_health"`) {
-		t.Errorf("marshaled JSON missing pi_health field: %s", blob)
+	for _, want := range []string{`"pi_throttle"`, `"system"`, `"hardware_health"`} {
+		if !strings.Contains(string(blob), want) {
+			t.Errorf("marshaled JSON missing %s: %s", want, blob)
+		}
+	}
+	if strings.Contains(string(blob), `"pi_health"`) {
+		t.Errorf("marshaled JSON contains legacy pi_health key: %s", blob)
 	}
 }
 
-func TestRead_NoPiHealthOption_OmitsField(t *testing.T) {
+func TestRead_NoHardwareOption_EmitsEmptySystem(t *testing.T) {
 	t.Parallel()
 	p, _ := newTestPaths(t)
 	r := NewReader("v", p, fixedRunner("active", nil))
 	got, _ := r.Read(context.Background())
-	if got.PiHealth != nil {
-		t.Errorf("PiHealth = %+v, want nil (no WithPiHealth)", got.PiHealth)
+	if got.PiThrottle != nil {
+		t.Errorf("PiThrottle = %+v, want nil (no WithHardware)", got.PiThrottle)
+	}
+	if got.HardwareHealth != nil {
+		t.Errorf("HardwareHealth = %+v, want nil (no WithHardware)", got.HardwareHealth)
 	}
 	blob, _ := json.Marshal(got)
-	if strings.Contains(string(blob), `"pi_health"`) {
-		t.Errorf("marshaled JSON should omit pi_health: %s", blob)
+	if strings.Contains(string(blob), `"pi_throttle"`) {
+		t.Errorf("marshaled JSON should omit pi_throttle: %s", blob)
+	}
+	if strings.Contains(string(blob), `"hardware_health"`) {
+		t.Errorf("marshaled JSON should omit hardware_health: %s", blob)
+	}
+	// Universal-always contract: system emits at least `{}`.
+	if !strings.Contains(string(blob), `"system":{}`) {
+		t.Errorf("marshaled JSON should contain `\"system\":{}` even with no probe: %s", blob)
+	}
+}
+
+// HardwareProbe is wired but returns nil (e.g. a transient construction
+// failure or a stub that's intentionally empty). The Read() path must
+// not panic and must omit pi_throttle + hardware_health while still
+// emitting `system: {}`.
+func TestRead_HardwareProbeReturnsNil_NoPanic(t *testing.T) {
+	t.Parallel()
+	p, _ := newTestPaths(t)
+	r := NewReader("v", p, fixedRunner("active", nil), WithHardware(stubHardwareProbe{nil}))
+	got, _ := r.Read(context.Background())
+	if got.PiThrottle != nil {
+		t.Errorf("PiThrottle should be nil when probe returned nil, got %+v", got.PiThrottle)
+	}
+	if got.HardwareHealth != nil {
+		t.Errorf("HardwareHealth should be nil when probe returned nil, got %+v", got.HardwareHealth)
+	}
+	blob, _ := json.Marshal(got)
+	if !strings.Contains(string(blob), `"system":{}`) {
+		t.Errorf("system key must remain present as {} even with nil probe: %s", blob)
+	}
+}
+
+// Codex sentinel: non-Pi feeder. PiThrottle absent, system present,
+// hardware_health.is_raspberry_pi false. Pi_throttle key must not leak.
+func TestRead_NonPi_OmitsPiThrottle(t *testing.T) {
+	t.Parallel()
+	p, _ := newTestPaths(t)
+	payload := &hardware.Snapshot{
+		PiThrottle: nil,
+		System: hardware.System{
+			CPUTempCelsius: float64Ptr(56),
+		},
+		Health: hardware.Health{
+			Severity:      "ok",
+			Summary:       "generic Linux · healthy · 56°C",
+			IsRaspberryPi: false,
+		},
+	}
+	r := NewReader("v", p, fixedRunner("active", nil), WithHardware(stubHardwareProbe{payload}))
+	got, _ := r.Read(context.Background())
+	if got.PiThrottle != nil {
+		t.Errorf("PiThrottle = %+v, want nil on non-Pi", got.PiThrottle)
+	}
+	if got.HardwareHealth == nil || got.HardwareHealth.IsRaspberryPi {
+		t.Errorf("HardwareHealth.IsRaspberryPi should be false, got %+v", got.HardwareHealth)
+	}
+	blob, _ := json.Marshal(got)
+	if strings.Contains(string(blob), `"pi_throttle"`) {
+		t.Errorf("marshaled JSON should omit pi_throttle on non-Pi: %s", blob)
+	}
+	if !strings.Contains(string(blob), `"system"`) {
+		t.Errorf("marshaled JSON should keep system on non-Pi: %s", blob)
 	}
 }
 

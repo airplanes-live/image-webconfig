@@ -1,7 +1,7 @@
-package pihealth
+package hardware
 
 // Thresholds are the warn/err cutoffs for each numeric sub-check. Held on
-// pihealth.Reader (not as package globals) so concurrent tests with
+// hardware.Reader (not as package globals) so concurrent tests with
 // t.Parallel() can use distinct values without racing.
 type Thresholds struct {
 	// CPU temperature warn/err in Celsius. The Pi soft-throttles around

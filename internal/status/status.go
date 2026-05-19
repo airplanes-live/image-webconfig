@@ -16,16 +16,16 @@ import (
 	"time"
 
 	wexec "github.com/airplanes-live/image-webconfig/internal/exec"
-	"github.com/airplanes-live/image-webconfig/internal/pihealth"
+	"github.com/airplanes-live/image-webconfig/internal/hardware"
 	"github.com/airplanes-live/image-webconfig/internal/runtimestate"
 	"github.com/airplanes-live/image-webconfig/internal/wifi"
 )
 
-// PiHealthProbe is the interface status.Reader uses to fetch a hardware
-// snapshot. Concrete production type is *pihealth.Reader; tests inject a
-// stub.
-type PiHealthProbe interface {
-	Probe(ctx context.Context) *pihealth.PiHealth
+// HardwareProbe is the interface status.Reader uses to fetch a hardware
+// snapshot. Concrete production type is *hardware.Reader; tests inject
+// a stub.
+type HardwareProbe interface {
+	Probe(ctx context.Context) *hardware.Snapshot
 }
 
 // WifiProbe is the interface status.Reader uses to fetch WiFi signal
@@ -39,11 +39,11 @@ type WifiProbe interface {
 // signature stable so existing callers compile unchanged.
 type Option func(*Reader)
 
-// WithPiHealth wires a PiHealthProbe into the Reader. When set, Read()
+// WithHardware wires a HardwareProbe into the Reader. When set, Read()
 // runs the probe in parallel with the systemctl fan-out and embeds the
-// result as Status.PiHealth.
-func WithPiHealth(p PiHealthProbe) Option {
-	return func(r *Reader) { r.pihealth = p }
+// result as Status.{PiThrottle, System, HardwareHealth}.
+func WithHardware(p HardwareProbe) Option {
+	return func(r *Reader) { r.hardware = p }
 }
 
 // WithWifi wires a WifiProbe into the Reader. When set, Read() runs the
@@ -101,7 +101,7 @@ type Reader struct {
 	paths    Paths
 	runner   wexec.CommandRunner
 	version  string
-	pihealth PiHealthProbe
+	hardware HardwareProbe
 	wifi     WifiProbe
 }
 
@@ -140,10 +140,20 @@ type Status struct {
 	UATDecision       *Decision `json:"uat_decision,omitempty"`
 	Dump978FADecision *Decision `json:"dump978fa_decision,omitempty"`
 
-	// PiHealth is the hardware-health snapshot. omitempty so a Reader
-	// configured without WithPiHealth (e.g. server tests that don't care)
-	// keeps the JSON shape compatible.
-	PiHealth *pihealth.PiHealth `json:"pi_health,omitempty"`
+	// Hardware-health surface. Three top-level keys mirror the
+	// airplanes-live/website feeder-diagnostics split:
+	//   - pi_throttle: Pi-only, the 8 vcgencmd get_throttled bits +
+	//     optional PSU enrichment. Omitted on non-Pi or throttle probe
+	//     failure.
+	//   - system: universal, always present (emits at least `{}` even
+	//     when no probe is wired). Per-sub-probe success carried by
+	//     pointer-omitempty on each field.
+	//   - hardware_health: local-only rollup the SPA tile and
+	//     --hardware CLI consume. Omitted when no HardwareProbe is
+	//     wired (test-only path).
+	PiThrottle     *hardware.Throttle `json:"pi_throttle,omitempty"`
+	System         hardware.System    `json:"system"`
+	HardwareHealth *hardware.Health   `json:"hardware_health,omitempty"`
 
 	// Wifi is the live signal snapshot. omitempty when there is no WiFi
 	// hardware (or the probe wasn't configured) so the frontend can hide
@@ -198,16 +208,16 @@ func (r *Reader) Read(ctx context.Context) (Status, error) {
 		}(unit)
 	}
 
-	// Pi health probe runs in parallel with the systemctl fan-out. The
+	// Hardware probe runs in parallel with the systemctl fan-out. The
 	// probe is bounded by its own per-sub-probe timeouts inside the
-	// pihealth package; we just collect its result.
-	var phWG sync.WaitGroup
-	var phResult *pihealth.PiHealth
-	if r.pihealth != nil {
-		phWG.Add(1)
+	// hardware package; we just collect its result.
+	var hwWG sync.WaitGroup
+	var hwResult *hardware.Snapshot
+	if r.hardware != nil {
+		hwWG.Add(1)
 		go func() {
-			defer phWG.Done()
-			phResult = r.pihealth.Probe(ctx)
+			defer hwWG.Done()
+			hwResult = r.hardware.Probe(ctx)
 		}()
 	}
 
@@ -230,8 +240,12 @@ func (r *Reader) Read(ctx context.Context) (Status, error) {
 		out.Services[s.unit] = s.state
 	}
 
-	phWG.Wait()
-	out.PiHealth = phResult
+	hwWG.Wait()
+	if hwResult != nil {
+		out.PiThrottle = hwResult.PiThrottle
+		out.System = hwResult.System
+		out.HardwareHealth = &hwResult.Health
+	}
 
 	wifiWG.Wait()
 	out.Wifi = wifiResult
