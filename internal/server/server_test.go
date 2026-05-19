@@ -47,12 +47,14 @@ func newTestServer(t *testing.T) (*httptest.Server, *Server) {
 	}
 
 	idPaths := identity.Paths{
-		FeederIDFile:    filepath.Join(dir, "feeder-id"),
-		ClaimSecretFile: filepath.Join(dir, "feeder-claim-secret"),
-		ClaimPageURL:    "https://airplanes.live/feeder/claim",
+		FeederIDFile:     filepath.Join(dir, "feeder-id"),
+		ClaimSecretFile:  filepath.Join(dir, "feeder-claim-secret"),
+		ClaimVersionFile: filepath.Join(dir, "feeder-claim-secret.version"),
+		ClaimPageURL:     "https://airplanes.live/feeder/claim",
 	}
 	_ = os.WriteFile(idPaths.FeederIDFile, []byte("test-feeder-id"), 0o644)
 	_ = os.WriteFile(idPaths.ClaimSecretFile, []byte("ABCDEFGHIJKLMNOP"), 0o640)
+	_ = os.WriteFile(idPaths.ClaimVersionFile, []byte("1\n"), 0o640)
 
 	feedEnvPath := filepath.Join(dir, "feed.env")
 	_ = os.WriteFile(feedEnvPath,
@@ -1422,6 +1424,23 @@ func TestIdentity_AuthedReturnsFeederID(t *testing.T) {
 	}
 	if got["claim_secret_present"] != true {
 		t.Errorf("claim_secret_present = %v, want true", got["claim_secret_present"])
+	}
+	// JSON numbers decode to float64 when target is map[string]any.
+	if v, ok := got["claim_secret_version"].(float64); !ok || v != 1 {
+		t.Errorf("claim_secret_version = %v, want 1", got["claim_secret_version"])
+	}
+	updatedAt, ok := got["claim_secret_updated_at"].(string)
+	if !ok || updatedAt == "" {
+		t.Fatalf("claim_secret_updated_at = %v, want non-empty RFC3339 string", got["claim_secret_updated_at"])
+	}
+	// RFC3339 UTC: must end in Z (NOT +00:00); time.Time.UTC().Format(RFC3339)
+	// emits Z. Pin the format so a refactor that drops .UTC() doesn't drift
+	// to a +HH:MM offset that downstream JS / API consumers may not parse.
+	if !strings.HasSuffix(updatedAt, "Z") {
+		t.Errorf("claim_secret_updated_at = %q, want trailing Z (UTC RFC3339)", updatedAt)
+	}
+	if _, err := time.Parse(time.RFC3339, updatedAt); err != nil {
+		t.Errorf("claim_secret_updated_at = %q, not RFC3339-parseable: %v", updatedAt, err)
 	}
 }
 
