@@ -600,6 +600,22 @@
         return frac.length >= LATLON_MIN_DECIMALS;
     }
 
+    // refreshFieldError toggles a `<p class="wc-field-error">` element +
+    // input[aria-invalid] based on the supplied predicate. Centralises the
+    // decoration so every recheck path (input events, Cancel reset, save
+    // hook, group visibility toggle, programmatic value write) keeps the
+    // error UI consistent with the actual Save gate. Caller controls
+    // empty-handling semantics via shouldShowError: empty-valid fields
+    // (MLAT_USER, DUMP978_SDR_SERIAL, identity-import UUID/secret) hide
+    // their error on empty input; empty-invalid fields (GAIN, DUMP978_GAIN)
+    // surface the error even on empty.
+    function refreshFieldError(inputEl, errorEl, shouldShowError) {
+        const invalid = shouldShowError(inputEl.value);
+        errorEl.hidden = !invalid;
+        if (invalid) inputEl.setAttribute("aria-invalid", "true");
+        else inputEl.removeAttribute("aria-invalid");
+    }
+
     // previewLatLonSet — projection of unsaved form values onto the
     // daemon's "would MLAT be enabled?" rule. Used ONLY for the form-time
     // preview path and for the legacy fallback in classifyService when
@@ -1448,6 +1464,23 @@
         // invalid input.
         let busy = false;
 
+        // Per-field inline errors — mirror the config-tile pattern so the
+        // user knows WHY submit is disabled, not just that it is.
+        const uuidError = el("p", { class: "field-help wc-field-error", hidden: true, role: "alert" },
+            "Format: 8-4-4-4-12 hex digits (UUID).");
+        const secretError = el("p", { class: "field-help wc-field-error", hidden: true, role: "alert" },
+            "16 letters/digits; dashes or spaces are ignored.");
+        // Predicates trim because isCanonical* both normalise via stripRE
+        // / trim+lowercase before testing; the surfaced error matches the
+        // validator. Empty stays clean (the disabled button already
+        // communicates "you haven't filled this in").
+        const uuidShouldShowError = (v) => v.trim() !== "" && !isCanonicalFeederUUID(v);
+        const secretShouldShowError = (v) => v.trim() !== "" && !isCanonicalClaimSecret(v);
+        function refreshIdentityErrors() {
+            refreshFieldError(uuidIn, uuidError, uuidShouldShowError);
+            refreshFieldError(secretIn, secretError, secretShouldShowError);
+        }
+
         function updateSubmitState() {
             submit.disabled = busy
                 || !isCanonicalFeederUUID(uuidIn.value)
@@ -1473,10 +1506,12 @@
                 catch (_) { /* not focusable */ }
             }
             storedVersion = null;
+            refreshFieldError(uuidIn, uuidError, uuidShouldShowError);
             updateSubmitState();
         });
         secretIn.addEventListener("input", () => {
             storedVersion = null;
+            refreshFieldError(secretIn, secretError, secretShouldShowError);
             updateSubmitState();
         });
 
@@ -1522,12 +1557,15 @@
                     return;
                 }
                 // Atomic prefill: only after every check passes. Manual
-                // .value writes don't fire input events, so call
-                // updateSubmitState() explicitly.
+                // .value writes don't fire input events, so refresh the
+                // inline field-errors and submit state explicitly (a
+                // valid backup must clear any stale errors from a prior
+                // manual edit).
                 uuidIn.value = v.feederUUID;
                 secretIn.value = v.claimSecret;
                 storedVersion = v.claimVersion;
                 fileStatus.textContent = "Loaded from " + file.name;
+                refreshIdentityErrors();
                 updateSubmitState();
             };
             reader.readAsText(file);
@@ -1586,8 +1624,8 @@
                 fileInput,
                 fileStatus,
             ),
-            el("div", { class: "field" }, el("label", { for: "import-identity-uuid" }, "Feeder ID"), uuidIn),
-            el("div", { class: "field" }, el("label", { for: "import-identity-secret" }, "Claim secret"), secretIn),
+            el("div", { class: "field" }, el("label", { for: "import-identity-uuid" }, "Feeder ID"), uuidIn, uuidError),
+            el("div", { class: "field" }, el("label", { for: "import-identity-secret" }, "Claim secret"), secretIn, secretError),
             el("div", { class: "actions" }, cancel, submit),
             err,
         );
@@ -1860,21 +1898,6 @@
                 form,
             );
             return { fieldset, body, footer, form };
-        };
-
-        // refreshFieldError toggles a `<p class="wc-field-error">` element +
-        // input[aria-invalid] based on the supplied predicate. Centralises
-        // the decoration so every recheck path (input events, Cancel reset,
-        // save hook, group visibility toggle) keeps the error UI consistent
-        // with the actual Save gate. Caller controls empty-handling semantics
-        // via shouldShowError — empty MLAT_USER/DUMP978_SDR_SERIAL is valid
-        // (predicate returns false on empty); empty GAIN/DUMP978_GAIN is
-        // invalid (predicate returns true on empty).
-        const refreshFieldError = (inputEl, errorEl, shouldShowError) => {
-            const invalid = shouldShowError(inputEl.value);
-            errorEl.hidden = !invalid;
-            if (invalid) inputEl.setAttribute("aria-invalid", "true");
-            else inputEl.removeAttribute("aria-invalid");
         };
 
         // buildEditableField wraps a per-group set of inputs in a
@@ -2833,7 +2856,13 @@
 
         function showForm(existing) {
             const isEdit = !!existing;
-            const ssid = el("input", { type: "text", required: true, value: existing ? (existing.ssid || "") : "" });
+            // novalidate: bypass native HTML5 validation so the inline-error
+            // UX owns the field-level rules end-to-end. SSID's `required`
+            // attribute is dropped for the same reason — pre-disable governs
+            // whether submit fires. Wi-Fi validators are intentionally
+            // no-trim (SSIDs and PSKs may carry whitespace), so error
+            // predicates use `v !== ""` rather than `v.trim()`.
+            const ssid = el("input", { type: "text", value: existing ? (existing.ssid || "") : "" });
             const psk = el("input", {
                 type: "password", autocomplete: "new-password",
                 placeholder: isEdit && existing.has_psk ? "(unchanged — leave blank to keep)" : "8-63 chars or 64-hex",
@@ -2850,24 +2879,79 @@
             cancel.onclick = () => { formHost.replaceChildren(); };
             const inlineErr = el("p", { class: "error", role: "alert" });
 
+            // Per-field inline errors (mirror the config-tile pattern).
+            const ssidError = el("p", { class: "field-help wc-field-error", hidden: true, role: "alert" },
+                "1-32 bytes, no control characters.");
+            const pskError = el("p", { class: "field-help wc-field-error", hidden: true, role: "alert" },
+                "8-63 printable ASCII chars or 64 hex chars.");
+            const priorityError = el("p", { class: "field-help wc-field-error", hidden: true, role: "alert" },
+                "Integer 0-999, no leading zeros.");
+
+            // PSK empty is valid in BOTH add mode (open network) and edit
+            // mode (leave-unchanged), per the existing payload-build logic.
+            // The error shows only when PSK is non-empty AND fails the rule.
+            const ssidShouldShowError = (v) => v !== "" && !isValidWifiSSID(v);
+            const pskShouldShowError = (v) => v !== "" && !isValidWifiPSK(v);
+            // Priority is `<input type="number">`. The browser exposes
+            // `validity.badInput === true` when the user typed non-numeric
+            // text (in which case `.value` is "" but the field is NOT empty
+            // in the way regex-check would expect). Surface that as an
+            // error and as a disabled-submit reason.
+            const priorityShouldShowError = (v) => {
+                if (priority.validity && priority.validity.badInput) return true;
+                return v !== "" && !isValidWifiPriority(v);
+            };
+
+            // busy tracks in-flight save so the post-fetch state restore
+            // can route through recheck() instead of unconditionally
+            // re-enabling submit on an invalid form.
+            let busy = false;
+            const recheck = () => {
+                if (busy) { submit.disabled = true; return; }
+                if (!isValidWifiSSID(ssid.value)) { submit.disabled = true; return; }
+                if (psk.value !== "" && !isValidWifiPSK(psk.value)) { submit.disabled = true; return; }
+                if (priority.validity && priority.validity.badInput) { submit.disabled = true; return; }
+                if (!isValidWifiPriority(priority.value || "0")) { submit.disabled = true; return; }
+                submit.disabled = false;
+            };
+            ssid.addEventListener("input", () => {
+                refreshFieldError(ssid, ssidError, ssidShouldShowError);
+                recheck();
+            });
+            psk.addEventListener("input", () => {
+                refreshFieldError(psk, pskError, pskShouldShowError);
+                recheck();
+            });
+            priority.addEventListener("input", () => {
+                refreshFieldError(priority, priorityError, priorityShouldShowError);
+                recheck();
+            });
+
             const form = el("form", {
                 class: "wifi-form",
+                novalidate: true,
                 onsubmit: async (e) => {
                     e.preventDefault();
                     inlineErr.textContent = "";
                     const ssidVal = ssid.value;
                     const pskVal = psk.value;
+                    // Defense-in-depth: pre-disable should have prevented
+                    // reaching here with invalid values, but keep the guard
+                    // for programmatic submits and any browser quirks.
                     if (!isValidWifiSSID(ssidVal)) {
                         inlineErr.textContent = "SSID must be 1-32 bytes, no control characters.";
+                        recheck();
                         return;
                     }
                     if (pskVal !== "" && !isValidWifiPSK(pskVal)) {
                         inlineErr.textContent = "Password must be 8-63 printable ASCII chars or 64 hex chars.";
+                        recheck();
                         return;
                     }
                     const priVal = priority.value || "0";
-                    if (!isValidWifiPriority(priVal)) {
+                    if ((priority.validity && priority.validity.badInput) || !isValidWifiPriority(priVal)) {
                         inlineErr.textContent = "Priority must be an integer 0-999.";
+                        recheck();
                         return;
                     }
                     const body = {
@@ -2882,12 +2966,14 @@
                     // against that surprise by sending no key at all.
                     if (!isEdit || pskVal !== "") body.psk = pskVal;
 
-                    submit.disabled = true;
+                    busy = true;
+                    recheck();
                     submit.textContent = testBox.checked ? "Testing (up to 30s)…" : "Saving…";
                     const url = isEdit ? "/api/wifi/" + encodeURIComponent(existing.id) : "/api/wifi";
                     const r = isEdit ? await putJSON(url, body) : await postJSON(url, body);
-                    submit.disabled = false;
+                    busy = false;
                     submit.textContent = isEdit ? "Save changes" : "Add network";
+                    recheck();
                     if (handleAuthFailure(r)) return;
                     if (!r.ok) {
                         const p = r.payload || {};
@@ -2905,12 +2991,13 @@
                 },
             },
                 el("h3", {}, isEdit ? "Edit " + (existing.ssid || existing.id) : "Add network"),
-                el("div", { class: "field" }, el("label", {}, "SSID"), ssid),
-                el("div", { class: "field" }, el("label", {}, "Password"), psk),
+                el("div", { class: "field" }, el("label", {}, "SSID"), ssid, ssidError),
+                el("div", { class: "field" }, el("label", {}, "Password"), psk, pskError),
                 el("div", { class: "field-row" },
                     el("label", {}, hidden, " Hidden network"),
                     el("label", {}, "Priority ", priority),
                 ),
+                priorityError,
                 el("div", { class: "field" },
                     el("label", {}, testBox, " Test connection before saving"),
                     el("p", { class: "muted" }, "Tries to join now; rolls back on failure. Connecting to a new network may briefly drop this page if the feeder is on Wi-Fi."),
@@ -2919,6 +3006,8 @@
                 el("div", { class: "actions" }, submit, cancel),
             );
             formHost.replaceChildren(form);
+            // Initial sync — sets submit's disabled state for the seed values.
+            recheck();
             ssid.focus();
         }
 
