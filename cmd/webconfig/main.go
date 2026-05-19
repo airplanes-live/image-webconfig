@@ -19,9 +19,9 @@ import (
 	"github.com/airplanes-live/image-webconfig/internal/auth"
 	wexec "github.com/airplanes-live/image-webconfig/internal/exec"
 	"github.com/airplanes-live/image-webconfig/internal/feedenv"
+	"github.com/airplanes-live/image-webconfig/internal/hardware"
 	"github.com/airplanes-live/image-webconfig/internal/identity"
 	"github.com/airplanes-live/image-webconfig/internal/logs"
-	"github.com/airplanes-live/image-webconfig/internal/pihealth"
 	"github.com/airplanes-live/image-webconfig/internal/schemacache"
 	"github.com/airplanes-live/image-webconfig/internal/server"
 	"github.com/airplanes-live/image-webconfig/internal/status"
@@ -85,17 +85,17 @@ func main() {
 		"sliding window for failure counting")
 	lockoutDuration := flag.Duration("lockout-duration", 15*time.Minute,
 		"duration of an active lockout")
-	piHealthMode := flag.Bool("pi-health", false,
-		"emit a one-line pi-health summary and exit (for render-status / MOTD)")
-	piHealthTimeout := flag.Duration("pi-health-timeout", 2*time.Second,
-		"probe timeout for --pi-health (must be < the shell timeout wrapping the call)")
+	hardwareMode := flag.Bool("hardware", false,
+		"emit a one-line hardware-health summary and exit (for render-status / MOTD)")
+	hardwareTimeout := flag.Duration("hardware-timeout", 2*time.Second,
+		"probe timeout for --hardware (must be < the shell timeout wrapping the call)")
 	validateSudoers := flag.Bool("validate-sudoers", false,
 		"verify every DefaultPrivilegedArgv() shape is authorized by /etc/sudoers.d/010_* + 011_* and exit (exit 0 on parity, 1 on mismatch)")
 	flag.Parse()
 
-	if *piHealthMode {
-		ph := pihealth.NewReader(pihealth.DefaultPaths(), pihealth.DefaultThresholds(), nil, nil)
-		os.Exit(runPiHealthCmd(os.Stdout, os.Stderr, ph.Probe, *piHealthTimeout))
+	if *hardwareMode {
+		hw := hardware.NewReader(hardware.DefaultPaths(), hardware.DefaultThresholds(), nil, nil)
+		os.Exit(runHardwareCmd(os.Stdout, os.Stderr, hw.Probe, *hardwareTimeout))
 	}
 
 	if *validateSudoers {
@@ -155,9 +155,9 @@ func main() {
 			Identity:     identity.NewReader(identity.DefaultPaths()),
 			FeedEnv:      feedenv.New(),
 			Status: status.NewReader(effectiveVersion, status.DefaultPaths(), nil,
-				status.WithPiHealth(pihealth.NewReader(
-					pihealth.DefaultPaths(),
-					pihealth.DefaultThresholds(),
+				status.WithHardware(hardware.NewReader(
+					hardware.DefaultPaths(),
+					hardware.DefaultThresholds(),
 					nil, // RealRunner
 					nil, // statfs-backed DiskProber
 				)),

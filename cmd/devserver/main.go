@@ -30,7 +30,6 @@ import (
 	"github.com/airplanes-live/image-webconfig/internal/feedenv"
 	"github.com/airplanes-live/image-webconfig/internal/identity"
 	"github.com/airplanes-live/image-webconfig/internal/logs"
-	"github.com/airplanes-live/image-webconfig/internal/pihealth"
 	"github.com/airplanes-live/image-webconfig/internal/schemacache"
 	"github.com/airplanes-live/image-webconfig/internal/server"
 	"github.com/airplanes-live/image-webconfig/internal/status"
@@ -100,14 +99,6 @@ func main() {
 		SystemctlBinary:    "/usr/bin/systemctl",
 		IsActiveTimeout:    2 * time.Second,
 	}
-	piPaths := pihealth.DefaultPaths()
-	// Probe paths can stay at /sys/... on a non-Pi machine — pihealth's
-	// individual sub-probes degrade gracefully when a file is missing
-	// (IsRaspberryPi=false, *Probed=false). The fake PiHealthProbe is
-	// what status.WithPiHealth uses, so the dashboard tile data comes
-	// from devfakes regardless.
-	_ = piPaths
-
 	idPaths := identity.Paths{
 		FeederIDFile:    state.Paths.FeederID,
 		ClaimSecretFile: state.Paths.ClaimSecret,
@@ -115,7 +106,7 @@ func main() {
 	}
 
 	statusReader := status.NewReader("dev", statusPaths, devfakes.Runner(state, priv),
-		status.WithPiHealth(devfakes.NewPiHealthProbe(state)),
+		status.WithHardware(devfakes.NewHardwareProbe(state)),
 		status.WithWifi(devfakes.NewWifiProbe(state)),
 	)
 

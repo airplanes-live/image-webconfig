@@ -80,7 +80,7 @@
 
     // Bootstrap-icons cpu glyph (16×16 viewBox). Same single-path shape
     // SERVICE_ICONS uses; consumed by svgIcon().
-    const PIHEALTH_ICON =
+    const HARDWARE_ICON =
         "M5 0a.5.5 0 0 1 .5.5V2h1V.5a.5.5 0 0 1 1 0V2h1V.5a.5.5 0 0 1 1 0V2h1V.5a.5.5 0 0 1 1 0V2A2.5 2.5 0 0 1 14 4.5h1.5a.5.5 0 0 1 0 1H14v1h1.5a.5.5 0 0 1 0 1H14v1h1.5a.5.5 0 0 1 0 1H14v1h1.5a.5.5 0 0 1 0 1H14A2.5 2.5 0 0 1 11.5 14H10v1.5a.5.5 0 0 1-1 0V14H8v1.5a.5.5 0 0 1-1 0V14H6v1.5a.5.5 0 0 1-1 0V14H4.5A2.5 2.5 0 0 1 2 11.5H.5a.5.5 0 0 1 0-1H2v-1H.5a.5.5 0 0 1 0-1H2v-1H.5a.5.5 0 0 1 0-1H2v-1H.5a.5.5 0 0 1 0-1H2A2.5 2.5 0 0 1 4.5 2V.5A.5.5 0 0 1 5 0m-.5 3A1.5 1.5 0 0 0 3 4.5v7A1.5 1.5 0 0 0 4.5 13h7a1.5 1.5 0 0 0 1.5-1.5v-7A1.5 1.5 0 0 0 11.5 3z";
 
     // Bootstrap-icons wifi glyph (16×16 viewBox).
@@ -784,8 +784,8 @@
         // Hardware health demotes only on err — a warn-level hardware
         // condition (75°C summer afternoon, history flags) shouldn't paint
         // the whole dashboard yellow when feeding is otherwise fine.
-        const ph = payload.pi_health || null;
-        if (ph && ph.severity === "err") {
+        const hh = payload.hardware_health || null;
+        if (hh && hh.severity === "err") {
             return { dot: "warn", label: "partial" };
         }
         return { dot: "ok", label: "healthy" };
@@ -887,9 +887,9 @@
         tile.root.setAttribute("data-state", state);
     }
 
-    function buildPiHealthTile() {
-        const iconNode = el("span", { class: "wc-tile__icon" }, svgIcon(PIHEALTH_ICON));
-        const titleEl  = el("span", { class: "wc-tile__title" }, "Raspberry Pi");
+    function buildHardwareTile() {
+        const iconNode = el("span", { class: "wc-tile__icon" }, svgIcon(HARDWARE_ICON));
+        const titleEl  = el("span", { class: "wc-tile__title" }, "Hardware");
         const metaEl   = el("span", { class: "wc-tile__meta" }, "—");
         const dotEl    = el("span", { class: "wc-tile__dot wc-tile__dot--na" });
         const root = el("div", { class: "wc-tile wc-tile--hardware", "data-state": "unknown" },
@@ -900,17 +900,17 @@
         return { root, titleEl, metaEl, dotEl };
     }
 
-    function updatePiHealthTile(tile, payload) {
-        const ph = (payload && payload.pi_health) || null;
-        if (!ph) {
+    function updateHardwareTile(tile, payload) {
+        const hh = (payload && payload.hardware_health) || null;
+        if (!hh) {
             tile.dotEl.className = "wc-tile__dot wc-tile__dot--na";
             tile.metaEl.textContent = "—";
             tile.root.title = "";
             tile.root.setAttribute("data-state", "unknown");
             return;
         }
-        const sev = ph.severity || "na";
-        const summary = ph.summary || "—";
+        const sev = hh.severity || "na";
+        const summary = hh.summary || "—";
         tile.dotEl.className = "wc-tile__dot wc-tile__dot--" + sev;
         tile.metaEl.textContent = summary;
         tile.root.title = summary;
@@ -971,9 +971,9 @@
 
         // Row 1: hardware + Wi-Fi. Two tiles on a 3-col grid; the
         // third cell is intentionally empty at desktop width.
-        const piHealth = buildPiHealthTile();
+        const hardware = buildHardwareTile();
         const wifi = buildWifiTile();
-        const row1 = el("div", { class: "wc-grid--tiles" }, piHealth.root, wifi.root);
+        const row1 = el("div", { class: "wc-grid--tiles" }, hardware.root, wifi.root);
 
         // Row 2: 1090 stack (feed → readsb → mlat).
         // Row 3: 978 UAT stack (dump978 + airplanes-978).
@@ -995,7 +995,7 @@
         }
 
         const root = el("div", { class: "wc-tiles-stack" }, row1, row2, row3, apps);
-        return { root, tiles, appTiles, piHealth, wifi };
+        return { root, tiles, appTiles, hardware, wifi };
     }
 
     function buildAppTile(app) {
@@ -1065,7 +1065,7 @@
         // payload.values and payload.mlat_decision; merging here keeps
         // the call sites simple.
         payload.values = Object.assign({}, payload.values || {}, configValues || {});
-        if (grid.piHealth) updatePiHealthTile(grid.piHealth, payload);
+        if (grid.hardware) updateHardwareTile(grid.hardware, payload);
         if (grid.wifi) updateWifiTile(grid.wifi, payload);
         for (const unit of MONITORED_SERVICES) {
             const tile = grid.tiles[unit];

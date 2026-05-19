@@ -7,8 +7,19 @@ import (
 	"testing"
 	"time"
 
-	"github.com/airplanes-live/image-webconfig/internal/pihealth"
+	"github.com/airplanes-live/image-webconfig/internal/hardware"
 )
+
+// snap is a small constructor that builds a Snapshot from a Health
+// summary + severity + (optionally) a Throttle pointer. The tests
+// below only care about Health.{Severity, Summary} for the CLI's
+// wire shape, so we don't bother populating System.
+func snap(sev, summary string, t *hardware.Throttle) *hardware.Snapshot {
+	return &hardware.Snapshot{
+		PiThrottle: t,
+		Health:     hardware.Health{Severity: sev, Summary: summary},
+	}
+}
 
 func TestAsciiSafe(t *testing.T) {
 	t.Parallel()
@@ -53,84 +64,44 @@ func TestFormatCLILine(t *testing.T) {
 	t.Parallel()
 	cases := []struct {
 		name string
-		in   *pihealth.PiHealth
+		in   *hardware.Snapshot
 		want string
 	}{
 		{
-			name: "ok with temp probed drops temp suffix",
-			in: &pihealth.PiHealth{
-				Severity:       "ok",
-				Summary:        "healthy · 56°C",
-				TempProbed:     true,
-				IsRaspberryPi:  true,
-				CPUTempCelsius: 56,
-			},
+			name: "ok with temp suffix drops the suffix",
+			in:   snap("ok", "healthy · 56°C", nil),
 			want: "ok\thealthy",
 		},
 		{
-			name: "ok without temp probed keeps summary as-is",
-			in: &pihealth.PiHealth{
-				Severity:      "ok",
-				Summary:       "healthy",
-				IsRaspberryPi: true,
-			},
+			name: "ok without temp suffix keeps summary as-is",
+			in:   snap("ok", "healthy", nil),
 			want: "ok\thealthy",
 		},
 		{
 			name: "ok on non-Pi: keep generic-linux prefix, drop temp",
-			in: &pihealth.PiHealth{
-				Severity:       "ok",
-				Summary:        "generic Linux · healthy · 56°C",
-				TempProbed:     true,
-				CPUTempCelsius: 56,
-			},
+			in:   snap("ok", "generic Linux · healthy · 56°C", nil),
 			want: "ok\tgeneric Linux * healthy",
 		},
 		{
-			name: "warn with history and temp blurb",
-			in: &pihealth.PiHealth{
-				Severity:         "warn",
-				Summary:          "undervoltage history · 78°C",
-				TempProbed:       true,
-				CPUTempCelsius:   78,
-				UndervoltageEver: true,
-			},
-			// stripTempSuffix only fires on severity==ok, so the temp
-			// blurb stays — it's part of the issue list now.
+			name: "warn with embedded temp keeps the temp (it's a finding, not a suffix)",
+			// stripTempSuffix runs only on Severity == "ok"; warn/err
+			// leaves any embedded temperature finding intact.
+			in:   snap("warn", "undervoltage history · 78°C", nil),
 			want: "warn\tundervoltage history * 78C",
 		},
 		{
 			name: "err worst-case keeps all blurbs",
-			in: &pihealth.PiHealth{
-				Severity:        "err",
-				Summary:         "undervolted now · throttling now · arm freq capped now",
-				ThrottleProbed:  true,
-				UndervoltageNow: true,
-				ThrottlingNow:   true,
-				ARMFreqCapNow:   true,
-			},
+			in:   snap("err", "undervolted now · throttling now · arm freq capped now", nil),
 			want: "err\tundervolted now * throttling now * arm freq capped now",
 		},
 		{
 			name: "err with PSU-enriched undervoltage (already ASCII, no transform)",
-			in: &pihealth.PiHealth{
-				Severity:        "err",
-				Summary:         "undervolted now (PSU 3A, needs 5A) · throttling now",
-				ThrottleProbed:  true,
-				UndervoltageNow: true,
-				ThrottlingNow:   true,
-				PSUProbed:       true,
-				PSUMaxCurrentMA: 3000,
-				PSUExpectedMA:   5000,
-			},
+			in:   snap("err", "undervolted now (PSU 3A, needs 5A) · throttling now", nil),
 			want: "err\tundervolted now (PSU 3A, needs 5A) * throttling now",
 		},
 		{
 			name: "na probe failed",
-			in: &pihealth.PiHealth{
-				Severity: "na",
-				Summary:  "probe failed",
-			},
+			in:   snap("na", "probe failed", nil),
 			want: "na\tprobe failed",
 		},
 	}
@@ -143,19 +114,13 @@ func TestFormatCLILine(t *testing.T) {
 	}
 }
 
-func TestRunPiHealthCmd_HappyPath(t *testing.T) {
+func TestRunHardwareCmd_HappyPath(t *testing.T) {
 	t.Parallel()
-	probe := func(_ context.Context) *pihealth.PiHealth {
-		return &pihealth.PiHealth{
-			Severity:       "ok",
-			Summary:        "healthy · 56°C",
-			TempProbed:     true,
-			IsRaspberryPi:  true,
-			CPUTempCelsius: 56,
-		}
+	probe := func(_ context.Context) *hardware.Snapshot {
+		return snap("ok", "healthy · 56°C", nil)
 	}
 	var stdout, stderr bytes.Buffer
-	code := runPiHealthCmd(&stdout, &stderr, probe, time.Second)
+	code := runHardwareCmd(&stdout, &stderr, probe, time.Second)
 	if code != 0 {
 		t.Errorf("exit code = %d, want 0", code)
 	}
@@ -167,11 +132,11 @@ func TestRunPiHealthCmd_HappyPath(t *testing.T) {
 	}
 }
 
-func TestRunPiHealthCmd_NilProbeResult(t *testing.T) {
+func TestRunHardwareCmd_NilProbeResult(t *testing.T) {
 	t.Parallel()
-	probe := func(_ context.Context) *pihealth.PiHealth { return nil }
+	probe := func(_ context.Context) *hardware.Snapshot { return nil }
 	var stdout, stderr bytes.Buffer
-	code := runPiHealthCmd(&stdout, &stderr, probe, time.Second)
+	code := runHardwareCmd(&stdout, &stderr, probe, time.Second)
 	if code != 1 {
 		t.Errorf("exit code = %d, want 1", code)
 	}
@@ -183,18 +148,15 @@ func TestRunPiHealthCmd_NilProbeResult(t *testing.T) {
 	}
 }
 
-func TestRunPiHealthCmd_RespectsTimeout(t *testing.T) {
+func TestRunHardwareCmd_RespectsTimeout(t *testing.T) {
 	t.Parallel()
-	probe := func(ctx context.Context) *pihealth.PiHealth {
-		// Block until ctx fires, then return a canned "na" result the
-		// way pihealth.Reader.Probe would if all sub-probes were
-		// cancelled.
+	probe := func(ctx context.Context) *hardware.Snapshot {
 		<-ctx.Done()
-		return &pihealth.PiHealth{Severity: "na", Summary: "probe failed"}
+		return snap("na", "probe failed", nil)
 	}
 	var stdout, stderr bytes.Buffer
 	start := time.Now()
-	code := runPiHealthCmd(&stdout, &stderr, probe, 50*time.Millisecond)
+	code := runHardwareCmd(&stdout, &stderr, probe, 50*time.Millisecond)
 	elapsed := time.Since(start)
 	if code != 0 {
 		t.Errorf("exit code = %d, want 0 (na is still a valid result)", code)

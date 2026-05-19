@@ -1,7 +1,8 @@
-package pihealth
+package hardware
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
@@ -230,15 +231,18 @@ func TestProbe_AllProbesFail(t *testing.T) {
 		canned: canned{vcgencmdErr: errors.New("not found"), timeErr: errors.New("not found")},
 		disk:   errDiskProber(errors.New("statfs: no such file")),
 	}
-	got := f.reader().Probe(context.Background())
-	if got.Severity != "na" {
-		t.Errorf("severity = %q, want na", got.Severity)
+	snap := f.reader().Probe(context.Background())
+	if snap.Health.Severity != "na" {
+		t.Errorf("severity = %q, want na", snap.Health.Severity)
 	}
-	if got.Summary != "probe failed" {
-		t.Errorf("summary = %q, want \"probe failed\"", got.Summary)
+	if snap.Health.Summary != "probe failed" {
+		t.Errorf("summary = %q, want \"probe failed\"", snap.Health.Summary)
 	}
-	if got.IsRaspberryPi {
+	if snap.Health.IsRaspberryPi {
 		t.Error("IsRaspberryPi should be false when device-tree file missing")
+	}
+	if snap.PiThrottle != nil {
+		t.Errorf("PiThrottle = %+v, want nil", snap.PiThrottle)
 	}
 }
 
@@ -256,21 +260,33 @@ func TestProbe_HealthyPi(t *testing.T) {
 		},
 		disk: fixedDiskProber(45),
 	}
-	got := f.reader().Probe(context.Background())
-	if got.Severity != "ok" {
-		t.Errorf("severity = %q, want ok (got: %+v)", got.Severity, got)
+	snap := f.reader().Probe(context.Background())
+	if snap.Health.Severity != "ok" {
+		t.Errorf("severity = %q, want ok", snap.Health.Severity)
 	}
-	if !strings.HasPrefix(got.Summary, "healthy") {
-		t.Errorf("summary = %q, want prefix \"healthy\"", got.Summary)
+	if !strings.HasPrefix(snap.Health.Summary, "healthy") {
+		t.Errorf("summary = %q, want prefix \"healthy\"", snap.Health.Summary)
 	}
-	if !strings.Contains(got.Summary, "56°C") {
-		t.Errorf("summary = %q, expected to contain 56°C", got.Summary)
+	if !strings.Contains(snap.Health.Summary, "56°C") {
+		t.Errorf("summary = %q, expected to contain 56°C", snap.Health.Summary)
 	}
-	if !got.IsRaspberryPi {
+	if !snap.Health.IsRaspberryPi {
 		t.Error("IsRaspberryPi should be true")
 	}
-	if !got.ThrottleProbed || !got.TempProbed || !got.TimeProbed || !got.MemProbed || !got.DiskProbed {
-		t.Errorf("all *Probed flags should be true, got %+v", got)
+	if snap.PiThrottle == nil {
+		t.Fatal("PiThrottle = nil, want populated on healthy Pi")
+	}
+	if snap.System.CPUTempCelsius == nil {
+		t.Error("System.CPUTempCelsius should be populated")
+	}
+	if snap.System.NTPSynchronized == nil {
+		t.Error("System.NTPSynchronized should be populated")
+	}
+	if snap.System.MemoryAvailPct == nil {
+		t.Error("System.MemoryAvailPct should be populated")
+	}
+	if snap.System.DiskFreePct == nil {
+		t.Error("System.DiskFreePct should be populated")
 	}
 }
 
@@ -287,15 +303,18 @@ func TestProbe_GenericLinux_PiAbsent(t *testing.T) {
 		},
 		disk: fixedDiskProber(60),
 	}
-	got := f.reader().Probe(context.Background())
-	if got.IsRaspberryPi {
+	snap := f.reader().Probe(context.Background())
+	if snap.Health.IsRaspberryPi {
 		t.Error("IsRaspberryPi should be false")
 	}
-	if got.Severity != "ok" {
-		t.Errorf("severity = %q, want ok", got.Severity)
+	if snap.Health.Severity != "ok" {
+		t.Errorf("severity = %q, want ok", snap.Health.Severity)
 	}
-	if !strings.HasPrefix(got.Summary, "generic Linux") {
-		t.Errorf("summary = %q, want prefix \"generic Linux\"", got.Summary)
+	if !strings.HasPrefix(snap.Health.Summary, "generic Linux") {
+		t.Errorf("summary = %q, want prefix \"generic Linux\"", snap.Health.Summary)
+	}
+	if snap.PiThrottle != nil {
+		t.Errorf("PiThrottle = %+v, want nil on non-Pi", snap.PiThrottle)
 	}
 }
 
@@ -313,24 +332,51 @@ func TestProbe_PiButVcgencmdMissing(t *testing.T) {
 		},
 		disk: fixedDiskProber(40),
 	}
-	got := f.reader().Probe(context.Background())
-	if !got.IsRaspberryPi {
+	snap := f.reader().Probe(context.Background())
+	if !snap.Health.IsRaspberryPi {
 		t.Error("IsRaspberryPi should be true (device-tree confirmed)")
 	}
-	if got.ThrottleProbed {
-		t.Error("ThrottleProbed should be false")
+	if snap.PiThrottle != nil {
+		t.Errorf("PiThrottle should be nil when vcgencmd missing, got %+v", snap.PiThrottle)
 	}
 	// Missing vcgencmd alone (with every other probe happy) stays sevOK
 	// so the dashboard tile doesn't paint amber over a feeder that is
 	// otherwise fine; the summary still mentions the partial probe.
-	if got.Severity != "ok" {
-		t.Errorf("severity = %q, want ok (partial probe alone shouldn't warn)", got.Severity)
+	if snap.Health.Severity != "ok" {
+		t.Errorf("severity = %q, want ok", snap.Health.Severity)
 	}
-	if !strings.Contains(got.Summary, "healthy") {
-		t.Errorf("summary = %q, expected to mention \"healthy\"", got.Summary)
+	if !strings.Contains(snap.Health.Summary, "healthy") {
+		t.Errorf("summary = %q, expected to mention \"healthy\"", snap.Health.Summary)
 	}
-	if !strings.Contains(got.Summary, "vcgencmd unavailable") {
-		t.Errorf("summary = %q, expected to mention \"vcgencmd unavailable\"", got.Summary)
+	if !strings.Contains(snap.Health.Summary, "vcgencmd unavailable") {
+		t.Errorf("summary = %q, expected to mention \"vcgencmd unavailable\"", snap.Health.Summary)
+	}
+}
+
+// Codex regression sentinel: Pi confirmed, get_throttled fails, get_config
+// psu_max_current would succeed. The Reader must NOT call probePSU on a
+// nil Throttle pointer and must NOT leak a PSU-only PiThrottle.
+func TestProbe_PiModelTrue_ThrottleFailsButPSUWouldWork_NoPanic(t *testing.T) {
+	t.Parallel()
+	f := &fixture{
+		t:       t,
+		model:   "Raspberry Pi 5\x00",
+		thermal: "55000\n",
+		meminfo: "MemTotal: 8000000 kB\nMemAvailable: 6000000 kB\n",
+		uptime:  "12345.67\n",
+		canned: canned{
+			vcgencmdErr: errors.New("exec: file not found"),
+			vcgencmdPSU: "psu_max_current=5000\n", // unreachable: vcgencmdErr fires first
+			timedatectl: "NTPSynchronized=yes\n",
+		},
+		disk: fixedDiskProber(40),
+	}
+	// Production probeThrottle errors out via vcgencmdErr; probePSU is
+	// then never called because PiThrottle stays nil. The test asserts
+	// the no-panic + no-phantom-PiThrottle posture explicitly.
+	snap := f.reader().Probe(context.Background())
+	if snap.PiThrottle != nil {
+		t.Errorf("PiThrottle should be nil; got %+v", snap.PiThrottle)
 	}
 }
 
@@ -348,19 +394,22 @@ func TestProbe_UndervoltageNow(t *testing.T) {
 		},
 		disk: fixedDiskProber(40),
 	}
-	got := f.reader().Probe(context.Background())
-	if !got.UndervoltageNow || !got.UndervoltageEver {
-		t.Errorf("undervolt flags wrong: %+v", got)
+	snap := f.reader().Probe(context.Background())
+	if snap.PiThrottle == nil {
+		t.Fatal("PiThrottle = nil")
 	}
-	if got.Severity != "err" {
-		t.Errorf("severity = %q, want err", got.Severity)
+	if !snap.PiThrottle.UndervoltageNow || !snap.PiThrottle.UndervoltageEver {
+		t.Errorf("undervolt flags wrong: %+v", snap.PiThrottle)
 	}
-	if !strings.HasPrefix(got.Summary, "undervolted now") {
-		t.Errorf("summary = %q, expected to lead with \"undervolted now\"", got.Summary)
+	if snap.Health.Severity != "err" {
+		t.Errorf("severity = %q, want err", snap.Health.Severity)
+	}
+	if !strings.HasPrefix(snap.Health.Summary, "undervolted now") {
+		t.Errorf("summary = %q, expected to lead with \"undervolted now\"", snap.Health.Summary)
 	}
 }
 
-func TestProbe_ThrottlingEverOnly_IsWarn(t *testing.T) {
+func TestProbe_ThrottledEverOnly_IsWarn(t *testing.T) {
 	t.Parallel()
 	f := &fixture{
 		t:       t,
@@ -369,23 +418,26 @@ func TestProbe_ThrottlingEverOnly_IsWarn(t *testing.T) {
 		meminfo: "MemTotal: 4000000 kB\nMemAvailable: 2000000 kB\n",
 		uptime:  "12345.67\n",
 		canned: canned{
-			vcgencmd:    "throttled=0x50000\n", // bits 16 + 18: undervolt ever + throttling ever
+			vcgencmd:    "throttled=0x50000\n", // bits 16 + 18: undervolt ever + throttled ever
 			timedatectl: "NTPSynchronized=yes\n",
 		},
 		disk: fixedDiskProber(40),
 	}
-	got := f.reader().Probe(context.Background())
-	if !got.UndervoltageEver || !got.ThrottlingEver {
-		t.Errorf("expected undervolt-ever + throttling-ever, got %+v", got)
+	snap := f.reader().Probe(context.Background())
+	if snap.PiThrottle == nil {
+		t.Fatal("PiThrottle = nil")
 	}
-	if got.UndervoltageNow || got.ThrottlingNow {
+	if !snap.PiThrottle.UndervoltageEver || !snap.PiThrottle.ThrottledEver {
+		t.Errorf("expected undervolt-ever + throttled-ever, got %+v", snap.PiThrottle)
+	}
+	if snap.PiThrottle.UndervoltageNow || snap.PiThrottle.ThrottledNow {
 		t.Errorf("now flags should be false")
 	}
-	if got.Severity != "warn" {
-		t.Errorf("severity = %q, want warn", got.Severity)
+	if snap.Health.Severity != "warn" {
+		t.Errorf("severity = %q, want warn", snap.Health.Severity)
 	}
-	if !strings.Contains(got.Summary, "undervoltage history") {
-		t.Errorf("summary = %q, expected mention of history", got.Summary)
+	if !strings.Contains(snap.Health.Summary, "undervoltage history") {
+		t.Errorf("summary = %q, expected mention of history", snap.Health.Summary)
 	}
 }
 
@@ -403,12 +455,12 @@ func TestProbe_TemperatureWarn(t *testing.T) {
 		},
 		disk: fixedDiskProber(40),
 	}
-	got := f.reader().Probe(context.Background())
-	if got.Severity != "warn" {
-		t.Errorf("severity = %q, want warn (temp=78)", got.Severity)
+	snap := f.reader().Probe(context.Background())
+	if snap.Health.Severity != "warn" {
+		t.Errorf("severity = %q, want warn (temp=78)", snap.Health.Severity)
 	}
-	if !strings.Contains(got.Summary, "78°C") {
-		t.Errorf("summary = %q, expected 78°C", got.Summary)
+	if !strings.Contains(snap.Health.Summary, "78°C") {
+		t.Errorf("summary = %q, expected 78°C", snap.Health.Summary)
 	}
 }
 
@@ -426,9 +478,9 @@ func TestProbe_TemperatureErr(t *testing.T) {
 		},
 		disk: fixedDiskProber(40),
 	}
-	got := f.reader().Probe(context.Background())
-	if got.Severity != "err" {
-		t.Errorf("severity = %q, want err (temp=82)", got.Severity)
+	snap := f.reader().Probe(context.Background())
+	if snap.Health.Severity != "err" {
+		t.Errorf("severity = %q, want err (temp=82)", snap.Health.Severity)
 	}
 }
 
@@ -446,12 +498,12 @@ func TestProbe_NTPNotSynced_WithinGrace(t *testing.T) {
 		},
 		disk: fixedDiskProber(40),
 	}
-	got := f.reader().Probe(context.Background())
-	if got.Severity != "warn" {
-		t.Errorf("severity = %q, want warn (within grace)", got.Severity)
+	snap := f.reader().Probe(context.Background())
+	if snap.Health.Severity != "warn" {
+		t.Errorf("severity = %q, want warn (within grace)", snap.Health.Severity)
 	}
-	if !strings.Contains(got.Summary, "time sync pending") {
-		t.Errorf("summary = %q, expected \"time sync pending\"", got.Summary)
+	if !strings.Contains(snap.Health.Summary, "time sync pending") {
+		t.Errorf("summary = %q, expected \"time sync pending\"", snap.Health.Summary)
 	}
 }
 
@@ -469,12 +521,12 @@ func TestProbe_NTPNotSynced_PastGrace(t *testing.T) {
 		},
 		disk: fixedDiskProber(40),
 	}
-	got := f.reader().Probe(context.Background())
-	if got.Severity != "err" {
-		t.Errorf("severity = %q, want err (past grace)", got.Severity)
+	snap := f.reader().Probe(context.Background())
+	if snap.Health.Severity != "err" {
+		t.Errorf("severity = %q, want err (past grace)", snap.Health.Severity)
 	}
-	if !strings.Contains(got.Summary, "time not synced") {
-		t.Errorf("summary = %q, expected \"time not synced\"", got.Summary)
+	if !strings.Contains(snap.Health.Summary, "time not synced") {
+		t.Errorf("summary = %q, expected \"time not synced\"", snap.Health.Summary)
 	}
 }
 
@@ -492,12 +544,12 @@ func TestProbe_MemoryErr(t *testing.T) {
 		},
 		disk: fixedDiskProber(40),
 	}
-	got := f.reader().Probe(context.Background())
-	if got.Severity != "err" {
-		t.Errorf("severity = %q, want err (mem 2.5%%)", got.Severity)
+	snap := f.reader().Probe(context.Background())
+	if snap.Health.Severity != "err" {
+		t.Errorf("severity = %q, want err (mem 2.5%%)", snap.Health.Severity)
 	}
-	if !strings.Contains(got.Summary, "mem 2% free") {
-		t.Errorf("summary = %q, expected mem 2%% free", got.Summary)
+	if !strings.Contains(snap.Health.Summary, "mem 2% free") {
+		t.Errorf("summary = %q, expected mem 2%% free", snap.Health.Summary)
 	}
 }
 
@@ -516,9 +568,9 @@ func TestProbe_DiskWarnAndErr(t *testing.T) {
 		},
 		disk: fixedDiskProber(12),
 	}
-	got := warnCase.reader().Probe(context.Background())
-	if got.Severity != "warn" {
-		t.Errorf("disk 12%%: severity = %q, want warn", got.Severity)
+	snap := warnCase.reader().Probe(context.Background())
+	if snap.Health.Severity != "warn" {
+		t.Errorf("disk 12%%: severity = %q, want warn", snap.Health.Severity)
 	}
 
 	errCase := &fixture{
@@ -533,9 +585,64 @@ func TestProbe_DiskWarnAndErr(t *testing.T) {
 		},
 		disk: fixedDiskProber(3),
 	}
-	got = errCase.reader().Probe(context.Background())
-	if got.Severity != "err" {
-		t.Errorf("disk 3%%: severity = %q, want err", got.Severity)
+	snap = errCase.reader().Probe(context.Background())
+	if snap.Health.Severity != "err" {
+		t.Errorf("disk 3%%: severity = %q, want err", snap.Health.Severity)
+	}
+}
+
+// Codex regression sentinel: a 0% disk-free reading must NOT be hidden by
+// pointer-omitempty (the value is real, dangerous, and worth showing).
+// Same for 0% memory.
+func TestProbe_ZeroDiskFreePct_NotHidden(t *testing.T) {
+	t.Parallel()
+	f := &fixture{
+		t:       t,
+		thermal: "60000\n",
+		meminfo: "MemTotal: 4000000 kB\nMemAvailable: 2000000 kB\n",
+		uptime:  "12345.67\n",
+		canned: canned{
+			vcgencmdErr: errors.New("not found"),
+			timedatectl: "NTPSynchronized=yes\n",
+		},
+		disk: fixedDiskProber(0),
+	}
+	snap := f.reader().Probe(context.Background())
+	if snap.System.DiskFreePct == nil {
+		t.Fatal("DiskFreePct should be populated even at 0%")
+	}
+	if *snap.System.DiskFreePct != 0 {
+		t.Errorf("DiskFreePct = %v, want 0", *snap.System.DiskFreePct)
+	}
+	blob, _ := json.Marshal(snap.System)
+	if !strings.Contains(string(blob), `"disk_free_pct":0`) {
+		t.Errorf("marshaled JSON missing disk_free_pct:0 — pointer-omitempty hiding zero: %s", blob)
+	}
+}
+
+func TestProbe_ZeroMemoryAvailPct_NotHidden(t *testing.T) {
+	t.Parallel()
+	f := &fixture{
+		t:       t,
+		thermal: "60000\n",
+		meminfo: "MemTotal: 4000000 kB\nMemAvailable: 0 kB\n",
+		uptime:  "12345.67\n",
+		canned: canned{
+			vcgencmdErr: errors.New("not found"),
+			timedatectl: "NTPSynchronized=yes\n",
+		},
+		disk: fixedDiskProber(40),
+	}
+	snap := f.reader().Probe(context.Background())
+	if snap.System.MemoryAvailPct == nil {
+		t.Fatal("MemoryAvailPct should be populated even at 0%")
+	}
+	if *snap.System.MemoryAvailPct != 0 {
+		t.Errorf("MemoryAvailPct = %v, want 0", *snap.System.MemoryAvailPct)
+	}
+	blob, _ := json.Marshal(snap.System)
+	if !strings.Contains(string(blob), `"mem_avail_pct":0`) {
+		t.Errorf("marshaled JSON missing mem_avail_pct:0: %s", blob)
 	}
 }
 
@@ -555,20 +662,18 @@ func TestProbe_WorstCase_SummaryOrdering(t *testing.T) {
 		},
 		disk: fixedDiskProber(3),
 	}
-	got := f.reader().Probe(context.Background())
-	if got.Severity != "err" {
-		t.Errorf("severity = %q, want err", got.Severity)
+	snap := f.reader().Probe(context.Background())
+	if snap.Health.Severity != "err" {
+		t.Errorf("severity = %q, want err", snap.Health.Severity)
 	}
 	wantLead := "undervolted now · throttling now · arm freq capped now"
-	if !strings.HasPrefix(got.Summary, wantLead) {
-		t.Errorf("summary = %q, want prefix %q", got.Summary, wantLead)
+	if !strings.HasPrefix(snap.Health.Summary, wantLead) {
+		t.Errorf("summary = %q, want prefix %q", snap.Health.Summary, wantLead)
 	}
 }
 
 func TestProbe_PartialSuccess_MemOnly(t *testing.T) {
 	t.Parallel()
-	// Only mem probe succeeds. Verify no false "healthy" and severity
-	// reflects the mem error.
 	f := &fixture{
 		t:       t,
 		meminfo: "MemTotal: 4000000 kB\nMemAvailable: 100000 kB\n",
@@ -578,15 +683,15 @@ func TestProbe_PartialSuccess_MemOnly(t *testing.T) {
 		},
 		disk: errDiskProber(errors.New("statfs failed")),
 	}
-	got := f.reader().Probe(context.Background())
-	if got.Severity != "err" {
-		t.Errorf("severity = %q, want err (mem low)", got.Severity)
+	snap := f.reader().Probe(context.Background())
+	if snap.Health.Severity != "err" {
+		t.Errorf("severity = %q, want err (mem low)", snap.Health.Severity)
 	}
-	if !strings.Contains(got.Summary, "mem") {
-		t.Errorf("summary = %q, expected mention of mem", got.Summary)
+	if !strings.Contains(snap.Health.Summary, "mem") {
+		t.Errorf("summary = %q, expected mention of mem", snap.Health.Summary)
 	}
-	if strings.Contains(got.Summary, "healthy") {
-		t.Errorf("summary = %q, should NOT say healthy when only mem probed", got.Summary)
+	if strings.Contains(snap.Health.Summary, "healthy") {
+		t.Errorf("summary = %q, should NOT say healthy when only mem probed", snap.Health.Summary)
 	}
 }
 
@@ -605,12 +710,12 @@ func TestProbe_HealthyWithoutTemp(t *testing.T) {
 		},
 		disk: fixedDiskProber(40),
 	}
-	got := f.reader().Probe(context.Background())
-	if got.Severity != "ok" {
-		t.Errorf("severity = %q, want ok", got.Severity)
+	snap := f.reader().Probe(context.Background())
+	if snap.Health.Severity != "ok" {
+		t.Errorf("severity = %q, want ok", snap.Health.Severity)
 	}
-	if got.Summary != "healthy" {
-		t.Errorf("summary = %q, want exactly \"healthy\"", got.Summary)
+	if snap.Health.Summary != "healthy" {
+		t.Errorf("summary = %q, want exactly \"healthy\"", snap.Health.Summary)
 	}
 }
 
@@ -635,14 +740,14 @@ func TestNewReader_NilRunnerDefaultsToReal(t *testing.T) {
 func TestParsePSUMaxCurrent(t *testing.T) {
 	t.Parallel()
 	cases := []struct {
-		in    string
-		want  int
+		in     string
+		want   int
 		wantOK bool
 	}{
 		{"psu_max_current=5000\n", 5000, true},
 		{"psu_max_current=3000", 3000, true},
 		{"  psu_max_current=5000  \n", 5000, true},
-		{"psu_max_current=0\n", 0, false},          // 0 is "not probed", not "0A"
+		{"psu_max_current=0\n", 0, false},
 		{"psu_max_current=\n", 0, false},
 		{"psu_max_current=garbage\n", 0, false},
 		{"some_other_key=5000\n", 0, false},
@@ -670,7 +775,7 @@ func TestExpectedPSUMaxCurrentMA(t *testing.T) {
 		{"Raspberry Pi Compute Module 4\x00", 3000},
 		{"Raspberry Pi 3 Model B+\x00", 2500},
 		{"Raspberry Pi Zero 2 W Rev 1.0\x00", 2500},
-		{"Raspberry Pi 2 Model B\x00", 0}, // pre-Pi-3 / Zero 2: unknown
+		{"Raspberry Pi 2 Model B\x00", 0},
 		{"Some other SBC\x00", 0},
 		{"", 0},
 	}
@@ -685,37 +790,37 @@ func TestUndervoltedNowBlurb(t *testing.T) {
 	t.Parallel()
 	cases := []struct {
 		name string
-		in   *PiHealth
+		in   *Throttle
 		want string
 	}{
 		{
 			name: "PSU not probed → plain blurb",
-			in:   &PiHealth{},
+			in:   &Throttle{},
 			want: "undervolted now",
 		},
 		{
-			name: "PSU probed but expected unknown (pre-Pi-3) → plain blurb",
-			in:   &PiHealth{PSUProbed: true, PSUMaxCurrentMA: 1500, PSUExpectedMA: 0},
+			name: "PSU rating present but expected unknown → plain blurb",
+			in:   &Throttle{PSUMaxCurrentMA: intPtr(1500)},
 			want: "undervolted now",
 		},
 		{
 			name: "PSU rating matches expectation → plain blurb",
-			in:   &PiHealth{PSUProbed: true, PSUMaxCurrentMA: 5000, PSUExpectedMA: 5000},
+			in:   &Throttle{PSUMaxCurrentMA: intPtr(5000), PSUExpectedMA: intPtr(5000)},
 			want: "undervolted now",
 		},
 		{
 			name: "PSU rating exceeds expectation → plain blurb",
-			in:   &PiHealth{PSUProbed: true, PSUMaxCurrentMA: 5500, PSUExpectedMA: 5000},
+			in:   &Throttle{PSUMaxCurrentMA: intPtr(5500), PSUExpectedMA: intPtr(5000)},
 			want: "undervolted now",
 		},
 		{
 			name: "Pi 5 with 3A PSU → enriched",
-			in:   &PiHealth{PSUProbed: true, PSUMaxCurrentMA: 3000, PSUExpectedMA: 5000},
+			in:   &Throttle{PSUMaxCurrentMA: intPtr(3000), PSUExpectedMA: intPtr(5000)},
 			want: "undervolted now (PSU 3A, needs 5A)",
 		},
 		{
 			name: "Non-integer rating uses %g (4.5A not 4.50A)",
-			in:   &PiHealth{PSUProbed: true, PSUMaxCurrentMA: 4500, PSUExpectedMA: 5000},
+			in:   &Throttle{PSUMaxCurrentMA: intPtr(4500), PSUExpectedMA: intPtr(5000)},
 			want: "undervolted now (PSU 4.5A, needs 5A)",
 		},
 	}
@@ -737,25 +842,28 @@ func TestProbe_PSU_Pi5With3APSU_UndervoltageEnriched(t *testing.T) {
 		meminfo: "MemTotal: 8000000 kB\nMemAvailable: 6000000 kB\n",
 		uptime:  "12345.67\n",
 		canned: canned{
-			vcgencmd:    "throttled=0x10001\n", // undervolt now + ever
+			vcgencmd:    "throttled=0x10001\n",
 			timedatectl: "NTPSynchronized=yes\n",
 			vcgencmdPSU: "psu_max_current=3000\n",
 		},
 		disk: fixedDiskProber(40),
 	}
-	got := f.reader().Probe(context.Background())
-	if !got.PSUProbed || got.PSUMaxCurrentMA != 3000 {
-		t.Errorf("PSU probe wrong: probed=%v ma=%d", got.PSUProbed, got.PSUMaxCurrentMA)
+	snap := f.reader().Probe(context.Background())
+	if snap.PiThrottle == nil {
+		t.Fatal("PiThrottle = nil")
 	}
-	if got.PSUExpectedMA != 5000 {
-		t.Errorf("PSUExpectedMA = %d, want 5000", got.PSUExpectedMA)
+	if snap.PiThrottle.PSUMaxCurrentMA == nil || *snap.PiThrottle.PSUMaxCurrentMA != 3000 {
+		t.Errorf("PSUMaxCurrentMA wrong: %v", snap.PiThrottle.PSUMaxCurrentMA)
 	}
-	if got.Severity != "err" {
-		t.Errorf("severity = %q, want err", got.Severity)
+	if snap.PiThrottle.PSUExpectedMA == nil || *snap.PiThrottle.PSUExpectedMA != 5000 {
+		t.Errorf("PSUExpectedMA wrong: %v", snap.PiThrottle.PSUExpectedMA)
+	}
+	if snap.Health.Severity != "err" {
+		t.Errorf("severity = %q, want err", snap.Health.Severity)
 	}
 	wantLead := "undervolted now (PSU 3A, needs 5A)"
-	if !strings.HasPrefix(got.Summary, wantLead) {
-		t.Errorf("summary = %q, want prefix %q", got.Summary, wantLead)
+	if !strings.HasPrefix(snap.Health.Summary, wantLead) {
+		t.Errorf("summary = %q, want prefix %q", snap.Health.Summary, wantLead)
 	}
 }
 
@@ -774,17 +882,23 @@ func TestProbe_PSU_Pi5With5APSU_NoEnrichment(t *testing.T) {
 		},
 		disk: fixedDiskProber(40),
 	}
-	got := f.reader().Probe(context.Background())
-	if got.PSUMaxCurrentMA != 5000 {
-		t.Errorf("PSUMaxCurrentMA = %d, want 5000", got.PSUMaxCurrentMA)
+	snap := f.reader().Probe(context.Background())
+	if snap.PiThrottle == nil || snap.PiThrottle.PSUMaxCurrentMA == nil ||
+		*snap.PiThrottle.PSUMaxCurrentMA != 5000 {
+		t.Errorf("PSUMaxCurrentMA wrong: %+v", snap.PiThrottle)
 	}
-	// 5A meets the 5A expectation — no enrichment.
-	if !strings.HasPrefix(got.Summary, "undervolted now") || strings.Contains(got.Summary, "PSU") {
-		t.Errorf("summary should be plain 'undervolted now', got %q", got.Summary)
+	if !strings.HasPrefix(snap.Health.Summary, "undervolted now") ||
+		strings.Contains(snap.Health.Summary, "PSU") {
+		t.Errorf("summary should be plain 'undervolted now', got %q", snap.Health.Summary)
 	}
 }
 
-func TestProbe_PSU_Pi4NoVcgencmdReport_NoEnrichment(t *testing.T) {
+// Codex regression sentinel: Pi 4 (no firmware psu_max_current). The
+// previous code set PSUExpectedMA from the device-tree model regardless
+// of probe outcome — emitting "expected 3000 mA" against no actual
+// measurement. Pointer-omitempty fixes this: expected is only set when
+// actual was read.
+func TestProbe_PSU_Pi4NoVcgencmdReport_NoExpectedLeak(t *testing.T) {
 	t.Parallel()
 	f := &fixture{
 		t:       t,
@@ -800,22 +914,31 @@ func TestProbe_PSU_Pi4NoVcgencmdReport_NoEnrichment(t *testing.T) {
 		},
 		disk: fixedDiskProber(40),
 	}
-	got := f.reader().Probe(context.Background())
-	if got.PSUProbed {
-		t.Error("PSUProbed should be false on Pi 4 (no firmware report)")
+	snap := f.reader().Probe(context.Background())
+	if snap.PiThrottle == nil {
+		t.Fatal("PiThrottle = nil — throttle should still be populated even on PSU probe miss")
 	}
-	if got.PSUExpectedMA != 3000 {
-		t.Errorf("PSUExpectedMA = %d, want 3000 (Pi 4)", got.PSUExpectedMA)
+	if snap.PiThrottle.PSUMaxCurrentMA != nil {
+		t.Errorf("PSUMaxCurrentMA should be nil on Pi 4 (no firmware report), got %d",
+			*snap.PiThrottle.PSUMaxCurrentMA)
 	}
-	if strings.Contains(got.Summary, "PSU") {
-		t.Errorf("summary should not mention PSU when not probed, got %q", got.Summary)
+	if snap.PiThrottle.PSUExpectedMA != nil {
+		t.Errorf("PSUExpectedMA should be nil when actual not read, got %d",
+			*snap.PiThrottle.PSUExpectedMA)
+	}
+	blob, _ := json.Marshal(snap.PiThrottle)
+	if strings.Contains(string(blob), "psu_expected_ma") {
+		t.Errorf("marshaled JSON leaks psu_expected_ma: %s", blob)
+	}
+	if strings.Contains(snap.Health.Summary, "PSU") {
+		t.Errorf("summary should not mention PSU when not probed, got %q", snap.Health.Summary)
 	}
 }
 
 func TestProbe_PSU_NonPi_NoEnrichment(t *testing.T) {
 	t.Parallel()
-	// No model file → not a Pi → PSUExpectedMA=0 → no enrichment even
-	// if vcgencmd were somehow to return a value.
+	// No model file → not a Pi → PiThrottle stays nil → no PSU enrichment
+	// even if vcgencmd were somehow to return a value.
 	f := &fixture{
 		t:       t,
 		thermal: "60000\n",
@@ -828,11 +951,27 @@ func TestProbe_PSU_NonPi_NoEnrichment(t *testing.T) {
 		},
 		disk: fixedDiskProber(40),
 	}
-	got := f.reader().Probe(context.Background())
-	if got.PSUExpectedMA != 0 {
-		t.Errorf("PSUExpectedMA = %d, want 0 (non-Pi)", got.PSUExpectedMA)
+	snap := f.reader().Probe(context.Background())
+	if snap.PiThrottle != nil {
+		t.Errorf("PiThrottle should be nil on non-Pi, got %+v", snap.PiThrottle)
 	}
-	if strings.Contains(got.Summary, "PSU") {
-		t.Errorf("summary should not mention PSU on non-Pi, got %q", got.Summary)
+	if strings.Contains(snap.Health.Summary, "PSU") {
+		t.Errorf("summary should not mention PSU on non-Pi, got %q", snap.Health.Summary)
+	}
+}
+
+// === System struct JSON marshaling ===
+
+// MarshalJSON contract: System emits at least "{}" when every sub-probe
+// is nil. Anchors the universal-always-present-on-wire contract.
+func TestSystem_EmptyMarshalsToEmptyObject(t *testing.T) {
+	t.Parallel()
+	var s System
+	blob, err := json.Marshal(s)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(blob) != "{}" {
+		t.Errorf("empty System marshaled to %q, want \"{}\"", blob)
 	}
 }

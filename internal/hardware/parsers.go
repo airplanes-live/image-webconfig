@@ -1,4 +1,4 @@
-package pihealth
+package hardware
 
 import (
 	"bytes"
