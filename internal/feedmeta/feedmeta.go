@@ -18,6 +18,8 @@
 package feedmeta
 
 import (
+	"regexp"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -79,32 +81,97 @@ func IsTracked(key string) bool {
 	return ok
 }
 
+// altitudeShapeRE matches the suffix-tolerant altitude input shape
+// `^-?<digits>(.<digits>)?(m|ft)?$`. The capture groups are 1=signed
+// numeric, 2=unit suffix ("", "m", "ft"). Mirrors the bash regex used
+// by feed's altitude_to_bare_metres helper byte-for-byte.
+var altitudeShapeRE = regexp.MustCompile(`^(-?[0-9]+(?:\.[0-9]+)?)(m|ft)?$`)
+
+// trimAltitudeFraction strips trailing zeros after the decimal point
+// and a trailing bare decimal point from a fixed-point ASCII number.
+// Mirrors `sed -E 's/\.?0+$//'` in feed's altitude_to_bare_metres byte
+// for byte: "120.0000000000" → "120", "121.9200000000" → "121.92",
+// "10.0" → "10", "10." → "10". Inputs without a decimal point pass
+// through unchanged.
+func trimAltitudeFraction(s string) string {
+	if !strings.ContainsRune(s, '.') {
+		return s
+	}
+	s = strings.TrimRight(s, "0")
+	s = strings.TrimRight(s, ".")
+	return s
+}
+
+// AltitudeToBareMetres parses a suffix-tolerant altitude string and
+// returns its bare-metres canonical form alongside an ok flag.
+//
+//	""        → ("", true)        tombstone passthrough
+//	"<n>"     → ("<n>", true)     already bare metres
+//	"<n>m"    → ("<n>", true)     strip metre suffix
+//	"<n>ft"   → ("<n>×0.3048", true) convert feet to metres
+//
+// Range-gates the POST-CONVERSION metres value against [-1000, 10000];
+// out-of-range or regex-mismatched inputs return ("", false).
+//
+// Output format is fixed-point — never scientific notation — with ten
+// fractional digits before trimming trailing zeros and a bare decimal
+// point. Mirrors feed/scripts/lib/configure-validators.sh's
+// altitude_to_bare_metres byte-for-byte; the shared fixture at
+// internal/feedmeta/testdata/altitude-canonicalization.json (vendored
+// from feed) pins the exact expected outputs.
+//
+// Used by:
+//   - canonicalizeForCompare so BuildApplyPayload sees feed's storage
+//     view of the value when deciding "did this change?"
+//   - internal/devfakes ApplyFeedEnv to mirror feed's apply-layer
+//     canonicalization in the dev-server.
+func AltitudeToBareMetres(value string) (string, bool) {
+	if value == "" {
+		return "", true
+	}
+	m := altitudeShapeRE.FindStringSubmatch(value)
+	if m == nil {
+		return "", false
+	}
+	num, err := strconv.ParseFloat(m[1], 64)
+	if err != nil {
+		return "", false
+	}
+	metres := num
+	if m[2] == "ft" {
+		metres = num * 0.3048
+	}
+	if metres < -1000 || metres > 10000 {
+		return "", false
+	}
+	formatted := trimAltitudeFraction(strconv.FormatFloat(metres, 'f', 10, 64))
+	return formatted, true
+}
+
 // canonicalizeForCompare returns a value normalised to the form the
 // apply library would store on disk after its own canonicalization, so
 // the "is this an actual value change" decision in BuildApplyPayload
 // matches apply's view rather than raw-byte equality.
 //
-// Today only ALTITUDE needs canonicalization: apply appends a default
-// `m` suffix when none of `m`/`ft` is present (mirrors
-// _apl_feed_apply_canonicalize_altitude in
-// feed/scripts/lib/feed-env-apply.sh). Without this, a user typing
-// `120` while disk holds `120m` would produce a byte-different but
-// canonically-equal pair; Go would then send object metadata, apply
-// would canonicalize to a no-value-change, and the sidecar's edited_at
-// would still get bumped because explicit metadata is load-bearing.
+// For ALTITUDE this delegates to AltitudeToBareMetres so that a user
+// typing `400ft` while disk holds `121.92` (the bare-metres value feed
+// canonicalises both to) compares equal — Go must not send object
+// metadata for a value the apply layer would treat as no-change.
+//
+// On parse failure (out-of-range, regex mismatch) we return the
+// original value so the validator catches it on the apply round trip
+// rather than papering over the error with a synthetic "no change".
 //
 // Other tracked keys (LATITUDE/LONGITUDE/MLAT_*) are byte-equal under
 // apply's storage rules, so this helper is a no-op for them.
 func canonicalizeForCompare(key, value string) string {
 	switch key {
 	case "ALTITUDE":
-		if value == "" {
+		out, ok := AltitudeToBareMetres(value)
+		if !ok {
 			return value
 		}
-		if strings.HasSuffix(value, "m") || strings.HasSuffix(value, "ft") {
-			return value
-		}
-		return value + "m"
+		return out
 	default:
 		return value
 	}
