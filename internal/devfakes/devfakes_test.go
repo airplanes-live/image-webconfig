@@ -261,6 +261,100 @@ func TestApplyFeed_AltitudeFixtureParity(t *testing.T) {
 	}
 }
 
+// TestApplyFeed_StrictFieldValidation exercises the devfake's server-parity
+// validators for MLAT_USER, GAIN, DUMP978_SDR_SERIAL, and DUMP978_GAIN.
+// Each rule mirrors feed/scripts/lib/configure-validators.sh; this test
+// is the local guard against the devfake quietly accepting input the
+// real apl-feed would reject.
+func TestApplyFeed_StrictFieldValidation(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name   string
+		key    string
+		value  string
+		reject bool
+	}{
+		// MLAT_USER: empty OK, else [A-Za-z0-9_-]{1,64}.
+		{"mlat empty ok", "MLAT_USER", "", false},
+		{"mlat alpha ok", "MLAT_USER", "alice", false},
+		{"mlat mixed ok", "MLAT_USER", "ALice_99-x", false},
+		{"mlat with bang", "MLAT_USER", "alice!", true},
+		{"mlat with space", "MLAT_USER", "alice bob", true},
+		{"mlat too long", "MLAT_USER", strings.Repeat("a", 65), true},
+		{"mlat exactly 64", "MLAT_USER", strings.Repeat("a", 64), false},
+		// GAIN: auto/min/max or numeric in [0, 60].
+		{"gain auto", "GAIN", "auto", false},
+		{"gain min", "GAIN", "min", false},
+		{"gain max", "GAIN", "max", false},
+		{"gain zero", "GAIN", "0", false},
+		{"gain sixty", "GAIN", "60", false},
+		{"gain decimal", "GAIN", "30.5", false},
+		{"gain over", "GAIN", "61", true},
+		{"gain negative", "GAIN", "-1", true},
+		{"gain scientific", "GAIN", "1e1", true},
+		{"gain empty", "GAIN", "", true},
+		{"gain hex", "GAIN", "0x10", true},
+		{"gain leading dot", "GAIN", ".5", true},
+		// DUMP978_SDR_SERIAL: empty OK, else [0-9A-Za-z_-]{1,32}.
+		{"dump978 serial empty ok", "DUMP978_SDR_SERIAL", "", false},
+		{"dump978 serial num ok", "DUMP978_SDR_SERIAL", "978", false},
+		{"dump978 serial mixed ok", "DUMP978_SDR_SERIAL", "abc-def_123", false},
+		{"dump978 serial bang", "DUMP978_SDR_SERIAL", "abc!", true},
+		{"dump978 serial too long", "DUMP978_SDR_SERIAL", strings.Repeat("a", 33), true},
+		// DUMP978_GAIN: numeric in [0, 60], no auto/min/max.
+		{"dump978 gain default", "DUMP978_GAIN", "42.1", false},
+		{"dump978 gain zero", "DUMP978_GAIN", "0", false},
+		{"dump978 gain sixty", "DUMP978_GAIN", "60", false},
+		{"dump978 gain auto", "DUMP978_GAIN", "auto", true},
+		{"dump978 gain over", "DUMP978_GAIN", "61", true},
+		{"dump978 gain empty", "DUMP978_GAIN", "", true},
+	}
+	priv := StubPrivilegedArgv()
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			s := mustNewState(t)
+			before := s.FeedEnvSnapshot()[tc.key]
+			runner := StdinRunner(s, priv)
+			body, _ := json.Marshal(map[string]any{
+				"updates": map[string]any{tc.key: tc.value},
+			})
+			res, err := runner(context.Background(), priv.ApplyFeed, bytes.NewReader(body))
+			if err != nil {
+				t.Fatalf("runner: %v", err)
+			}
+			var env struct {
+				Status string            `json:"status"`
+				Errors map[string]string `json:"errors"`
+			}
+			if jerr := json.Unmarshal(res.Stdout, &env); jerr != nil {
+				t.Fatalf("envelope decode: %v (body=%q)", jerr, res.Stdout)
+			}
+			after := s.FeedEnvSnapshot()[tc.key]
+			if tc.reject {
+				if env.Status != "rejected" {
+					t.Errorf("status=%q, want rejected (body=%q)", env.Status, res.Stdout)
+				}
+				if env.Errors[tc.key] == "" {
+					t.Errorf("rejected envelope missing per-key error for %s (body=%q)", tc.key, res.Stdout)
+				}
+				if after != before {
+					t.Errorf("%s on disk = %q after rejection, want unchanged %q", tc.key, after, before)
+				}
+				return
+			}
+			if env.Status != "applied" {
+				t.Errorf("status=%q, want applied (body=%q)", env.Status, res.Stdout)
+			}
+			if after != tc.value {
+				t.Errorf("%s on disk = %q after apply(%q), want %q",
+					tc.key, after, tc.value, tc.value)
+			}
+		})
+	}
+}
+
 func TestApplyFeed_WritesAreVisibleToFeedenvReader(t *testing.T) {
 	t.Parallel()
 	s := mustNewState(t)

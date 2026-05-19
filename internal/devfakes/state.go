@@ -139,7 +139,7 @@ func NewState(p Paths) *State {
 			"GAIN":                  "auto",
 			"UAT_INPUT":             "",
 			"DUMP978_SDR_SERIAL":    "",
-			"DUMP978_GAIN":          "auto",
+			"DUMP978_GAIN":          "42.1",
 		},
 		networks: []WifiNetwork{
 			{

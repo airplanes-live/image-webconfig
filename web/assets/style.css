@@ -1217,3 +1217,15 @@ textarea:focus {
     backdrop-filter: none;
   }
 }
+
+/* ========== Inline field-level error ========== */
+
+.wc-field-error {
+  color: var(--wc-danger);
+  font-size: 0.8rem;
+  margin: 0.25rem 0 0;
+}
+.wc-field-error[hidden] { display: none; }
+input[aria-invalid="true"] {
+  border-color: var(--wc-danger);
+}
