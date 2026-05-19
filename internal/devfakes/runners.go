@@ -8,6 +8,8 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
@@ -15,6 +17,46 @@ import (
 	"github.com/airplanes-live/image-webconfig/internal/feedmeta"
 	"github.com/airplanes-live/image-webconfig/internal/server"
 )
+
+// Devfake server-parity validators. Mirror feed/scripts/lib/configure-validators.sh
+// rules so manual testing through cmd/devserver matches what production
+// apl-feed accepts. Drift between these regexes and feed's bash twins
+// surfaces as "client thinks input is fine but real Pi 400s" in the
+// field — keep them aligned.
+var (
+	mlatUserRE       = regexp.MustCompile(`^[A-Za-z0-9_-]{1,64}$`)
+	gainNumericRE    = regexp.MustCompile(`^-?[0-9]+(?:\.[0-9]+)?$`)
+	dump978SerialRE  = regexp.MustCompile(`^[0-9A-Za-z_-]{1,32}$`)
+)
+
+// validateGainValue mirrors valid_gain: auto/min/max OR numeric in [0, 60].
+// Returns "" on success, the user-facing error message on failure.
+func validateGainValue(v string) string {
+	if v == "auto" || v == "min" || v == "max" {
+		return ""
+	}
+	if !gainNumericRE.MatchString(v) {
+		return "must be in [0, 60] or one of auto/min/max"
+	}
+	n, err := strconv.ParseFloat(v, 64)
+	if err != nil || n < 0 || n > 60 {
+		return "must be in [0, 60] or one of auto/min/max"
+	}
+	return ""
+}
+
+// validateDump978GainValue mirrors valid_dump978_gain: numeric in [0, 60].
+// dump978-fa rejects auto/min/max so we do too. Returns "" on success.
+func validateDump978GainValue(v string) string {
+	if !gainNumericRE.MatchString(v) {
+		return "must be a number in [0, 60]"
+	}
+	n, err := strconv.ParseFloat(v, 64)
+	if err != nil || n < 0 || n > 60 {
+		return "must be a number in [0, 60]"
+	}
+	return ""
+}
 
 // StubPrivilegedArgv returns a PrivilegedArgv that the fake runners
 // can dispatch on without colliding with anything a developer might
@@ -230,23 +272,46 @@ func applyFeed(state *State, body []byte) (wexec.Result, error) {
 		}
 		updates[k] = s
 	}
-	// Mirror feed's apply-layer validator: ALTITUDE that fails the
-	// suffix-tolerant regex or the post-conversion metres range is
-	// rejected before any disk mutation. Production feed returns a
-	// `rejected` envelope with a per-key error; the dev-fake does
-	// the same so the SPA's rejected-envelope branch is exercised
-	// against bad altitude input.
+	// Mirror feed's apply-layer validator: invalid input gets rejected
+	// before any disk mutation. Production apl-feed accumulates per-key
+	// errors and returns a `rejected` envelope; we do the same so the
+	// SPA's rejected-envelope branch sees the same shape in dev as in
+	// production. Each key here mirrors the rule from
+	// feed/scripts/lib/configure-validators.sh — keep the messages
+	// aligned with feed/scripts/lib/feed-env-apply.sh's wording.
+	rejectErrors := map[string]string{}
 	if alt, present := updates["ALTITUDE"]; present {
 		if _, ok := feedmeta.AltitudeToBareMetres(alt); !ok {
-			env := map[string]any{
-				"status": "rejected",
-				"errors": map[string]string{
-					"ALTITUDE": "must parse as a metric or imperial altitude in [-1000, 10000] metres (e.g. 120m, 400ft, 0)",
-				},
-			}
-			b, _ := json.Marshal(env)
-			return wexec.Result{Stdout: b}, nil
+			rejectErrors["ALTITUDE"] = "must parse as a metric or imperial altitude in [-1000, 10000] metres (e.g. 120m, 400ft, 0)"
 		}
+	}
+	if u, present := updates["MLAT_USER"]; present && u != "" {
+		if !mlatUserRE.MatchString(u) {
+			rejectErrors["MLAT_USER"] = "must match [A-Za-z0-9_-]{1,64} or be empty"
+		}
+	}
+	if g, present := updates["GAIN"]; present {
+		if msg := validateGainValue(g); msg != "" {
+			rejectErrors["GAIN"] = msg
+		}
+	}
+	if s, present := updates["DUMP978_SDR_SERIAL"]; present && s != "" {
+		if !dump978SerialRE.MatchString(s) {
+			rejectErrors["DUMP978_SDR_SERIAL"] = "must match [0-9A-Za-z_-]{1,32} or be empty"
+		}
+	}
+	if g, present := updates["DUMP978_GAIN"]; present {
+		if msg := validateDump978GainValue(g); msg != "" {
+			rejectErrors["DUMP978_GAIN"] = msg
+		}
+	}
+	if len(rejectErrors) > 0 {
+		env := map[string]any{
+			"status": "rejected",
+			"errors": rejectErrors,
+		}
+		b, _ := json.Marshal(env)
+		return wexec.Result{Stdout: b}, nil
 	}
 	changed, err := state.ApplyFeedEnv(updates)
 	if err != nil {

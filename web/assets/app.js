@@ -534,6 +534,53 @@
         return frac.length >= LATLON_MIN_DECIMALS;
     }
 
+    // Shared numeric shape used by gain validators. Mirrors bash regex
+    // `^-?[0-9]+([.][0-9]+)?$` — rejects scientific notation (`1e1`),
+    // leading-dot (`.5`), trailing-dot (`1.`), explicit-plus (`+1`),
+    // and hex (`0x10`), all of which would round-trip via Number() but
+    // would be rejected server-side.
+    const gainNumericRE = /^-?[0-9]+(?:\.[0-9]+)?$/;
+
+    // isValidMlatUser mirrors feed/scripts/lib/configure-validators.sh:valid_mlat_user_strict
+    // (regex ^[A-Za-z0-9_-]{1,64}$) and feed/scripts/apl-feed/mlat.sh's
+    // _MLAT_USER_RE. Empty is valid: apl-feed accepts empty MLAT_USER and the
+    // daemon falls back to "Anonymous-<short-feeder-id>" when MLAT is enabled.
+    const mlatUserRE = /^[A-Za-z0-9_-]{1,64}$/;
+    function isValidMlatUser(v) {
+        const s = (v == null ? "" : String(v)).trim();
+        if (s === "") return true;
+        return mlatUserRE.test(s);
+    }
+
+    // isValidGain mirrors feed/scripts/lib/configure-validators.sh:valid_gain.
+    // Accepts auto|min|max, or a finite number in [0, 60]. Empty is NOT valid.
+    function isValidGain(v) {
+        const s = (v == null ? "" : String(v)).trim();
+        if (s === "auto" || s === "min" || s === "max") return true;
+        if (!gainNumericRE.test(s)) return false;
+        const n = Number(s);
+        return Number.isFinite(n) && n >= 0 && n <= 60;
+    }
+
+    // isValidDump978Serial mirrors valid_dump978_serial. Empty is valid
+    // (treated as "no SDR serial selected").
+    const dump978SerialRE = /^[0-9A-Za-z_-]{1,32}$/;
+    function isValidDump978Serial(v) {
+        const s = (v == null ? "" : String(v)).trim();
+        if (s === "") return true;
+        return dump978SerialRE.test(s);
+    }
+
+    // isValidDump978Gain mirrors valid_dump978_gain. dump978-fa rejects
+    // auto/min/max (unlike readsb), so this validator does too. Empty is
+    // NOT valid.
+    function isValidDump978Gain(v) {
+        const s = (v == null ? "" : String(v)).trim();
+        if (!gainNumericRE.test(s)) return false;
+        const n = Number(s);
+        return Number.isFinite(n) && n >= 0 && n <= 60;
+    }
+
     // previewLatLonSet — projection of unsaved form values onto the
     // daemon's "would MLAT be enabled?" rule. Used ONLY for the form-time
     // preview path and for the legacy fallback in classifyService when
@@ -1463,6 +1510,15 @@
             const state = configState;
             if (state.inFlight) return;
             if (!isDirty()) return; // defensive: button shouldn't show
+            // Defensive validity gate: Enter-key / programmatic submits
+            // can bypass a disabled button. Re-check isValid() and bail
+            // if the input is bad; recheck() resyncs the button state
+            // so the user sees the disabled Save instead of a phantom
+            // "Saving…" that never lands.
+            if (isValid && !isValid()) {
+                recheck();
+                return;
+            }
             err.textContent = "";
             pending.hidden = true;
             pending.textContent = "";
@@ -1605,6 +1661,21 @@
                 form,
             );
             return { fieldset, body, footer, form };
+        };
+
+        // refreshFieldError toggles a `<p class="wc-field-error">` element +
+        // input[aria-invalid] based on the supplied predicate. Centralises
+        // the decoration so every recheck path (input events, Cancel reset,
+        // save hook, group visibility toggle) keeps the error UI consistent
+        // with the actual Save gate. Caller controls empty-handling semantics
+        // via shouldShowError — empty MLAT_USER/DUMP978_SDR_SERIAL is valid
+        // (predicate returns false on empty); empty GAIN/DUMP978_GAIN is
+        // invalid (predicate returns true on empty).
+        const refreshFieldError = (inputEl, errorEl, shouldShowError) => {
+            const invalid = shouldShowError(inputEl.value);
+            errorEl.hidden = !invalid;
+            if (invalid) inputEl.setAttribute("aria-invalid", "true");
+            else inputEl.removeAttribute("aria-invalid");
         };
 
         // buildEditableField wraps a per-group set of inputs in a
@@ -1904,11 +1975,22 @@
         mlatGateMsg.appendChild(setLocationLink);
         mlatGateMsg.hidden = true;
 
-        const mlatUserEditor = el("div", {}, mlatUserInput);
+        const mlatUserError = el("p", {
+            class: "field-help wc-field-error", hidden: true, role: "alert",
+        }, "Letters, digits, underscore, hyphen — up to 64 characters.");
+        const mlatUserShouldShowError = (v) =>
+            (v || "").trim() !== "" && !isValidMlatUser(v);
+        mlatUserInput.addEventListener("input", () =>
+            refreshFieldError(mlatUserInput, mlatUserError, mlatUserShouldShowError));
+
+        const mlatUserEditor = el("div", {}, mlatUserInput, mlatUserError);
         const mlatUserEdit = buildEditableField({
             summarise: () => configState.savedValues.MLAT_USER || "",
             inputsWrapper: mlatUserEditor,
-            resetInputs: () => { mlatUserInput.value = configState.savedValues.MLAT_USER || ""; },
+            resetInputs: () => {
+                mlatUserInput.value = configState.savedValues.MLAT_USER || "";
+                refreshFieldError(mlatUserInput, mlatUserError, mlatUserShouldShowError);
+            },
             focusInput: mlatUserInput,
             footerEl: mlatG.footer,
             afterCancel: () => { mlatGroup.recheck(); },
@@ -1942,10 +2024,16 @@
             // bad on-disk geo).
             mlatGateMsg.hidden = !(mlatInput.checked && !geoOk);
             // Re-collapse the MLAT name editor whenever the gate closes
-            // so the next reveal starts from a known read-only state
-            // (also drops any half-typed value into the discard path
-            // via the readInputs/payload hidden-skip).
-            if (!visible) mlatUserEdit.setEditing(false);
+            // so the next reveal starts from a known read-only state.
+            // Also reset the input to its saved value and clear any
+            // stale error display — a half-typed invalid value left
+            // here would otherwise be hidden but still block Save when
+            // the gate later re-opens.
+            if (!visible) {
+                mlatUserEdit.setEditing(false);
+                mlatUserInput.value = configState.savedValues.MLAT_USER || "";
+                refreshFieldError(mlatUserInput, mlatUserError, mlatUserShouldShowError);
+            }
         };
         mlatInput.addEventListener("change", updateMlatVisibility);
         updateMlatVisibility();
@@ -1971,7 +2059,9 @@
             },
             isValid: () => {
                 if (!mlatInput.checked) return true;
-                return locationSaved(configState.savedValues);
+                if (!locationSaved(configState.savedValues)) return false;
+                if (!mlatSubFields.hidden && !isValidMlatUser(mlatUserInput.value)) return false;
+                return true;
             },
             payload: () => {
                 const out = {};
@@ -1993,6 +2083,7 @@
                 // Rebase the input to the canonical saved value (apl-feed
                 // trims) so a "bob " save isn't stuck dirty against "bob".
                 mlatUserInput.value = configState.savedValues.MLAT_USER || "";
+                refreshFieldError(mlatUserInput, mlatUserError, mlatUserShouldShowError);
                 mlatUserEdit.refreshSummary();
                 mlatUserEdit.setEditing(false);
                 mlatGroup.recheck();
@@ -2023,11 +2114,21 @@
             }, "wiedehopf's gain guide"),
             ".",
         ));
-        const gainEditor = el("div", {}, gainInput);
+        const gainError = el("p", {
+            class: "field-help wc-field-error", hidden: true, role: "alert",
+        }, "auto, min, max, or a number between 0 and 60.");
+        const gainShouldShowError = (v) => !isValidGain(v);
+        gainInput.addEventListener("input", () =>
+            refreshFieldError(gainInput, gainError, gainShouldShowError));
+
+        const gainEditor = el("div", {}, gainInput, gainError);
         const gainEdit = buildEditableField({
             summarise: () => configState.savedValues.GAIN || "auto",
             inputsWrapper: gainEditor,
-            resetInputs: () => { gainInput.value = configState.savedValues.GAIN || ""; },
+            resetInputs: () => {
+                gainInput.value = configState.savedValues.GAIN || "";
+                refreshFieldError(gainInput, gainError, gainShouldShowError);
+            },
             focusInput: gainInput,
             footerEl: gainG.footer,
             afterCancel: () => { gainGroup.recheck(); },
@@ -2043,10 +2144,11 @@
             footerEl: gainG.footer,
             keys: ["GAIN"],
             readInputs: () => ({ GAIN: gainInput.value }),
-            isValid: () => true,
+            isValid: () => isValidGain(gainInput.value),
             payload: () => ({ GAIN: gainInput.value.trim() }),
             onSavedHook: () => {
                 gainInput.value = configState.savedValues.GAIN || "";
+                refreshFieldError(gainInput, gainError, gainShouldShowError);
                 gainEdit.refreshSummary();
                 gainEdit.setEditing(false);
                 gainGroup.recheck();
@@ -2074,14 +2176,38 @@
             placeholder: "42.1", inputmode: "decimal",
         });
 
+        const sdrSerialError = el("p", {
+            class: "field-help wc-field-error", hidden: true, role: "alert",
+        }, "Letters, digits, underscore, hyphen — up to 32 characters.");
+        const sdrSerialShouldShowError = (v) =>
+            (v || "").trim() !== "" && !isValidDump978Serial(v);
+        sdrSerialInput.addEventListener("input", () =>
+            refreshFieldError(sdrSerialInput, sdrSerialError, sdrSerialShouldShowError));
+
+        const dump978GainError = el("p", {
+            class: "field-help wc-field-error", hidden: true, role: "alert",
+        }, "A number between 0 and 60.");
+        const dump978GainShouldShowError = (v) => !isValidDump978Gain(v);
+        dump978GainInput.addEventListener("input", () =>
+            refreshFieldError(dump978GainInput, dump978GainError, dump978GainShouldShowError));
+
+        const resetUatInputs = () => {
+            sdrSerialInput.value = configState.savedValues.DUMP978_SDR_SERIAL || "978";
+            dump978GainInput.value = configState.savedValues.DUMP978_GAIN || "42.1";
+            refreshFieldError(sdrSerialInput, sdrSerialError, sdrSerialShouldShowError);
+            refreshFieldError(dump978GainInput, dump978GainError, dump978GainShouldShowError);
+        };
+
         const uatEditor = el("div", {},
             el("div", { class: "field" },
                 el("label", { for: sdrSerialId }, "978 SDR serial"),
                 sdrSerialInput,
+                sdrSerialError,
             ),
             el("div", { class: "field" },
                 el("label", { for: dump978GainId }, "978 gain"),
                 dump978GainInput,
+                dump978GainError,
             ),
         );
         const uatEdit = buildEditableField({
@@ -2091,10 +2217,7 @@
                 return "serial " + ser + " · gain " + g;
             },
             inputsWrapper: uatEditor,
-            resetInputs: () => {
-                sdrSerialInput.value = configState.savedValues.DUMP978_SDR_SERIAL || "978";
-                dump978GainInput.value = configState.savedValues.DUMP978_GAIN || "42.1";
-            },
+            resetInputs: resetUatInputs,
             focusInput: sdrSerialInput,
             footerEl: uatG.footer,
             afterCancel: () => { uatGroup.recheck(); },
@@ -2107,7 +2230,13 @@
         uatSub.hidden = !uatInput.checked;
         uatInput.addEventListener("change", () => {
             uatSub.hidden = !uatInput.checked;
-            if (!uatInput.checked) uatEdit.setEditing(false);
+            if (!uatInput.checked) {
+                uatEdit.setEditing(false);
+                // Reset stale inputs + clear any error display so a
+                // half-typed invalid value left behind doesn't lurk as
+                // a hidden dirty value when UAT is re-enabled.
+                resetUatInputs();
+            }
         });
 
         uatG.body.appendChild(el("div", { class: "field" },
@@ -2135,7 +2264,11 @@
                 }
                 return out;
             },
-            isValid: () => true,
+            isValid: () => {
+                if (!uatInput.checked) return true;
+                return isValidDump978Serial(sdrSerialInput.value)
+                    && isValidDump978Gain(dump978GainInput.value);
+            },
             payload: () => {
                 const out = {};
                 const want = uatInput.checked ? "127.0.0.1:30978" : "";
@@ -2155,6 +2288,8 @@
             onSavedHook: () => {
                 sdrSerialInput.value = configState.savedValues.DUMP978_SDR_SERIAL || "978";
                 dump978GainInput.value = configState.savedValues.DUMP978_GAIN || "42.1";
+                refreshFieldError(sdrSerialInput, sdrSerialError, sdrSerialShouldShowError);
+                refreshFieldError(dump978GainInput, dump978GainError, dump978GainShouldShowError);
                 uatEdit.refreshSummary();
                 uatEdit.setEditing(false);
                 uatGroup.recheck();
