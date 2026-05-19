@@ -200,8 +200,20 @@
 
     function buildFlashNode(flash) {
         if (!flash || !flash.text) return null;
-        const cls = flash.level === "warn" ? "wc-flash wc-flash--warn" : "wc-flash";
-        return el("div", { class: cls, role: "status", "aria-live": "polite" }, flash.text);
+        let cls = "wc-flash";
+        if (flash.level === "warn") cls += " wc-flash--warn";
+        else if (flash.level === "ok") cls += " wc-flash--ok";
+        const node = el("div", { class: cls, role: "status", "aria-live": "polite" },
+            el("span", {}, flash.text));
+        const dismiss = el("button", {
+            type: "button",
+            class: "wc-flash__dismiss",
+            "aria-label": "Dismiss",
+            title: "Dismiss",
+        }, "×");
+        dismiss.onclick = () => node.remove();
+        node.appendChild(dismiss);
+        return node;
     }
 
     function navigate(panelFn, opts) {
@@ -1113,6 +1125,13 @@
         const id = resp.payload || {};
         if (!id.feeder_id) {
             parent.appendChild(el("p", { class: "muted" }, "Feeder ID will be assigned on first run."));
+            // Allow restore from a backup before first-run assigns a
+            // UUID: a freshly-flashed replacement device with a saved
+            // backup file should be able to recover its identity here.
+            parent.appendChild(el("div", { class: "wc-action-grid" },
+                buildImportIdentityNavBtn(null),
+                el("span", { class: "wc-action-grid__spacer", "aria-hidden": "true" }),
+            ));
             return;
         }
         parent.appendChild(el("p", {}, el("strong", {}, "Feeder ID: "), id.feeder_id));
@@ -1121,8 +1140,6 @@
             type: "button",
             onclick: () => navigate(() => claimActivityPanel(), { title: "Claim activity", showBack: true }),
         }, "Claim activity");
-
-        const importControl = buildIdentityImportControl();
 
         if (!id.claim_secret_present) {
             parent.appendChild(el("p", { class: "muted" },
@@ -1149,10 +1166,10 @@
             // secret-present view).
             parent.appendChild(el("div", { class: "wc-action-grid" },
                 registerBtn, claimLog,
-                importControl.btn, el("span", { class: "wc-action-grid__spacer", "aria-hidden": "true" }),
+                buildImportIdentityNavBtn(id.feeder_id),
+                el("span", { class: "wc-action-grid__spacer", "aria-hidden": "true" }),
             ));
             parent.appendChild(registerErr);
-            parent.appendChild(importControl.form);
             return;
         }
 
@@ -1231,122 +1248,297 @@
         // Row 2: Export identity + Import identity.
         parent.appendChild(el("div", { class: "wc-action-grid" },
             reveal, claimLog,
-            exportBtn, importControl.btn,
+            exportBtn, buildImportIdentityNavBtn(id.feeder_id),
         ));
-        parent.appendChild(importControl.form);
     }
 
-    // buildIdentityImportControl returns the Import button + its
-    // collapsed form panel as two separate nodes, so the caller can
-    // place the button inside an action grid and drop the form below.
-    // Clicking the button toggles the form; submitting POSTs the
-    // canonical { schema_version, feeder_uuid, claim:{secret, version} }
-    // envelope to /api/identity/import (apl-feed restore via wrapper).
-    function buildIdentityImportControl() {
-        const importBtn = el("button", {
+    // feederUUIDRE mirrors isCanonicalUUID in
+    // internal/server/handlers.go: 8-4-4-4-12 lowercase hex. The server
+    // rejects uppercase, so the UUID input lowercases on every keystroke
+    // (matches apl-feed's canonicalize_uuid) and the payload is always
+    // normalized before send.
+    const feederUUIDRE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+
+    // claimSecretStripRE mirrors isCanonicalClaimSecret in
+    // internal/server/handlers.go — strip hyphen, ASCII space, tab, LF,
+    // CR. Deliberately NOT JS \s: \s also matches NBSP, form-feed,
+    // vertical-tab, and U+2028 / U+2029 which the Go validator does NOT
+    // strip, so using \s would let invalid input pass client-side and
+    // fail server-side with the button green.
+    const claimSecretStripRE = /[- \t\n\r]/g;
+
+    function normalizedFeederUUID(v) {
+        return String(v == null ? "" : v).trim().toLowerCase();
+    }
+    function isCanonicalFeederUUID(v) {
+        return feederUUIDRE.test(normalizedFeederUUID(v));
+    }
+    function isCanonicalClaimSecret(v) {
+        const s = String(v == null ? "" : v).replace(claimSecretStripRE, "");
+        return s.length === 16 && /^[A-Za-z0-9]+$/.test(s);
+    }
+
+    // buildImportIdentityNavBtn returns the ghost button shown in the
+    // identity card that navigates to the dedicated import sub-page.
+    // currentFeederId is forwarded so the panel can show what's about to
+    // be replaced; pass null in the "no identity yet" branch.
+    function buildImportIdentityNavBtn(currentFeederId) {
+        return el("button", {
             class: "wc-btn-ghost",
             type: "button",
+            onclick: () => navigate(
+                () => importIdentityPanel(currentFeederId),
+                { title: "Import identity", showBack: true },
+            ),
         }, "Import identity");
+    }
 
-        const form = el("div", { class: "identity-import" });
-        form.hidden = true;
+    // Maximum size for an uploaded backup file. apl-feed's export
+    // envelope is well under 1 KiB; 8 KiB is comfortable headroom for
+    // any reasonable JSON formatting / future sidecar fields without
+    // handing the FileReader a multi-megabyte file by accident.
+    const IDENTITY_BACKUP_MAX_BYTES = 8192;
 
-        const pasteTa = el("textarea", {
-            rows: "4",
-            placeholder: "Paste exported JSON, or fill in the fields below",
-            class: "identity-import__paste",
+    // validateBackupEnvelope checks an uploaded JSON value against the
+    // apl-feed backup envelope shape AND the per-field validators the
+    // server applies. Returns { error } or normalized fields ready to
+    // drop into the form inputs. Permissive on unknown keys so a future
+    // export adding a sidecar field doesn't break today's UI.
+    function validateBackupEnvelope(obj) {
+        if (obj === null || typeof obj !== "object" || Array.isArray(obj)) {
+            return { error: "File doesn't contain a JSON object." };
+        }
+        if (obj.schema_version !== 1) {
+            return { error: "Unsupported backup schema (expected schema_version 1)." };
+        }
+        if (typeof obj.feeder_uuid !== "string") {
+            return { error: "Backup is missing feeder_uuid." };
+        }
+        if (obj.claim === null || typeof obj.claim !== "object" || Array.isArray(obj.claim)) {
+            return { error: "Backup is missing claim." };
+        }
+        if (typeof obj.claim.secret !== "string") {
+            return { error: "Backup is missing claim.secret." };
+        }
+        const feederUUID = normalizedFeederUUID(obj.feeder_uuid);
+        if (!isCanonicalFeederUUID(feederUUID)) {
+            return { error: "Backup feeder_uuid is not a valid feeder ID." };
+        }
+        if (!isCanonicalClaimSecret(obj.claim.secret)) {
+            return { error: "Backup claim.secret is not a valid claim secret." };
+        }
+        let claimVersion = null;
+        if (obj.claim.version !== undefined && obj.claim.version !== null) {
+            if (!Number.isSafeInteger(obj.claim.version)) {
+                return { error: "Backup claim.version is not an integer." };
+            }
+            claimVersion = obj.claim.version;
+        }
+        return { feederUUID: feederUUID, claimSecret: obj.claim.secret, claimVersion: claimVersion };
+    }
+
+    // importIdentityPanel: full-page identity restore. Accepts an
+    // uploaded backup JSON file (apl-feed backup export shape) OR direct
+    // UUID + claim-secret input; runs the same validators the Go side
+    // enforces in /api/identity/import before allowing submit, and
+    // POSTs the canonical envelope.
+    //
+    // currentFeederId is the feeder_id currently on disk (or null when
+    // no identity exists yet) — used in the page banner and the confirm
+    // dialog so the user sees what they're about to replace.
+    function importIdentityPanel(currentFeederId) {
+        const err = errorEl();
+        const fileInput = el("input", {
+            id: "import-identity-file",
+            type: "file", accept: ".json,application/json", autocomplete: "off",
         });
+        const fileStatus = el("p", { class: "muted" });
         const uuidIn = el("input", {
+            id: "import-identity-uuid",
             type: "text",
             autocomplete: "off",
+            autocapitalize: "none",
+            autocorrect: "off",
+            spellcheck: "false",
+            // Soft guard, not a hard limit: the canonical UUID is 36
+            // chars but pasted clipboard text can have leading or
+            // trailing whitespace/newlines. The input event handler
+            // trims those before validating; the validator regex is
+            // the authoritative length gate.
+            maxlength: "64",
             placeholder: "11111111-2222-3333-4444-555555555555",
         });
         const secretIn = el("input", {
+            id: "import-identity-secret",
             type: "text",
             autocomplete: "off",
+            autocapitalize: "characters",
+            autocorrect: "off",
+            spellcheck: "false",
+            maxlength: "32",
             placeholder: "ABCD-EFGH-IJKL-MNOP",
         });
-        const inlineErr = el("p", { class: "error", role: "alert" });
-        const submit = el("button", { class: "wc-btn-primary", type: "submit" }, "Import");
-        const cancel = el("button", { class: "wc-btn-ghost", type: "button" }, "Cancel");
+        const submit = el("button", { type: "submit", class: "wc-btn-primary", disabled: true }, "Import");
+        const cancel = el("button", {
+            type: "button", class: "wc-btn-ghost",
+            onclick: () => navigateDashboard(),
+        }, "Cancel");
 
-        // Live-parse pasted JSON: if valid, populate the field inputs so
-        // the user sees what we'll send.
-        pasteTa.addEventListener("input", () => {
-            const t = pasteTa.value.trim();
-            if (t === "") return;
-            try {
-                const obj = JSON.parse(t);
-                if (obj && typeof obj.feeder_uuid === "string") uuidIn.value = obj.feeder_uuid;
-                if (obj && obj.claim && typeof obj.claim.secret === "string") secretIn.value = obj.claim.secret;
-            } catch (_) { /* invalid JSON yet — leave fields alone */ }
+        // storedVersion: the claim.version pulled from the most recent
+        // uploaded JSON, if any. Cleared on any manual edit of UUID /
+        // secret so we never submit fileA's version with fileB's (or
+        // hand-typed) credentials.
+        let storedVersion = null;
+        // busy gates submit during the POST so completion routes through
+        // updateSubmitState() rather than blindly re-enabling on now-
+        // invalid input.
+        let busy = false;
+
+        function updateSubmitState() {
+            submit.disabled = busy
+                || !isCanonicalFeederUUID(uuidIn.value)
+                || !isCanonicalClaimSecret(secretIn.value);
+        }
+
+        uuidIn.addEventListener("input", () => {
+            // Silent normalize on input: trim + lowercase, matching
+            // apl-feed's canonicalize_uuid. A clipboard paste often
+            // carries leading/trailing whitespace that would otherwise
+            // sit in the field invisibly and keep submit disabled with
+            // no obvious reason. Caret tracking is best-effort —
+            // clamping to the new length is correct for the typical
+            // paste-at-end case.
+            const before = uuidIn.value;
+            const after = before.trim().toLowerCase();
+            if (after !== before) {
+                const start = uuidIn.selectionStart;
+                const end = uuidIn.selectionEnd;
+                uuidIn.value = after;
+                const n = after.length;
+                try { uuidIn.setSelectionRange(Math.min(start, n), Math.min(end, n)); }
+                catch (_) { /* not focusable */ }
+            }
+            storedVersion = null;
+            updateSubmitState();
+        });
+        secretIn.addEventListener("input", () => {
+            storedVersion = null;
+            updateSubmitState();
         });
 
-        const formEl = el("form", {
-            class: "identity-import__form",
+        fileInput.addEventListener("change", () => {
+            // Capture the File reference, then clear the input so
+            // picking the same filename twice in a row still fires change.
+            const file = fileInput.files && fileInput.files[0];
+            fileInput.value = "";
+            if (!file) return;
+            err.textContent = "";
+            if (file.size === 0) {
+                fileStatus.textContent = "";
+                err.textContent = "Selected file is empty.";
+                return;
+            }
+            if (file.size > IDENTITY_BACKUP_MAX_BYTES) {
+                fileStatus.textContent = "";
+                err.textContent = "Identity backup files are under 1 KB; selected file is too large.";
+                return;
+            }
+            const reader = new FileReader();
+            reader.onerror = () => {
+                fileStatus.textContent = "";
+                err.textContent = "Could not read the selected file.";
+            };
+            reader.onabort = () => {
+                fileStatus.textContent = "";
+                err.textContent = "Reading the selected file was cancelled.";
+            };
+            reader.onload = () => {
+                const text = typeof reader.result === "string" ? reader.result : "";
+                let parsed;
+                try { parsed = JSON.parse(text); }
+                catch (_) {
+                    fileStatus.textContent = "";
+                    err.textContent = "Not a valid JSON file.";
+                    return;
+                }
+                const v = validateBackupEnvelope(parsed);
+                if (v.error) {
+                    fileStatus.textContent = "";
+                    err.textContent = v.error;
+                    return;
+                }
+                // Atomic prefill: only after every check passes. Manual
+                // .value writes don't fire input events, so call
+                // updateSubmitState() explicitly.
+                uuidIn.value = v.feederUUID;
+                secretIn.value = v.claimSecret;
+                storedVersion = v.claimVersion;
+                fileStatus.textContent = "Loaded from " + file.name;
+                updateSubmitState();
+            };
+            reader.readAsText(file);
+        });
+
+        const form = el("form", {
+            class: "wc-card",
             onsubmit: async (e) => {
                 e.preventDefault();
-                inlineErr.textContent = "";
-                const uuid = uuidIn.value.trim();
-                const secret = secretIn.value.trim();
-                if (!uuid || !secret) {
-                    inlineErr.textContent = "Feeder ID and claim secret are both required.";
+                err.textContent = "";
+                if (!isCanonicalFeederUUID(uuidIn.value)
+                    || !isCanonicalClaimSecret(secretIn.value)) {
+                    err.textContent = "Feeder ID and claim secret must be valid.";
                     return;
                 }
-                if (!confirm("Importing replaces this feeder's identity with the supplied UUID and claim secret. Continue?")) {
-                    return;
-                }
-                let versionFromPaste = null;
-                const paste = pasteTa.value.trim();
-                if (paste !== "") {
-                    try {
-                        const obj = JSON.parse(paste);
-                        if (obj && obj.claim && Number.isInteger(obj.claim.version)) {
-                            versionFromPaste = obj.claim.version;
-                        }
-                    } catch (_) { /* fall through — handler validates */ }
-                }
-                const body = {
-                    schema_version: 1,
-                    feeder_uuid: uuid,
-                    claim: { secret: secret, version: versionFromPaste },
-                };
-                submit.disabled = true;
+                const targetUUID = normalizedFeederUUID(uuidIn.value);
+                const currentLine = currentFeederId
+                    ? "Current feeder ID: " + currentFeederId + "\n"
+                    : "This feeder has no identity yet.\n";
+                const prompt = currentLine
+                    + "New feeder ID: " + targetUUID + "\n\n"
+                    + "Importing replaces this feeder's identity with the supplied "
+                    + "UUID and claim secret. Continue?";
+                if (!confirm(prompt)) return;
+                busy = true;
+                updateSubmitState();
                 cancel.disabled = true;
                 submit.textContent = "Importing…";
+                const body = {
+                    schema_version: 1,
+                    feeder_uuid: targetUUID,
+                    claim: { secret: secretIn.value, version: storedVersion },
+                };
                 const r = await postJSON("/api/identity/import", body);
-                submit.disabled = false;
+                busy = false;
                 cancel.disabled = false;
                 submit.textContent = "Import";
+                updateSubmitState();
                 if (handleAuthFailure(r)) return;
                 if (!r.ok) {
-                    inlineErr.textContent = (r.payload && r.payload.error) || "import failed";
+                    err.textContent = (r.payload && r.payload.error) || "import failed";
                     return;
                 }
-                navigateDashboard({ flash: { text: "Identity imported. Reloading…", level: "ok" } });
+                navigateDashboard({ flash: { text: "Identity imported.", level: "ok" } });
             },
         },
-            el("div", { class: "field" }, el("label", {}, "Paste exported JSON"), pasteTa),
-            el("div", { class: "field" }, el("label", {}, "Feeder ID"), uuidIn),
-            el("div", { class: "field" }, el("label", {}, "Claim secret"), secretIn),
-            inlineErr,
-            el("div", { class: "actions" }, submit, cancel),
+            el("h2", {}, "Import identity"),
+            el("p", {},
+                "Restore this feeder's identity from a JSON backup you exported earlier, "
+                + "or enter the feeder ID and claim secret by hand."),
+            currentFeederId
+                ? el("p", {}, el("strong", {}, "Current feeder ID: "), currentFeederId)
+                : el("p", { class: "muted" }, "This feeder has no identity yet."),
+            el("div", { class: "field" },
+                el("label", { for: "import-identity-file" }, "Identity backup (optional)"),
+                fileInput,
+                fileStatus,
+            ),
+            el("div", { class: "field" }, el("label", { for: "import-identity-uuid" }, "Feeder ID"), uuidIn),
+            el("div", { class: "field" }, el("label", { for: "import-identity-secret" }, "Claim secret"), secretIn),
+            el("div", { class: "actions" }, cancel, submit),
+            err,
         );
-
-        cancel.onclick = () => {
-            pasteTa.value = "";
-            uuidIn.value = "";
-            secretIn.value = "";
-            inlineErr.textContent = "";
-            form.hidden = true;
-        };
-        importBtn.onclick = () => {
-            form.hidden = !form.hidden;
-            if (!form.hidden) setTimeout(() => pasteTa.focus(), 0);
-        };
-
-        form.appendChild(formEl);
-        return { btn: importBtn, form };
+        render(form);
+        uuidIn.focus();
     }
 
     function identityChanged(prev, next) {

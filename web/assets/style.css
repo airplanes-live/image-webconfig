@@ -262,19 +262,26 @@ main {
    its row's natural y-origin. Vertical spacing comes from the grid gap
    or from explicit margin on the container. */
 
-/* Banner notifications. .wc-flash is the default neutral tone (used by
-   the pending-flash path after navigation); .wc-flash--warn paints a
-   warm-toned strip for actionable warnings like "reboot required". */
+/* Banner notifications. .wc-flash is the neutral baseline; .wc-flash--ok
+   paints a success-accent strip for completed-action confirmations;
+   .wc-flash--warn paints a warm-toned strip for actionable warnings
+   like "reboot required". Margin-bottom keeps the banner from touching
+   the first dashboard tile below it. */
 .wc-flash {
   display: flex;
   align-items: center;
   justify-content: space-between;
   gap: 0.75rem;
+  margin: 0 0 1rem;
   padding: 0.75rem 1rem;
   border-radius: var(--wc-radius);
   border: 1px solid var(--wc-line-soft);
   background: var(--wc-surface-2);
   color: var(--wc-ink-1);
+}
+.wc-flash--ok {
+  background: color-mix(in srgb, var(--wc-success) 18%, var(--wc-surface-1));
+  border-color: var(--wc-success);
 }
 .wc-flash--warn {
   background: color-mix(in srgb, var(--wc-warm) 18%, var(--wc-surface-1));
@@ -286,6 +293,21 @@ main {
   padding: 0.4rem 0.9rem;
   font-size: 0.9rem;
   flex: 0 0 auto;
+}
+.wc-flash__dismiss {
+  background: transparent;
+  border: 0;
+  color: inherit;
+  padding: 0.25rem 0.5rem;
+  min-height: 2rem;
+  font-size: 1.2rem;
+  line-height: 1;
+  cursor: pointer;
+  opacity: 0.7;
+}
+.wc-flash__dismiss:hover,
+.wc-flash__dismiss:focus-visible {
+  opacity: 1;
 }
 
 .wc-card h2,
@@ -1168,31 +1190,6 @@ textarea:focus {
   min-height: 0;
   font-size: 0.85rem;
 }
-
-/* ========== Identity import form ========== */
-
-.identity-import {
-  margin-top: 0.75rem;
-  padding: 0.75rem;
-  border: 1px solid var(--wc-line-soft);
-  border-radius: var(--wc-radius-sm);
-  background: var(--wc-surface-2);
-}
-.identity-import[hidden] { display: none; }
-.identity-import .field { margin: 0.5rem 0; }
-.identity-import textarea {
-  width: 100%;
-  padding: 0.55rem 0.65rem;
-  font-family: var(--wc-font-mono);
-  font-size: 0.85rem;
-  background: var(--wc-surface-3);
-  color: var(--wc-ink-1);
-  border: 1px solid var(--wc-line-strong);
-  border-radius: var(--wc-radius-sm);
-  resize: vertical;
-  min-height: 4.5rem;
-}
-.identity-import__form .actions { margin-top: 0.5rem; }
 
 /* ========== Reduced motion ========== */
 
