@@ -2654,8 +2654,11 @@
     // Steps that mean the orchestrator is no longer running. The poller
     // stops on any of these. "idle" appears before the first run on a
     // post-boot device (the state file lives on tmpfs); "done" and
-    // "failed" are the terminal markers the orchestrator writes.
-    const ORCHESTRATOR_TERMINAL_STEPS = new Set(["done", "failed", "idle"]);
+    // "failed" are the terminal markers the orchestrator writes;
+    // "unavailable" appears if the capability gate flips off mid-run
+    // (image-side teardown during an active orchestrator — pathological,
+    // but treat it as a terminal stop so the poller doesn't spin).
+    const ORCHESTRATOR_TERMINAL_STEPS = new Set(["done", "failed", "idle", "unavailable"]);
 
     // orchestratorProgress renders the polling progress view after the
     // user clicks "Update System". It polls /api/orchestrator/state at
