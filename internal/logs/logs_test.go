@@ -18,16 +18,17 @@ import (
 func TestResolve_Whitelist(t *testing.T) {
 	t.Parallel()
 	cases := map[string]string{
-		"feed":           "airplanes-feed.service",
-		"mlat":           "airplanes-mlat.service",
-		"readsb":         "readsb.service",
-		"dump978":        "dump978-fa.service",
-		"uat":            "airplanes-978.service",
-		"claim":          "airplanes-claim.service",
-		"webconfig":        "airplanes-webconfig.service",
-		"update":           "airplanes-update.service",
-		"system-upgrade":   "airplanes-system-upgrade.service",
-		"webconfig-update": "airplanes-webconfig-update.service",
+		"feed":                "airplanes-feed.service",
+		"mlat":                "airplanes-mlat.service",
+		"readsb":              "readsb.service",
+		"dump978":             "dump978-fa.service",
+		"uat":                 "airplanes-978.service",
+		"claim":               "airplanes-claim.service",
+		"webconfig":           "airplanes-webconfig.service",
+		"update":              "airplanes-update.service",
+		"system-upgrade":      "airplanes-system-upgrade.service",
+		"webconfig-update":    "airplanes-webconfig-update.service",
+		"update-orchestrator": "airplanes-update-orchestrator.service",
 	}
 	for slug, want := range cases {
 		got, err := Resolve(slug)

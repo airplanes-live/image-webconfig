@@ -43,9 +43,10 @@
         "uat":       "airplanes-978.service",
         "claim":     "airplanes-claim.service",
         "webconfig":      "airplanes-webconfig.service",
-        "update":           "airplanes-update.service",
-        "system-upgrade":   "airplanes-system-upgrade.service",
-        "webconfig-update": "airplanes-webconfig-update.service",
+        "update":               "airplanes-update.service",
+        "system-upgrade":       "airplanes-system-upgrade.service",
+        "webconfig-update":     "airplanes-webconfig-update.service",
+        "update-orchestrator":  "airplanes-update-orchestrator.service",
     };
     const UNIT_TO_LOG_SLUG = Object.fromEntries(
         Object.entries(LOG_SLUG_TO_UNIT).map(([s, u]) => [u, s])

@@ -167,9 +167,10 @@ func NewState(p Paths) *State {
 			// Maintenance units — must be inactive so the pre-flight
 			// guard at handlers.go:maintenanceUnitActive lets the user click
 			// reboot / update / system-upgrade without a 409.
-			"airplanes-update.service":           "inactive",
-			"airplanes-system-upgrade.service":   "inactive",
-			"airplanes-webconfig-update.service": "inactive",
+			"airplanes-update.service":              "inactive",
+			"airplanes-system-upgrade.service":      "inactive",
+			"airplanes-webconfig-update.service":    "inactive",
+			"airplanes-update-orchestrator.service": "inactive",
 			// Claim unit — never reported active; the SPA pulls progress from
 			// the claim SSE log instead.
 			"airplanes-claim.service": "inactive",

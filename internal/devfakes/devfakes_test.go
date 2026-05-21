@@ -442,7 +442,7 @@ func TestSystemctl_IsActiveMixedUnits(t *testing.T) {
 	s := mustNewState(t)
 	priv := StubPrivilegedArgv()
 	runner := Runner(s, priv)
-	// maintenanceUnitActive calls all three maintenance units in one
+	// maintenanceUnitActive calls all maintenance units in one
 	// is-active. They must be inactive so the maintenance guard lets
 	// reboot/update through.
 	res, err := runner(context.Background(), []string{
@@ -450,13 +450,14 @@ func TestSystemctl_IsActiveMixedUnits(t *testing.T) {
 		"airplanes-system-upgrade.service",
 		"airplanes-update.service",
 		"airplanes-webconfig-update.service",
+		"airplanes-update-orchestrator.service",
 	})
 	if err != nil {
 		t.Fatalf("runner: %v", err)
 	}
 	lines := strings.Split(strings.TrimRight(string(res.Stdout), "\n"), "\n")
-	if len(lines) != 3 {
-		t.Fatalf("expected 3 state lines, got %d (out=%q)", len(lines), res.Stdout)
+	if len(lines) != 4 {
+		t.Fatalf("expected 4 state lines, got %d (out=%q)", len(lines), res.Stdout)
 	}
 	for _, l := range lines {
 		if l != "inactive" {
@@ -484,17 +485,18 @@ func TestSystemdRun_PinsMaintenanceUnitActivating(t *testing.T) {
 	if got := s.ServiceState("airplanes-update.service"); got != "activating" {
 		t.Fatalf("after StartUpdate: airplanes-update.service=%q want activating", got)
 	}
-	// Fan-out is-active over the three maintenance units; the update
+	// Fan-out is-active over the maintenance units; the update
 	// one must come back activating, the others inactive.
 	res, _ := runner(context.Background(), []string{
 		"/usr/bin/systemctl", "is-active",
 		"airplanes-system-upgrade.service",
 		"airplanes-update.service",
 		"airplanes-webconfig-update.service",
+		"airplanes-update-orchestrator.service",
 	})
 	lines := strings.Split(strings.TrimRight(string(res.Stdout), "\n"), "\n")
-	if len(lines) != 3 || lines[0] != "inactive" || lines[1] != "activating" || lines[2] != "inactive" {
-		t.Fatalf("is-active fan-out=%v want [inactive activating inactive]", lines)
+	if len(lines) != 4 || lines[0] != "inactive" || lines[1] != "activating" || lines[2] != "inactive" || lines[3] != "inactive" {
+		t.Fatalf("is-active fan-out=%v want [inactive activating inactive inactive]", lines)
 	}
 }
 

@@ -657,6 +657,10 @@ var unitLogLines = map[string][]string{
 		"webconfig-update: resolving latest tag",
 		"webconfig-update: would download release",
 	},
+	"airplanes-update-orchestrator.service": {
+		"update-orchestrator: sequencing apt -> feed -> webconfig -> runtime",
+		"update-orchestrator: idle",
+	},
 }
 
 // StreamRunner returns a wexec.StreamRunner that emits one canned

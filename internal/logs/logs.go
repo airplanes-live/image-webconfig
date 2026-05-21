@@ -26,16 +26,17 @@ import (
 // Keep slugs in sync with LOG_SLUG_TO_UNIT in web/assets/app.js — a slug
 // missing here returns 404, while a slug missing there just hides the link.
 var Whitelist = map[string]string{
-	"feed":           "airplanes-feed.service",
-	"mlat":           "airplanes-mlat.service",
-	"readsb":         "readsb.service",
-	"dump978":        "dump978-fa.service",
-	"uat":            "airplanes-978.service",
-	"claim":          "airplanes-claim.service",
-	"webconfig":      "airplanes-webconfig.service",
-	"update":           "airplanes-update.service",
-	"system-upgrade":   "airplanes-system-upgrade.service",
-	"webconfig-update": "airplanes-webconfig-update.service",
+	"feed":                "airplanes-feed.service",
+	"mlat":                "airplanes-mlat.service",
+	"readsb":              "readsb.service",
+	"dump978":             "dump978-fa.service",
+	"uat":                 "airplanes-978.service",
+	"claim":               "airplanes-claim.service",
+	"webconfig":           "airplanes-webconfig.service",
+	"update":              "airplanes-update.service",
+	"system-upgrade":      "airplanes-system-upgrade.service",
+	"webconfig-update":    "airplanes-webconfig-update.service",
+	"update-orchestrator": "airplanes-update-orchestrator.service",
 }
 
 // JournalctlBinary is overridable for tests.
