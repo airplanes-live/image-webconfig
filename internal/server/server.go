@@ -38,6 +38,16 @@ type Server struct {
 	// with "clean" / "in-progress" / "failed". Defaults to
 	// DefaultUpgradeStatePath; tests override via Deps.UpgradeStatePath.
 	upgradeStatePath string
+	// orchestratorStatePath is the on-disk JSON state file the update
+	// orchestrator atomically writes per step. Defaults to
+	// DefaultOrchestratorStatePath; tests override via
+	// Deps.OrchestratorStatePath.
+	orchestratorStatePath string
+	// orchestratorCapableFunc reports whether the orchestrator surfaces
+	// are present + executable (trampoline + overlay target). Defaults to
+	// the production capability check; tests override via
+	// Deps.OrchestratorCapable.
+	orchestratorCapableFunc func() bool
 	// assetsFS, when non-nil, overrides the embedded web/assets used for
 	// GET / and GET /static/*. Default (nil) keeps production behavior:
 	// assets are served from the binary's go:embed FS. cmd/devserver sets
@@ -73,6 +83,7 @@ type PrivilegedArgv struct {
 	StartUpdate          []string // sudo systemd-run --unit=airplanes-update ...
 	StartSystemUpgrade   []string // sudo systemd-run --unit=airplanes-system-upgrade ...
 	StartWebconfigUpdate []string // sudo systemd-run --unit=airplanes-webconfig-update ...
+	StartOrchestrator    []string // sudo systemd-run --unit=airplanes-update-orchestrator ...
 	RegisterClaim      []string // sudo systemctl start --no-block airplanes-claim.service
 	WifiList           []string
 	WifiAdd            []string
@@ -125,6 +136,22 @@ func DefaultPrivilegedArgv() PrivilegedArgv {
 			"--collect",
 			"/usr/local/lib/airplanes-webconfig/webconfig-self-update.sh",
 		),
+		// StartOrchestrator launches the unified update orchestrator —
+		// apt → feed → webconfig → runtime overlay — as a transient
+		// systemd unit. --collect drops the unit record on exit so a
+		// repeat invocation doesn't 409 on a stale unit name. The
+		// ExecStopPost HUPs this service so the schema cache reloads
+		// after the feed leg potentially rewrote /etc/airplanes/*.
+		// Trampoline at /usr/local/lib/airplanes-webconfig/ is owned by
+		// the image's pi-gen stage 06d; it execs into the orchestrator
+		// binary inside the active runtime release.
+		StartOrchestrator: sudo(
+			"/usr/bin/systemd-run",
+			"--unit=airplanes-update-orchestrator.service",
+			"--collect",
+			"--property=ExecStopPost=/usr/bin/systemctl kill -s HUP airplanes-webconfig.service",
+			"/usr/local/lib/airplanes-webconfig/start-orchestrator.sh",
+		),
 		// --no-block: the unit is Type=oneshot and apl-feed claim register
 		// retries on network failure for up to ~15s. A blocking start could
 		// exceed systemctlTimeout; --no-block enqueues the job and returns
@@ -167,6 +194,15 @@ type Deps struct {
 	// UpgradeStatePath is the path the GET /api/status/upgrade handler
 	// reads. Defaults to DefaultUpgradeStatePath; tests inject a tempfile.
 	UpgradeStatePath string
+	// OrchestratorStatePath is the path the GET /api/orchestrator/state
+	// handler reads. Defaults to DefaultOrchestratorStatePath; tests
+	// inject a tempfile.
+	OrchestratorStatePath string
+	// OrchestratorCapable, when non-nil, overrides the production
+	// capability check (trampoline + overlay target are X_OK accessible).
+	// Tests inject a closure that flips the gate without touching the
+	// filesystem at well-known paths owned by airplanes-live/image.
+	OrchestratorCapable func() bool
 	// AssetsFS, when non-nil, overrides the embedded web/assets used for
 	// GET / and GET /static/*. Default (nil) keeps production behavior:
 	// assets are served from the binary's go:embed FS. cmd/devserver sets
@@ -192,24 +228,34 @@ func New(d Deps) http.Handler {
 	if upgradeStatePath == "" {
 		upgradeStatePath = DefaultUpgradeStatePath
 	}
+	orchestratorStatePath := d.OrchestratorStatePath
+	if orchestratorStatePath == "" {
+		orchestratorStatePath = DefaultOrchestratorStatePath
+	}
+	orchestratorCapable := d.OrchestratorCapable
+	if orchestratorCapable == nil {
+		orchestratorCapable = defaultOrchestratorCapable
+	}
 	s := &Server{
-		version:          d.Version,
-		store:            d.Store,
-		sessions:         d.Sessions,
-		lockout:          d.Lockout,
-		guard:            d.Guard,
-		argon2Params:     d.Argon2Params,
-		identity:         d.Identity,
-		feedEnv:          d.FeedEnv,
-		status:           d.Status,
-		logs:             d.Logs,
-		runner:           runner,
-		stdinRunner:      stdinRunner,
-		schema:           d.Schema,
-		nowFunc:          nowFunc,
-		priv:             d.Privileged,
-		upgradeStatePath: upgradeStatePath,
-		assetsFS:         d.AssetsFS,
+		version:                 d.Version,
+		store:                   d.Store,
+		sessions:                d.Sessions,
+		lockout:                 d.Lockout,
+		guard:                   d.Guard,
+		argon2Params:            d.Argon2Params,
+		identity:                d.Identity,
+		feedEnv:                 d.FeedEnv,
+		status:                  d.Status,
+		logs:                    d.Logs,
+		runner:                  runner,
+		stdinRunner:             stdinRunner,
+		schema:                  d.Schema,
+		nowFunc:                 nowFunc,
+		priv:                    d.Privileged,
+		upgradeStatePath:        upgradeStatePath,
+		orchestratorStatePath:   orchestratorStatePath,
+		orchestratorCapableFunc: orchestratorCapable,
+		assetsFS:                d.AssetsFS,
 	}
 
 	mux := http.NewServeMux()
@@ -236,6 +282,8 @@ func New(d Deps) http.Handler {
 	mux.HandleFunc("POST /api/update", s.requireSession(s.handleUpdate))
 	mux.HandleFunc("POST /api/system-upgrade", s.requireSession(s.handleSystemUpgrade))
 	mux.HandleFunc("POST /api/webconfig-update", s.requireSession(s.handleWebconfigUpdate))
+	mux.HandleFunc("POST /api/orchestrator/start", s.requireSession(s.handleOrchestratorStart))
+	mux.HandleFunc("GET /api/orchestrator/state", s.requireSession(s.handleOrchestratorState))
 	mux.HandleFunc("POST /api/reboot", s.requireSession(s.handleReboot))
 	mux.HandleFunc("POST /api/poweroff", s.requireSession(s.handlePoweroff))
 	mux.HandleFunc("POST /api/claim/register", s.requireSession(s.handleClaimRegister))

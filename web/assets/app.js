@@ -2631,6 +2631,87 @@
         )), { title: "Rebooting", showBack: false });
     }
 
+    // ORCHESTRATOR_POLL_INTERVAL_MS is the cadence the SPA polls
+    // /api/orchestrator/state at after kicking off an orchestrator run.
+    // 2s matches the orchestrator's per-step granularity (apt + feed +
+    // webconfig + runtime — each step is typically tens of seconds to
+    // minutes, so 2s is plenty of resolution without flooding the
+    // device).
+    const ORCHESTRATOR_POLL_INTERVAL_MS = 2000;
+
+    // Steps that mean the orchestrator is no longer running. The poller
+    // stops on any of these. "idle" appears before the first run on a
+    // post-boot device (the state file lives on tmpfs); "done" and
+    // "failed" are the terminal markers the orchestrator writes.
+    const ORCHESTRATOR_TERMINAL_STEPS = new Set(["done", "failed", "idle"]);
+
+    // orchestratorProgress renders the polling progress view after the
+    // user clicks "Update System". It polls /api/orchestrator/state at
+    // ORCHESTRATOR_POLL_INTERVAL_MS and stops once a terminal step is
+    // reported. The card shows step + status + (when present) the
+    // error string the orchestrator wrote, plus an apt_irreversible
+    // notice the orchestrator surfaces once the apt phase has run.
+    function orchestratorProgress() {
+        const stepEl = el("p", { class: "muted" }, "Starting…");
+        const statusEl = el("p", { class: "muted" }, "");
+        const errorEl = el("div", { class: "wc-flash wc-flash--warn", role: "alert" }, "");
+        errorEl.hidden = true;
+        const aptNoteEl = el("p", { class: "muted" }, "");
+        aptNoteEl.hidden = true;
+        render(
+            el("section", { class: "wc-card" },
+                el("h2", {}, "Update system"),
+                stepEl,
+                statusEl,
+                errorEl,
+                aptNoteEl,
+            ),
+        );
+
+        let cancelled = false;
+        let pollTimer = null;
+        const prevAbort = activeAbort;
+        activeAbort = {
+            abort: () => {
+                cancelled = true;
+                if (pollTimer) { clearTimeout(pollTimer); pollTimer = null; }
+                if (prevAbort && typeof prevAbort.abort === "function") prevAbort.abort();
+            },
+        };
+
+        async function pollOnce() {
+            if (cancelled) return;
+            const r = await getJSON("/api/orchestrator/state");
+            if (cancelled) return;
+            if (handleAuthFailure(r)) return;
+            const p = r && r.payload;
+            const step = (p && p.step) || "unknown";
+            const status = (p && p.status) || "";
+            const err = (p && p.error) || "";
+            const aptIrr = !!(p && p.apt_irreversible);
+            stepEl.textContent = "Step: " + step;
+            statusEl.textContent = status ? ("Status: " + status) : "";
+            if (err) {
+                errorEl.textContent = err;
+                errorEl.hidden = false;
+            } else {
+                errorEl.hidden = true;
+            }
+            if (aptIrr) {
+                aptNoteEl.textContent = "Note: the apt package upgrade has run and is not rolled back automatically; webconfig and runtime steps can still roll back independently.";
+                aptNoteEl.hidden = false;
+            }
+            if (ORCHESTRATOR_TERMINAL_STEPS.has(step)) {
+                // Terminal step. Stop polling. Keep the final state on
+                // screen so the user can read it.
+                pollTimer = null;
+                return;
+            }
+            pollTimer = setTimeout(pollOnce, ORCHESTRATOR_POLL_INTERVAL_MS);
+        }
+        pollOnce();
+    }
+
     function buildUpdatesCard() {
         // Row 1: web UI — the outermost layer
         const webUiUpdateBtn = el("button", {
@@ -2705,8 +2786,66 @@
             onclick: () => navigate(() => logViewer("system-upgrade"), { title: "Update system log", showBack: true }),
         }, "Update system log");
 
+        // Unified "Update System" button. Drives the orchestrator
+        // (apt → feed → webconfig → runtime). Hidden when the device's
+        // image build hasn't shipped the orchestrator trampoline /
+        // overlay target, in which case the per-step buttons below stay
+        // the user's only path. The orchestrator log button is always
+        // visible — useful to inspect prior runs even on capable
+        // devices, since a clicked unified button navigates to the
+        // polling view, not the log stream.
+        const unifiedUpdateBtn = el("button", {
+            type: "button", class: "wc-btn-primary",
+            onclick: async () => {
+                unifiedUpdateBtn.disabled = true;
+                const r = await postJSON("/api/orchestrator/start", {});
+                unifiedUpdateBtn.disabled = false;
+                if (handleAuthFailure(r)) return;
+                if (r.status === 503) {
+                    // The capability gate flipped between the mount-time
+                    // probe and the click — rare (image-side downgrade /
+                    // race during pi-gen build), but possible. Surface
+                    // the same fallback the UI does at mount time.
+                    alert("Unified update is unavailable on this device; use the per-step buttons below.");
+                    unifiedUpdateRow.hidden = true;
+                    return;
+                }
+                if (!r.ok) {
+                    alert((r.payload && r.payload.error) || (r.payload && r.payload.reason) || "update failed");
+                    return;
+                }
+                navigate(() => orchestratorProgress(), { title: "Update system", showBack: true });
+            },
+        }, "Update System");
+        const orchestratorLogBtn = el("button", {
+            type: "button", class: "wc-btn-ghost",
+            onclick: () => navigate(() => logViewer("update-orchestrator"), { title: "Update orchestrator log", showBack: true }),
+        }, "Orchestrator log");
+        const unifiedUpdateRow = el("div", { class: "wc-action-grid" },
+            unifiedUpdateBtn, orchestratorLogBtn,
+        );
+        // Hide the unified row by default; the mount-time probe flips
+        // it visible once /api/orchestrator/state reports a non-
+        // "unavailable" step. Hiding by default avoids a flash of the
+        // button before the probe lands on a slow connection.
+        unifiedUpdateRow.hidden = true;
+
+        // Probe the orchestrator's capability gate. The endpoint is
+        // designed to return 200 with {"step":"unavailable"} when the
+        // gate fails, NOT a 5xx — so this fetch always succeeds on a
+        // booted feeder. We treat any non-"unavailable" step as
+        // "capable" (idle / done / failed / in-flight all count).
+        getJSON("/api/orchestrator/state").then((r) => {
+            if (handleAuthFailure(r)) return;
+            const p = (r && r.payload) || {};
+            if (p.step && p.step !== "unavailable") {
+                unifiedUpdateRow.hidden = false;
+            }
+        }).catch(() => { /* leave hidden; per-step buttons are the fallback */ });
+
         return el("section", { class: "wc-card" },
             el("h2", {}, "Updates"),
+            unifiedUpdateRow,
             el("div", { class: "wc-action-grid" },
                 webUiUpdateBtn, webUiUpdateLog,
                 feedUpdateBtn, feedUpdateLog,
