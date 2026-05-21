@@ -2639,6 +2639,18 @@
     // device).
     const ORCHESTRATOR_POLL_INTERVAL_MS = 2000;
 
+    // ORCHESTRATOR_STALE_GRACE_POLLS bounds how many terminal-step
+    // polls the SPA tolerates before accepting the terminal state as
+    // authoritative even though no non-terminal step has been seen.
+    // 5 polls * 2 s = 10 s. The orchestrator writes its first state
+    // file within a few hundred milliseconds of starting (it's a
+    // single tmp+rename right after parsing argv); a terminal step
+    // that survives this grace window most likely means the orchestrator
+    // started, failed during early init, and wrote `failed` before any
+    // non-terminal step — or never started at all. Either is a real
+    // outcome the user must see, not a perpetual "Starting…".
+    const ORCHESTRATOR_STALE_GRACE_POLLS = 5;
+
     // Steps that mean the orchestrator is no longer running. The poller
     // stops on any of these. "idle" appears before the first run on a
     // post-boot device (the state file lives on tmpfs); "done" and
@@ -2676,7 +2688,11 @@
         // as leftover state from a prior run — the new orchestrator
         // hasn't reached its first state-file write yet — so we keep
         // polling rather than declare "done" on a stale marker.
+        // staleTerminalPolls bounds how long we'll keep "starting"
+        // before accepting a terminal step (see
+        // ORCHESTRATOR_STALE_GRACE_POLLS rationale above).
         let sawNonTerminal = false;
+        let staleTerminalPolls = 0;
         let cancelled = false;
         let pollTimer = null;
         // Local AbortController so a poller-issued fetch can be cancelled
@@ -2732,14 +2748,22 @@
             if (!sawNonTerminal && isTerminal) {
                 // Either the orchestrator hasn't written its first
                 // state yet, or this is leftover state from a prior
-                // run. Either way: keep polling. Show a holding
-                // message rather than the stale terminal step.
-                stepEl.textContent = "Starting…";
-                statusEl.textContent = "";
-                errorEl.hidden = true;
-                aptNoteEl.hidden = true;
-                pollTimer = setTimeout(pollOnce, ORCHESTRATOR_POLL_INTERVAL_MS);
-                return;
+                // run. Either way: keep polling, but only for a bounded
+                // window — past ORCHESTRATOR_STALE_GRACE_POLLS, accept
+                // the terminal step as authoritative so an orchestrator
+                // that fails during early init (and writes `failed`
+                // before any non-terminal step) doesn't leave the
+                // user stuck on "Starting…".
+                staleTerminalPolls += 1;
+                if (staleTerminalPolls <= ORCHESTRATOR_STALE_GRACE_POLLS) {
+                    stepEl.textContent = "Starting…";
+                    statusEl.textContent = "";
+                    errorEl.hidden = true;
+                    aptNoteEl.hidden = true;
+                    pollTimer = setTimeout(pollOnce, ORCHESTRATOR_POLL_INTERVAL_MS);
+                    return;
+                }
+                // Fall through and render the terminal step.
             }
             if (!isTerminal) {
                 sawNonTerminal = true;

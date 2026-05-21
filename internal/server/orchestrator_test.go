@@ -386,9 +386,21 @@ func TestOrchestratorStart_RefusedDuringMaintenance(t *testing.T) {
 // authenticated sessions). The stderr-contains heuristic on the
 // existing transient endpoints maps to 409; the orchestrator endpoint
 // must too.
+//
+// The state path is pinned to a fresh tempfile so the test exercises
+// the systemd-run branch — not the running-state probe branch — and
+// the test asserts the orchestrator argv WAS invoked. Without these
+// guards, the test could quietly pass against the running-state probe
+// on a machine where /run/airplanes/orchestrator.state happens to
+// exist.
 func TestOrchestratorStart_SystemdRunAlreadyExistsReturns409(t *testing.T) {
 	t.Parallel()
-	h := newWriteHarness(t, withOrchestratorCapable(true))
+	dir := t.TempDir()
+	missing := filepath.Join(dir, "orchestrator.state")
+	h := newWriteHarness(t,
+		withOrchestratorCapable(true),
+		withOrchestratorStatePath(missing),
+	)
 	h.mu.Lock()
 	h.runnerErrFor = func(argv []string) error {
 		if len(argv) >= 2 && argv[1] == "orchestrator" {
@@ -414,6 +426,18 @@ func TestOrchestratorStart_SystemdRunAlreadyExistsReturns409(t *testing.T) {
 	}
 	if got["reason"] != "already_running" {
 		t.Errorf("reason = %q, want already_running", got["reason"])
+	}
+	// Confirm we actually hit the systemd-run branch (not the
+	// running-state probe). The orchestrator argv must appear in the
+	// runner call log.
+	saw := false
+	for _, c := range h.callsCopy() {
+		if len(c) >= 2 && c[0] == "sudo-stub" && c[1] == "orchestrator" {
+			saw = true
+		}
+	}
+	if !saw {
+		t.Fatalf("StartOrchestrator argv not invoked; want the systemd-run branch to fire; calls=%v", h.callsCopy())
 	}
 }
 
