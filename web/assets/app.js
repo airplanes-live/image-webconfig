@@ -2648,9 +2648,12 @@
     // orchestratorProgress renders the polling progress view after the
     // user clicks "Update System". It polls /api/orchestrator/state at
     // ORCHESTRATOR_POLL_INTERVAL_MS and stops once a terminal step is
-    // reported. The card shows step + status + (when present) the
-    // error string the orchestrator wrote, plus an apt_irreversible
-    // notice the orchestrator surfaces once the apt phase has run.
+    // reported, ignoring any terminal step that pre-dates the current
+    // click (left over from a prior run — the state file lives on
+    // /run/ which survives the orchestrator's process exit). The card
+    // shows step + status + (when present) the error string the
+    // orchestrator wrote, plus an apt_irreversible notice the
+    // orchestrator surfaces once the apt phase has run.
     function orchestratorProgress() {
         const stepEl = el("p", { class: "muted" }, "Starting…");
         const statusEl = el("p", { class: "muted" }, "");
@@ -2668,20 +2671,55 @@
             ),
         );
 
+        // sawNonTerminal flips true the first time the poller observes
+        // a non-terminal step. Until then, a terminal step is treated
+        // as leftover state from a prior run — the new orchestrator
+        // hasn't reached its first state-file write yet — so we keep
+        // polling rather than declare "done" on a stale marker.
+        let sawNonTerminal = false;
         let cancelled = false;
         let pollTimer = null;
+        // Local AbortController so a poller-issued fetch can be cancelled
+        // without depending on getJSON's writeback to the global
+        // activeAbort (which only carries the most recent in-flight
+        // request — not this view's lifecycle). The wrapper around
+        // activeAbort below ties the global teardown call to our local
+        // cancel flag so a navigate() away kills both.
+        const localCtrl = new AbortController();
         const prevAbort = activeAbort;
         activeAbort = {
             abort: () => {
                 cancelled = true;
                 if (pollTimer) { clearTimeout(pollTimer); pollTimer = null; }
+                try { localCtrl.abort(); } catch (_) {}
                 if (prevAbort && typeof prevAbort.abort === "function") prevAbort.abort();
             },
         };
 
         async function pollOnce() {
             if (cancelled) return;
-            const r = await getJSON("/api/orchestrator/state");
+            // Bypass getJSON's global-abort wiring so a state poll
+            // doesn't blow away an unrelated activeAbort. Inline the
+            // small fetch + JSON parse the helper does.
+            let r;
+            try {
+                const resp = await fetch("/api/orchestrator/state", {
+                    method: "GET",
+                    credentials: "same-origin",
+                    signal: localCtrl.signal,
+                });
+                let payload = null;
+                try { payload = await resp.json(); } catch (_) {}
+                r = { ok: resp.ok, status: resp.status, payload: payload || {} };
+            } catch (e) {
+                if (cancelled) return;
+                // Network glitch — retry. Don't surface to the user
+                // unless we burn through many in a row (out of scope
+                // for this view; a transient blip during an update
+                // resolves itself).
+                pollTimer = setTimeout(pollOnce, ORCHESTRATOR_POLL_INTERVAL_MS);
+                return;
+            }
             if (cancelled) return;
             if (handleAuthFailure(r)) return;
             const p = r && r.payload;
@@ -2689,6 +2727,24 @@
             const status = (p && p.status) || "";
             const err = (p && p.error) || "";
             const aptIrr = !!(p && p.apt_irreversible);
+            const isTerminal = ORCHESTRATOR_TERMINAL_STEPS.has(step);
+
+            if (!sawNonTerminal && isTerminal) {
+                // Either the orchestrator hasn't written its first
+                // state yet, or this is leftover state from a prior
+                // run. Either way: keep polling. Show a holding
+                // message rather than the stale terminal step.
+                stepEl.textContent = "Starting…";
+                statusEl.textContent = "";
+                errorEl.hidden = true;
+                aptNoteEl.hidden = true;
+                pollTimer = setTimeout(pollOnce, ORCHESTRATOR_POLL_INTERVAL_MS);
+                return;
+            }
+            if (!isTerminal) {
+                sawNonTerminal = true;
+            }
+
             stepEl.textContent = "Step: " + step;
             statusEl.textContent = status ? ("Status: " + status) : "";
             if (err) {
@@ -2701,9 +2757,9 @@
                 aptNoteEl.textContent = "Note: the apt package upgrade has run and is not rolled back automatically; webconfig and runtime steps can still roll back independently.";
                 aptNoteEl.hidden = false;
             }
-            if (ORCHESTRATOR_TERMINAL_STEPS.has(step)) {
-                // Terminal step. Stop polling. Keep the final state on
-                // screen so the user can read it.
+            if (isTerminal) {
+                // Terminal step reached for the live run. Stop polling
+                // and keep the final state on screen.
                 pollTimer = null;
                 return;
             }

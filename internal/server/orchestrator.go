@@ -58,11 +58,15 @@ const (
 // executable. Used as the production gate; the in-memory test override
 // lives in Deps.OrchestratorCapable.
 //
-// unix.Access checks the effective UID's X bit (the airplanes-webconfig
-// service account, in production) so a path mode of 0700 root:root will
-// correctly fail — even though `os.Stat` would have succeeded. The two
-// checks together avoid two false positives: a missing file and a file
-// present but unexecutable by the service account.
+// unix.Access maps to Linux access(2), which checks the real UID/GID
+// (NOT the effective creds). The airplanes-webconfig service runs
+// without privilege changes, so real and effective are the same here
+// and the result reflects what the airplanes-webconfig account can
+// actually execute. The two checks together avoid two false positives:
+// a missing file and a file present but unexecutable by the service
+// account. The privilege boundary itself is still enforced by sudoers
+// and by the fact that both paths must be root-owned and non-writable
+// by the airplanes-webconfig account — capability here is UX-only.
 func defaultOrchestratorCapable() bool {
 	if unix.Access(orchestratorTrampolinePath, unix.X_OK) != nil {
 		return false
@@ -145,6 +149,17 @@ func (s *Server) handleOrchestratorStart(w http.ResponseWriter, r *http.Request)
 	// transient unit is queued and the state-file check sees it.
 	s.maintenanceMu.Lock()
 	defer s.maintenanceMu.Unlock()
+
+	// Refuse if any other maintenance unit is active (apt upgrade /
+	// feed update / webconfig update / orchestrator). All four touch
+	// dpkg or release artefacts and would deadlock or corrupt state if
+	// they overlapped. The orchestrator itself appears in
+	// maintenanceUnits so a second start-during-orchestrator click hits
+	// this guard before the state-file probe runs.
+	if busy := s.maintenanceUnitActive(r.Context()); busy != "" {
+		writeJSON(w, http.StatusConflict, map[string]string{"reason": "already_running"})
+		return
+	}
 
 	running, err := orchestratorRunning(s.orchestratorStatePath)
 	if err != nil {

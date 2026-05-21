@@ -2,12 +2,15 @@ package server
 
 import (
 	"encoding/json"
+	"errors"
 	"net/http"
 	"os"
 	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
+
+	wexec "github.com/airplanes-live/image-webconfig/internal/exec"
 )
 
 // TestOrchestratorStart_UnavailableReturns503 covers the capability gate
@@ -337,6 +340,80 @@ func TestDefaultPrivilegedArgv_SudoersParity_CoversOrchestrator(t *testing.T) {
 	got := DefaultPrivilegedArgv().StartOrchestrator
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("StartOrchestrator = %v, want %v", got, want)
+	}
+}
+
+// TestOrchestratorStart_RefusedDuringMaintenance covers the no-overlap
+// guard: a busy apt upgrade / feed update / webconfig update / prior
+// orchestrator unit must block a start. The orchestrator drives all
+// four under the hood, so an overlapping kickoff would deadlock on
+// dpkg or corrupt release state.
+func TestOrchestratorStart_RefusedDuringMaintenance(t *testing.T) {
+	t.Parallel()
+	for _, unit := range []string{
+		"airplanes-system-upgrade.service",
+		"airplanes-update.service",
+		"airplanes-webconfig-update.service",
+		"airplanes-update-orchestrator.service",
+	} {
+		unit := unit
+		t.Run(unit, func(t *testing.T) {
+			t.Parallel()
+			h := newWriteHarness(t, withOrchestratorCapable(true))
+			h.mu.Lock()
+			h.runnerResultFor = activeFor(unit)
+			h.mu.Unlock()
+			r := postJSON(t, h.client, h.ts.URL+"/api/orchestrator/start", map[string]any{})
+			defer r.Body.Close()
+			if r.StatusCode != http.StatusConflict {
+				t.Fatalf("status = %d, want 409", r.StatusCode)
+			}
+			// StartOrchestrator argv must not have been invoked.
+			for _, c := range h.callsCopy() {
+				if len(c) >= 2 && c[1] == "orchestrator" {
+					t.Fatalf("StartOrchestrator argv invoked despite 409: %v", c)
+				}
+			}
+		})
+	}
+}
+
+// TestOrchestratorStart_SystemdRunAlreadyExistsReturns409 covers the
+// rare race where systemd-run reports the transient unit name already
+// taken — both the running-state probe and the maintenance guard
+// missed it (e.g. the transient unit cleanup is still in flight despite
+// --collect, or two starts raced through the lock from different
+// authenticated sessions). The stderr-contains heuristic on the
+// existing transient endpoints maps to 409; the orchestrator endpoint
+// must too.
+func TestOrchestratorStart_SystemdRunAlreadyExistsReturns409(t *testing.T) {
+	t.Parallel()
+	h := newWriteHarness(t, withOrchestratorCapable(true))
+	h.mu.Lock()
+	h.runnerErrFor = func(argv []string) error {
+		if len(argv) >= 2 && argv[1] == "orchestrator" {
+			return errors.New("systemd-run failed")
+		}
+		return nil
+	}
+	h.runnerResultFor = func(argv []string) wexec.Result {
+		if len(argv) >= 2 && argv[1] == "orchestrator" {
+			return wexec.Result{Stderr: []byte("Unit airplanes-update-orchestrator.service already exists")}
+		}
+		return wexec.Result{}
+	}
+	h.mu.Unlock()
+	r := postJSON(t, h.client, h.ts.URL+"/api/orchestrator/start", map[string]any{})
+	defer r.Body.Close()
+	if r.StatusCode != http.StatusConflict {
+		t.Fatalf("status = %d, want 409", r.StatusCode)
+	}
+	var got map[string]string
+	if err := json.NewDecoder(r.Body).Decode(&got); err != nil {
+		t.Fatalf("decode body: %v", err)
+	}
+	if got["reason"] != "already_running" {
+		t.Errorf("reason = %q, want already_running", got["reason"])
 	}
 }
 
