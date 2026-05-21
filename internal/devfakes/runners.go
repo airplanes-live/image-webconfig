@@ -74,6 +74,7 @@ func StubPrivilegedArgv() server.PrivilegedArgv {
 		StartUpdate:          []string{"dev-stub", "systemd-run", "airplanes-update"},
 		StartSystemUpgrade:   []string{"dev-stub", "systemd-run", "airplanes-system-upgrade"},
 		StartWebconfigUpdate: []string{"dev-stub", "systemd-run", "airplanes-webconfig-update"},
+		StartOrchestrator:    []string{"dev-stub", "systemd-run", "airplanes-update-orchestrator"},
 		RegisterClaim:        []string{"dev-stub", "systemctl", "claim-register"},
 		WifiList:             []string{"dev-stub", "apl-wifi", "list"},
 		WifiAdd:              []string{"dev-stub", "apl-wifi", "add"},

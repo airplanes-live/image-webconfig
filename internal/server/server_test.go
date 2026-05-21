@@ -107,6 +107,7 @@ func newTestServer(t *testing.T) (*httptest.Server, *Server) {
 		StartUpdate:          []string{"sudo-stub", "update"},
 		StartSystemUpgrade:   []string{"sudo-stub", "system-upgrade"},
 		StartWebconfigUpdate: []string{"sudo-stub", "webconfig-update"},
+		StartOrchestrator:    []string{"sudo-stub", "orchestrator"},
 		RegisterClaim:        []string{"sudo-stub", "systemctl", "start", "--no-block", "airplanes-claim.service"},
 		WifiList:             []string{"sudo-stub", "apl-wifi", "list", "--json"},
 		WifiAdd:              []string{"sudo-stub", "apl-wifi", "add", "--json"},
@@ -182,6 +183,16 @@ type writeHarness struct {
 	// the production path (which doesn't exist in tests, surfacing
 	// "unknown" — matches what an un-upgraded feeder would report).
 	upgradeStatePath string
+	// orchestratorStatePath is wired into Deps.OrchestratorStatePath.
+	// Set via withOrchestratorStatePath() before harness construction;
+	// defaults to the production path, which doesn't exist in tests.
+	orchestratorStatePath string
+	// orchestratorCapable is wired into Deps.OrchestratorCapable. nil
+	// means "use the production capability check" — that returns false
+	// in tests because the well-known image-owned paths don't exist,
+	// matching what an un-imaged feeder would report. Tests that need
+	// the capable path use withOrchestratorCapable(true) to flip it.
+	orchestratorCapable func() bool
 }
 
 // harnessOption mutates a writeHarness BEFORE Deps is constructed, so
@@ -190,6 +201,16 @@ type harnessOption func(*writeHarness)
 
 func withUpgradeStatePath(p string) harnessOption {
 	return func(h *writeHarness) { h.upgradeStatePath = p }
+}
+
+func withOrchestratorStatePath(p string) harnessOption {
+	return func(h *writeHarness) { h.orchestratorStatePath = p }
+}
+
+func withOrchestratorCapable(capable bool) harnessOption {
+	return func(h *writeHarness) {
+		h.orchestratorCapable = func() bool { return capable }
+	}
 }
 
 func newWriteHarness(t *testing.T, opts ...harnessOption) *writeHarness {
@@ -253,6 +274,7 @@ func newWriteHarness(t *testing.T, opts ...harnessOption) *writeHarness {
 		StartUpdate:          []string{"sudo-stub", "update"},
 		StartSystemUpgrade:   []string{"sudo-stub", "system-upgrade"},
 		StartWebconfigUpdate: []string{"sudo-stub", "webconfig-update"},
+		StartOrchestrator:    []string{"sudo-stub", "orchestrator"},
 		RegisterClaim:        []string{"sudo-stub", "systemctl", "start", "--no-block", "airplanes-claim.service"},
 		WifiList:             []string{"sudo-stub", "apl-wifi", "list", "--json"},
 		WifiAdd:              []string{"sudo-stub", "apl-wifi", "add", "--json"},
@@ -282,10 +304,12 @@ func newWriteHarness(t *testing.T, opts ...harnessOption) *writeHarness {
 			[]string{"LATITUDE", "LONGITUDE", "ALTITUDE", "GEO_CONFIGURED", "MLAT_USER", "MLAT_ENABLED", "MLAT_PRIVATE", "REPORT_STATUS", "REMOTE_CONFIG_ENABLED", "GAIN", "UAT_INPUT", "DUMP978_SDR_SERIAL", "DUMP978_GAIN"},
 			[]string{"LATITUDE", "LONGITUDE", "ALTITUDE", "GEO_CONFIGURED", "MLAT_USER", "MLAT_ENABLED", "MLAT_PRIVATE", "REPORT_STATUS", "REMOTE_CONFIG_ENABLED", "INPUT", "INPUT_TYPE", "GAIN", "UAT_INPUT", "DUMP978_SDR_SERIAL", "DUMP978_GAIN"},
 		),
-		Runner:           captureRunner,
-		StdinRunner:      captureStdinRunner,
-		Privileged:       priv,
-		UpgradeStatePath: h.upgradeStatePath,
+		Runner:                captureRunner,
+		StdinRunner:           captureStdinRunner,
+		Privileged:            priv,
+		UpgradeStatePath:      h.upgradeStatePath,
+		OrchestratorStatePath: h.orchestratorStatePath,
+		OrchestratorCapable:   h.orchestratorCapable,
 	}
 	h.ts = httptest.NewServer(New(deps))
 	t.Cleanup(h.ts.Close)
