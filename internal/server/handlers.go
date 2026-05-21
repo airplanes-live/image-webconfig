@@ -721,13 +721,15 @@ func (s *Server) runSudo(ctx context.Context, argv []string, timeout time.Durati
 }
 
 // maintenanceUnits is the set of transient maintenance units that must not
-// overlap each other or be interrupted by a reboot. Both run apt/dpkg and
-// would deadlock on the dpkg lock or leave half-configured state if either
-// happened concurrently with the other or with a shutdown.
+// overlap each other or be interrupted by a reboot. Each touches apt/dpkg,
+// release artefacts, or shells out to the others, and would deadlock on
+// the dpkg lock or leave half-configured state if any overlapped with
+// another or with a shutdown.
 var maintenanceUnits = []string{
 	"airplanes-system-upgrade.service",
 	"airplanes-update.service",
 	"airplanes-webconfig-update.service",
+	"airplanes-update-orchestrator.service",
 }
 
 // maintenanceUnitActive returns the name of any maintenance unit currently

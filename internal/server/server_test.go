@@ -740,6 +740,8 @@ func TestReboot_RefusedDuringMaintenance(t *testing.T) {
 	for _, unit := range []string{
 		"airplanes-system-upgrade.service",
 		"airplanes-update.service",
+		"airplanes-webconfig-update.service",
+		"airplanes-update-orchestrator.service",
 	} {
 		unit := unit
 		t.Run(unit, func(t *testing.T) {
@@ -850,6 +852,8 @@ func TestPoweroff_RefusedDuringMaintenance(t *testing.T) {
 	for _, unit := range []string{
 		"airplanes-system-upgrade.service",
 		"airplanes-update.service",
+		"airplanes-webconfig-update.service",
+		"airplanes-update-orchestrator.service",
 	} {
 		unit := unit
 		t.Run(unit, func(t *testing.T) {
