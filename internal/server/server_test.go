@@ -106,7 +106,6 @@ func newTestServer(t *testing.T) (*httptest.Server, *Server) {
 		Poweroff:             []string{"sudo-stub", "poweroff"},
 		StartUpdate:          []string{"sudo-stub", "update"},
 		StartSystemUpgrade:   []string{"sudo-stub", "system-upgrade"},
-		StartWebconfigUpdate: []string{"sudo-stub", "webconfig-update"},
 		StartOrchestrator:    []string{"sudo-stub", "orchestrator"},
 		RegisterClaim:        []string{"sudo-stub", "systemctl", "start", "--no-block", "airplanes-claim.service"},
 		WifiList:             []string{"sudo-stub", "apl-wifi", "list", "--json"},
@@ -273,7 +272,6 @@ func newWriteHarness(t *testing.T, opts ...harnessOption) *writeHarness {
 		Poweroff:             []string{"sudo-stub", "poweroff"},
 		StartUpdate:          []string{"sudo-stub", "update"},
 		StartSystemUpgrade:   []string{"sudo-stub", "system-upgrade"},
-		StartWebconfigUpdate: []string{"sudo-stub", "webconfig-update"},
 		StartOrchestrator:    []string{"sudo-stub", "orchestrator"},
 		RegisterClaim:        []string{"sudo-stub", "systemctl", "start", "--no-block", "airplanes-claim.service"},
 		WifiList:             []string{"sudo-stub", "apl-wifi", "list", "--json"},
@@ -582,56 +580,6 @@ func TestUpdate_AlreadyRunning409(t *testing.T) {
 	}
 }
 
-func TestWebconfigUpdate_RequiresAuth(t *testing.T) {
-	t.Parallel()
-	ts, _ := newTestServer(t)
-	c := httpClient(t)
-	r := postJSON(t, c, ts.URL+"/api/webconfig-update", map[string]any{})
-	defer r.Body.Close()
-	if r.StatusCode != http.StatusUnauthorized {
-		t.Fatalf("status = %d", r.StatusCode)
-	}
-}
-
-func TestWebconfigUpdate_HappyPathReturns202(t *testing.T) {
-	t.Parallel()
-	h := newWriteHarness(t)
-	r := postJSON(t, h.client, h.ts.URL+"/api/webconfig-update", map[string]any{})
-	defer r.Body.Close()
-	if r.StatusCode != http.StatusAccepted {
-		t.Fatalf("status = %d", r.StatusCode)
-	}
-	var got map[string]string
-	_ = json.NewDecoder(r.Body).Decode(&got)
-	if got["unit"] != "airplanes-webconfig-update.service" {
-		t.Errorf("unit = %q", got["unit"])
-	}
-}
-
-func TestWebconfigUpdate_AlreadyRunning409(t *testing.T) {
-	t.Parallel()
-	h := newWriteHarness(t)
-	h.mu.Lock()
-	h.runnerErrFor = func(argv []string) error {
-		if len(argv) >= 2 && argv[1] == "webconfig-update" {
-			return errors.New("systemd-run failed")
-		}
-		return nil
-	}
-	h.runnerResultFor = func(argv []string) wexec.Result {
-		if len(argv) >= 2 && argv[1] == "webconfig-update" {
-			return wexec.Result{Stderr: []byte("Unit airplanes-webconfig-update.service already exists")}
-		}
-		return wexec.Result{}
-	}
-	h.mu.Unlock()
-	r := postJSON(t, h.client, h.ts.URL+"/api/webconfig-update", map[string]any{})
-	defer r.Body.Close()
-	if r.StatusCode != http.StatusConflict {
-		t.Fatalf("status = %d, want 409", r.StatusCode)
-	}
-}
-
 func TestSystemUpgrade_RequiresAuth(t *testing.T) {
 	t.Parallel()
 	ts, _ := newTestServer(t)
@@ -764,7 +712,6 @@ func TestReboot_RefusedDuringMaintenance(t *testing.T) {
 	for _, unit := range []string{
 		"airplanes-system-upgrade.service",
 		"airplanes-update.service",
-		"airplanes-webconfig-update.service",
 		"airplanes-update-orchestrator.service",
 	} {
 		unit := unit
@@ -876,7 +823,6 @@ func TestPoweroff_RefusedDuringMaintenance(t *testing.T) {
 	for _, unit := range []string{
 		"airplanes-system-upgrade.service",
 		"airplanes-update.service",
-		"airplanes-webconfig-update.service",
 		"airplanes-update-orchestrator.service",
 	} {
 		unit := unit
@@ -1613,8 +1559,8 @@ func TestLog_KnownUnitStreamsSSE(t *testing.T) {
 // TestDefaultPrivilegedArgv_SudoersParity guards against drift between the
 // production argv shapes and the sudoers entries that authorize them. Each
 // argv tail (after the `/usr/bin/sudo -n` prefix) must EXACTLY equal a
-// NOPASSWD command-spec from 010 or 011 — a substring match would not
-// catch a sudoers entry of `apl-feed apply --json` failing to authorize
+// NOPASSWD command-spec from 010 — a substring match would not catch a
+// sudoers entry of `apl-feed apply --json` failing to authorize
 // `apl-feed apply --json --extra` (Contains would pass, sudo would reject
 // at runtime). Implementation lives in ValidatePrivilegedArgvParity so the
 // runtime --validate-sudoers subcommand exercises the same logic against
@@ -1623,7 +1569,6 @@ func TestDefaultPrivilegedArgv_SudoersParity(t *testing.T) {
 	t.Parallel()
 	err := ValidatePrivilegedArgvParity(DefaultPrivilegedArgv(),
 		filepath.Join("..", "..", "files", "etc", "sudoers.d", "010_airplanes-webconfig"),
-		filepath.Join("..", "..", "files", "etc", "sudoers.d", "011_airplanes-webconfig-update"),
 	)
 	if err != nil {
 		t.Fatal(err)

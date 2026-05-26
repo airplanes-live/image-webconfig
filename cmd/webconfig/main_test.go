@@ -4,10 +4,8 @@ import "testing"
 
 // TestComposeVersion locks in the contract that composeVersion appends a
 // short commit-SHA suffix when sha is non-empty, and is a no-op otherwise.
-// The suffix is what makes /health byte-change after a dev→dev self-update
-// (the moving "dev-latest" tag is reused across builds); without it, the
-// SPA's post-update poller never observes a /health change and times out at
-// 90s — see web/assets/app.js:webconfigUpdateProgress.
+// The suffix is what makes /health byte-change between two dev builds that
+// carry the same moving "dev-latest" tag.
 func TestComposeVersion(t *testing.T) {
 	t.Parallel()
 	cases := []struct {

@@ -115,24 +115,13 @@ done
 echo "build-release: stage files/ tree"
 cp -a "$SOURCE/files/." "$STAGING/files/"
 
-# 3. Ship install.sh, update.sh, and the lib inside the rootfs payload so
-#    extraction lands them at /usr/local/share/airplanes-webconfig/. The
-#    on-device self-update helper invokes the installed copy, so each
-#    release carries the installer needed to apply the NEXT release.
-install -d -m 0755 "$STAGING/files/usr/local/share/airplanes-webconfig"
-install -d -m 0755 "$STAGING/files/usr/local/share/airplanes-webconfig/scripts/lib"
-install -m 0755 "$SOURCE/install.sh" "$STAGING/files/usr/local/share/airplanes-webconfig/install.sh"
-install -m 0755 "$SOURCE/update.sh"  "$STAGING/files/usr/local/share/airplanes-webconfig/update.sh"
-install -m 0644 "$SOURCE/scripts/lib/install-common.sh" \
-    "$STAGING/files/usr/local/share/airplanes-webconfig/scripts/lib/install-common.sh"
-
-# 4. sudo refuses to load a sudoers file whose mode is not 0440. Encode the
+# 3. sudo refuses to load a sudoers file whose mode is not 0440. Encode the
 #    right mode in the tarball so on-device extraction lands it ready-to-use.
 if compgen -G "$STAGING/files/etc/sudoers.d/*" >/dev/null; then
     chmod 0440 "$STAGING/files/etc/sudoers.d/"*
 fi
 
-# 5. Tar with deterministic owner/group/mtime/sort. --owner/--group/--numeric-owner
+# 4. Tar with deterministic owner/group/mtime/sort. --owner/--group/--numeric-owner
 #    zero-pads filesystem metadata; --mtime pins timestamps; --sort=name makes
 #    archive order independent of inode order from the cp -a above.
 echo "build-release: tar rootfs.tar.gz"
@@ -142,7 +131,7 @@ tar -C "$STAGING/files" \
     --sort=name \
     -czf "$OUTPUT/rootfs.tar.gz" .
 
-# 6. Manifest.
+# 5. Manifest.
 echo "build-release: manifest.json"
 arches_json="["
 for i in "${!ARCHES[@]}"; do
@@ -160,7 +149,7 @@ cat > "$OUTPUT/manifest.json" <<MANIFEST
 }
 MANIFEST
 
-# 7. SHA256SUMS over the release-facing assets only (not the staging dir).
+# 6. SHA256SUMS over the release-facing assets only (not the staging dir).
 echo "build-release: SHA256SUMS"
 (
     cd "$OUTPUT"

@@ -169,7 +169,6 @@ func NewState(p Paths) *State {
 			// reboot / update / system-upgrade without a 409.
 			"airplanes-update.service":              "inactive",
 			"airplanes-system-upgrade.service":      "inactive",
-			"airplanes-webconfig-update.service":    "inactive",
 			"airplanes-update-orchestrator.service": "inactive",
 			// Claim unit — never reported active; the SPA pulls progress from
 			// the claim SSE log instead.

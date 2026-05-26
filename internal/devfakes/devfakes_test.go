@@ -449,15 +449,14 @@ func TestSystemctl_IsActiveMixedUnits(t *testing.T) {
 		"/usr/bin/systemctl", "is-active",
 		"airplanes-system-upgrade.service",
 		"airplanes-update.service",
-		"airplanes-webconfig-update.service",
 		"airplanes-update-orchestrator.service",
 	})
 	if err != nil {
 		t.Fatalf("runner: %v", err)
 	}
 	lines := strings.Split(strings.TrimRight(string(res.Stdout), "\n"), "\n")
-	if len(lines) != 4 {
-		t.Fatalf("expected 4 state lines, got %d (out=%q)", len(lines), res.Stdout)
+	if len(lines) != 3 {
+		t.Fatalf("expected 3 state lines, got %d (out=%q)", len(lines), res.Stdout)
 	}
 	for _, l := range lines {
 		if l != "inactive" {
@@ -491,12 +490,11 @@ func TestSystemdRun_PinsMaintenanceUnitActivating(t *testing.T) {
 		"/usr/bin/systemctl", "is-active",
 		"airplanes-system-upgrade.service",
 		"airplanes-update.service",
-		"airplanes-webconfig-update.service",
 		"airplanes-update-orchestrator.service",
 	})
 	lines := strings.Split(strings.TrimRight(string(res.Stdout), "\n"), "\n")
-	if len(lines) != 4 || lines[0] != "inactive" || lines[1] != "activating" || lines[2] != "inactive" || lines[3] != "inactive" {
-		t.Fatalf("is-active fan-out=%v want [inactive activating inactive inactive]", lines)
+	if len(lines) != 3 || lines[0] != "inactive" || lines[1] != "activating" || lines[2] != "inactive" {
+		t.Fatalf("is-active fan-out=%v want [inactive activating inactive]", lines)
 	}
 }
 

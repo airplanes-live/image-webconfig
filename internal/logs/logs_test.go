@@ -27,7 +27,6 @@ func TestResolve_Whitelist(t *testing.T) {
 		"webconfig":           "airplanes-webconfig.service",
 		"update":              "airplanes-update.service",
 		"system-upgrade":      "airplanes-system-upgrade.service",
-		"webconfig-update":    "airplanes-webconfig-update.service",
 		"update-orchestrator": "airplanes-update-orchestrator.service",
 	}
 	for slug, want := range cases {

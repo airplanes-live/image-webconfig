@@ -7,9 +7,9 @@ import (
 	"strings"
 )
 
-// DefaultUpgradeStatePath is where the self-update helper writes the
-// upgrade-state marker. /var/lib/airplanes-webconfig-upgrade/ is a new,
-// root-owned parent — intentionally NOT /var/lib/airplanes-webconfig/,
+// DefaultUpgradeStatePath is where the runtime overlay's update path
+// writes the upgrade-state marker. /var/lib/airplanes-webconfig-upgrade/
+// is a root-owned parent — intentionally NOT /var/lib/airplanes-webconfig/,
 // which is mode 0700 owned by the unprivileged service account and would
 // let the account unlink files there regardless of file ownership.
 const DefaultUpgradeStatePath = "/var/lib/airplanes-webconfig-upgrade/upgrade-state"
@@ -41,16 +41,16 @@ func readUpgradeState(path string) string {
 	}
 }
 
-// handleUpgradeStatus serves GET /api/status/upgrade. The SPA polls this
-// after POST /api/webconfig-update so it can render "rolling back" or
-// "wedged — manual recovery required" without grepping the SSE log.
+// handleUpgradeStatus serves GET /api/status/upgrade, reporting the
+// on-disk upgrade-state marker ("clean" / "in-progress" / "failed" /
+// "unknown"). The marker is written by the runtime overlay's update
+// path; on a feeder that has never been upgraded — or where the marker
+// is absent — the endpoint answers "unknown".
 //
-// /health intentionally stays plain-text `ok <version>` — the SPA
-// captures it as raw text and treats any version change as "upgrade
-// applied", so JSON-ifying /health would misreport a rolled-back-with-
-// failed-marker device as a successful upgrade (the binary's version
-// byte-changes after a partial extract). Upgrade state belongs on a
-// dedicated status endpoint, not a health probe.
+// /health intentionally stays plain-text `ok <version>`: JSON-ifying it
+// would misreport a rolled-back-with-failed-marker device as a successful
+// upgrade (the binary's version byte-changes after a partial extract).
+// Upgrade state belongs on a dedicated status endpoint, not a health probe.
 func (s *Server) handleUpgradeStatus(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{
 		"state": readUpgradeState(s.upgradeStatePath),

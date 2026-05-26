@@ -322,7 +322,6 @@ func TestDefaultPrivilegedArgv_SudoersParity_CoversOrchestrator(t *testing.T) {
 	if err := ValidatePrivilegedArgvParity(
 		DefaultPrivilegedArgv(),
 		filepath.Join("..", "..", "files", "etc", "sudoers.d", "010_airplanes-webconfig"),
-		filepath.Join("..", "..", "files", "etc", "sudoers.d", "011_airplanes-webconfig-update"),
 	); err != nil {
 		t.Fatalf("parity check failed against in-tree sudoers: %v", err)
 	}
@@ -344,16 +343,14 @@ func TestDefaultPrivilegedArgv_SudoersParity_CoversOrchestrator(t *testing.T) {
 }
 
 // TestOrchestratorStart_RefusedDuringMaintenance covers the no-overlap
-// guard: a busy apt upgrade / feed update / webconfig update / prior
-// orchestrator unit must block a start. The orchestrator drives all
-// four under the hood, so an overlapping kickoff would deadlock on
-// dpkg or corrupt release state.
+// guard: a busy apt upgrade / feed update / prior orchestrator unit must
+// block a start. The orchestrator drives all of them under the hood, so an
+// overlapping kickoff would deadlock on dpkg or corrupt release state.
 func TestOrchestratorStart_RefusedDuringMaintenance(t *testing.T) {
 	t.Parallel()
 	for _, unit := range []string{
 		"airplanes-system-upgrade.service",
 		"airplanes-update.service",
-		"airplanes-webconfig-update.service",
 		"airplanes-update-orchestrator.service",
 	} {
 		unit := unit

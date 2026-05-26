@@ -45,7 +45,6 @@
         "webconfig":      "airplanes-webconfig.service",
         "update":               "airplanes-update.service",
         "system-upgrade":       "airplanes-system-upgrade.service",
-        "webconfig-update":     "airplanes-webconfig-update.service",
         "update-orchestrator":  "airplanes-update-orchestrator.service",
     };
     const UNIT_TO_LOG_SLUG = Object.fromEntries(
@@ -2796,38 +2795,7 @@
     }
 
     function buildUpdatesCard() {
-        // Row 1: web UI — the outermost layer
-        const webUiUpdateBtn = el("button", {
-            type: "button", class: "wc-btn-ghost",
-            onclick: async () => {
-                webUiUpdateBtn.disabled = true;
-                // Capture /health BEFORE issuing the update POST so the
-                // progress view has a baseline to compare against once the
-                // service restarts. Doing this after the POST opens a race
-                // where a very fast restart could land the new version
-                // here and the poller would then wait forever for a change.
-                let preUpdateHealth = null;
-                try {
-                    const h = await fetch("/health", { cache: "no-store" });
-                    if (h.ok) preUpdateHealth = await h.text();
-                } catch (_) { /* ignore — poller still works without baseline */ }
-                const r = await postJSON("/api/webconfig-update", {});
-                webUiUpdateBtn.disabled = false;
-                if (handleAuthFailure(r)) return;
-                if (!r.ok) {
-                    alert((r.payload && r.payload.error) || "web UI update failed");
-                    return;
-                }
-                navigate(() => webconfigUpdateProgress(preUpdateHealth), { title: "Web UI update", showBack: true });
-            },
-        }, "Update web UI");
-
-        const webUiUpdateLog = el("button", {
-            type: "button", class: "wc-btn-ghost",
-            onclick: () => navigate(() => logViewer("webconfig-update"), { title: "Web UI update log", showBack: true }),
-        }, "Web UI update log");
-
-        // Row 2: feed scripts — the middle layer
+        // Row 1: feed scripts — the middle layer
         const feedUpdateBtn = el("button", {
             type: "button", class: "wc-btn-ghost",
             onclick: async () => {
@@ -2930,7 +2898,6 @@
             el("h2", {}, "Updates"),
             unifiedUpdateRow,
             el("div", { class: "wc-action-grid" },
-                webUiUpdateBtn, webUiUpdateLog,
                 feedUpdateBtn, feedUpdateLog,
                 sysUpdateBtn,  sysUpdateLog,
             ),
@@ -3716,100 +3683,6 @@
         );
         render(form);
         input.focus();
-    }
-
-    // webconfigUpdateProgress is a specialised log viewer for the webconfig
-    // self-update flow. The standard logViewer closes its EventSource on the
-    // first error and prints "[stream closed]" — that's correct for feed
-    // updates but wrong here, where the update INTENTIONALLY restarts this
-    // service mid-stream. We extend the pattern: tail the journal until SSE
-    // dies, then poll /health until it responds with a different version
-    // (success) or until we give up (failure). On success, reload so the
-    // SPA reconnects to the new binary; on failure, stay on the page with
-    // a hint to refresh manually.
-    //
-    // baselineHealth: the /health response text captured BEFORE the POST
-    // that started this update. May be null (fetch failed); the poller
-    // treats null as "any successful /health after SSE death counts as
-    // restart", which is a slightly weaker signal but still safe.
-    function webconfigUpdateProgress(baselineHealth) {
-        const slug = "webconfig-update";
-        const pre = el("pre", { class: "log-output" });
-        const status = el("p", { class: "muted" }, "Update in progress; the page will reload when the new web UI is ready.");
-        const placeholder = el("span", { class: "muted" }, "(waiting for the update to begin)");
-        pre.appendChild(placeholder);
-        const clearPlaceholder = () => {
-            if (placeholder.parentNode === pre) pre.removeChild(placeholder);
-        };
-        render(
-            el("section", { class: "wc-card" },
-                el("h2", {}, "Web UI update"),
-                status,
-                pre,
-            ),
-        );
-
-        // cancelled lets the polling loop bail out cleanly when the user
-        // navigates away. activeAbort + activeStream are reset by navigate()
-        // on transition; setting both here ties this panel's resources to
-        // that lifecycle.
-        let cancelled = false;
-        let pollTimer = null;
-        const ctrl = new AbortController();
-        const prevAbort = activeAbort;
-        activeAbort = {
-            abort: () => {
-                cancelled = true;
-                if (pollTimer) { clearTimeout(pollTimer); pollTimer = null; }
-                try { ctrl.abort(); } catch (_) {}
-                if (prevAbort && typeof prevAbort.abort === "function") prevAbort.abort();
-            },
-        };
-
-        const es = new EventSource("/api/log/" + encodeURIComponent(slug));
-        activeStream = es;
-        es.onmessage = (ev) => {
-            clearPlaceholder();
-            appendLogLine(pre, ev.data);
-        };
-        es.onerror = () => {
-            clearPlaceholder();
-            appendLogLine(pre, "[restart in progress]");
-            try { es.close(); } catch (_) {}
-            if (activeStream === es) activeStream = null;
-            if (cancelled) return;
-            status.textContent = "Waiting for the new web UI to come back online…";
-            pollForRestart();
-        };
-
-        const POLL_INTERVAL_MS = 1000;
-        const POLL_MAX_ATTEMPTS = 90; // 90 seconds total
-        let attempts = 0;
-        function pollForRestart() {
-            if (cancelled) return;
-            attempts += 1;
-            fetch("/health", { cache: "no-store", signal: ctrl.signal })
-                .then((r) => (r.ok ? r.text() : null))
-                .then((t) => {
-                    if (cancelled) return;
-                    if (t && (baselineHealth === null || t !== baselineHealth)) {
-                        status.textContent = "Update applied — reloading…";
-                        appendLogLine(pre, "[restart complete: " + t.trim() + "]");
-                        pollTimer = setTimeout(() => { if (!cancelled) window.location.reload(); }, 500);
-                        return;
-                    }
-                    scheduleNext();
-                })
-                .catch(() => { if (!cancelled) scheduleNext(); });
-        }
-        function scheduleNext() {
-            if (cancelled) return;
-            if (attempts >= POLL_MAX_ATTEMPTS) {
-                status.textContent = "The web UI did not come back online within 90 seconds. Refresh the page once the feeder is reachable, or check the log for a rollback message.";
-                return;
-            }
-            pollTimer = setTimeout(pollForRestart, POLL_INTERVAL_MS);
-        }
     }
 
     // LOG_TS_RE matches the journalctl --output=short timestamp prefix
