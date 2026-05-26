@@ -34,8 +34,8 @@ type Server struct {
 	schema        *schemacache.Cache
 	priv          PrivilegedArgv
 	nowFunc       func() time.Time // injected for tests; defaults to time.Now
-	// upgradeStatePath is the on-disk file the self-update helper writes
-	// with "clean" / "in-progress" / "failed". Defaults to
+	// upgradeStatePath is the on-disk file the runtime overlay's update
+	// path writes with "clean" / "in-progress" / "failed". Defaults to
 	// DefaultUpgradeStatePath; tests override via Deps.UpgradeStatePath.
 	upgradeStatePath string
 	// orchestratorStatePath is the on-disk JSON state file the update
@@ -82,7 +82,6 @@ type PrivilegedArgv struct {
 	Poweroff           []string // sudo -n /usr/bin/systemctl poweroff
 	StartUpdate          []string // sudo systemd-run --unit=airplanes-update ...
 	StartSystemUpgrade   []string // sudo systemd-run --unit=airplanes-system-upgrade ...
-	StartWebconfigUpdate []string // sudo systemd-run --unit=airplanes-webconfig-update ...
 	StartOrchestrator    []string // sudo systemd-run --unit=airplanes-update-orchestrator ...
 	RegisterClaim      []string // sudo systemctl start --no-block airplanes-claim.service
 	WifiList           []string
@@ -125,16 +124,6 @@ func DefaultPrivilegedArgv() PrivilegedArgv {
 			"--unit=airplanes-system-upgrade",
 			"--collect",
 			"/usr/local/lib/airplanes-webconfig/system-upgrade.sh",
-		),
-		// StartWebconfigUpdate launches the in-product self-update helper as
-		// a transient systemd unit. The HTTP request returns 202 before the
-		// helper runs systemctl restart on this service, so the client sees
-		// a clean response and then reconnects against the new version.
-		StartWebconfigUpdate: sudo(
-			"/usr/bin/systemd-run",
-			"--unit=airplanes-webconfig-update",
-			"--collect",
-			"/usr/local/lib/airplanes-webconfig/webconfig-self-update.sh",
 		),
 		// StartOrchestrator launches the unified update orchestrator —
 		// apt → feed → webconfig → runtime overlay — as a transient
@@ -281,7 +270,6 @@ func New(d Deps) http.Handler {
 	mux.HandleFunc("POST /api/config", s.requireSession(s.handleConfigPost))
 	mux.HandleFunc("POST /api/update", s.requireSession(s.handleUpdate))
 	mux.HandleFunc("POST /api/system-upgrade", s.requireSession(s.handleSystemUpgrade))
-	mux.HandleFunc("POST /api/webconfig-update", s.requireSession(s.handleWebconfigUpdate))
 	mux.HandleFunc("POST /api/orchestrator/start", s.requireSession(s.handleOrchestratorStart))
 	mux.HandleFunc("GET /api/orchestrator/state", s.requireSession(s.handleOrchestratorState))
 	mux.HandleFunc("POST /api/reboot", s.requireSession(s.handleReboot))

@@ -34,9 +34,7 @@ import (
 // for stable releases the tag alone is unique enough (v0.1.2 differs from
 // v0.1.3), but the moving "dev-latest" tag is reused across consecutive dev
 // builds, so we append a short SHA suffix (semver +build metadata) so
-// /health byte-changes after a dev→dev self-update — that byte change is
-// what the SPA's post-update poller in web/assets/app.js uses to detect that
-// the new binary is online and reload.
+// /health byte-changes between two dev builds carrying the same tag.
 var (
 	version   = "dev"
 	commitSha = ""
@@ -90,7 +88,7 @@ func main() {
 	hardwareTimeout := flag.Duration("hardware-timeout", 2*time.Second,
 		"probe timeout for --hardware (must be < the shell timeout wrapping the call)")
 	validateSudoers := flag.Bool("validate-sudoers", false,
-		"verify every DefaultPrivilegedArgv() shape is authorized by /etc/sudoers.d/010_* + 011_* and exit (exit 0 on parity, 1 on mismatch)")
+		"verify every DefaultPrivilegedArgv() shape is authorized by /etc/sudoers.d/010_* and exit (exit 0 on parity, 1 on mismatch)")
 	flag.Parse()
 
 	if *hardwareMode {

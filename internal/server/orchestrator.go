@@ -151,9 +151,8 @@ func (s *Server) handleOrchestratorStart(w http.ResponseWriter, r *http.Request)
 	defer s.maintenanceMu.Unlock()
 
 	// Refuse if any other maintenance unit is active (apt upgrade /
-	// feed update / webconfig update / orchestrator). All four touch
-	// dpkg or release artefacts and would deadlock or corrupt state if
-	// they overlapped. The orchestrator itself appears in
+	// feed update / orchestrator). All three touch dpkg or release
+	// artefacts and would deadlock or corrupt state if they overlapped. The orchestrator itself appears in
 	// maintenanceUnits so a second start-during-orchestrator click hits
 	// this guard before the state-file probe runs.
 	if busy := s.maintenanceUnitActive(r.Context()); busy != "" {

@@ -2,9 +2,9 @@
 #
 # Unit tests for scripts/lib/install-common.sh:
 #   - airplanes_webconfig_resolve_latest_stable_tag against a local fake remote
-#   - airplanes_webconfig_resolve_channel against synthetic release-channel files
-#   - airplanes_webconfig_detect_arch in build-mode and runtime
-#   - airplanes_webconfig_is_build_mode / parse_mode_args
+#   - airplanes_webconfig_resolve_channel reads AIRPLANES_WEBCONFIG_BRANCH
+#   - airplanes_webconfig_detect_arch honors the pi-gen ARCH enum
+#   - airplanes_webconfig_parse_mode_args
 #   - airplanes_webconfig_verify_manifest_sha
 
 setup() {
@@ -38,9 +38,7 @@ setup() {
     )
 
     # Reset env so a stray export from the host shell doesn't leak in.
-    unset AIRPLANES_BUILD_MODE
     unset AIRPLANES_WEBCONFIG_BRANCH
-    unset AIRPLANES_ROOT
     unset ARCH
 
     AIRPLANES_WEBCONFIG_REPO="$FAKE_REMOTE"
@@ -137,91 +135,42 @@ teardown() {
 
 # -- airplanes_webconfig_resolve_channel -----------------------------------
 
-@test "resolve_channel: build-mode reads AIRPLANES_WEBCONFIG_BRANCH" {
-    AIRPLANES_BUILD_MODE=1
+@test "resolve_channel: reads AIRPLANES_WEBCONFIG_BRANCH" {
     AIRPLANES_WEBCONFIG_BRANCH="v9.9.9"
     run airplanes_webconfig_resolve_channel
     [ "$status" -eq 0 ]
     [ "$output" = "v9.9.9" ]
 }
 
-@test "resolve_channel: build-mode rejects unset AIRPLANES_WEBCONFIG_BRANCH" {
-    AIRPLANES_BUILD_MODE=1
+@test "resolve_channel: rejects unset AIRPLANES_WEBCONFIG_BRANCH" {
     unset AIRPLANES_WEBCONFIG_BRANCH
     run airplanes_webconfig_resolve_channel
     [ "$status" -ne 0 ]
 }
 
-@test "resolve_channel: runtime reads release-channel=stable" {
-    install -d "$WORK/root/etc/airplanes"
-    echo stable > "$WORK/root/etc/airplanes/release-channel"
-    AIRPLANES_ROOT="$WORK/root"
-    run airplanes_webconfig_resolve_channel
-    [ "$status" -eq 0 ]
-    [ "$output" = "stable" ]
-}
-
-@test "resolve_channel: runtime treats 'main' as stable alias" {
-    install -d "$WORK/root/etc/airplanes"
-    echo main > "$WORK/root/etc/airplanes/release-channel"
-    AIRPLANES_ROOT="$WORK/root"
-    run airplanes_webconfig_resolve_channel
-    [ "$status" -eq 0 ]
-    [ "$output" = "stable" ]
-}
-
-@test "resolve_channel: runtime reads release-channel=dev" {
-    install -d "$WORK/root/etc/airplanes"
-    echo dev > "$WORK/root/etc/airplanes/release-channel"
-    AIRPLANES_ROOT="$WORK/root"
-    run airplanes_webconfig_resolve_channel
-    [ "$status" -eq 0 ]
-    [ "$output" = "dev" ]
-}
-
-@test "resolve_channel: runtime rejects unknown channel" {
-    install -d "$WORK/root/etc/airplanes"
-    echo unstable > "$WORK/root/etc/airplanes/release-channel"
-    AIRPLANES_ROOT="$WORK/root"
-    run airplanes_webconfig_resolve_channel
-    [ "$status" -ne 0 ]
-}
-
-@test "resolve_channel: runtime defaults to stable when file is missing" {
-    AIRPLANES_ROOT="$WORK/empty-root"
-    install -d "$AIRPLANES_ROOT/etc/airplanes"
-    run airplanes_webconfig_resolve_channel
-    [ "$status" -eq 0 ]
-    [ "$output" = "stable" ]
-}
-
 # -- airplanes_webconfig_detect_arch ---------------------------------------
 
-@test "detect_arch: build-mode honors ARCH=arm64" {
-    AIRPLANES_BUILD_MODE=1
+@test "detect_arch: honors ARCH=arm64" {
     ARCH=arm64
     run airplanes_webconfig_detect_arch
     [ "$status" -eq 0 ]
     [ "$output" = "arm64" ]
 }
 
-@test "detect_arch: build-mode honors ARCH=armhf" {
-    AIRPLANES_BUILD_MODE=1
+@test "detect_arch: honors ARCH=armhf" {
     ARCH=armhf
     run airplanes_webconfig_detect_arch
     [ "$status" -eq 0 ]
     [ "$output" = "armhf" ]
 }
 
-@test "detect_arch: build-mode rejects unset ARCH" {
-    AIRPLANES_BUILD_MODE=1
+@test "detect_arch: rejects unset ARCH" {
     unset ARCH
     run airplanes_webconfig_detect_arch
     [ "$status" -ne 0 ]
 }
 
-@test "detect_arch: build-mode rejects unknown ARCH" {
-    AIRPLANES_BUILD_MODE=1
+@test "detect_arch: rejects unknown ARCH" {
     ARCH=mips
     run airplanes_webconfig_detect_arch
     [ "$status" -ne 0 ]
@@ -229,31 +178,9 @@ teardown() {
 
 # -- mode-arg parsing ------------------------------------------------------
 
-@test "parse_mode_args: --build-mode sets AIRPLANES_BUILD_MODE" {
-    airplanes_webconfig_parse_mode_args --build-mode
-    [ "$AIRPLANES_BUILD_MODE" = "1" ]
-}
-
-@test "parse_mode_args: --runtime clears AIRPLANES_BUILD_MODE" {
-    AIRPLANES_BUILD_MODE=1
-    airplanes_webconfig_parse_mode_args --runtime
-    [ "$AIRPLANES_BUILD_MODE" = "0" ]
-}
-
-@test "is_build_mode: false by default" {
-    unset AIRPLANES_BUILD_MODE
-    run airplanes_webconfig_is_build_mode
-    [ "$status" -ne 0 ]
-}
-
-@test "is_build_mode: true when env is '1'" {
-    AIRPLANES_BUILD_MODE=1
-    airplanes_webconfig_is_build_mode
-}
-
-@test "is_build_mode: true when env is 'true'" {
-    AIRPLANES_BUILD_MODE=true
-    airplanes_webconfig_is_build_mode
+@test "parse_mode_args: --build-mode is accepted" {
+    run airplanes_webconfig_parse_mode_args --build-mode
+    [ "$status" -eq 0 ]
 }
 
 # -- manifest commit_sha verification --------------------------------------

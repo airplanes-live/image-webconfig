@@ -73,7 +73,6 @@ func StubPrivilegedArgv() server.PrivilegedArgv {
 		Poweroff:             []string{"dev-stub", "systemctl", "poweroff"},
 		StartUpdate:          []string{"dev-stub", "systemd-run", "airplanes-update"},
 		StartSystemUpgrade:   []string{"dev-stub", "systemd-run", "airplanes-system-upgrade"},
-		StartWebconfigUpdate: []string{"dev-stub", "systemd-run", "airplanes-webconfig-update"},
 		StartOrchestrator:    []string{"dev-stub", "systemd-run", "airplanes-update-orchestrator"},
 		RegisterClaim:        []string{"dev-stub", "systemctl", "claim-register"},
 		WifiList:             []string{"dev-stub", "apl-wifi", "list"},
@@ -100,7 +99,7 @@ func StubPrivilegedArgv() server.PrivilegedArgv {
 //     The fake returns "0" so the dashboard never renders an exit-status
 //     warning over the simulated feed.
 //   - dev-stub systemctl {reboot,poweroff} — log the intent and exit 0.
-//   - dev-stub systemd-run airplanes-{update,system-upgrade,webconfig-update}
+//   - dev-stub systemd-run airplanes-{update,system-upgrade}
 //     — log the intent and exit 0. The HTTP handler writes 202.
 //   - dev-stub systemctl claim-register — calls state.RegisterClaim()
 //     so the next GET /api/identity reports claim_secret_present=true.
@@ -222,7 +221,7 @@ func dispatchStub(state *State, priv server.PrivilegedArgv, argv []string, body 
 		unit := argv[2] + ".service"
 		log.Printf("devfakes: would systemd-run %s", unit)
 		// Pin the maintenance unit `activating` for a short window so a
-		// double-click on Update / System upgrade / Web UI update exercises
+		// double-click on Update / System upgrade exercises
 		// handlers.maintenanceUnitActive's 409 guard the same way it would
 		// on a real Pi. Production systemd flips a transient unit through
 		// activating → active → inactive on its own; we approximate with a
@@ -653,10 +652,6 @@ var unitLogLines = map[string][]string{
 	"airplanes-system-upgrade.service": {
 		"system-upgrade: apt-get update (simulated)",
 		"system-upgrade: 0 packages to upgrade",
-	},
-	"airplanes-webconfig-update.service": {
-		"webconfig-update: resolving latest tag",
-		"webconfig-update: would download release",
 	},
 	"airplanes-update-orchestrator.service": {
 		"update-orchestrator: sequencing apt -> feed -> webconfig -> runtime",

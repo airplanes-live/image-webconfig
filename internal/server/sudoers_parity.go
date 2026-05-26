@@ -14,7 +14,6 @@ import (
 func DefaultSudoersPaths() []string {
 	return []string{
 		"/etc/sudoers.d/010_airplanes-webconfig",
-		"/etc/sudoers.d/011_airplanes-webconfig-update",
 	}
 }
 
@@ -64,7 +63,6 @@ func privilegedArgvCases(priv PrivilegedArgv) []privilegedArgvCase {
 		{"Poweroff", priv.Poweroff},
 		{"StartUpdate", priv.StartUpdate},
 		{"StartSystemUpgrade", priv.StartSystemUpgrade},
-		{"StartWebconfigUpdate", priv.StartWebconfigUpdate},
 		{"StartOrchestrator", priv.StartOrchestrator},
 		{"RegisterClaim", priv.RegisterClaim},
 		{"WifiList", priv.WifiList},
@@ -105,9 +103,9 @@ func privilegedArgvCases(priv PrivilegedArgv) []privilegedArgvCase {
 //   - The unit test TestDefaultPrivilegedArgv_SudoersParity (against the
 //     in-tree files/etc/sudoers.d/* — catches build-time drift).
 //   - The `airplanes-webconfig --validate-sudoers` runtime subcommand
-//     (against /etc/sudoers.d/010_* + /etc/sudoers.d/011_* — catches drift
-//     between an upgraded binary and the not-yet-replaced sudoers files,
-//     i.e. the cross-version case the unit test cannot reach).
+//     (against /etc/sudoers.d/010_* — catches drift between an upgraded
+//     binary and the not-yet-replaced sudoers file, i.e. the cross-version
+//     case the unit test cannot reach).
 func ValidatePrivilegedArgvParity(priv PrivilegedArgv, sudoersPaths ...string) error {
 	commands, err := LoadSudoersCommands(sudoersPaths...)
 	if err != nil {

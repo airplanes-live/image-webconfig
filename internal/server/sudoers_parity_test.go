@@ -12,7 +12,6 @@ func TestValidatePrivilegedArgvParity_PassesAgainstInTreeFiles(t *testing.T) {
 	if err := ValidatePrivilegedArgvParity(
 		DefaultPrivilegedArgv(),
 		filepath.Join("..", "..", "files", "etc", "sudoers.d", "010_airplanes-webconfig"),
-		filepath.Join("..", "..", "files", "etc", "sudoers.d", "011_airplanes-webconfig-update"),
 	); err != nil {
 		t.Fatalf("parity check failed against in-tree sudoers: %v", err)
 	}

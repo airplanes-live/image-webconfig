@@ -67,13 +67,13 @@ jobs:
           sudo apt-get install -y --no-install-recommends shellcheck
       - name: shellcheck
         run: |
-          shellcheck -x install.sh update.sh scripts/lib/install-common.sh \
+          shellcheck -x install.sh scripts/lib/install-common.sh \
             files/usr/local/lib/airplanes-webconfig/*.sh \
             files/usr/local/bin/apl-wifi \
             files/usr/local/lib/airplanes/*.sh
       - name: bash -n
         run: |
-          for f in install.sh update.sh scripts/lib/install-common.sh \
+          for f in install.sh scripts/lib/install-common.sh \
                    files/usr/local/lib/airplanes-webconfig/*.sh \
                    files/usr/local/bin/apl-wifi \
                    files/usr/local/lib/airplanes/*.sh; do
@@ -105,8 +105,6 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends bats
       - name: Run bats suite
-        # test_self_update.bats skips on the host (mutates production paths);
-        # it runs via the bats-self-update job below.
         run: bats test/bats/
 
   build-release-smoke:
@@ -135,14 +133,6 @@ jobs:
       - name: verify SHA256SUMS
         working-directory: ${{ runner.temp }}/release
         run: sha256sum -c SHA256SUMS
-      - name: assert installer staged in rootfs payload
-        run: |
-          tar -tzf "$RUNNER_TEMP/release/rootfs.tar.gz" | \
-            grep -qE '^\./usr/local/share/airplanes-webconfig/install\.sh$'
-          tar -tzf "$RUNNER_TEMP/release/rootfs.tar.gz" | \
-            grep -qE '^\./usr/local/share/airplanes-webconfig/update\.sh$'
-          tar -tzf "$RUNNER_TEMP/release/rootfs.tar.gz" | \
-            grep -qE '^\./usr/local/share/airplanes-webconfig/scripts/lib/install-common\.sh$'
       - name: assert sudoers files carry mode 0440 in tarball
         run: |
           # File entries only (drop the directory entry). Each line that
@@ -155,16 +145,3 @@ jobs:
             exit 1
           fi
 
-  bats-self-update:
-    # test_self_update.bats exercises webconfig-self-update.sh end-to-end. The
-    # helper re-execs under env -i and operates on absolute production paths
-    # (/usr/local/bin/airplanes-webconfig, /etc/systemd/..., /etc/airplanes/...,
-    # http://127.0.0.1:8080/health). $PATH shims don't survive env -i and the
-    # paths can't be relocated for a test, so the bats run inside a disposable
-    # debian:trixie-slim container instead. See test/bats/dockerized-bats.sh.
-    runs-on: ubuntu-24.04
-    timeout-minutes: 10
-    steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
-      - name: Run self-update helper bats inside debian:trixie-slim
-        run: bash test/bats/dockerized-bats.sh
