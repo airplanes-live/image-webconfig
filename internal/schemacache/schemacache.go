@@ -1,13 +1,14 @@
 // Package schemacache caches the feed.env schema published by
 // `apl-feed schema --json`. The webconfig binary fetches it at boot,
 // holds an atomic-swap copy in memory, and refreshes it on SIGHUP after
-// `airplanes-update.service` runs (a feed update can introduce new keys
-// or retire old ones; webconfig must not stale-cache the previous list).
+// the update orchestrator's feed leg runs (a feed update can introduce
+// new keys or retire old ones; webconfig must not stale-cache the
+// previous list).
 //
 // On boot-time fetch failure the cache enters degraded mode: the
 // /api/config endpoint returns 503, but the rest of the webconfig
-// surface (login, /api/update, /api/log, /api/reboot, /api/poweroff,
-// status tiles)
+// surface (login, /api/orchestrator/*, /api/log, /api/reboot,
+// /api/poweroff, status tiles)
 // stays alive so an operator can still recover via the dashboard.
 package schemacache
 
@@ -78,8 +79,8 @@ func NewPrepopulated(writable, readable []string) *Cache {
 // in place. The first-boot failure path sets degraded=true so callers
 // can render a 503.
 //
-// Callers: webconfig main goroutine at boot; SIGHUP handler after
-// airplanes-update.service finishes.
+// Callers: webconfig main goroutine at boot; SIGHUP handler after the
+// update orchestrator's feed leg finishes.
 func (c *Cache) Load(ctx context.Context) error {
 	cctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()

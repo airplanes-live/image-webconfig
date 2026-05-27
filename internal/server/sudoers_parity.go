@@ -61,7 +61,6 @@ func privilegedArgvCases(priv PrivilegedArgv) []privilegedArgvCase {
 		{"ApplyFeed", priv.ApplyFeed},
 		{"Reboot", priv.Reboot},
 		{"Poweroff", priv.Poweroff},
-		{"StartUpdate", priv.StartUpdate},
 		{"StartSystemUpgrade", priv.StartSystemUpgrade},
 		{"StartOrchestrator", priv.StartOrchestrator},
 		{"RegisterClaim", priv.RegisterClaim},

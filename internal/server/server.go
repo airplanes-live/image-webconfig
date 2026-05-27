@@ -80,7 +80,6 @@ type PrivilegedArgv struct {
 	SchemaFeed         []string // /usr/local/bin/apl-feed schema --json (no sudo: read-only)
 	Reboot             []string // sudo -n /usr/bin/systemctl reboot
 	Poweroff           []string // sudo -n /usr/bin/systemctl poweroff
-	StartUpdate          []string // sudo systemd-run --unit=airplanes-update ...
 	StartSystemUpgrade   []string // sudo systemd-run --unit=airplanes-system-upgrade ...
 	StartOrchestrator    []string // sudo systemd-run --unit=airplanes-update-orchestrator ...
 	RegisterClaim      []string // sudo systemctl start --no-block airplanes-claim.service
@@ -112,13 +111,6 @@ func DefaultPrivilegedArgv() PrivilegedArgv {
 		SchemaFeed: []string{"/usr/local/bin/apl-feed", "schema", "--json"},
 		Reboot:     sudo("/usr/bin/systemctl", "reboot"),
 		Poweroff:   sudo("/usr/bin/systemctl", "poweroff"),
-		StartUpdate: sudo(
-			"/usr/bin/systemd-run",
-			"--unit=airplanes-update",
-			"--collect",
-			"--property=ExecStopPost=/usr/bin/systemctl kill -s HUP airplanes-webconfig.service",
-			"/usr/local/share/airplanes/update.sh",
-		),
 		StartSystemUpgrade: sudo(
 			"/usr/bin/systemd-run",
 			"--unit=airplanes-system-upgrade",
@@ -268,7 +260,6 @@ func New(d Deps) http.Handler {
 	mux.HandleFunc("GET /api/status/upgrade", s.requireSession(s.handleUpgradeStatus))
 	mux.HandleFunc("GET /api/log/{unit}", s.requireSession(s.handleLog))
 	mux.HandleFunc("POST /api/config", s.requireSession(s.handleConfigPost))
-	mux.HandleFunc("POST /api/update", s.requireSession(s.handleUpdate))
 	mux.HandleFunc("POST /api/system-upgrade", s.requireSession(s.handleSystemUpgrade))
 	mux.HandleFunc("POST /api/orchestrator/start", s.requireSession(s.handleOrchestratorStart))
 	mux.HandleFunc("GET /api/orchestrator/state", s.requireSession(s.handleOrchestratorState))

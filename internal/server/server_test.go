@@ -104,7 +104,6 @@ func newTestServer(t *testing.T) (*httptest.Server, *Server) {
 		SchemaFeed:           []string{"apl-feed", "schema", "--json"},
 		Reboot:               []string{"sudo-stub", "reboot"},
 		Poweroff:             []string{"sudo-stub", "poweroff"},
-		StartUpdate:          []string{"sudo-stub", "update"},
 		StartSystemUpgrade:   []string{"sudo-stub", "system-upgrade"},
 		StartOrchestrator:    []string{"sudo-stub", "orchestrator"},
 		RegisterClaim:        []string{"sudo-stub", "systemctl", "start", "--no-block", "airplanes-claim.service"},
@@ -162,9 +161,9 @@ type stdinCall struct {
 	stdin []byte
 }
 
-// writeHarness is the test harness for POST /api/config / /api/update /
-// /api/reboot — it wires deterministic captures for both runners and
-// pre-authenticates the returned client.
+// writeHarness is the test harness for POST /api/config /
+// /api/system-upgrade / /api/reboot — it wires deterministic captures for
+// both runners and pre-authenticates the returned client.
 type writeHarness struct {
 	ts              *httptest.Server
 	client          *http.Client
@@ -270,7 +269,6 @@ func newWriteHarness(t *testing.T, opts ...harnessOption) *writeHarness {
 		SchemaFeed:           []string{"apl-feed", "schema", "--json"},
 		Reboot:               []string{"sudo-stub", "reboot"},
 		Poweroff:             []string{"sudo-stub", "poweroff"},
-		StartUpdate:          []string{"sudo-stub", "update"},
 		StartSystemUpgrade:   []string{"sudo-stub", "system-upgrade"},
 		StartOrchestrator:    []string{"sudo-stub", "orchestrator"},
 		RegisterClaim:        []string{"sudo-stub", "systemctl", "start", "--no-block", "airplanes-claim.service"},
@@ -526,60 +524,6 @@ func TestConfigPost_UnknownKeyRejectedPreShellout(t *testing.T) {
 // pending_restart surfaces 978 unit failures alongside feed/mlat. Confirms
 // that both 978 entries land in the response when their restart fails.
 
-func TestUpdate_RequiresAuth(t *testing.T) {
-	t.Parallel()
-	ts, _ := newTestServer(t)
-	c := httpClient(t)
-	r := postJSON(t, c, ts.URL+"/api/update", map[string]any{})
-	defer r.Body.Close()
-	if r.StatusCode != http.StatusUnauthorized {
-		t.Fatalf("status = %d", r.StatusCode)
-	}
-}
-
-func TestUpdate_HappyPathReturns202(t *testing.T) {
-	t.Parallel()
-	h := newWriteHarness(t)
-	r := postJSON(t, h.client, h.ts.URL+"/api/update", map[string]any{})
-	defer r.Body.Close()
-	if r.StatusCode != http.StatusAccepted {
-		t.Fatalf("status = %d", r.StatusCode)
-	}
-	var got map[string]string
-	_ = json.NewDecoder(r.Body).Decode(&got)
-	if got["unit"] != "airplanes-update.service" {
-		t.Errorf("unit = %q", got["unit"])
-	}
-}
-
-func TestUpdate_AlreadyRunning409(t *testing.T) {
-	t.Parallel()
-	h := newWriteHarness(t)
-	h.mu.Lock()
-	// The handler runs `systemctl is-active` first (empty stdout → no unit
-	// active, proceed), then `sudo systemd-run ...`. Tag the systemd-run
-	// path with the "already exists" stderr so the handler's contains-check
-	// fires and maps to 409.
-	h.runnerErrFor = func(argv []string) error {
-		if len(argv) >= 2 && argv[1] == "update" {
-			return errors.New("systemd-run failed")
-		}
-		return nil
-	}
-	h.runnerResultFor = func(argv []string) wexec.Result {
-		if len(argv) >= 2 && argv[1] == "update" {
-			return wexec.Result{Stderr: []byte("Unit airplanes-update.service already exists")}
-		}
-		return wexec.Result{}
-	}
-	h.mu.Unlock()
-	r := postJSON(t, h.client, h.ts.URL+"/api/update", map[string]any{})
-	defer r.Body.Close()
-	if r.StatusCode != http.StatusConflict {
-		t.Fatalf("status = %d, want 409", r.StatusCode)
-	}
-}
-
 func TestSystemUpgrade_RequiresAuth(t *testing.T) {
 	t.Parallel()
 	ts, _ := newTestServer(t)
@@ -670,48 +614,10 @@ func activeFor(unit string) func([]string) wexec.Result {
 	}
 }
 
-func TestUpdate_RefusedDuringSystemUpgrade(t *testing.T) {
-	t.Parallel()
-	h := newWriteHarness(t)
-	h.mu.Lock()
-	h.runnerResultFor = activeFor("airplanes-system-upgrade.service")
-	h.mu.Unlock()
-	r := postJSON(t, h.client, h.ts.URL+"/api/update", map[string]any{})
-	defer r.Body.Close()
-	if r.StatusCode != http.StatusConflict {
-		t.Fatalf("status = %d, want 409", r.StatusCode)
-	}
-	// systemd-run argv must not have been invoked.
-	for _, c := range h.callsCopy() {
-		if len(c) >= 2 && c[1] == "update" {
-			t.Fatalf("StartUpdate argv invoked despite 409: %v", c)
-		}
-	}
-}
-
-func TestSystemUpgrade_RefusedDuringFeedUpdate(t *testing.T) {
-	t.Parallel()
-	h := newWriteHarness(t)
-	h.mu.Lock()
-	h.runnerResultFor = activeFor("airplanes-update.service")
-	h.mu.Unlock()
-	r := postJSON(t, h.client, h.ts.URL+"/api/system-upgrade", map[string]any{})
-	defer r.Body.Close()
-	if r.StatusCode != http.StatusConflict {
-		t.Fatalf("status = %d, want 409", r.StatusCode)
-	}
-	for _, c := range h.callsCopy() {
-		if len(c) >= 2 && c[1] == "system-upgrade" {
-			t.Fatalf("StartSystemUpgrade argv invoked despite 409: %v", c)
-		}
-	}
-}
-
 func TestReboot_RefusedDuringMaintenance(t *testing.T) {
 	t.Parallel()
 	for _, unit := range []string{
 		"airplanes-system-upgrade.service",
-		"airplanes-update.service",
 		"airplanes-update-orchestrator.service",
 	} {
 		unit := unit
@@ -822,7 +728,6 @@ func TestPoweroff_RefusedDuringMaintenance(t *testing.T) {
 	t.Parallel()
 	for _, unit := range []string{
 		"airplanes-system-upgrade.service",
-		"airplanes-update.service",
 		"airplanes-update-orchestrator.service",
 	} {
 		unit := unit

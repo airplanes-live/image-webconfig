@@ -133,7 +133,7 @@ func main() {
 	cache := schemacache.New(priv.SchemaFeed, wexec.RealRunner)
 	loadCtx, loadCancel := context.WithTimeout(context.Background(), 15*time.Second)
 	if err := cache.Load(loadCtx); err != nil {
-		// Degraded mode: /api/config returns 503, but /api/update,
+		// Degraded mode: /api/config returns 503, but /api/orchestrator/*,
 		// /api/log/*, /api/reboot, /api/poweroff, and the auth endpoints
 		// stay alive so the operator can still recover via the dashboard.
 		log.Printf("schema: boot fetch failed (degraded mode, /api/config unavailable): %v", err)
@@ -172,10 +172,11 @@ func main() {
 		MaxHeaderBytes:    1 << 14,
 	}
 
-	// SIGHUP refreshes the schema cache. The airplanes-update transient
-	// unit fires this after a feed update so a new feed-env-keys.sh
-	// can take effect without bouncing the webconfig session table
-	// (sessions are in-memory; a restart logs every operator out).
+	// SIGHUP refreshes the schema cache. The update orchestrator's
+	// transient unit fires this after its feed leg so a new
+	// feed-env-keys.sh can take effect without bouncing the webconfig
+	// session table (sessions are in-memory; a restart logs every
+	// operator out).
 	hup := make(chan os.Signal, 1)
 	signal.Notify(hup, syscall.SIGHUP)
 	go func() {
