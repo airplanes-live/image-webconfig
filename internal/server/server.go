@@ -80,7 +80,6 @@ type PrivilegedArgv struct {
 	SchemaFeed         []string // /usr/local/bin/apl-feed schema --json (no sudo: read-only)
 	Reboot             []string // sudo -n /usr/bin/systemctl reboot
 	Poweroff           []string // sudo -n /usr/bin/systemctl poweroff
-	StartSystemUpgrade   []string // sudo systemd-run --unit=airplanes-system-upgrade ...
 	StartOrchestrator    []string // sudo systemd-run --unit=airplanes-update-orchestrator ...
 	RegisterClaim      []string // sudo systemctl start --no-block airplanes-claim.service
 	WifiList           []string
@@ -111,18 +110,12 @@ func DefaultPrivilegedArgv() PrivilegedArgv {
 		SchemaFeed: []string{"/usr/local/bin/apl-feed", "schema", "--json"},
 		Reboot:     sudo("/usr/bin/systemctl", "reboot"),
 		Poweroff:   sudo("/usr/bin/systemctl", "poweroff"),
-		StartSystemUpgrade: sudo(
-			"/usr/bin/systemd-run",
-			"--unit=airplanes-system-upgrade",
-			"--collect",
-			"/usr/local/lib/airplanes-webconfig/system-upgrade.sh",
-		),
 		// StartOrchestrator launches the unified update orchestrator —
-		// apt → feed → webconfig → runtime overlay — as a transient
-		// systemd unit. --collect drops the unit record on exit so a
-		// repeat invocation doesn't 409 on a stale unit name. The
-		// ExecStopPost HUPs this service so the schema cache reloads
-		// after the feed leg potentially rewrote /etc/airplanes/*.
+		// apt → runtime overlay — as a transient systemd unit. --collect
+		// drops the unit record on exit so a repeat invocation doesn't 409
+		// on a stale unit name. The ExecStopPost HUPs this service so the
+		// schema cache reloads after the overlay leg potentially rewrote
+		// /etc/airplanes/*.
 		// Trampoline at /usr/local/lib/airplanes-webconfig/ is owned by
 		// the image's pi-gen stage 06d; it execs into the orchestrator
 		// binary inside the active runtime release.
@@ -260,7 +253,6 @@ func New(d Deps) http.Handler {
 	mux.HandleFunc("GET /api/status/upgrade", s.requireSession(s.handleUpgradeStatus))
 	mux.HandleFunc("GET /api/log/{unit}", s.requireSession(s.handleLog))
 	mux.HandleFunc("POST /api/config", s.requireSession(s.handleConfigPost))
-	mux.HandleFunc("POST /api/system-upgrade", s.requireSession(s.handleSystemUpgrade))
 	mux.HandleFunc("POST /api/orchestrator/start", s.requireSession(s.handleOrchestratorStart))
 	mux.HandleFunc("GET /api/orchestrator/state", s.requireSession(s.handleOrchestratorState))
 	mux.HandleFunc("POST /api/reboot", s.requireSession(s.handleReboot))

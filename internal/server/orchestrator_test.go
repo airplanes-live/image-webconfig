@@ -343,13 +343,12 @@ func TestDefaultPrivilegedArgv_SudoersParity_CoversOrchestrator(t *testing.T) {
 }
 
 // TestOrchestratorStart_RefusedDuringMaintenance covers the no-overlap
-// guard: a busy apt upgrade / prior orchestrator unit must block a start.
-// The orchestrator drives both of them under the hood, so an overlapping
-// kickoff would deadlock on dpkg or corrupt release state.
+// guard: a prior orchestrator unit still in flight must block a second
+// start. An overlapping kickoff would deadlock on dpkg or corrupt
+// release state.
 func TestOrchestratorStart_RefusedDuringMaintenance(t *testing.T) {
 	t.Parallel()
 	for _, unit := range []string{
-		"airplanes-system-upgrade.service",
 		"airplanes-update-orchestrator.service",
 	} {
 		unit := unit

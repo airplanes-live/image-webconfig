@@ -444,18 +444,17 @@ func TestSystemctl_IsActiveMixedUnits(t *testing.T) {
 	runner := Runner(s, priv)
 	// maintenanceUnitActive calls all maintenance units in one
 	// is-active. They must be inactive so the maintenance guard lets
-	// reboot/system-upgrade through.
+	// reboot / Update System through.
 	res, err := runner(context.Background(), []string{
 		"/usr/bin/systemctl", "is-active",
-		"airplanes-system-upgrade.service",
 		"airplanes-update-orchestrator.service",
 	})
 	if err != nil {
 		t.Fatalf("runner: %v", err)
 	}
 	lines := strings.Split(strings.TrimRight(string(res.Stdout), "\n"), "\n")
-	if len(lines) != 2 {
-		t.Fatalf("expected 2 state lines, got %d (out=%q)", len(lines), res.Stdout)
+	if len(lines) != 1 {
+		t.Fatalf("expected 1 state line, got %d (out=%q)", len(lines), res.Stdout)
 	}
 	for _, l := range lines {
 		if l != "inactive" {
@@ -474,25 +473,24 @@ func TestSystemdRun_PinsMaintenanceUnitActivating(t *testing.T) {
 	s := mustNewState(t)
 	priv := StubPrivilegedArgv()
 	runner := Runner(s, priv)
-	// Fire the system-upgrade transient — the maintenance unit must flip
+	// Fire the orchestrator transient — the maintenance unit must flip
 	// to `activating` so a follow-up handlers.maintenanceUnitActive guard
 	// returns the unit name and the second click sees 409.
-	if _, err := runner(context.Background(), priv.StartSystemUpgrade); err != nil {
+	if _, err := runner(context.Background(), priv.StartOrchestrator); err != nil {
 		t.Fatalf("runner: %v", err)
 	}
-	if got := s.ServiceState("airplanes-system-upgrade.service"); got != "activating" {
-		t.Fatalf("after StartSystemUpgrade: airplanes-system-upgrade.service=%q want activating", got)
+	if got := s.ServiceState("airplanes-update-orchestrator.service"); got != "activating" {
+		t.Fatalf("after StartOrchestrator: airplanes-update-orchestrator.service=%q want activating", got)
 	}
-	// Fan-out is-active over the maintenance units; the system-upgrade
-	// one must come back activating, the others inactive.
+	// Fan-out is-active over the maintenance units; the orchestrator
+	// must come back activating.
 	res, _ := runner(context.Background(), []string{
 		"/usr/bin/systemctl", "is-active",
-		"airplanes-system-upgrade.service",
 		"airplanes-update-orchestrator.service",
 	})
 	lines := strings.Split(strings.TrimRight(string(res.Stdout), "\n"), "\n")
-	if len(lines) != 2 || lines[0] != "activating" || lines[1] != "inactive" {
-		t.Fatalf("is-active fan-out=%v want [activating inactive]", lines)
+	if len(lines) != 1 || lines[0] != "activating" {
+		t.Fatalf("is-active fan-out=%v want [activating]", lines)
 	}
 }
 

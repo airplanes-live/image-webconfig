@@ -33,7 +33,6 @@ var Whitelist = map[string]string{
 	"uat":                 "airplanes-978.service",
 	"claim":               "airplanes-claim.service",
 	"webconfig":           "airplanes-webconfig.service",
-	"system-upgrade":      "airplanes-system-upgrade.service",
 	"update-orchestrator": "airplanes-update-orchestrator.service",
 }
 

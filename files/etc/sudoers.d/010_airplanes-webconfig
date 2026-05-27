@@ -34,15 +34,14 @@ airplanes-webconfig ALL=(root) NOPASSWD: /usr/local/bin/apl-wifi status --json
 airplanes-webconfig ALL=(root) NOPASSWD: /usr/bin/systemctl reboot
 airplanes-webconfig ALL=(root) NOPASSWD: /usr/bin/systemctl poweroff
 airplanes-webconfig ALL=(root) NOPASSWD: /usr/bin/systemctl start --no-block airplanes-claim.service
-airplanes-webconfig ALL=(root) NOPASSWD: /usr/bin/systemd-run --unit=airplanes-system-upgrade --collect /usr/local/lib/airplanes-webconfig/system-upgrade.sh
 
-# Unified update orchestrator (apt → feed → webconfig → runtime overlay).
+# Unified update orchestrator (apt → runtime overlay).
 # The trampoline at /usr/local/lib/airplanes-webconfig/start-orchestrator.sh
 # is shipped by airplanes-live/image (pi-gen stage 06d); it execs into the
 # orchestrator binary inside the active runtime release. --collect drops
 # the transient unit record on exit so a repeat invocation doesn't 409 on
 # a stale unit name. ExecStopPost HUPs this service so the schema cache
-# reloads after the orchestrator's feed leg may have rewritten
+# reloads after the orchestrator's overlay leg may have rewritten
 # /etc/airplanes/*.
 airplanes-webconfig ALL=(root) NOPASSWD: /usr/bin/systemd-run --unit=airplanes-update-orchestrator.service --collect --property=ExecStopPost=/usr/bin/systemctl kill -s HUP airplanes-webconfig.service /usr/local/lib/airplanes-webconfig/start-orchestrator.sh
 

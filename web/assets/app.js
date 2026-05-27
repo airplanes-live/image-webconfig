@@ -43,7 +43,6 @@
         "uat":       "airplanes-978.service",
         "claim":     "airplanes-claim.service",
         "webconfig":      "airplanes-webconfig.service",
-        "system-upgrade":       "airplanes-system-upgrade.service",
         "update-orchestrator":  "airplanes-update-orchestrator.service",
     };
     const UNIT_TO_LOG_SLUG = Object.fromEntries(
@@ -2794,89 +2793,34 @@
     }
 
     function buildUpdatesCard() {
-        // Per-step system upgrade — the underlying OS, deepest layer
-        const sysUpdateBtn = el("button", {
-            type: "button", class: "wc-btn-ghost",
-            onclick: async () => {
-                sysUpdateBtn.disabled = true;
-                const r = await postJSON("/api/system-upgrade", {});
-                sysUpdateBtn.disabled = false;
-                if (handleAuthFailure(r)) return;
-                if (!r.ok) {
-                    alert((r.payload && r.payload.error) || "system update failed");
-                    return;
-                }
-                navigate(() => logViewer("system-upgrade"), { title: "Update system log", showBack: true });
-            },
-        }, "Update system");
-
-        const sysUpdateLog = el("button", {
-            type: "button", class: "wc-btn-ghost",
-            onclick: () => navigate(() => logViewer("system-upgrade"), { title: "Update system log", showBack: true }),
-        }, "Update system log");
-
-        // Unified "Update System" button. Drives the orchestrator
-        // (apt → feed → webconfig → runtime). Hidden when the device's
-        // image build hasn't shipped the orchestrator trampoline /
-        // overlay target, in which case the per-step buttons below stay
-        // the user's only path. The orchestrator log button is always
-        // visible — useful to inspect prior runs even on capable
-        // devices, since a clicked unified button navigates to the
-        // polling view, not the log stream.
-        const unifiedUpdateBtn = el("button", {
+        const updateBtn = el("button", {
             type: "button", class: "wc-btn-primary",
             onclick: async () => {
-                unifiedUpdateBtn.disabled = true;
+                updateBtn.disabled = true;
                 const r = await postJSON("/api/orchestrator/start", {});
-                unifiedUpdateBtn.disabled = false;
+                updateBtn.disabled = false;
                 if (handleAuthFailure(r)) return;
                 if (r.status === 503) {
-                    // The capability gate flipped between the mount-time
-                    // probe and the click — rare (image-side downgrade /
-                    // race during pi-gen build), but possible. Surface
-                    // the same fallback the UI does at mount time.
-                    alert("Unified update is unavailable on this device; use the per-step buttons below.");
-                    unifiedUpdateRow.hidden = true;
+                    alert("System update is currently unavailable on this device.");
                     return;
                 }
                 if (!r.ok) {
                     alert((r.payload && r.payload.error) || (r.payload && r.payload.reason) || "update failed");
                     return;
                 }
-                navigate(() => orchestratorProgress(), { title: "Update system", showBack: true });
+                navigate(() => orchestratorProgress(), { title: "Update System", showBack: true });
             },
         }, "Update System");
-        const orchestratorLogBtn = el("button", {
-            type: "button", class: "wc-btn-ghost",
-            onclick: () => navigate(() => logViewer("update-orchestrator"), { title: "Update orchestrator log", showBack: true }),
-        }, "Orchestrator log");
-        const unifiedUpdateRow = el("div", { class: "wc-action-grid" },
-            unifiedUpdateBtn, orchestratorLogBtn,
-        );
-        // Hide the unified row by default; the mount-time probe flips
-        // it visible once /api/orchestrator/state reports a non-
-        // "unavailable" step. Hiding by default avoids a flash of the
-        // button before the probe lands on a slow connection.
-        unifiedUpdateRow.hidden = true;
 
-        // Probe the orchestrator's capability gate. The endpoint is
-        // designed to return 200 with {"step":"unavailable"} when the
-        // gate fails, NOT a 5xx — so this fetch always succeeds on a
-        // booted feeder. We treat any non-"unavailable" step as
-        // "capable" (idle / done / failed / in-flight all count).
-        getJSON("/api/orchestrator/state").then((r) => {
-            if (handleAuthFailure(r)) return;
-            const p = (r && r.payload) || {};
-            if (p.step && p.step !== "unavailable") {
-                unifiedUpdateRow.hidden = false;
-            }
-        }).catch(() => { /* leave hidden; per-step buttons are the fallback */ });
+        const updateLogBtn = el("button", {
+            type: "button", class: "wc-btn-ghost",
+            onclick: () => navigate(() => logViewer("update-orchestrator"), { title: "Update System log", showBack: true }),
+        }, "Update System log");
 
         return el("section", { class: "wc-card" },
             el("h2", {}, "Updates"),
-            unifiedUpdateRow,
             el("div", { class: "wc-action-grid" },
-                sysUpdateBtn, sysUpdateLog,
+                updateBtn, updateLogBtn,
             ),
         );
     }

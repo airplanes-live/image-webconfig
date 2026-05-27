@@ -104,7 +104,6 @@ func newTestServer(t *testing.T) (*httptest.Server, *Server) {
 		SchemaFeed:           []string{"apl-feed", "schema", "--json"},
 		Reboot:               []string{"sudo-stub", "reboot"},
 		Poweroff:             []string{"sudo-stub", "poweroff"},
-		StartSystemUpgrade:   []string{"sudo-stub", "system-upgrade"},
 		StartOrchestrator:    []string{"sudo-stub", "orchestrator"},
 		RegisterClaim:        []string{"sudo-stub", "systemctl", "start", "--no-block", "airplanes-claim.service"},
 		WifiList:             []string{"sudo-stub", "apl-wifi", "list", "--json"},
@@ -162,8 +161,8 @@ type stdinCall struct {
 }
 
 // writeHarness is the test harness for POST /api/config /
-// /api/system-upgrade / /api/reboot — it wires deterministic captures for
-// both runners and pre-authenticates the returned client.
+// /api/orchestrator/start / /api/reboot — it wires deterministic captures
+// for both runners and pre-authenticates the returned client.
 type writeHarness struct {
 	ts              *httptest.Server
 	client          *http.Client
@@ -269,7 +268,6 @@ func newWriteHarness(t *testing.T, opts ...harnessOption) *writeHarness {
 		SchemaFeed:           []string{"apl-feed", "schema", "--json"},
 		Reboot:               []string{"sudo-stub", "reboot"},
 		Poweroff:             []string{"sudo-stub", "poweroff"},
-		StartSystemUpgrade:   []string{"sudo-stub", "system-upgrade"},
 		StartOrchestrator:    []string{"sudo-stub", "orchestrator"},
 		RegisterClaim:        []string{"sudo-stub", "systemctl", "start", "--no-block", "airplanes-claim.service"},
 		WifiList:             []string{"sudo-stub", "apl-wifi", "list", "--json"},
@@ -524,72 +522,31 @@ func TestConfigPost_UnknownKeyRejectedPreShellout(t *testing.T) {
 // pending_restart surfaces 978 unit failures alongside feed/mlat. Confirms
 // that both 978 entries land in the response when their restart fails.
 
-func TestSystemUpgrade_RequiresAuth(t *testing.T) {
-	t.Parallel()
-	ts, _ := newTestServer(t)
-	c := httpClient(t)
-	r := postJSON(t, c, ts.URL+"/api/system-upgrade", map[string]any{})
-	defer r.Body.Close()
-	if r.StatusCode != http.StatusUnauthorized {
-		t.Fatalf("status = %d", r.StatusCode)
-	}
-}
-
-func TestSystemUpgrade_HappyPathReturns202(t *testing.T) {
+// Negative test: the removed /api/system-upgrade route must not be
+// reachable.  The default mux returns 405 for a known path with the
+// wrong method and 404 for an entirely unknown path; since we removed
+// the route, POST lands on the fallback and we accept either.
+func TestSystemUpgrade_RouteRemoved(t *testing.T) {
 	t.Parallel()
 	h := newWriteHarness(t)
 	r := postJSON(t, h.client, h.ts.URL+"/api/system-upgrade", map[string]any{})
 	defer r.Body.Close()
-	if r.StatusCode != http.StatusAccepted {
-		t.Fatalf("status = %d", r.StatusCode)
-	}
-	var got map[string]string
-	_ = json.NewDecoder(r.Body).Decode(&got)
-	if got["unit"] != "airplanes-system-upgrade.service" {
-		t.Errorf("unit = %q", got["unit"])
+	if r.StatusCode != http.StatusNotFound && r.StatusCode != http.StatusMethodNotAllowed {
+		t.Fatalf("status = %d, want 404 or 405 (route removed)", r.StatusCode)
 	}
 }
 
-func TestSystemUpgrade_AlreadyRunning409(t *testing.T) {
+// Negative test: the removed system-upgrade log slug must not resolve.
+func TestSystemUpgradeLog_SlugRemoved(t *testing.T) {
 	t.Parallel()
 	h := newWriteHarness(t)
-	h.mu.Lock()
-	h.runnerErrFor = func(argv []string) error {
-		if len(argv) >= 2 && argv[1] == "system-upgrade" {
-			return errors.New("systemd-run failed")
-		}
-		return nil
+	r, err := h.client.Get(h.ts.URL + "/api/log/system-upgrade")
+	if err != nil {
+		t.Fatalf("get: %v", err)
 	}
-	h.runnerResultFor = func(argv []string) wexec.Result {
-		if len(argv) >= 2 && argv[1] == "system-upgrade" {
-			return wexec.Result{Stderr: []byte("Unit airplanes-system-upgrade.service already exists")}
-		}
-		return wexec.Result{}
-	}
-	h.mu.Unlock()
-	r := postJSON(t, h.client, h.ts.URL+"/api/system-upgrade", map[string]any{})
 	defer r.Body.Close()
-	if r.StatusCode != http.StatusConflict {
-		t.Fatalf("status = %d, want 409", r.StatusCode)
-	}
-}
-
-func TestSystemUpgrade_ArgvShape(t *testing.T) {
-	t.Parallel()
-	h := newWriteHarness(t)
-	r := postJSON(t, h.client, h.ts.URL+"/api/system-upgrade", map[string]any{})
-	defer r.Body.Close()
-	if r.StatusCode != http.StatusAccepted {
-		t.Fatalf("status = %d", r.StatusCode)
-	}
-	saw := false
-	for _, c := range h.callsCopy() {
-		if len(c) >= 2 && c[0] == "sudo-stub" && c[1] == "system-upgrade" {
-			saw = true
-		}
-	}
-	if !saw {
-		t.Errorf("system-upgrade argv not invoked; calls=%v", h.callsCopy())
+	if r.StatusCode != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404 (slug delisted)", r.StatusCode)
 	}
 }
 
@@ -617,7 +574,6 @@ func activeFor(unit string) func([]string) wexec.Result {
 func TestReboot_RefusedDuringMaintenance(t *testing.T) {
 	t.Parallel()
 	for _, unit := range []string{
-		"airplanes-system-upgrade.service",
 		"airplanes-update-orchestrator.service",
 	} {
 		unit := unit
@@ -727,7 +683,6 @@ func TestPoweroff_AuthedReturns202(t *testing.T) {
 func TestPoweroff_RefusedDuringMaintenance(t *testing.T) {
 	t.Parallel()
 	for _, unit := range []string{
-		"airplanes-system-upgrade.service",
 		"airplanes-update-orchestrator.service",
 	} {
 		unit := unit

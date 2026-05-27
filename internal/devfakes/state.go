@@ -164,10 +164,9 @@ func NewState(p Paths) *State {
 			"airplanes-978.service":       "active",
 			"lighttpd.service":            "active",
 			"airplanes-webconfig.service": "active",
-			// Maintenance units — must be inactive so the pre-flight
+			// Maintenance unit — must be inactive so the pre-flight
 			// guard at handlers.go:maintenanceUnitActive lets the user click
-			// reboot / system-upgrade / update-system without a 409.
-			"airplanes-system-upgrade.service":      "inactive",
+			// reboot / Update System without a 409.
 			"airplanes-update-orchestrator.service": "inactive",
 			// Claim unit — never reported active; the SPA pulls progress from
 			// the claim SSE log instead.
