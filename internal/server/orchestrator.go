@@ -134,7 +134,7 @@ func orchestratorRunning(path string) (bool, error) {
 // SPA polls /api/orchestrator/state for progress and a terminal step.
 //
 // The wire envelope on success is `{"status":"running","unit":...,
-// "started_at":...}` — identical to /api/update so the SPA's
+// "started_at":...}` — identical to /api/system-upgrade so the SPA's
 // transient-unit response shape is uniform across update flows.
 func (s *Server) handleOrchestratorStart(w http.ResponseWriter, r *http.Request) {
 	if !s.orchestratorCapableFunc() {

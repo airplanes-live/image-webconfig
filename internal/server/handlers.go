@@ -727,7 +727,6 @@ func (s *Server) runSudo(ctx context.Context, argv []string, timeout time.Durati
 // another or with a shutdown.
 var maintenanceUnits = []string{
 	"airplanes-system-upgrade.service",
-	"airplanes-update.service",
 	"airplanes-update-orchestrator.service",
 }
 
@@ -790,18 +789,10 @@ func (s *Server) startTransientUnit(w http.ResponseWriter, r *http.Request, argv
 	})
 }
 
-// /api/update (POST): kicks off a transient airplanes-update.service via
-// systemd-run. Returns 202 + the unit name so the SPA can stream
-// /api/log/update for live output. systemd-run exits with non-zero on
-// "unit already exists" — we map that to 409. Also 409s when the
-// system-package upgrade unit is busy (both touch dpkg locks).
-func (s *Server) handleUpdate(w http.ResponseWriter, r *http.Request) {
-	s.startTransientUnit(w, r, s.priv.StartUpdate, "airplanes-update.service", "update")
-}
-
 // /api/system-upgrade (POST): kicks off a transient
-// airplanes-system-upgrade.service that runs apt-get update + upgrade. Same
-// shape as /api/update; the SPA streams /api/log/system-upgrade for output.
+// airplanes-system-upgrade.service that runs apt-get update + upgrade.
+// Returns 202 + the unit name so the SPA can stream
+// /api/log/system-upgrade for live output.
 func (s *Server) handleSystemUpgrade(w http.ResponseWriter, r *http.Request) {
 	s.startTransientUnit(w, r, s.priv.StartSystemUpgrade, "airplanes-system-upgrade.service", "system upgrade")
 }

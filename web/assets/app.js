@@ -43,7 +43,6 @@
         "uat":       "airplanes-978.service",
         "claim":     "airplanes-claim.service",
         "webconfig":      "airplanes-webconfig.service",
-        "update":               "airplanes-update.service",
         "system-upgrade":       "airplanes-system-upgrade.service",
         "update-orchestrator":  "airplanes-update-orchestrator.service",
     };
@@ -2795,28 +2794,7 @@
     }
 
     function buildUpdatesCard() {
-        // Row 1: feed scripts — the middle layer
-        const feedUpdateBtn = el("button", {
-            type: "button", class: "wc-btn-ghost",
-            onclick: async () => {
-                feedUpdateBtn.disabled = true;
-                const r = await postJSON("/api/update", {});
-                feedUpdateBtn.disabled = false;
-                if (handleAuthFailure(r)) return;
-                if (!r.ok) {
-                    alert((r.payload && r.payload.error) || "update failed");
-                    return;
-                }
-                navigate(() => logViewer("update"), { title: "Feed update log", showBack: true });
-            },
-        }, "Run feed update");
-
-        const feedUpdateLog = el("button", {
-            type: "button", class: "wc-btn-ghost",
-            onclick: () => navigate(() => logViewer("update"), { title: "Feed update log", showBack: true }),
-        }, "Feed update log");
-
-        // Row 3: system — the underlying OS, deepest layer
+        // Per-step system upgrade — the underlying OS, deepest layer
         const sysUpdateBtn = el("button", {
             type: "button", class: "wc-btn-ghost",
             onclick: async () => {
@@ -2898,8 +2876,7 @@
             el("h2", {}, "Updates"),
             unifiedUpdateRow,
             el("div", { class: "wc-action-grid" },
-                feedUpdateBtn, feedUpdateLog,
-                sysUpdateBtn,  sysUpdateLog,
+                sysUpdateBtn, sysUpdateLog,
             ),
         );
     }

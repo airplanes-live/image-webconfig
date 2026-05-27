@@ -71,7 +71,6 @@ func StubPrivilegedArgv() server.PrivilegedArgv {
 		SchemaFeed:           []string{"dev-stub", "apl-feed", "schema"},
 		Reboot:               []string{"dev-stub", "systemctl", "reboot"},
 		Poweroff:             []string{"dev-stub", "systemctl", "poweroff"},
-		StartUpdate:          []string{"dev-stub", "systemd-run", "airplanes-update"},
 		StartSystemUpgrade:   []string{"dev-stub", "systemd-run", "airplanes-system-upgrade"},
 		StartOrchestrator:    []string{"dev-stub", "systemd-run", "airplanes-update-orchestrator"},
 		RegisterClaim:        []string{"dev-stub", "systemctl", "claim-register"},
@@ -99,7 +98,7 @@ func StubPrivilegedArgv() server.PrivilegedArgv {
 //     The fake returns "0" so the dashboard never renders an exit-status
 //     warning over the simulated feed.
 //   - dev-stub systemctl {reboot,poweroff} — log the intent and exit 0.
-//   - dev-stub systemd-run airplanes-{update,system-upgrade}
+//   - dev-stub systemd-run airplanes-system-upgrade
 //     — log the intent and exit 0. The HTTP handler writes 202.
 //   - dev-stub systemctl claim-register — calls state.RegisterClaim()
 //     so the next GET /api/identity reports claim_secret_present=true.
@@ -221,7 +220,7 @@ func dispatchStub(state *State, priv server.PrivilegedArgv, argv []string, body 
 		unit := argv[2] + ".service"
 		log.Printf("devfakes: would systemd-run %s", unit)
 		// Pin the maintenance unit `activating` for a short window so a
-		// double-click on Update / System upgrade exercises
+		// double-click on System upgrade / Update System exercises
 		// handlers.maintenanceUnitActive's 409 guard the same way it would
 		// on a real Pi. Production systemd flips a transient unit through
 		// activating → active → inactive on its own; we approximate with a
@@ -644,10 +643,6 @@ var unitLogLines = map[string][]string{
 	"airplanes-webconfig.service": {
 		"webconfig: dev-mode active",
 		"webconfig: /api/status served in 1.2ms",
-	},
-	"airplanes-update.service": {
-		"update: would clone feed scripts",
-		"update: would systemctl restart airplanes-feed",
 	},
 	"airplanes-system-upgrade.service": {
 		"system-upgrade: apt-get update (simulated)",
