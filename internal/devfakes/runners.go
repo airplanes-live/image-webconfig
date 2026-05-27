@@ -71,7 +71,6 @@ func StubPrivilegedArgv() server.PrivilegedArgv {
 		SchemaFeed:           []string{"dev-stub", "apl-feed", "schema"},
 		Reboot:               []string{"dev-stub", "systemctl", "reboot"},
 		Poweroff:             []string{"dev-stub", "systemctl", "poweroff"},
-		StartSystemUpgrade:   []string{"dev-stub", "systemd-run", "airplanes-system-upgrade"},
 		StartOrchestrator:    []string{"dev-stub", "systemd-run", "airplanes-update-orchestrator"},
 		RegisterClaim:        []string{"dev-stub", "systemctl", "claim-register"},
 		WifiList:             []string{"dev-stub", "apl-wifi", "list"},
@@ -98,7 +97,7 @@ func StubPrivilegedArgv() server.PrivilegedArgv {
 //     The fake returns "0" so the dashboard never renders an exit-status
 //     warning over the simulated feed.
 //   - dev-stub systemctl {reboot,poweroff} — log the intent and exit 0.
-//   - dev-stub systemd-run airplanes-system-upgrade
+//   - dev-stub systemd-run airplanes-update-orchestrator
 //     — log the intent and exit 0. The HTTP handler writes 202.
 //   - dev-stub systemctl claim-register — calls state.RegisterClaim()
 //     so the next GET /api/identity reports claim_secret_present=true.
@@ -644,12 +643,8 @@ var unitLogLines = map[string][]string{
 		"webconfig: dev-mode active",
 		"webconfig: /api/status served in 1.2ms",
 	},
-	"airplanes-system-upgrade.service": {
-		"system-upgrade: apt-get update (simulated)",
-		"system-upgrade: 0 packages to upgrade",
-	},
 	"airplanes-update-orchestrator.service": {
-		"update-orchestrator: sequencing apt -> feed -> webconfig -> runtime",
+		"update-orchestrator: sequencing apt -> runtime",
 		"update-orchestrator: idle",
 	},
 }

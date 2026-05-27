@@ -721,12 +721,10 @@ func (s *Server) runSudo(ctx context.Context, argv []string, timeout time.Durati
 }
 
 // maintenanceUnits is the set of transient maintenance units that must not
-// overlap each other or be interrupted by a reboot. Each touches apt/dpkg,
-// release artefacts, or shells out to the others, and would deadlock on
-// the dpkg lock or leave half-configured state if any overlapped with
-// another or with a shutdown.
+// be interrupted by a reboot. The orchestrator touches apt/dpkg and release
+// artefacts, and would deadlock on the dpkg lock or leave half-configured
+// state if it overlapped with a shutdown.
 var maintenanceUnits = []string{
-	"airplanes-system-upgrade.service",
 	"airplanes-update-orchestrator.service",
 }
 
@@ -750,51 +748,6 @@ func (s *Server) maintenanceUnitActive(ctx context.Context) string {
 		}
 	}
 	return ""
-}
-
-// startTransientUnit kicks off a transient systemd unit via the supplied
-// pinned argv (sudo systemd-run ...). It refuses with 409 if any maintenance
-// unit is already busy, and maps systemd-run's "already exists" stderr to a
-// 409 as well. On success it writes 202 + the unit name.
-//
-// The is-active guard and the systemd-run call are serialized via
-// maintenanceMu so two concurrent POSTs can't both observe an idle state and
-// then both kick off — by the time the second contender acquires the lock,
-// the first's transient unit is already registered and is-active reports it
-// as activating.
-func (s *Server) startTransientUnit(w http.ResponseWriter, r *http.Request, argv []string, unit, label string) {
-	s.maintenanceMu.Lock()
-	defer s.maintenanceMu.Unlock()
-	if busy := s.maintenanceUnitActive(r.Context()); busy != "" {
-		writeJSONError(w, http.StatusConflict, label+" refused: "+busy+" is in progress")
-		return
-	}
-	cctx, cancel := context.WithTimeout(r.Context(), systemctlTimeout)
-	defer cancel()
-	res, err := s.runner(cctx, argv)
-	if err != nil {
-		stderr := strings.TrimSpace(string(res.Stderr))
-		log.Printf("%s: %v stderr=%q", label, err, stderr)
-		if strings.Contains(stderr, "already exists") || strings.Contains(stderr, "already running") {
-			writeJSONError(w, http.StatusConflict, label+" is already in progress")
-			return
-		}
-		writeJSONError(w, http.StatusInternalServerError, label+" start failed")
-		return
-	}
-	writeJSON(w, http.StatusAccepted, map[string]string{
-		"status":     "running",
-		"unit":       unit,
-		"started_at": time.Now().UTC().Format(time.RFC3339),
-	})
-}
-
-// /api/system-upgrade (POST): kicks off a transient
-// airplanes-system-upgrade.service that runs apt-get update + upgrade.
-// Returns 202 + the unit name so the SPA can stream
-// /api/log/system-upgrade for live output.
-func (s *Server) handleSystemUpgrade(w http.ResponseWriter, r *http.Request) {
-	s.startTransientUnit(w, r, s.priv.StartSystemUpgrade, "airplanes-system-upgrade.service", "system upgrade")
 }
 
 // /api/reboot (POST): refuses with 409 if a maintenance unit is active

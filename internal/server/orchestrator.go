@@ -134,8 +134,8 @@ func orchestratorRunning(path string) (bool, error) {
 // SPA polls /api/orchestrator/state for progress and a terminal step.
 //
 // The wire envelope on success is `{"status":"running","unit":...,
-// "started_at":...}` — identical to /api/system-upgrade so the SPA's
-// transient-unit response shape is uniform across update flows.
+// "started_at":...}`, which the SPA polls against after navigating to
+// the progress view.
 func (s *Server) handleOrchestratorStart(w http.ResponseWriter, r *http.Request) {
 	if !s.orchestratorCapableFunc() {
 		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"reason": "orchestrator_unavailable"})
@@ -196,12 +196,10 @@ func (s *Server) handleOrchestratorStart(w http.ResponseWriter, r *http.Request)
 
 // handleOrchestratorState is GET /api/orchestrator/state.
 //
-// The endpoint is informational — the UI uses it both to decide whether
-// to render the unified "Update System" button (orchestrator capable =
-// yes) and to render progress while a run is in flight. So the
-// capability-failure response is a 200 with `{"step":"unavailable"}`,
-// not a 503; only POST /api/orchestrator/start hard-refuses on
-// capability failure.
+// The endpoint is informational — the UI polls it to render progress
+// while a run is in flight. The capability-failure response is a 200
+// with `{"step":"unavailable"}`, not a 503; only POST
+// /api/orchestrator/start hard-refuses on capability failure.
 //
 // Missing state file → `{"step":"idle"}` (capable but no run yet on
 // this boot — /run is tmpfs so this is the normal post-boot state).

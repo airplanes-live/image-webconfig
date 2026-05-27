@@ -37,7 +37,7 @@ func TestValidatePrivilegedArgvParity_FailsOnMissingEntry(t *testing.T) {
 	msg := err.Error()
 	// Must surface at least one missing entry by name so the diagnostic
 	// helps an operator triage cross-version drift on a feeder.
-	for _, want := range []string{"Reboot", "StartSystemUpgrade", "WifiList"} {
+	for _, want := range []string{"Reboot", "StartOrchestrator", "WifiList"} {
 		if !strings.Contains(msg, want) {
 			t.Errorf("error message missing %q: %s", want, msg)
 		}
