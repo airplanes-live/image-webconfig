@@ -464,6 +464,79 @@ _apl_wifi_with_lock() {
 	return "$rc"
 }
 
+# Single nmcli connection-field read with escaping disabled (so a `:` or `\` in
+# an SSID survives) and failures swallowed — callers default the value. Optional
+# by design: a missing field (e.g. key-mgmt on an open network) is a normal "".
+_apl_wifi_nm_field() {
+	"$APL_WIFI_NMCLI" -e no -g "$2" connection show uuid "$1" 2>/dev/null || true
+}
+
+# Append wifi connections NetworkManager knows about that aren't already in $1
+# (the keyfile-derived array) — e.g. netplan-generated /run profiles from the
+# flash-time Wi-Fi. They have no /etc keyfile webconfig can edit, so they're
+# surfaced read-only (managed:false) with a synthetic `foreign-<uuid>` id that
+# can never match the managed-id regex (mutation endpoints stay closed). Best-
+# effort: on any nmcli failure the input array is echoed back unchanged so the
+# managed-keyfile path never regresses. Reads NMCLI_AVAILABLE and
+# NMCLI_ACTIVE_WIFI_UUID (set by _apl_wifi_load_nm_state).
+_apl_wifi_append_foreign_connections() {
+	local nets="$1"
+	[[ "$NMCLI_AVAILABLE" == true ]] || { printf '%s' "$nets"; return 0; }
+
+	local seen out
+	seen="$(jq -r '.[].uuid' <<< "$nets" 2>/dev/null)" || { printf '%s' "$nets"; return 0; }
+	if ! out="$("$APL_WIFI_NMCLI" -t -g UUID,TYPE connection show 2>/dev/null)"; then
+		printf '%s' "$nets"
+		return 0
+	fi
+
+	local uuid type ssid hidden_raw keymgmt priority autoconnect_raw
+	local hidden has_psk autoconnect active entry
+	while IFS=: read -r uuid type; do
+		[[ -n "$uuid" ]] || continue
+		[[ "$type" == "802-11-wireless" ]] || continue
+		# Already represented by the keyfile scan (managed or /etc foreign).
+		grep -qxF "$uuid" <<< "$seen" && continue
+
+		ssid="$(_apl_wifi_nm_field "$uuid" 802-11-wireless.ssid)"
+		hidden_raw="$(_apl_wifi_nm_field "$uuid" 802-11-wireless.hidden)"
+		keymgmt="$(_apl_wifi_nm_field "$uuid" 802-11-wireless-security.key-mgmt)"
+		priority="$(_apl_wifi_nm_field "$uuid" connection.autoconnect-priority)"
+		autoconnect_raw="$(_apl_wifi_nm_field "$uuid" connection.autoconnect)"
+
+		# nmcli reports booleans as yes/no; accept true/false too. Default
+		# hidden=false, autoconnect=true. Guard priority before --argjson so one
+		# odd profile can't turn the whole list into a parse failure.
+		hidden=false
+		[[ "$hidden_raw" == yes || "$hidden_raw" == true ]] && hidden=true
+		autoconnect=true
+		[[ "$autoconnect_raw" == no || "$autoconnect_raw" == false ]] && autoconnect=false
+		has_psk=false
+		[[ -n "$keymgmt" && "$keymgmt" != none ]] && has_psk=true
+		[[ "$priority" =~ ^-?[0-9]+$ ]] || priority=0
+		active=false
+		[[ -n "$NMCLI_ACTIVE_WIFI_UUID" && "$uuid" == "$NMCLI_ACTIVE_WIFI_UUID" ]] && active=true
+
+		if ! entry="$(jq -nc \
+			--arg id "foreign-$uuid" \
+			--arg uuid "$uuid" \
+			--arg ssid "$ssid" \
+			--argjson hidden "$hidden" \
+			--argjson priority "$priority" \
+			--argjson has_psk "$has_psk" \
+			--argjson active "$active" \
+			--arg autoconnect "$autoconnect" \
+			'{id:$id, uuid:$uuid, ssid:$ssid, hidden:$hidden, priority:$priority,
+			  has_psk:$has_psk, managed:false, first_run_profile:false,
+			  autoconnect:$autoconnect, active:$active}')"; then
+			continue
+		fi
+		nets="$(jq -c --argjson e "$entry" '. + [$e]' <<< "$nets")" || continue
+	done <<< "$out"
+
+	printf '%s' "$nets"
+}
+
 # --- subcommand: list ------------------------------------------------------
 
 cmd_list() {
@@ -485,6 +558,10 @@ cmd_list() {
 		entry="$(jq -c --argjson a "$active" '. + {active:$a}' <<< "$entry")"
 		nets="$(jq -c --argjson e "$entry" '. + [$e]' <<< "$nets")"
 	done < <(_apl_wifi_list_keyfile_ids)
+
+	# Surface wifi connections NM knows but that have no /etc keyfile (netplan
+	# /run profiles from flash-time setup) as read-only foreign entries.
+	nets="$(_apl_wifi_append_foreign_connections "$nets")"
 
 	local active_json='null'
 	if [[ -n "$NMCLI_ACTIVE_WIFI_UUID" ]]; then
