@@ -2840,12 +2840,20 @@
         ]);
         if (handleAuthFailure(list) || handleAuthFailure(status)) return;
 
+        // Consume any flash a mutation queued before its re-render NOW, before
+        // the failure early-return below. If we deferred this past a reload
+        // that 500s, the stale message would survive and later surface on an
+        // unrelated panel (the dashboard also consumes pendingFlash).
+        const pf = consumePendingFlash();
+
         // A 500 / network failure on either fetch must not silently degrade to
         // an empty "No saved networks" view — that hides the real problem and
-        // makes the current-network block below misleading. Surface it.
+        // makes the current-network block below misleading. Surface it (with
+        // any queued success message, which is still accurate).
         if (!list.ok || !status.ok) {
             render(el("section", { class: "wc-card" },
                 el("h2", {}, "Wi-Fi networks"),
+                pf && pf.text ? el("div", { class: "wifi-flash-" + (pf.level || "ok"), role: "status" }, pf.text) : null,
                 el("p", { class: "error", role: "alert" }, "Could not load Wi-Fi state."),
                 el("div", { class: "wifi-add-row" },
                     el("button", { type: "button", class: "wc-btn-primary wifi-add-btn", onclick: () => wifiPanel() }, "Retry")),
@@ -2888,10 +2896,9 @@
             if (!msg) return;
             flashEl.appendChild(el("div", { class: "wifi-flash-" + (kind || "ok"), role: kind === "error" ? "alert" : "status" }, msg));
         }
-        // A mutation handler queues its result in pendingFlash before
-        // re-rendering (the flashEl it wrote to is destroyed by the re-render);
-        // consume it here, after the fetch, so the message actually paints.
-        const pf = consumePendingFlash();
+        // Paint the flash consumed above the failure branch (a mutation queues
+        // it before re-rendering; the flashEl it wrote to was destroyed by the
+        // re-render, so it's replayed here).
         if (pf && pf.text) setFlash(pf.text, pf.level || "ok");
 
         const formHost = el("div", {});
