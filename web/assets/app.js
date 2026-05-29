@@ -294,6 +294,10 @@
 
     function handleAuthFailure(resp) {
         if (resp && !resp.ok && resp.status === 401) {
+            // Drop any flash a mutation queued before its re-render hit the
+            // 401 — it's stale and would otherwise surface on the dashboard
+            // after re-login.
+            pendingFlash = null;
             navigate(() => loginPanel("Session expired — log in again."), {});
             return true;
         }
@@ -2836,6 +2840,19 @@
         ]);
         if (handleAuthFailure(list) || handleAuthFailure(status)) return;
 
+        // A 500 / network failure on either fetch must not silently degrade to
+        // an empty "No saved networks" view — that hides the real problem and
+        // makes the current-network block below misleading. Surface it.
+        if (!list.ok || !status.ok) {
+            render(el("section", { class: "wc-card" },
+                el("h2", {}, "Wi-Fi networks"),
+                el("p", { class: "error", role: "alert" }, "Could not load Wi-Fi state."),
+                el("div", { class: "wifi-add-row" },
+                    el("button", { type: "button", class: "wc-btn-primary wifi-add-btn", onclick: () => wifiPanel() }, "Retry")),
+            ));
+            return;
+        }
+
         const listPayload = (list && list.payload) || {};
         const statusPayload = (status && status.payload) || {};
         const networks = listPayload.networks || [];
@@ -2845,57 +2862,121 @@
         const hasEthernet = nonWifiUplinks.length > 0;
         const managedNets = networks.filter(n => n.managed);
 
-        const flashEl = el("div", { class: "wifi-flash" });
+        // Match the active connection to a listed network by UUID (stable),
+        // falling back to the active flag — never by SSID, since duplicate
+        // SSIDs are common and would mis-identify the row. `currentNet` is the
+        // real listed entry or null (e.g. an active /run netplan profile that
+        // apl-wifi doesn't enumerate). Edit/Remove are offered only for a real
+        // managed entry, so a null/foreign current can't issue a request
+        // against /api/wifi/undefined.
+        let currentNet = null;
+        if (activeConn && activeConn.uuid) currentNet = networks.find(n => n.uuid === activeConn.uuid) || null;
+        if (!currentNet) currentNet = networks.find(n => n.active) || null;
+        const currentSsid = (currentNet && currentNet.ssid) || (activeConn && activeConn.ssid) || "";
+        const currentDevice = (activeConn && activeConn.device) || "";
+        const hasCurrentWifi = !!(currentNet || (activeConn && (activeConn.uuid || activeConn.ssid)));
+        const currentManaged = !!(currentNet && currentNet.managed && currentNet.id);
 
+        // Flash slots. NetworkManager-unavailable is a persistent condition, so
+        // it gets its own banner: a transient success/error flash must not
+        // clobber it (and vice versa).
+        const nmWarn = nmAvailable ? null : el("div", { class: "wifi-flash-warn", role: "status" },
+            "NetworkManager is not available on this feeder — Wi-Fi changes won't take effect.");
+        const flashEl = el("div", { class: "wifi-flash" });
         function setFlash(msg, kind) {
             flashEl.replaceChildren();
             if (!msg) return;
-            flashEl.appendChild(el("div", { class: "wifi-flash-" + (kind || "ok"), role: "status" }, msg));
+            flashEl.appendChild(el("div", { class: "wifi-flash-" + (kind || "ok"), role: kind === "error" ? "alert" : "status" }, msg));
         }
-        if (!nmAvailable) {
-            setFlash("NetworkManager is not available on this feeder — Wi-Fi changes won't take effect.", "warn");
+        // A mutation handler queues its result in pendingFlash before
+        // re-rendering (the flashEl it wrote to is destroyed by the re-render);
+        // consume it here, after the fetch, so the message actually paints.
+        const pf = consumePendingFlash();
+        if (pf && pf.text) setFlash(pf.text, pf.level || "ok");
+
+        const formHost = el("div", {});
+
+        function badge(text, title, warn) {
+            return el("span", { class: warn ? "wifi-badge wifi-badge-warn" : "wifi-badge", title: title }, text);
         }
 
-        const statusBanner = el("div", { class: "wifi-status" });
-        renderStatusBanner();
-        function renderStatusBanner() {
-            statusBanner.replaceChildren();
-            if (activeConn && activeConn.ssid) {
-                statusBanner.appendChild(el("p", {},
-                    el("span", { class: "wifi-dot-active" }, ""),
-                    " Connected to ",
-                    el("strong", {}, activeConn.ssid),
-                    activeConn.device ? el("span", { class: "muted" }, " on " + activeConn.device) : null,
-                ));
-            } else if (hasEthernet) {
-                const e = nonWifiUplinks[0];
-                statusBanner.appendChild(el("p", { class: "muted" },
-                    "Ethernet only — " + (e.device || "") + (e.ipv4 ? " (" + e.ipv4 + ")" : "")));
-            } else {
-                statusBanner.appendChild(el("p", { class: "muted" }, "No active uplink detected."));
+        // --- current-network block (top) ---
+        const heroHost = el("div", { class: "wifi-current" });
+        function renderHero() {
+            heroHost.replaceChildren();
+            if (!hasCurrentWifi) {
+                if (hasEthernet) {
+                    const e = nonWifiUplinks[0];
+                    heroHost.appendChild(el("p", { class: "muted" },
+                        "Ethernet only — " + (e.device || "") + (e.ipv4 ? " (" + e.ipv4 + ")" : "")));
+                } else {
+                    heroHost.appendChild(el("p", { class: "muted" }, "No active uplink detected."));
+                }
+                return;
+            }
+            heroHost.appendChild(el("p", { class: "wifi-current__head" },
+                el("span", { class: "wifi-dot-active", "aria-hidden": "true", title: "Connected" }, ""),
+                " ",
+                currentSsid ? el("strong", {}, currentSsid) : el("strong", { class: "muted" }, "(SSID unknown)"),
+                currentDevice ? el("span", { class: "muted" }, " on " + currentDevice) : null,
+                currentNet && currentNet.first_run_profile ? badge("first-run", "Set during initial setup") : null,
+                currentNet && !currentNet.managed ? badge("foreign", "Created outside webconfig — edit via SSH", true) : null,
+                currentNet && currentNet.hidden ? badge("hidden", "Hidden network") : null,
+            ));
+
+            // Only state facts we actually know — a foreign/unlisted active
+            // connection has no keyfile to read priority or psk from.
+            if (currentNet) {
+                heroHost.appendChild(el("p", { class: "muted wifi-current__meta" },
+                    "Priority " + (currentNet.priority || 0) + " · " + (currentNet.has_psk ? "password saved" : "open network")));
+            }
+
+            if (currentManaged) {
+                const soleManaged = managedNets.length <= 1;
+                const editBtn = el("button", { type: "button", class: "wc-btn-ghost", onclick: () => showForm(currentNet) }, "Edit");
+                const removeBtn = el("button", {
+                    type: "button", class: "wc-btn-danger",
+                    disabled: soleManaged ? "" : null,
+                    title: soleManaged ? "Add another network before you can remove this one" : null,
+                    onclick: () => deleteNetwork(currentNet),
+                }, "Remove");
+                heroHost.appendChild(el("div", { class: "wifi-btn-row" }, editBtn, removeBtn));
+                if (soleManaged) {
+                    heroHost.appendChild(el("p", { class: "muted wifi-current__note" },
+                        "Add another network before you can remove this one."));
+                }
+            } else if (currentNet) {
+                heroHost.appendChild(el("p", { class: "muted wifi-current__note" },
+                    "Managed outside webconfig — edit via SSH."));
             }
         }
 
-        const addBtn = el("button", { type: "button", class: "wc-btn-primary" }, "Add network");
+        const addBtn = el("button", { type: "button", class: "wc-btn-primary wifi-add-btn" }, "Add network");
         const tableHost = el("div", {});
-        const formHost = el("div", {});
 
         function renderTable() {
             tableHost.replaceChildren();
-            if (networks.length === 0) {
-                tableHost.appendChild(el("p", { class: "muted" }, "No saved networks."));
+            // The current network is shown in the block above; the table lists
+            // the rest. Exclude by id identity (never by SSID).
+            const others = networks.filter(n => !(currentNet && n.id === currentNet.id));
+            tableHost.appendChild(el("h3", { class: "wifi-others-title" },
+                hasCurrentWifi ? "Other networks" : "Saved networks"));
+            if (others.length === 0) {
+                tableHost.appendChild(el("p", { class: "muted" },
+                    hasCurrentWifi ? "No other saved networks." : "No saved networks."));
                 return;
             }
-            const rows = networks.map(n => {
+            const rows = others.map(n => {
                 const editBtn = el("button", {
                     type: "button", class: "wc-btn-ghost",
                     disabled: n.managed ? null : "",
-                    title: n.managed ? null : "Foreign keyfile — edit via SSH",
+                    title: n.managed ? null : "Created outside webconfig — edit via SSH",
                     onclick: () => showForm(n),
                 }, "Edit");
                 const activateBtn = el("button", {
                     type: "button", class: "wc-btn-ghost",
                     disabled: (!nmAvailable || n.active) ? "" : null,
+                    title: !nmAvailable ? "NetworkManager unavailable — cannot activate" : (n.active ? "Already active" : null),
                     onclick: () => activateNetwork(n),
                 }, "Activate");
                 const deleteBtn = el("button", {
@@ -2905,15 +2986,15 @@
                 }, "Delete");
                 return el("tr", {},
                     el("td", {},
-                        n.active ? el("span", { class: "wifi-dot-active", title: "Active" }, "") : el("span", { class: "wifi-dot-idle" }, ""),
+                        n.active ? el("span", { class: "wifi-dot-active", "aria-hidden": "true", title: "Active" }, "") : el("span", { class: "wifi-dot-idle", "aria-hidden": "true" }, ""),
                         " ",
                         el("strong", {}, n.ssid || "(unknown)"),
-                        n.first_run_profile ? el("span", { class: "wifi-badge" }, "first-run") : null,
-                        n.managed ? null : el("span", { class: "wifi-badge wifi-badge-warn" }, "foreign"),
-                        n.hidden ? el("span", { class: "wifi-badge" }, "hidden") : null,
+                        n.first_run_profile ? badge("first-run", "Set during initial setup") : null,
+                        n.managed ? null : badge("foreign", "Created outside webconfig — edit via SSH", true),
+                        n.hidden ? badge("hidden", "Hidden network") : null,
                     ),
                     el("td", { class: "wifi-priority" }, String(n.priority || 0)),
-                    el("td", { class: "wifi-actions" }, editBtn, activateBtn, deleteBtn),
+                    el("td", { class: "wifi-actions" }, el("div", { class: "wifi-btn-row" }, editBtn, activateBtn, deleteBtn)),
                 );
             });
             const tbl = el("table", { class: "wifi-table" },
@@ -2956,7 +3037,7 @@
                 setFlash((r.payload && (r.payload.message || r.payload.reason || r.payload.error)) || "delete failed", "error");
                 return;
             }
-            setFlash("Deleted " + (n.ssid || n.id), "ok");
+            pendingFlash = { text: "Deleted " + (n.ssid || n.id), level: "ok" };
             await wifiPanel();
         }
 
@@ -2967,7 +3048,7 @@
                 setFlash((r.payload && (r.payload.message || r.payload.reason || r.payload.nm_reason || r.payload.error)) || "activate failed", "error");
                 return;
             }
-            setFlash("Activating " + (n.ssid || n.id) + "…", "ok");
+            pendingFlash = { text: "Activating " + (n.ssid || n.id) + "…", level: "ok" };
             await wifiPanel();
         }
 
@@ -2981,9 +3062,24 @@
             // predicates use `v !== ""` rather than `v.trim()`.
             const ssid = el("input", { type: "text", value: existing ? (existing.ssid || "") : "" });
             const psk = el("input", {
-                type: "password", autocomplete: "new-password",
+                type: "password", autocomplete: "new-password", class: "wifi-pw-input",
                 placeholder: isEdit && existing.has_psk ? "(unchanged — leave blank to keep)" : "8-63 chars or 64-hex",
             });
+            // Reveal toggle. aria-pressed is set as a string both here and in
+            // the handler because el() drops falsey attrs (a boolean false
+            // would never reach the DOM).
+            const pwToggle = el("button", {
+                type: "button", class: "wifi-pw-toggle",
+                "aria-label": "Show password", "aria-pressed": "false",
+            }, "Show");
+            pwToggle.onclick = () => {
+                const reveal = psk.type === "password";
+                psk.type = reveal ? "text" : "password";
+                pwToggle.textContent = reveal ? "Hide" : "Show";
+                pwToggle.setAttribute("aria-pressed", reveal ? "true" : "false");
+                pwToggle.setAttribute("aria-label", reveal ? "Hide password" : "Show password");
+            };
+            const pwField = el("div", { class: "wifi-pw-field" }, psk, pwToggle);
             const hidden = el("input", { type: "checkbox" });
             if (existing && existing.hidden) hidden.checked = true;
             const priority = el("input", {
@@ -3103,18 +3199,20 @@
                         }
                         return;
                     }
-                    setFlash(isEdit ? "Updated " + ssidVal : "Added " + ssidVal, "ok");
+                    pendingFlash = { text: isEdit ? "Updated " + ssidVal : "Added " + ssidVal, level: "ok" };
                     await wifiPanel();
                 },
             },
                 el("h3", {}, isEdit ? "Edit " + (existing.ssid || existing.id) : "Add network"),
                 el("div", { class: "field" }, el("label", {}, "SSID"), ssid, ssidError),
-                el("div", { class: "field" }, el("label", {}, "Password"), psk, pskError),
+                el("div", { class: "field" }, el("label", {}, "Password"), pwField, pskError),
                 el("div", { class: "field-row" },
                     el("label", {}, hidden, " Hidden network"),
                     el("label", {}, "Priority ", priority),
                 ),
                 priorityError,
+                el("p", { class: "field-help" },
+                    "Higher number wins — the feeder joins the highest-priority network it can reach first. Default 0."),
                 el("div", { class: "field" },
                     el("label", {}, testBox, " Test connection before saving"),
                     el("p", { class: "muted" }, "Tries to join now; rolls back on failure. Connecting to a new network may briefly drop this page if the feeder is on Wi-Fi."),
@@ -3130,18 +3228,18 @@
 
         addBtn.onclick = () => showForm(null);
 
+        renderHero();
         renderTable();
 
         render(
             el("section", { class: "wc-card" },
                 el("h2", {}, "Wi-Fi networks"),
-                statusBanner,
+                nmWarn,
                 flashEl,
-                el("div", { class: "actions" }, addBtn),
-                tableHost,
+                heroHost,
+                el("div", { class: "wifi-add-row" }, addBtn),
                 formHost,
-                el("p", { class: "muted wifi-help" },
-                    "Add a second network before removing the one this feeder is on. The first-run network from airplanes-config.txt is shown as 'first-run'."),
+                tableHost,
             ),
         );
     }

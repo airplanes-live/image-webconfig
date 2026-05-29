@@ -956,7 +956,6 @@ textarea:focus {
 
 /* ========== Wi-Fi panel ========== */
 
-.wifi-status p { margin: 0.25rem 0; }
 .wifi-dot-active,
 .wifi-dot-idle {
   display: inline-block;
@@ -994,8 +993,41 @@ textarea:focus {
   vertical-align: middle;
 }
 .wifi-priority { width: 5rem; }
-.wifi-actions  { width: auto; white-space: nowrap; }
-.wifi-actions button + button { margin-left: 0.35rem; }
+.wifi-actions  { width: auto; }
+
+/* Compact action buttons sharing a wrapping row. Overrides the global
+   button { width:100%; min-height:2.75rem } so table + hero actions sit
+   inline and wrap (rather than overflow the card) at narrow widths. */
+.wifi-btn-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.4rem;
+}
+.wifi-btn-row button {
+  width: auto;
+  min-width: max-content;
+  min-height: 2.1rem;
+  padding: 0.3rem 0.75rem;
+  font-size: 0.85rem;
+}
+
+/* Current-network block at the top of the panel. */
+.wifi-current {
+  border: 1px solid var(--wc-line-soft);
+  border-left: 3px solid var(--wc-accent);
+  border-radius: var(--wc-radius-sm);
+  background: var(--wc-surface-1);
+  padding: 0.7rem 0.85rem;
+  margin: 0.25rem 0 0.75rem;
+}
+.wifi-current__head { margin: 0 0 0.15rem; font-size: 1.05rem; }
+.wifi-current__meta { margin: 0 0 0.5rem; font-size: 0.85rem; }
+.wifi-current__note { margin: 0.4rem 0 0; font-size: 0.85rem; }
+
+.wifi-others-title { margin: 0.75rem 0 0.25rem; font-size: 0.95rem; }
+
+.wifi-add-row { margin: 0 0 0.75rem; }
+.wifi-add-btn { width: auto; min-width: max-content; }
 
 .wifi-form .field { margin: 0.5rem 0; }
 .wifi-form .field-row {
@@ -1009,7 +1041,29 @@ textarea:focus {
   width: 5rem;
   margin-left: 0.35rem;
 }
-.wifi-help { margin-top: 0.75rem; }
+
+/* Password field with an inline reveal toggle. The input reserves right
+   padding so its text never slides under the button; the button overrides
+   the global full-width sizing and keeps its vertical centering on hover
+   (the global button:hover translateY(-1px) would otherwise undo the
+   translateY(-50%) centering). */
+.wifi-pw-field { position: relative; }
+.wifi-pw-field .wifi-pw-input { padding-right: 4.25rem; }
+.wifi-pw-toggle {
+  position: absolute;
+  top: 50%;
+  right: 0.35rem;
+  transform: translateY(-50%);
+  width: auto;
+  min-width: 0;
+  min-height: 1.9rem;
+  padding: 0.1rem 0.55rem;
+  font-size: 0.8rem;
+  background: var(--wc-surface-2);
+  color: var(--wc-ink-1);
+  border: 1px solid var(--wc-line-soft);
+}
+.wifi-pw-toggle:hover { transform: translateY(-50%); background: var(--wc-surface-3); }
 
 .wifi-flash:empty { display: none; }
 .wifi-flash-ok,
