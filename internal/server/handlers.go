@@ -15,8 +15,10 @@ import (
 
 	"github.com/airplanes-live/image-webconfig/internal/auth"
 	"github.com/airplanes-live/image-webconfig/internal/feedmeta"
+	"github.com/airplanes-live/image-webconfig/internal/hardware"
 	"github.com/airplanes-live/image-webconfig/internal/identity"
 	"github.com/airplanes-live/image-webconfig/internal/logs"
+	"github.com/airplanes-live/image-webconfig/internal/status"
 )
 
 // MinPasswordLen is the minimum length we accept for setup / change-password.
@@ -488,6 +490,16 @@ func (s *Server) handleConfigGet(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"values": filtered})
 }
 
+// statusResponse is the /api/status body: the canonical status snapshot
+// plus the request-scoped display unit for CPU temperature. temp_unit is
+// presentation metadata derived from Accept-Language, so it lives here on
+// the HTTP response rather than on status.Status (which has non-HTTP
+// callers that have no locale).
+type statusResponse struct {
+	status.Status
+	TempUnit string `json:"temp_unit"`
+}
+
 // /api/status (GET): service states + manifest + feed snapshot.
 func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 	st, err := s.status.Read(r.Context())
@@ -496,7 +508,21 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 		writeJSONError(w, http.StatusInternalServerError, "status read failed")
 		return
 	}
-	writeJSON(w, http.StatusOK, st)
+
+	// Localize the hero-chip summary to the viewer's locale. Presentation
+	// only: the probed/canonical data stays Celsius. Copy HardwareHealth
+	// before mutating — it is a pointer and the summary string is the only
+	// field we rewrite.
+	unit := tempUnitFromAcceptLanguage(r.Header.Get("Accept-Language"))
+	if unit == "F" && st.HardwareHealth != nil && st.System.CPUTempCelsius != nil {
+		hh := *st.HardwareHealth
+		hh.Summary = hardware.LocalizeTempUnit(hh.Summary, st.System.CPUTempCelsius, unit)
+		st.HardwareHealth = &hh
+	}
+
+	// The body now varies by request locale.
+	w.Header().Set("Vary", "Accept-Language")
+	writeJSON(w, http.StatusOK, statusResponse{Status: st, TempUnit: unit})
 }
 
 // /api/log/{unit} (GET): SSE-stream journalctl output for the unit.

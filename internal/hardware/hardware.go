@@ -24,6 +24,7 @@ import (
 	"fmt"
 	"io/fs"
 	"os"
+	"regexp"
 	"strings"
 	"syscall"
 	"time"
@@ -578,4 +579,33 @@ func sortBlurbs(b []blurb) {
 			j--
 		}
 	}
+}
+
+// celsiusSummaryToken matches the single Celsius temperature token a
+// Summarize output can carry. Summarize emits "%.0f°C" today, but the
+// optional decimal keeps the whole token captured as one match (so the
+// exactly-one-token fail-closed check below stays correct) should the
+// formatter ever gain a fractional digit. Other blurbs ("mem 5% free",
+// "throttling now") never contain °C, so a Summary holds at most one.
+var celsiusSummaryToken = regexp.MustCompile(`-?\d+(?:\.\d+)?°C`)
+
+// LocalizeTempUnit rewrites the Celsius temperature token in a Summarize
+// output to Fahrenheit when unit == "F". Presentation-only: probing,
+// thresholds, severity, and the canonical Summary stay in Celsius — this is
+// applied at the HTTP edge per request locale.
+//
+// The Fahrenheit value is computed from rawC (the precise probed value), not
+// from the rounded token, so the localized chip agrees with the raw metric
+// row. Returns the summary unchanged for any unit other than "F", a nil rawC,
+// or a summary that does not contain exactly one Celsius token — fail closed
+// rather than guess which token to rewrite.
+func LocalizeTempUnit(summary string, rawC *float64, unit string) string {
+	if unit != "F" || rawC == nil {
+		return summary
+	}
+	if len(celsiusSummaryToken.FindAllStringIndex(summary, -1)) != 1 {
+		return summary
+	}
+	f := *rawC*9.0/5.0 + 32.0
+	return celsiusSummaryToken.ReplaceAllString(summary, fmt.Sprintf("%.0f°F", f))
 }
