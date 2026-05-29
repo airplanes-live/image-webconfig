@@ -2982,8 +2982,13 @@
                 }, "Edit");
                 const activateBtn = el("button", {
                     type: "button", class: "wc-btn-ghost",
-                    disabled: (!nmAvailable || n.active) ? "" : null,
-                    title: !nmAvailable ? "NetworkManager unavailable — cannot activate" : (n.active ? "Already active" : null),
+                    // Foreign (unmanaged) profiles can't be activated through
+                    // webconfig — the server rejects their id — so disable
+                    // rather than offer a button that always errors.
+                    disabled: (!nmAvailable || n.active || !n.managed) ? "" : null,
+                    title: !nmAvailable ? "NetworkManager unavailable — cannot activate"
+                        : (n.active ? "Already active"
+                            : (!n.managed ? "Created outside webconfig — activate via SSH" : null)),
                     onclick: () => activateNetwork(n),
                 }, "Activate");
                 const deleteBtn = el("button", {
