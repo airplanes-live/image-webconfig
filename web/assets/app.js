@@ -3180,66 +3180,83 @@
             return;
         }
 
-        const ph = (r.payload && r.payload.pi_health) || null;
-        const anyProbed = ph && (ph.throttle_probed || ph.temp_probed || ph.time_probed
-            || ph.mem_probed || ph.disk_probed || ph.psu_probed);
-        if (!ph || !anyProbed) {
+        const p = r.payload || {};
+        const sys = p.system || null;
+        const thr = p.pi_throttle || null;     // present only when Pi + throttle probed
+        const hh = p.hardware_health || null;   // local-only severity/summary/is_raspberry_pi rollup
+        const tempUnit = p.temp_unit === "F" ? "F" : "C";
+
+        // Per-sub-probe success is carried by value presence: the server emits
+        // omitempty pointers, so a present number/bool means that probe ran.
+        const tempProbed = !!sys && typeof sys.cpu_temp_c === "number";
+        const memProbed = !!sys && typeof sys.mem_avail_pct === "number";
+        const diskProbed = !!sys && typeof sys.disk_free_pct === "number";
+        const timeProbed = !!sys && typeof sys.ntp_synchronized === "boolean";
+        const uptimeProbed = !!sys && typeof sys.uptime_s === "number";
+        const throttleProbed = thr !== null;
+        const psuProbed = !!thr && typeof thr.psu_max_current_ma === "number";
+        const anyProbed = tempProbed || memProbed || diskProbed || timeProbed
+            || uptimeProbed || throttleProbed || psuProbed;
+        if (!anyProbed) {
             render(el("section", { class: "wc-card" },
                 el("h2", {}, "System metrics"),
                 el("p", { class: "muted" },
-                    ph && !ph.is_raspberry_pi
+                    hh && hh.is_raspberry_pi === false
                         ? "This device isn't a Raspberry Pi — no hardware metrics to show."
                         : "No metrics available — the hardware probes did not return data."),
             ));
             return;
         }
 
-        const severity = ph.severity || "na";
+        const severity = (hh && hh.severity) || "na";
         const summaryBanner = el("div", { class: "wc-metrics__summary" },
             el("span", { class: "wc-metrics__summary-dot wc-metrics__summary-dot--" + severity }),
-            el("span", {}, ph.summary || "Status unknown"),
+            el("span", {}, (hh && hh.summary) || "Status unknown"),
         );
 
         const cells = [];
 
-        if (ph.temp_probed) {
-            cells.push(metricCell("CPU temperature",
-                typeof ph.cpu_temp_c === "number" ? ph.cpu_temp_c.toFixed(1) + " °C" : "—"));
+        if (tempProbed) {
+            const c = sys.cpu_temp_c;
+            const val = tempUnit === "F"
+                ? (c * 9 / 5 + 32).toFixed(1) + " °F"
+                : c.toFixed(1) + " °C";
+            cells.push(metricCell("CPU temperature", val));
         }
-        if (ph.mem_probed) {
-            cells.push(metricCell("Memory free",
-                typeof ph.mem_avail_pct === "number" ? ph.mem_avail_pct.toFixed(0) + " %" : "—"));
+        if (memProbed) {
+            cells.push(metricCell("Memory free", sys.mem_avail_pct.toFixed(0) + " %"));
         }
-        if (ph.disk_probed) {
-            cells.push(metricCell("Disk free",
-                typeof ph.disk_free_pct === "number" ? ph.disk_free_pct.toFixed(0) + " %" : "—"));
+        if (diskProbed) {
+            cells.push(metricCell("Disk free", sys.disk_free_pct.toFixed(0) + " %"));
         }
-        const upStr = formatUptime(ph.uptime_s);
-        if (upStr) {
-            cells.push(metricCell("Uptime", upStr));
+        if (uptimeProbed) {
+            const upStr = formatUptime(sys.uptime_s);
+            if (upStr) {
+                cells.push(metricCell("Uptime", upStr));
+            }
         }
-        if (ph.time_probed) {
-            cells.push(metricCell("NTP synchronised", ph.ntp_synchronized ? "Yes" : "No"));
+        if (timeProbed) {
+            cells.push(metricCell("NTP synchronised", sys.ntp_synchronized ? "Yes" : "No"));
         }
-        if (ph.psu_probed) {
-            const maxMA = ph.psu_max_current_ma || 0;
-            const expMA = ph.psu_expected_ma || 0;
+        if (psuProbed) {
+            const maxMA = thr.psu_max_current_ma || 0;
+            const expMA = thr.psu_expected_ma || 0;
             const val = expMA > 0
                 ? maxMA + " / " + expMA + " mA"
                 : maxMA + " mA";
             cells.push(metricCell("PSU current capability", val));
         }
-        if (ph.throttle_probed) {
+        if (throttleProbed) {
             const flags = [];
             const addFlag = (label, now, ever) => {
                 if (!now && !ever) return;
                 flags.push(el("span", { class: "wc-metrics__flag" + (now ? " wc-metrics__flag--now" : "") },
                     label + (now ? "" : " (since boot)")));
             };
-            addFlag("Under-voltage", ph.undervoltage_now, ph.undervoltage_ever);
-            addFlag("Throttled", ph.throttled_now, ph.throttled_ever);
-            addFlag("Frequency capped", ph.freq_capped_now, ph.freq_capped_ever);
-            addFlag("Soft temp limit", ph.soft_temp_limit_now, ph.soft_temp_limit_ever);
+            addFlag("Under-voltage", thr.undervoltage_now, thr.undervoltage_ever);
+            addFlag("Throttled", thr.throttled_now, thr.throttled_ever);
+            addFlag("Frequency capped", thr.freq_capped_now, thr.freq_capped_ever);
+            addFlag("Soft temp limit", thr.soft_temp_limit_now, thr.soft_temp_limit_ever);
             const body = flags.length > 0
                 ? el("div", {}, ...flags)
                 : el("span", {}, "None reported");
