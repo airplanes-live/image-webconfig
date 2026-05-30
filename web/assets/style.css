@@ -779,11 +779,23 @@ textarea:focus {
   display: flex;
   align-items: center;
   flex-wrap: wrap;
+  justify-content: flex-end;
   gap: 0.5rem;
-  margin-top: 0.5rem;
+  margin-top: 1rem;
 }
 .config-fieldset__footer[hidden] { display: none; }
-.config-fieldset__footer .error { margin: 0; min-height: 0; flex: 1 1 auto; }
+/* Collapse the footer (and its top margin) when it holds nothing the user
+   can see — no visible button, no restart notice, no error text. Keeps a
+   clean/disabled group (e.g. MLAT off) from reserving dead space below its
+   content. Reappears the instant a Save/Cancel, pending notice, or error
+   shows. */
+.config-fieldset__footer:not(:has(button:not([hidden]))):not(:has(.config-fieldset__pending:not([hidden]))):not(:has(.error:not(:empty))) {
+  display: none;
+}
+/* Error sits first and grows, pushing the action buttons to the right
+   edge of the box. Empty (no error) it collapses to a flexible spacer
+   that still right-aligns the buttons. */
+.config-fieldset__footer .error { margin: 0; min-height: 0; order: -1; flex: 1 1 auto; }
 .config-fieldset__footer .config-fieldset__pending {
   margin: 0;
   flex-basis: 100%;
@@ -803,11 +815,38 @@ textarea:focus {
   line-height: 1.35;
 }
 
+/* Compact neutral helper link rendered as a small button under an input
+   (e.g. "Find elevation" beneath the altitude field). Shrinks to its
+   content and is pushed to the right edge of the field. */
+.wc-help-link {
+  display: flex;
+  width: fit-content;
+  margin-left: auto;
+  align-items: center;
+  gap: 0.35rem;
+  margin-top: 0.7rem;
+  padding: 0.3rem 0.7rem;
+  font-size: 0.85rem;
+  text-decoration: none;
+  color: var(--wc-ink-1);
+  background: var(--wc-surface-1);
+  border: 1px solid var(--wc-line-strong);
+  border-radius: var(--wc-radius-sm);
+}
+.wc-help-link:hover { background: var(--wc-surface-3); }
+
+/* Live feet→metres echo under the altitude input. Mono + a touch brighter
+   than ordinary help text so it reads as the value that will be saved. */
+.wc-alt-convert {
+  font-family: var(--wc-font-mono);
+  color: var(--wc-ink-2);
+}
+
 
 .config-fieldset {
   border: 1px solid var(--wc-line-soft);
   border-radius: var(--wc-radius-sm);
-  padding: 0.75rem 1rem 0.5rem;
+  padding: 0.75rem 1rem 1rem;
   margin: 0 0 1rem;
 }
 .config-fieldset > legend {
@@ -826,89 +865,16 @@ textarea:focus {
   color: var(--wc-ink-2);
 }
 
-.location-card {
-  display: flex;
-  align-items: flex-start;
-  justify-content: space-between;
-  gap: 0.75rem;
-  margin-bottom: 0.25rem;
-}
-.location-summary {
-  flex: 1 1 auto;
-  display: grid;
-  grid-template-columns: auto 1fr;
-  column-gap: 0.75rem;
-  row-gap: 0.2rem;
-  margin: 0;
-  color: var(--wc-ink-1);
-}
-.location-summary dt {
-  color: var(--wc-ink-3);
-  font-size: 0.85rem;
-  font-weight: 500;
-  margin: 0;
-}
-.location-summary dd {
-  margin: 0;
-  font-family: var(--wc-font-mono);
-  font-size: 0.95rem;
-  color: var(--wc-ink-1);
-}
-.location-summary__value {
-  display: inline-block;
-}
-.location-summary__note {
-  display: block;
-  font-family: var(--wc-font-sans);
-  color: var(--wc-ink-3);
-  font-size: 0.75rem;
-  margin-top: 0.1rem;
-}
-.location-card__edit {
-  flex: 0 0 auto;
-  width: auto;
-  min-width: auto;
-  min-height: 0;
-  padding: 0.3rem 0.7rem;
-  font-size: 0.85rem;
+/* Position + name inputs revealed by the Enable MLAT checkbox. They sit
+   flush with the other fields — the fieldset border already scopes them
+   to MLAT, so no extra indent is needed (matches the 978 UAT reveal). */
+.mlat-reveal {
+  margin-top: 0.5rem;
 }
 
-/* ========== Unit-suffixed input ========== */
-
-/* Altitude and any future unit-bearing field render the input
-   alongside a fixed-width unit indicator so the operator can tell at
-   a glance whether the value is interpreted as metres / feet / etc.
-   The indicator hides when the user has already typed an explicit
-   suffix; the fixed-width slot stays in the flex layout (visibility
-   hidden, not display none) so the input doesn't reflow as the
-   operator types the trailing `ft` / `m`. */
-.wc-input-with-unit {
-  display: flex;
-  align-items: stretch;
-  gap: 0.4rem;
-}
-.wc-input-with-unit > input {
-  flex: 1 1 auto;
-  min-width: 0;
-}
-.wc-unit-indicator {
-  flex: 0 0 1.5rem;
-  display: inline-flex;
-  align-items: center;
-  justify-content: flex-start;
-  color: var(--wc-ink-3);
-  font-family: var(--wc-font-mono);
-  font-size: 0.95rem;
-  line-height: 1;
-}
-/* Preserve layout slot when hidden: visibility-hidden keeps the
-   reserved 1.5rem flex basis, where the global [hidden] {display:none}
-   would collapse it and reflow the input. Override !important by
-   re-asserting display + visibility together. */
-.wc-unit-indicator[hidden] {
-  display: inline-flex !important;
-  visibility: hidden;
-}
+/* Extra separation above the "Hide on the MLAT feeder map" privacy toggle
+   to set it apart from the position/name inputs above it. */
+.mlat-privacy-field { margin-top: 1.25rem; }
 
 /* ========== Logs ========== */
 
