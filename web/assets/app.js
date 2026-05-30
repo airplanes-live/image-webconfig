@@ -509,6 +509,47 @@
         return altitudeToBareMetres(s) !== null;
     }
 
+    // imperialLengthFromLanguages mirrors tempUnitFromAcceptLanguage's
+    // region rule (internal/server/accept_language.go): any *-us regional
+    // tag selects imperial (feet); the first other regional tag selects
+    // metric; bare language tags are too weak a signal and are skipped.
+    // The caller passes navigator.languages, already ordered
+    // most-preferred-first, so list position stands in for the server's
+    // q-weighting. Defaults to metric. Pure (no navigator) so the Go test
+    // can pin it.
+    function imperialLengthFromLanguages(langs) {
+        const list = (langs && langs.length) ? langs : [];
+        for (const tag of list) {
+            const lower = String(tag || "").toLowerCase();
+            if (lower === "" || lower === "*") continue;
+            if (lower.endsWith("-us")) return true;
+            if (lower.includes("-")) return false;
+            // bare language tag — keep scanning for a regional signal
+        }
+        return false;
+    }
+
+    // altitudeDisplayValue renders a canonical bare-metres value for the
+    // altitude field. Metric viewers — and any value that isn't a whole
+    // number of feet — see "<metres>m". An imperial viewer sees "<feet>ft"
+    // ONLY when that round-trips back to exactly the stored metres, so a
+    // metres-entered value never shows as a fractional foot value or trips
+    // the dirty comparator. Empty in → empty out (tombstone passthrough).
+    function altitudeDisplayValue(metres, imperial) {
+        const s = (metres == null ? "" : String(metres)).trim();
+        if (s === "") return "";
+        if (imperial) {
+            const m = Number(s);
+            if (Number.isFinite(m)) {
+                const ft = Math.round(m / 0.3048);
+                if (altitudeToBareMetres(ft + "ft") === altitudeToBareMetres(s)) {
+                    return ft + "ft";
+                }
+            }
+        }
+        return s + "m";
+    }
+
     // Shared numeric shape used by gain validators. Mirrors bash regex
     // `^-?[0-9]+([.][0-9]+)?$` — rejects scientific notation (`1e1`),
     // leading-dot (`.5`), trailing-dot (`1.`), explicit-plus (`+1`),
@@ -587,6 +628,18 @@
     }
     /* @validator-parity end */
 
+    // viewerUsesImperialLength reads the browser locale and applies the
+    // region rule in imperialLengthFromLanguages. Kept outside the parity
+    // block because it touches navigator, which the Node test harness that
+    // extracts that block does not provide.
+    function viewerUsesImperialLength() {
+        const nav = (typeof navigator !== "undefined") ? navigator : null;
+        const langs = (nav && nav.languages && nav.languages.length)
+            ? nav.languages
+            : [nav && nav.language ? nav.language : ""];
+        return imperialLengthFromLanguages(langs);
+    }
+
     // hasLatLonPrecision counts decimal places in a trimmed numeric string.
     // UI-only gate above isValidLatitude/isValidLongitude (which mirror the
     // cross-repo validator-parity contract and only enforce range). MLAT
@@ -636,20 +689,6 @@
         const lat = Number(String(values.LATITUDE || "").trim());
         const lon = Number(String(values.LONGITUDE || "").trim());
         return !(lat === 0 && lon === 0);
-    }
-
-    // locationSaved — drives the form cascade. previewLatLonSet covers the
-    // GEO_CONFIGURED-first check; altitude is separate because the daemon
-    // classifies altitude_empty as its own MLAT misconfig reason.
-    //
-    // Empty altitude must NOT count as "location saved" here — the
-    // daemon will refuse to enable MLAT with ALTITUDE empty. The
-    // bare `isValidAltitude("")` returns true (tombstone-acceptance,
-    // matching feed's apply validator), so the explicit non-empty
-    // guard keeps the form-collapse logic honest.
-    function locationSaved(values) {
-        const v = (values || {}).ALTITUDE || "";
-        return previewLatLonSet(values || {}) && v.trim() !== "" && isValidAltitude(v);
     }
 
     // previewMlatDisabled — same projection semantics: read MLAT_ENABLED
@@ -1859,7 +1898,7 @@
     // omits them or not.
     function normaliseSavedValues(values) {
         return Object.assign({
-            MLAT_ENABLED: "true",
+            MLAT_ENABLED: "false",
             MLAT_PRIVATE: "false",
             REPORT_STATUS: "true",
             REMOTE_CONFIG_ENABLED: "false",
@@ -1977,9 +2016,26 @@
             return { summaryEl, setEditing, refreshSummary, cancelBtn };
         };
 
-        // ===== Location =====
-        const loc = buildGroup("Location");
+        // ===== MLAT =====
+        // Position (latitude/longitude/altitude) is only used for MLAT, so
+        // it lives inside this group: the inputs stay hidden until the
+        // operator enables MLAT, and a single Save writes the whole set
+        // (coordinates + MLAT settings) in one apply — the backend derives
+        // GEO_CONFIGURED from the lat/lon pair. This mirrors the apl-feed
+        // mlat setup flow.
+        const mlatG = buildGroup("MLAT");
 
+        const mlatId = fieldId("MLAT_ENABLED");
+        const mlatInput = el("input", {
+            id: mlatId, type: "checkbox", name: "MLAT_ENABLED",
+        });
+        // Absent MLAT_ENABLED defaults to off: MLAT's posture is
+        // "disabled until the operator opts in and sets a position", so an
+        // uninitialised feeder renders unchecked with the location inputs
+        // hidden. Production feed.env always carries the key explicitly.
+        if ((configState.savedValues.MLAT_ENABLED || "false") === "true") mlatInput.checked = true;
+
+        // --- Position inputs (revealed when MLAT is on) ---
         const latId = fieldId("LATITUDE");
         const latInput = el("input", {
             id: latId, name: "LATITUDE", type: "text",
@@ -1993,60 +2049,88 @@
             inputmode: "decimal", placeholder: "-0.1278",
         });
         const altId = fieldId("ALTITUDE");
+        // The unit is part of the field value (e.g. "20m" / "65ft"), not a
+        // separate chip. altitudeDisplayValue renders the canonical bare-
+        // metres value with its unit, showing feet only for imperial-locale
+        // viewers and only when the conversion is exact. Feet remains an
+        // input convenience; it is never what gets stored.
+        const altImperial = viewerUsesImperialLength();
+        const altDisplay = (sv) => altitudeDisplayValue(sv, altImperial);
         const altInput = el("input", {
             id: altId, name: "ALTITUDE", type: "text",
-            value: configState.savedValues.ALTITUDE || "",
-            placeholder: "120",
+            value: altDisplay(configState.savedValues.ALTITUDE),
+            placeholder: altImperial ? "65ft" : "20m",
         });
-        // Static "m" indicator next to the altitude input. The
-        // canonical on-disk form is bare metres now (apl-feed
-        // canonicalises ft→m on apply), so the indicator tells the
-        // operator that a bare number is interpreted as metres. The
-        // indicator hides when the operator typed an explicit unit
-        // suffix (ft / m) so the rendered field doesn't read "400ft m".
-        const altUnitIndicator = el("span", {
-            class: "wc-unit-indicator",
-            "aria-hidden": "true",
-        }, "m");
-        const altInputWrap = el("div", { class: "wc-input-with-unit" },
-            altInput,
-            altUnitIndicator,
-        );
-        const refreshAltUnitIndicator = () => {
+        // Live feet→metres echo. Altitude is stored in metres, so when the
+        // operator types feet we show the converted metres value they'll
+        // actually save. Hidden for bare or metres input.
+        const altConvert = el("p", { class: "field-help wc-alt-convert" });
+        altConvert.hidden = true;
+        const refreshAltConvert = () => {
             const v = (altInput.value || "").trim();
-            // Hide when the user already typed an explicit unit
-            // suffix; otherwise show. Empty input gets the indicator
-            // too because the input is "asking for metres".
-            altUnitIndicator.hidden = /(ft|m)$/i.test(v);
+            const metres = /ft$/i.test(v) ? altitudeToBareMetres(v) : null;
+            if (metres) {
+                altConvert.textContent = "= " + metres + " m";
+                altConvert.hidden = false;
+            } else {
+                altConvert.hidden = true;
+            }
         };
-        refreshAltUnitIndicator();
-        altInput.addEventListener("input", refreshAltUnitIndicator);
-
-        const latValEl = el("span", { class: "location-summary__value" });
-        const lonValEl = el("span", { class: "location-summary__value" });
-        const altValEl = el("span", { class: "location-summary__value" });
-        const updateSummaryValues = () => {
-            const sv = configState.savedValues;
-            latValEl.textContent = sv.LATITUDE || "—";
-            lonValEl.textContent = sv.LONGITUDE || "—";
-            altValEl.textContent = sv.ALTITUDE || "—";
-        };
-        updateSummaryValues();
-        const summaryEl = el("dl", { class: "location-summary" },
-            el("dt", {}, "Latitude"),
-            el("dd", {}, latValEl),
-            el("dt", {}, "Longitude"),
-            el("dd", {}, lonValEl),
-            el("dt", {}, "Altitude"),
-            el("dd", {},
-                altValEl,
-                el("span", { class: "location-summary__note" }, "above mean sea level (AMSL)"),
-            ),
+        refreshAltConvert();
+        altInput.addEventListener("input", refreshAltConvert);
+        // Help leads with the viewer's locale unit, then offers the other.
+        const altHelp = el("p", { class: "field-help" },
+            "Antenna height above sea level. Enter ",
+            ...(altImperial
+                ? ["feet (e.g. ", el("code", {}, "65ft"), ") or metres (e.g. ", el("code", {}, "20m"), ")."]
+                : ["metres (e.g. ", el("code", {}, "20m"), ") or feet (e.g. ", el("code", {}, "65ft"), ")."]),
         );
-        const editBtn = el("button", { type: "button", class: "wc-btn-ghost location-card__edit" }, "Edit");
-        const locationSummary = el("div", { class: "location-card" }, summaryEl, editBtn);
 
-        const locationEditor = el("div", { class: "location-inputs" },
+        // --- MLAT name + privacy ---
+        const mlatUserId = fieldId("MLAT_USER");
+        // Placeholder hints the daemon's per-device fallback name so the
+        // operator sees what they'll appear as if they leave this blank.
+        // Mirrors feed/scripts/airplanes-mlat.sh: "Anonymous-<first 8 of the
+        // feeder id>", or plain "Anonymous" when the feeder id isn't a
+        // canonical UUID (file missing / malformed on the device).
+        const feederId = (dashboardCtx && dashboardCtx.lastIdentity && dashboardCtx.lastIdentity.feeder_id) || "";
+        const mlatAnonFallback = isCanonicalFeederUUID(feederId)
+            ? "Anonymous-" + normalizedFeederUUID(feederId).slice(0, 8)
+            : "Anonymous";
+        const mlatUserInput = el("input", {
+            id: mlatUserId, name: "MLAT_USER", type: "text",
+            value: configState.savedValues.MLAT_USER || "",
+            placeholder: mlatAnonFallback,
+        });
+        const mlatUserError = el("p", {
+            class: "field-help wc-field-error", hidden: true, role: "alert",
+        }, "Letters, digits, underscore, hyphen — up to 64 characters.");
+        const mlatUserShouldShowError = (v) =>
+            (v || "").trim() !== "" && !isValidMlatUser(v);
+        mlatUserInput.addEventListener("input", () =>
+            refreshFieldError(mlatUserInput, mlatUserError, mlatUserShouldShowError));
+
+        const mlatPrivateId = fieldId("MLAT_PRIVATE");
+        const mlatPrivateInput = el("input", {
+            id: mlatPrivateId, type: "checkbox", name: "MLAT_PRIVATE",
+        });
+        if ((configState.savedValues.MLAT_PRIVATE || "false") === "true") mlatPrivateInput.checked = true;
+
+        // Verify-on-map: a compact neutral link under the longitude input
+        // that opens the entered position on OpenStreetMap (new tab) so the
+        // operator can confirm the pin lands on their actual antenna site.
+        // Shown only when MLAT is on and both coordinates are valid and
+        // precise (the position half of the save gate); see updateVerifyBtn.
+        const verifyBtn = el("a", {
+            class: "wc-help-link",
+            target: "_blank", rel: "noopener noreferrer",
+        }, "Verify on map");
+        verifyBtn.hidden = true;
+
+        // The reveal block holds everything that only matters once MLAT is
+        // on. Hidden (and irrelevant to dirty/save) until Enable MLAT is
+        // checked.
+        const mlatReveal = el("div", { class: "mlat-reveal" },
             el("div", { class: "field" },
                 el("label", { for: latId }, "Latitude"),
                 el("p", { class: "field-help" },
@@ -2064,86 +2148,132 @@
                     ". At least 4 decimals.",
                 ),
                 lonInput,
+                verifyBtn,
             ),
             el("div", { class: "field" },
                 el("label", { for: altId }, "Altitude"),
+                altHelp,
+                altInput,
+                altConvert,
+                el("a", {
+                    class: "wc-help-link",
+                    href: "https://www.freemaptools.com/elevation-finder.htm",
+                    target: "_blank", rel: "noopener noreferrer",
+                }, "Find elevation"),
+            ),
+            el("div", { class: "field" },
+                el("label", { for: mlatUserId }, "MLAT name"),
                 el("p", { class: "field-help" },
-                    "Antenna height above sea level, in metres. For example, ",
-                    el("code", {}, "20"),
-                    " for a typical rooftop.",
+                    "Shown on the MLAT map and in statistics.",
                 ),
-                altInputWrap,
+                mlatUserInput,
+                mlatUserError,
+            ),
+            el("div", { class: "field mlat-privacy-field" },
+                el("label", { for: mlatPrivateId }, mlatPrivateInput, " Hide on the MLAT feeder map"),
+                el("p", { class: "field-help" },
+                    "The MLAT map shows approximated feeder positions and their synchronization peers. Exact coordinates are never shown.",
+                ),
             ),
         );
 
-        loc.body.appendChild(locationSummary);
-        loc.body.appendChild(locationEditor);
+        mlatG.body.appendChild(el("div", { class: "field" },
+            el("label", { for: mlatId }, mlatInput, " Enable MLAT"),
+        ));
+        // Description stays visible whether MLAT is on or off so the
+        // operator can read what MLAT does before deciding to enable it.
+        mlatG.body.appendChild(el("p", { class: "help" },
+            "MLAT triangulates aircraft positions across feeders, providing better accuracy than aircraft-provided GPS data.",
+        ));
+        mlatG.body.appendChild(mlatReveal);
 
-        // Cancel must be declared before setEditing because the
-        // setter toggles its visibility alongside the editor's. Save
-        // visibility is owned by mountGroup (dirty-driven); Cancel
-        // visibility is owned here (edit-mode-driven).
-        const cancelBtn = el("button", {
-            type: "button", class: "wc-btn-ghost",
-            onclick: () => {
+        // Visibility is driven purely by the checkbox; collapsing also
+        // resets the hidden inputs to their saved values and clears any
+        // stale error so a half-typed value left behind never lurks as a
+        // hidden dirty value when MLAT is re-enabled.
+        const updateMlatReveal = () => {
+            mlatReveal.hidden = !mlatInput.checked;
+            if (!mlatInput.checked) {
                 latInput.value = configState.savedValues.LATITUDE || "";
                 lonInput.value = configState.savedValues.LONGITUDE || "";
-                altInput.value = configState.savedValues.ALTITUDE || "";
-                refreshAltUnitIndicator();
-                locGroup.recheck();   // forward-reference; assigned below
-                // Clear any group error & pending restart from a prior
-                // failed save attempt before collapsing.
-                const errEl = loc.footer.querySelector(".error");
-                if (errEl) errEl.textContent = "";
-                const pendEl = loc.footer.querySelector(".config-fieldset__pending");
-                if (pendEl) { pendEl.hidden = true; pendEl.textContent = ""; }
-                setEditing(false);
-            },
-        }, "Cancel");
-        // Cancel lives in the per-group footer alongside the Save
-        // button mountGroup will append. Its visibility tracks edit
-        // mode independently of the dirty state managed by mountGroup.
-        loc.footer.appendChild(cancelBtn);
-
-        // Editing state lives in DOM hidden flags, not in JS — the
-        // body is always mounted so input events work whether collapsed
-        // or expanded. setEditing also syncs Cancel since they share
-        // the same edit-mode lifecycle.
-        const setEditing = (editing) => {
-            locationSummary.hidden = editing;
-            locationEditor.hidden = !editing;
-            cancelBtn.hidden = !editing;
-            if (editing) setTimeout(() => latInput.focus(), 0);
+                altInput.value = altDisplay(configState.savedValues.ALTITUDE);
+                mlatUserInput.value = configState.savedValues.MLAT_USER || "";
+                refreshAltConvert();
+                refreshFieldError(mlatUserInput, mlatUserError, mlatUserShouldShowError);
+            }
         };
-        // Initial state: edit mode iff Location isn't saved
-        // (uninitialised feeder) so the user gets straight to setting
-        // coords on first boot. Otherwise stay collapsed.
-        setEditing(!locationSaved(configState.savedValues));
+        mlatInput.addEventListener("change", updateMlatReveal);
+        updateMlatReveal();
 
-        editBtn.addEventListener("click", () => setEditing(true));
+        const updateVerifyBtn = () => {
+            const lat = latInput.value.trim();
+            const lon = lonInput.value.trim();
+            const ok = mlatInput.checked
+                && isValidLatitude(lat) && isValidLongitude(lon)
+                && hasLatLonPrecision(lat) && hasLatLonPrecision(lon);
+            verifyBtn.hidden = !ok;
+            if (ok) {
+                const la = encodeURIComponent(lat);
+                const lo = encodeURIComponent(lon);
+                // ?mlat/mlon drops the marker pin; #map=zoom/lat/lon frames
+                // it at building zoom so the operator can eyeball the spot.
+                verifyBtn.href = "https://www.openstreetmap.org/?mlat=" + la
+                    + "&mlon=" + lo + "#map=18/" + la + "/" + lo;
+            } else {
+                verifyBtn.removeAttribute("href");
+            }
+        };
+        mlatG.form.addEventListener("input", updateVerifyBtn);
+        mlatG.form.addEventListener("change", updateVerifyBtn);
+        updateVerifyBtn();
 
-        const locGroup = mountGroup({
-            name: "location",
-            formEl: loc.form,
-            footerEl: loc.footer,
-            keys: ["LATITUDE", "LONGITUDE", "ALTITUDE"],
-            readInputs: () => ({
-                LATITUDE: latInput.value,
-                LONGITUDE: lonInput.value,
-                ALTITUDE: altInput.value,
-            }),
+        const mlatGroup = mountGroup({
+            name: "mlat",
+            formEl: mlatG.form,
+            footerEl: mlatG.footer,
+            keys: ["MLAT_ENABLED", "LATITUDE", "LONGITUDE", "ALTITUDE", "MLAT_USER", "MLAT_PRIVATE"],
+            // When MLAT is off the position/name/privacy inputs are hidden
+            // and irrelevant — emit only MLAT_ENABLED so abandoned edits in
+            // the collapsed reveal never count as dirty.
+            readInputs: () => {
+                const out = { MLAT_ENABLED: mlatInput.checked ? "true" : "false" };
+                if (mlatInput.checked) {
+                    out.LATITUDE = latInput.value;
+                    out.LONGITUDE = lonInput.value;
+                    out.ALTITUDE = altInput.value;
+                    out.MLAT_USER = mlatUserInput.value;
+                    out.MLAT_PRIVATE = mlatPrivateInput.checked ? "true" : "false";
+                }
+                return out;
+            },
+            // Enabling MLAT requires a valid, precise position and a valid
+            // name; until then Save stays visible-but-disabled. Disabling
+            // MLAT is always allowed (the user must be able to turn it off
+            // even with bad on-disk geo). Altitude must be non-empty:
+            // isValidAltitude("") is true (tombstone acceptance), but the
+            // daemon refuses MLAT with ALTITUDE empty (altitude_empty), so
+            // the gate demands an actual value before enabling.
             isValid: () => {
+                if (!mlatInput.checked) return true;
                 return isValidLatitude(latInput.value)
                     && isValidLongitude(lonInput.value)
                     && hasLatLonPrecision(latInput.value)
                     && hasLatLonPrecision(lonInput.value)
-                    && isValidAltitude(altInput.value);
+                    && altInput.value.trim() !== ""
+                    && isValidAltitude(altInput.value)
+                    && isValidMlatUser(mlatUserInput.value);
             },
             payload: () => {
-                // Send only dirty keys, with the lat+lon pair rule so
-                // backend GEO derivation gets both axes. ALTITUDE only
-                // when it actually changed.
                 const out = {};
+                const enabled = mlatInput.checked ? "true" : "false";
+                if (enabled !== (configState.savedValues.MLAT_ENABLED || "false")) {
+                    out.MLAT_ENABLED = enabled;
+                }
+                // Disabling MLAT touches nothing but the toggle.
+                if (!mlatInput.checked) return out;
+                // lat+lon travel as a pair so the backend re-derives
+                // GEO_CONFIGURED from both axes; altitude/name/privacy go
+                // only when they actually changed.
                 const latDirty = !sameValue("LATITUDE", latInput.value, configState.savedValues.LATITUDE);
                 const lonDirty = !sameValue("LONGITUDE", lonInput.value, configState.savedValues.LONGITUDE);
                 if (latDirty || lonDirty) {
@@ -2153,154 +2283,7 @@
                 if (!sameValue("ALTITUDE", altInput.value, configState.savedValues.ALTITUDE)) {
                     out.ALTITUDE = altInput.value.trim();
                 }
-                return out;
-            },
-            onSavedHook: () => {
-                // Rebase the inputs against savedValues post-refresh
-                // so an operator who typed `400ft` sees the canonical
-                // `121.92` next time they hit Edit. Without this the
-                // editor would still show the un-canonicalised input
-                // and the dirty comparator would re-flag the field
-                // on every input event.
-                latInput.value = configState.savedValues.LATITUDE || "";
-                lonInput.value = configState.savedValues.LONGITUDE || "";
-                altInput.value = configState.savedValues.ALTITUDE || "";
-                refreshAltUnitIndicator();
-                updateSummaryValues();
-                setEditing(false);
-            },
-        });
-
-        // ===== MLAT =====
-        const mlatG = buildGroup("MLAT");
-        const mlatId = fieldId("MLAT_ENABLED");
-        const mlatInput = el("input", {
-            id: mlatId, type: "checkbox", name: "MLAT_ENABLED",
-        });
-        if ((configState.savedValues.MLAT_ENABLED || "true") === "true") mlatInput.checked = true;
-
-        const mlatUserId = fieldId("MLAT_USER");
-        const mlatUserInput = el("input", {
-            id: mlatUserId, name: "MLAT_USER", type: "text",
-            value: configState.savedValues.MLAT_USER || "",
-            placeholder: "alice",
-        });
-
-        const mlatPrivateId = fieldId("MLAT_PRIVATE");
-        const mlatPrivateInput = el("input", {
-            id: mlatPrivateId, type: "checkbox", name: "MLAT_PRIVATE",
-        });
-        if ((configState.savedValues.MLAT_PRIVATE || "false") === "true") mlatPrivateInput.checked = true;
-
-        const mlatGateMsg = el("p", { class: "help mlat-gate" });
-        const setLocationLink = el("button", {
-            type: "button", class: "wc-btn-ghost",
-            onclick: () => {
-                setEditing(true);
-                mlatG.fieldset.scrollIntoView({ behavior: "smooth", block: "nearest" });
-                loc.fieldset.scrollIntoView({ behavior: "smooth", block: "start" });
-            },
-        }, "Set location");
-        mlatGateMsg.appendChild(document.createTextNode("Location is required before enabling MLAT. "));
-        mlatGateMsg.appendChild(setLocationLink);
-        mlatGateMsg.hidden = true;
-
-        const mlatUserError = el("p", {
-            class: "field-help wc-field-error", hidden: true, role: "alert",
-        }, "Letters, digits, underscore, hyphen — up to 64 characters.");
-        const mlatUserShouldShowError = (v) =>
-            (v || "").trim() !== "" && !isValidMlatUser(v);
-        mlatUserInput.addEventListener("input", () =>
-            refreshFieldError(mlatUserInput, mlatUserError, mlatUserShouldShowError));
-
-        const mlatUserEditor = el("div", {}, mlatUserInput, mlatUserError);
-        const mlatUserEdit = buildEditableField({
-            summarise: () => configState.savedValues.MLAT_USER || "",
-            inputsWrapper: mlatUserEditor,
-            resetInputs: () => {
-                mlatUserInput.value = configState.savedValues.MLAT_USER || "";
-                refreshFieldError(mlatUserInput, mlatUserError, mlatUserShouldShowError);
-            },
-            focusInput: mlatUserInput,
-            footerEl: mlatG.footer,
-            afterCancel: () => { mlatGroup.recheck(); },
-        });
-
-        const mlatSubFields = el("div", { class: "mlat-sub" },
-            el("div", { class: "field" },
-                el("label", { for: mlatUserId }, "MLAT name"),
-                mlatUserEdit.summaryEl,
-                mlatUserEditor,
-            ),
-            el("div", { class: "field" },
-                el("label", { for: mlatPrivateId }, mlatPrivateInput, " Hide MLAT name on public map"),
-            ),
-        );
-
-        mlatG.body.appendChild(el("div", { class: "field" },
-            el("label", { for: mlatId }, mlatInput, " Enable MLAT"),
-        ));
-        mlatG.body.appendChild(mlatGateMsg);
-        mlatG.body.appendChild(mlatSubFields);
-
-        const updateMlatVisibility = () => {
-            const geoOk = locationSaved(configState.savedValues);
-            const visible = mlatInput.checked && geoOk;
-            // Sub-fields only meaningful when MLAT is on AND geo is set.
-            mlatSubFields.hidden = !visible;
-            // Show the gate message ONLY when the user is trying to
-            // enable MLAT without saved geo. Disabling MLAT is always
-            // allowed (the user must be able to turn it off even with
-            // bad on-disk geo).
-            mlatGateMsg.hidden = !(mlatInput.checked && !geoOk);
-            // Re-collapse the MLAT name editor whenever the gate closes
-            // so the next reveal starts from a known read-only state.
-            // Also reset the input to its saved value and clear any
-            // stale error display — a half-typed invalid value left
-            // here would otherwise be hidden but still block Save when
-            // the gate later re-opens.
-            if (!visible) {
-                mlatUserEdit.setEditing(false);
-                mlatUserInput.value = configState.savedValues.MLAT_USER || "";
-                refreshFieldError(mlatUserInput, mlatUserError, mlatUserShouldShowError);
-            }
-        };
-        mlatInput.addEventListener("change", updateMlatVisibility);
-        updateMlatVisibility();
-
-        const mlatGroup = mountGroup({
-            name: "mlat",
-            formEl: mlatG.form,
-            footerEl: mlatG.footer,
-            keys: ["MLAT_ENABLED", "MLAT_USER", "MLAT_PRIVATE"],
-            // Hidden MLAT_USER edits must not silently save. When the
-            // sub-fields are collapsed (MLAT disabled or geo missing)
-            // omit MLAT_USER from the dirty comparator entirely so any
-            // half-typed value the user abandoned stays out of payload.
-            readInputs: () => {
-                const out = {
-                    MLAT_ENABLED: mlatInput.checked ? "true" : "false",
-                    MLAT_PRIVATE: mlatPrivateInput.checked ? "true" : "false",
-                };
-                if (!mlatSubFields.hidden) {
-                    out.MLAT_USER = mlatUserInput.value;
-                }
-                return out;
-            },
-            isValid: () => {
-                if (!mlatInput.checked) return true;
-                if (!locationSaved(configState.savedValues)) return false;
-                if (!mlatSubFields.hidden && !isValidMlatUser(mlatUserInput.value)) return false;
-                return true;
-            },
-            payload: () => {
-                const out = {};
-                const enabled = mlatInput.checked ? "true" : "false";
-                if (enabled !== (configState.savedValues.MLAT_ENABLED || "true")) {
-                    out.MLAT_ENABLED = enabled;
-                }
-                if (!mlatSubFields.hidden
-                    && !sameValue("MLAT_USER", mlatUserInput.value, configState.savedValues.MLAT_USER)) {
+                if (!sameValue("MLAT_USER", mlatUserInput.value, configState.savedValues.MLAT_USER)) {
                     out.MLAT_USER = mlatUserInput.value.trim();
                 }
                 const priv = mlatPrivateInput.checked ? "true" : "false";
@@ -2310,20 +2293,19 @@
                 return out;
             },
             onSavedHook: () => {
-                // Rebase the input to the canonical saved value (apl-feed
-                // trims) so a "bob " save isn't stuck dirty against "bob".
+                // Rebase inputs to the canonical saved values (apl-feed
+                // trims, and canonicalises altitude ft→m) so a "400ft" /
+                // "bob " save doesn't re-flag dirty against "121.92" / "bob".
+                latInput.value = configState.savedValues.LATITUDE || "";
+                lonInput.value = configState.savedValues.LONGITUDE || "";
+                altInput.value = altDisplay(configState.savedValues.ALTITUDE);
                 mlatUserInput.value = configState.savedValues.MLAT_USER || "";
+                refreshAltConvert();
                 refreshFieldError(mlatUserInput, mlatUserError, mlatUserShouldShowError);
-                mlatUserEdit.refreshSummary();
-                mlatUserEdit.setEditing(false);
+                updateMlatReveal();
+                updateVerifyBtn();
                 mlatGroup.recheck();
             },
-        });
-        // After any save lands, re-evaluate MLAT visibility (Location
-        // may have just saved valid geo, unblocking the gate).
-        configState.onSaved.add(() => {
-            updateMlatVisibility();
-            mlatGroup.recheck();
         });
 
         // ===== Gain =====
@@ -2527,7 +2509,6 @@
         });
 
         // Assemble
-        parent.appendChild(loc.fieldset);
         parent.appendChild(mlatG.fieldset);
         parent.appendChild(gainG.fieldset);
         parent.appendChild(uatG.fieldset);
