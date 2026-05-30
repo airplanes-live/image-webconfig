@@ -28,11 +28,12 @@
   --wc-line-strong: rgba(20, 32, 51, 0.22);
   --wc-accent: #0c6f9b;
   --wc-accent-strong: #074b70;
-  --wc-warm: #ef8458;
-  --wc-warm-strong: #db6a3a;
-  --wc-danger: #b1442e;
-  --wc-danger-strong: #8e351f;
-  --wc-success: #15803d;
+  --wc-warm: #f0a04b;
+  --wc-warm-strong: #d98a2b;
+  --wc-danger: #d9534a;
+  --wc-danger-strong: #c0392b;
+  --wc-success: #218459;
+  --wc-success-ink: #ffffff;
   --wc-shell-backdrop: rgba(247, 244, 236, 0.92);
 
   --wc-status-ok: var(--wc-success);
@@ -47,23 +48,24 @@
 
 /* User-chosen dark — overrides OS preference */
 html[data-theme="dark"] {
-  --wc-surface-0: #0d1520;
-  --wc-surface-1: #121f30;
-  --wc-surface-2: #121f30;
-  --wc-surface-3: #172538;
-  --wc-ink-1: #edf3f8;
-  --wc-ink-2: #b8c6d6;
+  --wc-surface-0: #181a1e;
+  --wc-surface-1: #20232a;
+  --wc-surface-2: #20232a;
+  --wc-surface-3: #282b33;
+  --wc-ink-1: #e7eaef;
+  --wc-ink-2: #adb3bd;
   --wc-ink-3: #8d9cae;
-  --wc-line-soft: rgba(237, 243, 248, 0.10);
-  --wc-line-strong: rgba(237, 243, 248, 0.22);
-  --wc-accent: #64b9df;
-  --wc-accent-strong: #91d4f0;
-  --wc-warm: #ff9b70;
-  --wc-warm-strong: #ffb489;
-  --wc-danger: #e87a5f;
-  --wc-danger-strong: #f08e74;
-  --wc-success: #3fb950;
-  --wc-shell-backdrop: rgba(13, 21, 32, 0.92);
+  --wc-line-soft: rgba(231, 234, 239, 0.10);
+  --wc-line-strong: rgba(231, 234, 239, 0.22);
+  --wc-accent: #1786b6;
+  --wc-accent-strong: #3aa0d3;
+  --wc-warm: #ffb547;
+  --wc-warm-strong: #ffc16a;
+  --wc-danger: #e85d5d;
+  --wc-danger-strong: #ef7878;
+  --wc-success: #3ddc97;
+  --wc-success-ink: #051a10;
+  --wc-shell-backdrop: rgba(24, 26, 30, 0.92);
   --wc-shadow-soft: 0 1px 2px rgba(0, 0, 0, 0.35);
 }
 
@@ -75,23 +77,24 @@ html[data-theme="light"] {
 /* OS preference applies only when no explicit override */
 @media (prefers-color-scheme: dark) {
   html:not([data-theme]) {
-    --wc-surface-0: #0d1520;
-    --wc-surface-1: #121f30;
-    --wc-surface-2: #121f30;
-    --wc-surface-3: #172538;
-    --wc-ink-1: #edf3f8;
-    --wc-ink-2: #b8c6d6;
+    --wc-surface-0: #181a1e;
+    --wc-surface-1: #20232a;
+    --wc-surface-2: #20232a;
+    --wc-surface-3: #282b33;
+    --wc-ink-1: #e7eaef;
+    --wc-ink-2: #adb3bd;
     --wc-ink-3: #8d9cae;
-    --wc-line-soft: rgba(237, 243, 248, 0.10);
-    --wc-line-strong: rgba(237, 243, 248, 0.22);
-    --wc-accent: #64b9df;
-    --wc-accent-strong: #91d4f0;
-    --wc-warm: #ff9b70;
-    --wc-warm-strong: #ffb489;
-    --wc-danger: #e87a5f;
-    --wc-danger-strong: #f08e74;
-    --wc-success: #3fb950;
-    --wc-shell-backdrop: rgba(13, 21, 32, 0.92);
+    --wc-line-soft: rgba(231, 234, 239, 0.10);
+    --wc-line-strong: rgba(231, 234, 239, 0.22);
+    --wc-accent: #1786b6;
+    --wc-accent-strong: #3aa0d3;
+    --wc-warm: #ffb547;
+    --wc-warm-strong: #ffc16a;
+    --wc-danger: #e85d5d;
+    --wc-danger-strong: #ef7878;
+    --wc-success: #3ddc97;
+    --wc-success-ink: #051a10;
+    --wc-shell-backdrop: rgba(24, 26, 30, 0.92);
     --wc-shadow-soft: 0 1px 2px rgba(0, 0, 0, 0.35);
   }
 }
@@ -562,7 +565,7 @@ button.wc-tile:hover {
   color: var(--wc-ink-2);
   font-weight: 600;
 }
-.service-state.state-active   { background: var(--wc-success); color: #fff; }
+.service-state.state-active   { background: var(--wc-success); color: var(--wc-success-ink); }
 .service-state.state-inactive { background: var(--wc-surface-2); color: var(--wc-ink-3); }
 .service-state.state-failed   { background: var(--wc-danger); color: #fff; }
 .service-state.state-unknown  { background: var(--wc-surface-2); color: var(--wc-ink-3); font-style: italic; }
@@ -965,7 +968,7 @@ textarea:focus {
   vertical-align: middle;
   margin-right: 0.35rem;
 }
-.wifi-dot-active { background: #1f8a45; box-shadow: 0 0 0 2px rgba(31, 138, 69, 0.18); }
+.wifi-dot-active { background: var(--wc-success); box-shadow: 0 0 0 2px color-mix(in srgb, var(--wc-success) 18%, transparent); }
 .wifi-dot-idle   { background: var(--wc-line-strong); }
 
 .wifi-badge {
@@ -978,7 +981,7 @@ textarea:focus {
   margin-left: 0.4rem;
   vertical-align: middle;
 }
-.wifi-badge-warn { background: #fdecc8; color: #5e3a00; }
+.wifi-badge-warn { background: color-mix(in srgb, var(--wc-warm) 18%, var(--wc-surface-1)); color: var(--wc-ink-1); }
 
 .wifi-table {
   width: 100%;
@@ -1073,9 +1076,9 @@ textarea:focus {
   border-radius: 0.4rem;
   margin: 0.25rem 0 0.5rem;
 }
-.wifi-flash-ok    { background: #e3f1e6; color: #14441f; }
-.wifi-flash-warn  { background: #fdecc8; color: #5e3a00; }
-.wifi-flash-error { background: #fbdcdc; color: #6a1b1b; }
+.wifi-flash-ok    { background: color-mix(in srgb, var(--wc-success) 18%, var(--wc-surface-1)); color: var(--wc-ink-1); }
+.wifi-flash-warn  { background: color-mix(in srgb, var(--wc-warm) 18%, var(--wc-surface-1)); color: var(--wc-ink-1); }
+.wifi-flash-error { background: color-mix(in srgb, var(--wc-danger) 18%, var(--wc-surface-1)); color: var(--wc-ink-1); }
 
 /* ========== Management card ========== */
 
