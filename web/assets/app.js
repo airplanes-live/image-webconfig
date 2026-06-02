@@ -2036,16 +2036,25 @@
         if ((configState.savedValues.MLAT_ENABLED || "false") === "true") mlatInput.checked = true;
 
         // --- Position inputs (revealed when MLAT is on) ---
+        // A never-configured feeder carries placeholder coordinates (0/0) with
+        // GEO_CONFIGURED=false. Treat the whole position as unset and render the
+        // fields blank (so their placeholders show) instead of leaking the
+        // sentinels in as if the operator had entered them. previewLatLonSet
+        // honors the explicit GEO_CONFIGURED flag. initAlt is defined below,
+        // after altDisplay.
+        const geoConfigured = () => previewLatLonSet(configState.savedValues);
+        const initLat = () => geoConfigured() ? (configState.savedValues.LATITUDE || "") : "";
+        const initLon = () => geoConfigured() ? (configState.savedValues.LONGITUDE || "") : "";
         const latId = fieldId("LATITUDE");
         const latInput = el("input", {
             id: latId, name: "LATITUDE", type: "text",
-            value: configState.savedValues.LATITUDE || "",
+            value: initLat(),
             inputmode: "decimal", placeholder: "51.5074",
         });
         const lonId = fieldId("LONGITUDE");
         const lonInput = el("input", {
             id: lonId, name: "LONGITUDE", type: "text",
-            value: configState.savedValues.LONGITUDE || "",
+            value: initLon(),
             inputmode: "decimal", placeholder: "-0.1278",
         });
         const altId = fieldId("ALTITUDE");
@@ -2056,9 +2065,12 @@
         // input convenience; it is never what gets stored.
         const altImperial = viewerUsesImperialLength();
         const altDisplay = (sv) => altitudeDisplayValue(sv, altImperial);
+        // Same unconfigured-feeder gate as lat/lon: don't pre-fill altitude
+        // from the placeholder value when the position isn't configured.
+        const initAlt = () => geoConfigured() ? altDisplay(configState.savedValues.ALTITUDE) : "";
         const altInput = el("input", {
             id: altId, name: "ALTITUDE", type: "text",
-            value: altDisplay(configState.savedValues.ALTITUDE),
+            value: initAlt(),
             placeholder: altImperial ? "65ft" : "20m",
         });
         // Live feet→metres echo. Altitude is stored in metres, so when the
@@ -2194,9 +2206,9 @@
         const updateMlatReveal = () => {
             mlatReveal.hidden = !mlatInput.checked;
             if (!mlatInput.checked) {
-                latInput.value = configState.savedValues.LATITUDE || "";
-                lonInput.value = configState.savedValues.LONGITUDE || "";
-                altInput.value = altDisplay(configState.savedValues.ALTITUDE);
+                latInput.value = initLat();
+                lonInput.value = initLon();
+                altInput.value = initAlt();
                 mlatUserInput.value = configState.savedValues.MLAT_USER || "";
                 refreshAltConvert();
                 refreshFieldError(mlatUserInput, mlatUserError, mlatUserShouldShowError);
@@ -2252,13 +2264,18 @@
             // even with bad on-disk geo). Altitude must be non-empty:
             // isValidAltitude("") is true (tombstone acceptance), but the
             // daemon refuses MLAT with ALTITUDE empty (altitude_empty), so
-            // the gate demands an actual value before enabling.
+            // the gate demands an actual value before enabling. The
+            // previewLatLonSet check (passed the live inputs, with no
+            // GEO_CONFIGURED key so it takes the derive path) rejects a
+            // both-axes-zero pair the way the daemon does — without it the UI
+            // would enable Save for 0,0 and let the server reject it.
             isValid: () => {
                 if (!mlatInput.checked) return true;
                 return isValidLatitude(latInput.value)
                     && isValidLongitude(lonInput.value)
                     && hasLatLonPrecision(latInput.value)
                     && hasLatLonPrecision(lonInput.value)
+                    && previewLatLonSet({ LATITUDE: latInput.value, LONGITUDE: lonInput.value })
                     && altInput.value.trim() !== ""
                     && isValidAltitude(altInput.value)
                     && isValidMlatUser(mlatUserInput.value);
@@ -2296,9 +2313,9 @@
                 // Rebase inputs to the canonical saved values (apl-feed
                 // trims, and canonicalises altitude ft→m) so a "400ft" /
                 // "bob " save doesn't re-flag dirty against "121.92" / "bob".
-                latInput.value = configState.savedValues.LATITUDE || "";
-                lonInput.value = configState.savedValues.LONGITUDE || "";
-                altInput.value = altDisplay(configState.savedValues.ALTITUDE);
+                latInput.value = initLat();
+                lonInput.value = initLon();
+                altInput.value = initAlt();
                 mlatUserInput.value = configState.savedValues.MLAT_USER || "";
                 refreshAltConvert();
                 refreshFieldError(mlatUserInput, mlatUserError, mlatUserShouldShowError);
