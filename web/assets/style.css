@@ -674,6 +674,43 @@ button.secondary:hover,
   .wc-btn-icon--spinning svg { animation: none; }
 }
 
+/* Copyable value row in the claim box: label + value + a small inline copy
+   button that sits right after the value and is sized to the text, not the
+   2.75rem header icon buttons. The value may wrap (overflow-wrap) so a long
+   feeder UUID can't push the button off a narrow screen. */
+.wc-copy-row {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 0.3rem;
+}
+.wc-copy-val {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+.wc-copy-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: auto;
+  min-width: 0;
+  min-height: 0;
+  /* Transparent padding: the glyph stays text-sized at rest, but the tap
+     target grows to ~24px for touch use. */
+  padding: 0.3rem;
+  line-height: 0;
+  background: transparent;
+  border: none;
+  border-radius: var(--wc-radius-sm);
+  color: var(--wc-ink-3);
+  flex: 0 0 auto;
+}
+.wc-copy-btn:hover { color: var(--wc-ink-1); background: var(--wc-surface-3); }
+.wc-copy-btn--done,
+.wc-copy-btn--done:hover { color: var(--wc-success); background: transparent; }
+.wc-copy-btn--error,
+.wc-copy-btn--error:hover { color: var(--wc-danger); background: transparent; }
+
 /* The header back button visually matches an icon button when collapsed
    on mobile but stretches with text on desktop — keep it as a normal
    ghost button. */

@@ -85,6 +85,13 @@
     const WIFI_ICON =
         "M15.384 6.115a.485.485 0 0 0-.047-.736A12.44 12.44 0 0 0 8 3C5.259 3 2.723 3.882.663 5.379a.485.485 0 0 0-.048.736.518.518 0 0 0 .668.05A11.45 11.45 0 0 1 8 4c2.507 0 4.827.802 6.716 2.164.205.148.49.13.668-.049m-2.55 2.516a.482.482 0 0 0-.063-.745A8.46 8.46 0 0 0 8 7a8.46 8.46 0 0 0-4.77 1.886.482.482 0 0 0-.064.745.525.525 0 0 0 .654.065A7.46 7.46 0 0 1 8 8c1.71 0 3.29.578 4.18 1.696a.525.525 0 0 0 .654-.065zm-2.557 2.514a.483.483 0 0 0-.089-.745A4.47 4.47 0 0 0 8 10c-.83 0-1.605.247-2.188.4a.483.483 0 0 0-.089.745.525.525 0 0 0 .626.085A3.47 3.47 0 0 1 8 11c.488 0 .947.118 1.349.314a.525.525 0 0 0 .626-.085zM9.5 14.25a1.5 1.5 0 1 1-3 0 1.5 1.5 0 0 1 3 0z";
 
+    // Bootstrap-icons clipboard glyph (two subpaths in one d string).
+    const COPY_ICON =
+        "M4 1.5H3a2 2 0 0 0-2 2V14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V3.5a2 2 0 0 0-2-2h-1v1h1a1 1 0 0 1 1 1V14a1 1 0 0 1-1 1H3a1 1 0 0 1-1-1V3.5a1 1 0 0 1 1-1h1z M9.5 1a.5.5 0 0 1 .5.5v1a.5.5 0 0 1-.5.5h-3a.5.5 0 0 1-.5-.5v-1a.5.5 0 0 1 .5-.5zm-3-1A1.5 1.5 0 0 0 5 1.5v1A1.5 1.5 0 0 0 6.5 4h3A1.5 1.5 0 0 0 11 2.5v-1A1.5 1.5 0 0 0 9.5 0z";
+    // Bootstrap-icons check2 glyph, shown briefly after a successful copy.
+    const COPY_DONE_ICON =
+        "M13.854 3.646a.5.5 0 0 1 0 .708l-7 7a.5.5 0 0 1-.708 0l-3.5-3.5a.5.5 0 1 1 .708-.708L6.5 10.293l6.646-6.647a.5.5 0 0 1 .708 0";
+
     // ===== Runtime state =====
 
     const app = document.getElementById("app");
@@ -367,6 +374,76 @@
         path.setAttribute("d", pathD);
         svg.appendChild(path);
         return svg;
+    }
+
+    // copyTextToClipboard prefers the async Clipboard API but falls back to
+    // an off-screen <textarea> + execCommand("copy"). The fallback is the
+    // path that actually runs on a feeder: the webconfig is served over
+    // plain HTTP on the LAN, which is not a secure context, so
+    // navigator.clipboard is undefined. It is also used when the async API
+    // is present but rejects (permission / user-activation quirks).
+    // try/finally guarantees the textarea is removed even if select throws.
+    function copyTextToClipboard(text) {
+        const fallback = () => new Promise((resolve, reject) => {
+            const ta = document.createElement("textarea");
+            ta.value = text;
+            ta.setAttribute("readonly", "");
+            ta.style.position = "fixed";
+            ta.style.top = "-9999px";
+            ta.style.opacity = "0";
+            document.body.appendChild(ta);
+            try {
+                ta.focus({ preventScroll: true });
+                ta.select();
+                ta.setSelectionRange(0, ta.value.length);
+                if (document.execCommand("copy")) resolve();
+                else reject(new Error("copy failed"));
+            } catch (e) {
+                reject(e);
+            } finally {
+                document.body.removeChild(ta);
+            }
+        });
+        if (navigator.clipboard && window.isSecureContext) {
+            return navigator.clipboard.writeText(text).catch(fallback);
+        }
+        return fallback();
+    }
+
+    // copyButton returns a small inline icon button that copies `value` and
+    // briefly swaps to a check glyph (or an error state) for feedback.
+    // `label` names the value for the aria-label / tooltip. The `gen` token
+    // stops a slow or failed copy from overwriting the state of a newer
+    // click, and stops a stale revert timer from firing.
+    function copyButton(value, label) {
+        const btn = el("button", {
+            class: "wc-copy-btn",
+            type: "button",
+            "aria-label": "Copy " + label,
+            title: "Copy " + label,
+        }, svgIcon(COPY_ICON, 14));
+        let gen = 0;
+        btn.addEventListener("click", async () => {
+            const myGen = ++gen;
+            let done = true;
+            try { await copyTextToClipboard(value); }
+            catch (_) { done = false; }
+            if (myGen !== gen) return;
+            btn.replaceChildren(svgIcon(done ? COPY_DONE_ICON : COPY_ICON, 14));
+            btn.classList.toggle("wc-copy-btn--done", done);
+            btn.classList.toggle("wc-copy-btn--error", !done);
+            btn.title = done ? "Copied" : "Copy failed — select manually";
+            btn.setAttribute("aria-label",
+                done ? label + " copied" : "Copy failed — select manually");
+            setTimeout(() => {
+                if (myGen !== gen) return;
+                btn.replaceChildren(svgIcon(COPY_ICON, 14));
+                btn.classList.remove("wc-copy-btn--done", "wc-copy-btn--error");
+                btn.title = "Copy " + label;
+                btn.setAttribute("aria-label", "Copy " + label);
+            }, 1400);
+        });
+        return btn;
     }
 
     // ===== Safe claim URL =====
@@ -1297,13 +1374,24 @@
                         (r.payload && r.payload.error) || "reveal failed"));
                     return;
                 }
+                if (!r.payload.feeder_id || !r.payload.claim_secret) {
+                    parent.replaceChildren(el("p", { class: "error", role: "alert" },
+                        "reveal returned incomplete data"));
+                    return;
+                }
                 const safe = safeClaimHref(r.payload.claim_page);
                 const linkOrText = safe
                     ? el("a", { href: safe, target: "_blank", rel: "noopener noreferrer" }, "Claim this feeder")
                     : el("span", { class: "muted" }, r.payload.claim_page || "");
                 parent.replaceChildren(
-                    el("p", {}, el("strong", {}, "Feeder ID: "), r.payload.feeder_id),
-                    el("p", {}, el("strong", {}, "Claim secret: "), el("code", {}, r.payload.claim_secret)),
+                    el("p", { class: "wc-copy-row" },
+                        el("strong", {}, "Feeder ID: "),
+                        el("span", { class: "wc-copy-val" }, r.payload.feeder_id),
+                        copyButton(r.payload.feeder_id, "feeder ID")),
+                    el("p", { class: "wc-copy-row" },
+                        el("strong", {}, "Claim secret: "),
+                        el("code", { class: "wc-copy-val" }, r.payload.claim_secret),
+                        copyButton(r.payload.claim_secret, "claim secret")),
                     el("p", {}, linkOrText),
                     el("div", { class: "wc-action-grid" }, claimLog),
                 );
