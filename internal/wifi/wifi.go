@@ -62,6 +62,29 @@ func ValidID(id string) bool {
 	return idRegexp.MatchString(id)
 }
 
+// foreignIDRegexp matches the synthetic id apl-wifi assigns to a foreign
+// (netplan/flash-time) Wi-Fi connection: `foreign-<uuid>` with a canonical
+// RFC 4122 UUID. The strict UUID shape (not a loose `[0-9a-f-]+`) keeps a
+// crafted id from smuggling odd bytes toward nmcli; apl-wifi additionally
+// re-checks the uuid against the live foreign-connection set, so this is a
+// syntactic gate only.
+var foreignIDRegexp = regexp.MustCompile(
+	`^foreign-[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$`)
+
+// ValidForeignID reports whether id is a syntactically valid `foreign-<uuid>`
+// id. Gates the adopt route, which only accepts foreign networks.
+func ValidForeignID(id string) bool {
+	return foreignIDRegexp.MatchString(id)
+}
+
+// ValidActivatableID reports whether id may be activated: a managed keyfile id
+// or a `foreign-<uuid>`. Activation is a runtime-only nmcli op (no keyfile
+// write), so it is the one route foreign networks may use. Update and delete
+// keep the strict ValidID gate so foreign profiles stay read-only there.
+func ValidActivatableID(id string) bool {
+	return ValidID(id) || ValidForeignID(id)
+}
+
 // HTTPStatus maps a helper status to the HTTP status the browser sees.
 //
 //   applied | no_change | ok | test_passed → 200

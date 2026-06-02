@@ -80,6 +80,7 @@ func StubPrivilegedArgv() server.PrivilegedArgv {
 		WifiDelete:           []string{"dev-stub", "apl-wifi", "delete"},
 		WifiTest:             []string{"dev-stub", "apl-wifi", "test"},
 		WifiActivate:         []string{"dev-stub", "apl-wifi", "activate"},
+		WifiAdopt:            []string{"dev-stub", "apl-wifi", "adopt"},
 		WifiStatus:           []string{"dev-stub", "apl-wifi", "status"},
 		ExportIdentity:       []string{"dev-stub", "identity", "export"},
 		ImportIdentity:       []string{"dev-stub", "identity", "import"},
@@ -455,6 +456,8 @@ func wifiCmd(state *State, sub string, body []byte) (wexec.Result, error) {
 		return wifiTest(state, body)
 	case "activate":
 		return wifiActivate(state, body)
+	case "adopt":
+		return wifiAdopt(state, body)
 	}
 	env := map[string]any{"status": "usage_error", "message": "unknown subcommand " + sub}
 	b, _ := json.Marshal(env)
@@ -607,6 +610,19 @@ func wifiActivate(state *State, body []byte) (wexec.Result, error) {
 		return wexec.Result{Stdout: b}, nil
 	}
 	env := map[string]any{"status": "applied", "id": in.ID}
+	b, _ := json.Marshal(env)
+	return wexec.Result{Stdout: b}, nil
+}
+
+func wifiAdopt(state *State, body []byte) (wexec.Result, error) {
+	in, _ := parseWifiInput(body)
+	newID, ok := state.WifiAdopt(in.ID)
+	if !ok {
+		env := map[string]any{"status": "rejected", "reason": "unknown_id", "id": in.ID}
+		b, _ := json.Marshal(env)
+		return wexec.Result{Stdout: b}, nil
+	}
+	env := map[string]any{"status": "applied", "id": newID, "adopted": true, "changed": []string{newID}}
 	b, _ := json.Marshal(env)
 	return wexec.Result{Stdout: b}, nil
 }

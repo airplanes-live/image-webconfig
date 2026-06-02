@@ -262,6 +262,80 @@ func TestWifiActivate_InjectsID(t *testing.T) {
 	}
 }
 
+func TestWifiActivate_AcceptsForeignID(t *testing.T) {
+	t.Parallel()
+	h := newWriteHarness(t)
+	const fid = "foreign-8d3a8adc-992a-30ce-84de-af794156bcc9"
+	h.stdinResult = wexec.Result{Stdout: []byte(`{"status":"applied","id":"` + fid + `","active":true}`)}
+
+	r := postJSON(t, h.client, h.ts.URL+"/api/wifi/"+fid+"/activate", map[string]any{})
+	defer r.Body.Close()
+	if r.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body = %s", r.StatusCode, mustReadAll(t, r.Body))
+	}
+	calls := h.stdinCallsCopy()
+	if len(calls) != 1 || calls[0].argv[len(calls[0].argv)-2] != "activate" {
+		t.Fatalf("argv = %v", calls)
+	}
+	var sent map[string]any
+	_ = json.Unmarshal(calls[0].stdin, &sent)
+	if sent["id"] != fid {
+		t.Fatalf("activate stdin id = %v, want %s", sent["id"], fid)
+	}
+}
+
+func TestWifiAdopt_AcceptsForeignAndInjectsID(t *testing.T) {
+	t.Parallel()
+	h := newWriteHarness(t)
+	h.stdinResult = wexec.Result{Stdout: []byte(`{"status":"applied","id":"airplanes-wifi-homelab","adopted":true}`)}
+
+	const fid = "foreign-8d3a8adc-992a-30ce-84de-af794156bcc9"
+	r := postJSON(t, h.client, h.ts.URL+"/api/wifi/"+fid+"/adopt", map[string]any{})
+	defer r.Body.Close()
+	if r.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body = %s", r.StatusCode, mustReadAll(t, r.Body))
+	}
+	calls := h.stdinCallsCopy()
+	if len(calls) != 1 {
+		t.Fatalf("stdinCalls = %d", len(calls))
+	}
+	wantArgv := []string{"sudo-stub", "apl-wifi", "adopt", "--json"}
+	if !equalSlice(calls[0].argv, wantArgv) {
+		t.Fatalf("argv = %v, want %v", calls[0].argv, wantArgv)
+	}
+	var sent map[string]any
+	_ = json.Unmarshal(calls[0].stdin, &sent)
+	if sent["id"] != fid {
+		t.Fatalf("adopt stdin id = %v, want %s", sent["id"], fid)
+	}
+}
+
+func TestWifiAdopt_RejectsNonForeignBeforeHelper(t *testing.T) {
+	t.Parallel()
+	h := newWriteHarness(t)
+
+	// Only a canonical foreign-<uuid> is adoptable. Managed ids and malformed
+	// foreign ids are rejected at the HTTP layer, before the helper runs.
+	paths := []string{
+		"/api/wifi/airplanes-wifi-home/adopt",
+		"/api/wifi/airplanes-config-wifi/adopt",
+		"/api/wifi/foreign-net/adopt",
+		"/api/wifi/foreign-/adopt",
+	}
+	for _, p := range paths {
+		t.Run(p, func(t *testing.T) {
+			r := postJSON(t, h.client, h.ts.URL+p, map[string]any{})
+			defer r.Body.Close()
+			if r.StatusCode != http.StatusBadRequest && r.StatusCode != http.StatusNotFound {
+				t.Fatalf("status = %d, want 400/404; body=%s", r.StatusCode, mustReadAll(t, r.Body))
+			}
+		})
+	}
+	if calls := h.stdinCallsCopy(); len(calls) != 0 {
+		t.Fatalf("helper invoked for invalid adopt id: %v", calls)
+	}
+}
+
 func TestWifiTest_PipesBody(t *testing.T) {
 	t.Parallel()
 	h := newWriteHarness(t)
@@ -324,6 +398,10 @@ func TestWifi_InvalidPathIDRejectedBeforeHelper(t *testing.T) {
 		{http.MethodPut, "/api/wifi/airplanes-config-wifi-extra", `{"ssid":"X"}`},
 		{http.MethodDelete, "/api/wifi/airplanes-wifi-..", ""},
 		{http.MethodPost, "/api/wifi/foreign/activate", ""},
+		// A canonical foreign id stays read-only on update/delete (only
+		// activate + adopt accept it).
+		{http.MethodPut, "/api/wifi/foreign-8d3a8adc-992a-30ce-84de-af794156bcc9", `{"ssid":"X"}`},
+		{http.MethodDelete, "/api/wifi/foreign-8d3a8adc-992a-30ce-84de-af794156bcc9", ""},
 	}
 	for _, tc := range cases {
 		t.Run(tc.method+" "+tc.path, func(t *testing.T) {

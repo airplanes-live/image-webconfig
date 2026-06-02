@@ -2954,7 +2954,6 @@
         const activeConn = listPayload.active_connection || null;
         const nonWifiUplinks = statusPayload.non_wifi_uplinks || [];
         const hasEthernet = nonWifiUplinks.length > 0;
-        const managedNets = networks.filter(n => n.managed);
 
         // Match the active connection to a listed network by UUID (stable),
         // falling back to the active flag — never by SSID, since duplicate
@@ -3025,19 +3024,34 @@
             }
 
             if (currentManaged) {
-                const soleManaged = managedNets.length <= 1;
+                // The last-network lock: you can't remove your only network. Any
+                // other network — managed OR foreign — is a usable fallback, which
+                // matches the server's delete guard exactly.
+                const noFallback = !networks.some(n => !(currentNet && n.id === currentNet.id));
                 const editBtn = el("button", { type: "button", class: "wc-btn-ghost", onclick: () => showForm(currentNet) }, "Edit");
                 const removeBtn = el("button", {
                     type: "button", class: "wc-btn-danger",
-                    disabled: soleManaged ? "" : null,
-                    title: soleManaged ? "Add another network before you can remove this one" : null,
+                    disabled: noFallback ? "" : null,
+                    title: noFallback ? "Add another network before you can remove this one" : null,
                     onclick: () => deleteNetwork(currentNet),
                 }, "Remove");
                 heroHost.appendChild(el("div", { class: "wifi-btn-row" }, editBtn, removeBtn));
-                if (soleManaged) {
+                if (noFallback) {
                     heroHost.appendChild(el("p", { class: "muted wifi-current__note" },
                         "Add another network before you can remove this one."));
                 }
+            } else if (currentNet && !currentNet.managed) {
+                // Active but foreign (e.g. an rpi-imager network set before first
+                // boot). Offer Adopt so it can be managed here without SSH.
+                const adoptBtn = el("button", {
+                    type: "button", class: "wc-btn-primary",
+                    disabled: nmAvailable ? null : "",
+                    title: nmAvailable ? null : "NetworkManager unavailable — cannot adopt",
+                    onclick: () => adoptNetwork(currentNet),
+                }, "Adopt");
+                heroHost.appendChild(el("div", { class: "wifi-btn-row" }, adoptBtn));
+                heroHost.appendChild(el("p", { class: "muted wifi-current__note" },
+                    "Set up before first boot. Adopt it to edit or remove it here."));
             } else if (currentNet) {
                 heroHost.appendChild(el("p", { class: "muted wifi-current__note" },
                     "Managed outside webconfig — edit via SSH."));
@@ -3060,26 +3074,37 @@
                 return;
             }
             const rows = others.map(n => {
+                const foreignNote = "Created outside webconfig — use Adopt to manage it here";
+                // Adopt: only for foreign rows. Imports the netplan/flash-time
+                // profile into a managed keyfile so Edit/Delete light up.
+                const adoptBtn = n.managed ? null : el("button", {
+                    type: "button", class: "wc-btn-primary",
+                    disabled: nmAvailable ? null : "",
+                    title: nmAvailable
+                        ? "Import this flash-time network so you can edit and remove it here"
+                        : "NetworkManager unavailable — cannot adopt",
+                    onclick: () => adoptNetwork(n),
+                }, "Adopt");
                 const editBtn = el("button", {
                     type: "button", class: "wc-btn-ghost",
                     disabled: n.managed ? null : "",
-                    title: n.managed ? null : "Created outside webconfig — edit via SSH",
+                    title: n.managed ? null : foreignNote,
                     onclick: () => showForm(n),
                 }, "Edit");
                 const activateBtn = el("button", {
                     type: "button", class: "wc-btn-ghost",
-                    // Foreign (unmanaged) profiles can't be activated through
-                    // webconfig — the server rejects their id — so disable
-                    // rather than offer a button that always errors.
-                    disabled: (!nmAvailable || n.active || !n.managed) ? "" : null,
+                    // Foreign profiles can be activated too — it's a runtime-only
+                    // nmcli up, no keyfile change. Only disable when NM is down or
+                    // the network is already active.
+                    disabled: (!nmAvailable || n.active) ? "" : null,
                     title: !nmAvailable ? "NetworkManager unavailable — cannot activate"
-                        : (n.active ? "Already active"
-                            : (!n.managed ? "Created outside webconfig — activate via SSH" : null)),
+                        : (n.active ? "Already active" : null),
                     onclick: () => activateNetwork(n),
                 }, "Activate");
                 const deleteBtn = el("button", {
                     type: "button", class: "wc-btn-danger",
                     disabled: n.managed ? null : "",
+                    title: n.managed ? null : foreignNote,
                     onclick: () => deleteNetwork(n),
                 }, "Delete");
                 return el("tr", {},
@@ -3088,11 +3113,11 @@
                         " ",
                         el("strong", {}, n.ssid || "(unknown)"),
                         n.first_run_profile ? badge("first-run", "Set during initial setup") : null,
-                        n.managed ? null : badge("foreign", "Created outside webconfig — edit via SSH", true),
+                        n.managed ? null : badge("foreign", foreignNote, true),
                         n.hidden ? badge("hidden", "Hidden network") : null,
                     ),
                     el("td", { class: "wifi-priority" }, String(n.priority || 0)),
-                    el("td", { class: "wifi-actions" }, el("div", { class: "wifi-btn-row" }, editBtn, activateBtn, deleteBtn)),
+                    el("td", { class: "wifi-actions" }, el("div", { class: "wifi-btn-row" }, adoptBtn, editBtn, activateBtn, deleteBtn)),
                 );
             });
             const tbl = el("table", { class: "wifi-table" },
@@ -3109,8 +3134,10 @@
         // Soft + strong confirm for delete. Both can compose; we always send
         // both force flags if needed (helper enforces server-side).
         async function deleteNetwork(n) {
-            const remainingManaged = managedNets.filter(m => m.id !== n.id).length;
-            const needForceLast = remainingManaged === 0;
+            // Any other network (managed or foreign) is a usable fallback, so the
+            // last-network confirm only fires when this is the only one left.
+            const remaining = networks.filter(m => m.id !== n.id).length;
+            const needForceLast = remaining === 0;
             const needForceActive = n.active && !hasEthernet;
 
             if (needForceActive) {
@@ -3147,6 +3174,21 @@
                 return;
             }
             pendingFlash = { text: "Activating " + (n.ssid || n.id) + "…", level: "ok" };
+            await wifiPanel();
+        }
+
+        // Adopt a foreign (flash-time) network into a managed keyfile so it can
+        // be edited/removed here. The server copies the SSID/password, writes the
+        // keyfile, and drops the original netplan profile.
+        async function adoptNetwork(n) {
+            if (!confirm("Import \"" + (n.ssid || n.id) + "\" so you can manage it here?")) return;
+            const r = await postJSON("/api/wifi/" + encodeURIComponent(n.id) + "/adopt", {});
+            if (handleAuthFailure(r)) return;
+            if (!r.ok) {
+                setFlash((r.payload && (r.payload.message || r.payload.reason || r.payload.nm_reason || r.payload.error)) || "adopt failed", "error");
+                return;
+            }
+            pendingFlash = { text: "Now managing " + (n.ssid || n.id), level: "ok" };
             await wifiPanel();
         }
 

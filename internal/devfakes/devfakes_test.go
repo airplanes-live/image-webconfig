@@ -380,9 +380,10 @@ func TestWifi_FullRoundtrip(t *testing.T) {
 	priv := StubPrivilegedArgv()
 	runStdin := StdinRunner(s, priv)
 
+	// Seed: two managed networks + one foreign (flash-time) network.
 	listEnv := decodeStdinCall(t, runStdin, priv.WifiList, "")
-	if len(listEnv["networks"].([]any)) != 2 {
-		t.Fatalf("seed list networks=%d want 2", len(listEnv["networks"].([]any)))
+	if len(listEnv["networks"].([]any)) != 3 {
+		t.Fatalf("seed list networks=%d want 3", len(listEnv["networks"].([]any)))
 	}
 
 	// Add a network with test:true (the SPA default). Production returns
@@ -411,8 +412,8 @@ func TestWifi_FullRoundtrip(t *testing.T) {
 	}
 
 	listEnv = decodeStdinCall(t, runStdin, priv.WifiList, "")
-	if len(listEnv["networks"].([]any)) != 3 {
-		t.Fatalf("after add: networks=%d want 3", len(listEnv["networks"].([]any)))
+	if len(listEnv["networks"].([]any)) != 4 {
+		t.Fatalf("after add: networks=%d want 4", len(listEnv["networks"].([]any)))
 	}
 
 	// Activate the new one.
@@ -432,8 +433,29 @@ func TestWifi_FullRoundtrip(t *testing.T) {
 		t.Fatalf("delete status=%v", delEnv["status"])
 	}
 	listEnv = decodeStdinCall(t, runStdin, priv.WifiList, "")
-	if len(listEnv["networks"].([]any)) != 2 {
-		t.Fatalf("after delete: networks=%d want 2", len(listEnv["networks"].([]any)))
+	if len(listEnv["networks"].([]any)) != 3 {
+		t.Fatalf("after delete: networks=%d want 3", len(listEnv["networks"].([]any)))
+	}
+
+	// Adopt the seeded foreign network → it becomes managed and the foreign id
+	// disappears from the list (count unchanged: re-homed in place).
+	adoptEnv := decodeStdinCall(t, runStdin, priv.WifiAdopt, `{"id":"foreign-00000000-0000-0000-0000-0000000000f0"}`)
+	if adoptEnv["status"] != "applied" {
+		t.Fatalf("adopt status=%v (env=%v)", adoptEnv["status"], adoptEnv)
+	}
+	newID, _ := adoptEnv["id"].(string)
+	if !strings.HasPrefix(newID, "airplanes-wifi-") {
+		t.Fatalf("adopt: new id=%q want airplanes-wifi-*", newID)
+	}
+	listEnv = decodeStdinCall(t, runStdin, priv.WifiList, "")
+	nets := listEnv["networks"].([]any)
+	if len(nets) != 3 {
+		t.Fatalf("after adopt: networks=%d want 3", len(nets))
+	}
+	for _, raw := range nets {
+		if id, _ := raw.(map[string]any)["id"].(string); strings.HasPrefix(id, "foreign-") {
+			t.Fatalf("after adopt: foreign network still present: %v", id)
+		}
 	}
 }
 
