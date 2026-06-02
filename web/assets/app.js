@@ -3464,7 +3464,7 @@
             summaryBanner,
             el("dl", { class: "wc-metrics" }, ...cells),
             el("p", { class: "muted",
-                style: "margin-top: 0.75rem; font-size: 0.85rem;" },
+                style: "margin-top: 1.25rem; font-size: 0.85rem;" },
                 "These are the same readings the feeder reports to airplanes.live when diagnostics are enabled."),
         ));
     }
