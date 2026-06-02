@@ -82,6 +82,7 @@ type PrivilegedArgv struct {
 	Poweroff           []string // sudo -n /usr/bin/systemctl poweroff
 	StartOrchestrator    []string // sudo systemd-run --unit=airplanes-update-orchestrator ...
 	RegisterClaim      []string // sudo systemctl start --no-block airplanes-claim.service
+	SyncConfig         []string // sudo systemctl start --no-block airplanes-config-sync.service
 	WifiList           []string
 	WifiAdd            []string
 	WifiUpdate         []string
@@ -132,6 +133,13 @@ func DefaultPrivilegedArgv() PrivilegedArgv {
 		// immediately. Progress and failures show up in the claim activity
 		// log via the SSE stream the SPA opens after this returns.
 		RegisterClaim: sudo("/usr/bin/systemctl", "start", "--no-block", "airplanes-claim.service"),
+		// Fired after a successful config save so a change reaches the server
+		// on the next sync instead of the ~60s timer tick. --no-block: the
+		// unit is Type=oneshot and `apl-feed config sync` does a network
+		// round-trip; enqueue and return rather than risk systemctlTimeout.
+		// The unit self-gates (claim secret + REMOTE_CONFIG_ENABLED opt-in),
+		// so a redundant trigger is a no-op.
+		SyncConfig:    sudo("/usr/bin/systemctl", "start", "--no-block", "airplanes-config-sync.service"),
 		WifiList:      sudo("/usr/local/bin/apl-wifi", "list", "--json"),
 		WifiAdd:       sudo("/usr/local/bin/apl-wifi", "add", "--json"),
 		WifiUpdate:    sudo("/usr/local/bin/apl-wifi", "update", "--json"),
