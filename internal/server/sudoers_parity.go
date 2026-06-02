@@ -63,6 +63,7 @@ func privilegedArgvCases(priv PrivilegedArgv) []privilegedArgvCase {
 		{"Poweroff", priv.Poweroff},
 		{"StartOrchestrator", priv.StartOrchestrator},
 		{"RegisterClaim", priv.RegisterClaim},
+		{"SyncConfig", priv.SyncConfig},
 		{"WifiList", priv.WifiList},
 		{"WifiAdd", priv.WifiAdd},
 		{"WifiUpdate", priv.WifiUpdate},

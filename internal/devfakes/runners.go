@@ -73,6 +73,7 @@ func StubPrivilegedArgv() server.PrivilegedArgv {
 		Poweroff:             []string{"dev-stub", "systemctl", "poweroff"},
 		StartOrchestrator:    []string{"dev-stub", "systemd-run", "airplanes-update-orchestrator"},
 		RegisterClaim:        []string{"dev-stub", "systemctl", "claim-register"},
+		SyncConfig:           []string{"dev-stub", "systemctl", "config-sync"},
 		WifiList:             []string{"dev-stub", "apl-wifi", "list"},
 		WifiAdd:              []string{"dev-stub", "apl-wifi", "add"},
 		WifiUpdate:           []string{"dev-stub", "apl-wifi", "update"},
@@ -213,6 +214,8 @@ func dispatchStub(state *State, priv server.PrivilegedArgv, argv []string, body 
 			if err := state.RegisterClaim(); err != nil {
 				log.Printf("devfakes: RegisterClaim: %v", err)
 			}
+		case "config-sync":
+			log.Printf("devfakes: would nudge config-sync")
 		}
 		return wexec.Result{}, nil
 	case "systemd-run":

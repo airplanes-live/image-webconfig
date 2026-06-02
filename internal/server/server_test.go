@@ -106,6 +106,7 @@ func newTestServer(t *testing.T) (*httptest.Server, *Server) {
 		Poweroff:             []string{"sudo-stub", "poweroff"},
 		StartOrchestrator:    []string{"sudo-stub", "orchestrator"},
 		RegisterClaim:        []string{"sudo-stub", "systemctl", "start", "--no-block", "airplanes-claim.service"},
+		SyncConfig:           []string{"sudo-stub", "systemctl", "start", "--no-block", "airplanes-config-sync.service"},
 		WifiList:             []string{"sudo-stub", "apl-wifi", "list", "--json"},
 		WifiAdd:              []string{"sudo-stub", "apl-wifi", "add", "--json"},
 		WifiUpdate:           []string{"sudo-stub", "apl-wifi", "update", "--json"},
@@ -270,6 +271,7 @@ func newWriteHarness(t *testing.T, opts ...harnessOption) *writeHarness {
 		Poweroff:             []string{"sudo-stub", "poweroff"},
 		StartOrchestrator:    []string{"sudo-stub", "orchestrator"},
 		RegisterClaim:        []string{"sudo-stub", "systemctl", "start", "--no-block", "airplanes-claim.service"},
+		SyncConfig:           []string{"sudo-stub", "systemctl", "start", "--no-block", "airplanes-config-sync.service"},
 		WifiList:             []string{"sudo-stub", "apl-wifi", "list", "--json"},
 		WifiAdd:              []string{"sudo-stub", "apl-wifi", "add", "--json"},
 		WifiUpdate:           []string{"sudo-stub", "apl-wifi", "update", "--json"},
@@ -1580,6 +1582,7 @@ func TestConfigPost_AltitudeFtRoundTripsAsBareMetres(t *testing.T) {
 		Privileged: PrivilegedArgv{
 			ApplyFeed:  []string{"sudo-stub", "apl-feed", "apply", "--json", "--lock-timeout", "5"},
 			SchemaFeed: []string{"apl-feed", "schema", "--json"},
+			SyncConfig: []string{"sudo-stub", "systemctl", "start", "--no-block", "airplanes-config-sync.service"},
 		},
 	}
 	ts := httptest.NewServer(New(deps))
@@ -1634,4 +1637,119 @@ func extractValueFromApplyPayload(raw json.RawMessage) (string, bool) {
 		return obj.Value, true
 	}
 	return "", false
+}
+
+// TestConfigPost_NudgesConfigSyncOnApplied asserts the post-save config-sync
+// nudge fires exactly when apl-feed reports a real write ("applied") and stays
+// silent on "no_change". The nudge is async, so the positive case waits on a
+// channel and the negative case asserts silence over a short window.
+func TestConfigPost_NudgesConfigSyncOnApplied(t *testing.T) {
+	wantSync := []string{"sudo-stub", "systemctl", "start", "--no-block", "airplanes-config-sync.service"}
+
+	cases := []struct {
+		name        string
+		applyStatus string
+		expectNudge bool
+	}{
+		{"applied fires the nudge", "applied", true},
+		{"no_change stays silent", "no_change", false},
+	}
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			hashPath := filepath.Join(dir, "password.hash")
+			guard, err := auth.NewHashGuard(2)
+			if err != nil {
+				t.Fatal(err)
+			}
+			feedEnvPath := filepath.Join(dir, "feed.env")
+			if err := os.WriteFile(feedEnvPath, []byte(`REMOTE_CONFIG_ENABLED="false"`+"\n"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+
+			// Apply runner returns the table-driven status without touching disk.
+			stdinRunner := func(_ context.Context, _ []string, stdin io.Reader) (wexec.Result, error) {
+				io.Copy(io.Discard, stdin)
+				return wexec.Result{Stdout: []byte(`{"status":"` + tc.applyStatus + `"}`)}, nil
+			}
+
+			// Capturing runner signals when the nudge argv fires.
+			syncCh := make(chan struct{}, 1)
+			runner := func(_ context.Context, argv []string) (wexec.Result, error) {
+				if reflect.DeepEqual(argv, wantSync) {
+					select {
+					case syncCh <- struct{}{}:
+					default:
+					}
+				}
+				return wexec.Result{}, nil
+			}
+
+			deps := Deps{
+				Version:      "test-sha",
+				Store:        auth.NewPasswordStore(hashPath),
+				Sessions:     auth.NewSessions(time.Hour),
+				Lockout:      auth.NewLockout(5, time.Minute, 15*time.Minute),
+				Guard:        guard,
+				Argon2Params: fastTestParams,
+				Identity:     identity.NewReader(identity.Paths{FeederIDFile: filepath.Join(dir, "feeder-id")}),
+				FeedEnv:      &feedenv.Reader{Path: feedEnvPath},
+				Status: status.NewReader("test-sha", status.Paths{
+					SystemctlBinary: "/bin/true", IsActiveTimeout: time.Second,
+				}, func(_ context.Context, _ []string) (wexec.Result, error) { return wexec.Result{}, nil }),
+				Logs:        logs.NewStreamer(nil),
+				Schema:      schemacache.NewPrepopulated([]string{"REMOTE_CONFIG_ENABLED"}, []string{"REMOTE_CONFIG_ENABLED"}),
+				Runner:      runner,
+				StdinRunner: stdinRunner,
+				Privileged: PrivilegedArgv{
+					ApplyFeed:  []string{"sudo-stub", "apl-feed", "apply", "--json", "--lock-timeout", "5"},
+					SchemaFeed: []string{"apl-feed", "schema", "--json"},
+					SyncConfig: wantSync,
+				},
+			}
+			ts := httptest.NewServer(New(deps))
+			defer ts.Close()
+
+			c := httpClient(t)
+			r := postJSON(t, c, ts.URL+"/api/setup", map[string]string{"password": testPassword})
+			r.Body.Close()
+			if r.StatusCode != http.StatusOK {
+				t.Fatalf("setup status = %d", r.StatusCode)
+			}
+
+			r = postJSON(t, c, ts.URL+"/api/config",
+				map[string]any{"updates": map[string]string{"REMOTE_CONFIG_ENABLED": "true"}})
+			r.Body.Close()
+			if r.StatusCode != http.StatusOK {
+				t.Fatalf("POST /api/config status=%d", r.StatusCode)
+			}
+
+			if tc.expectNudge {
+				select {
+				case <-syncCh:
+				case <-time.After(2 * time.Second):
+					t.Fatal("expected config-sync nudge after applied save, got none")
+				}
+			} else {
+				select {
+				case <-syncCh:
+					t.Fatal("config-sync nudge fired on no_change save")
+				case <-time.After(500 * time.Millisecond):
+				}
+			}
+		})
+	}
+}
+
+// TestDefaultPrivilegedArgv_SyncConfigPinned pins the exact argv so renaming the
+// unit on either the Go or sudoers side trips a test rather than silently
+// shipping a no-op nudge. Sudoers parity only proves the two sides agree with
+// each other; this proves they agree with the intended unit name.
+func TestDefaultPrivilegedArgv_SyncConfigPinned(t *testing.T) {
+	got := DefaultPrivilegedArgv().SyncConfig
+	want := []string{"/usr/bin/sudo", "-n", "/usr/bin/systemctl", "start", "--no-block", "airplanes-config-sync.service"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("SyncConfig argv = %v, want %v", got, want)
+	}
 }

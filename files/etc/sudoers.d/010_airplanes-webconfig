@@ -34,6 +34,11 @@ airplanes-webconfig ALL=(root) NOPASSWD: /usr/local/bin/apl-wifi status --json
 airplanes-webconfig ALL=(root) NOPASSWD: /usr/bin/systemctl reboot
 airplanes-webconfig ALL=(root) NOPASSWD: /usr/bin/systemctl poweroff
 airplanes-webconfig ALL=(root) NOPASSWD: /usr/bin/systemctl start --no-block airplanes-claim.service
+# Nudge the remote-config syncer after a config save so a change (e.g. enabling
+# remote configuration) reaches airplanes.live in seconds instead of waiting for
+# the ~60s timer tick. The unit self-gates (ConditionPathExists=feeder-claim-secret
+# and the REMOTE_CONFIG_ENABLED opt-in inside apl-feed), so a re-trigger is a no-op.
+airplanes-webconfig ALL=(root) NOPASSWD: /usr/bin/systemctl start --no-block airplanes-config-sync.service
 
 # Unified update orchestrator (apt → runtime overlay).
 # The trampoline at /usr/local/lib/airplanes-webconfig/start-orchestrator.sh

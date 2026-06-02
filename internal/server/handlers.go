@@ -590,31 +590,7 @@ func (s *Server) handleConfigPost(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	s.configMu.Lock()
-	defer s.configMu.Unlock()
-
-	// Read current feed.env under the same configMu so the "did this
-	// tracked key actually change" determination is consistent against
-	// concurrent webconfig writers. A concurrent `apl-feed config sync`
-	// write is handled by the apply library's flock + LWW gate — the
-	// race is benign (worst case: one wasted no-op apply round trip).
-	//
-	// A read error is not fatal: fall back to a bare-string payload —
-	// every posted key passes through with no metadata, which matches
-	// the pre-DEV-383 behavior. We must NOT treat the read failure as
-	// bootstrap; that would attach metadata to every tracked key the
-	// form posts, including unchanged ones, and stamp fresh edited_at
-	// tuples across the sidecar on every save.
-	current, readErr := s.feedEnv.ReadAll()
-	var payload map[string]any
-	if readErr != nil {
-		log.Printf("config-post: feed.env pre-read for metadata gating failed; falling back to bare-string payload: %v", readErr)
-		payload = feedmeta.BareStringPayload(req.Updates)
-	} else {
-		payload = feedmeta.BuildApplyPayload(current, req.Updates, s.now())
-	}
-
-	resp, status, err := s.invokeApplyFeed(r.Context(), payload)
+	resp, status, err := s.applyConfigLocked(r.Context(), req.Updates)
 	if err != nil {
 		log.Printf("config-post: %v", err)
 		writeJSONError(w, http.StatusInternalServerError, "config write failed")
@@ -629,7 +605,58 @@ func (s *Server) handleConfigPost(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, status, resp)
 		return
 	}
+	// A real write landed — nudge the remote-config syncer so the change
+	// reaches airplanes.live on the next sync (seconds) rather than waiting
+	// for the ~60s config-sync timer tick. Fire-and-forget and outside
+	// configMu: the unit self-gates, so this never blocks or alters the save
+	// response. no_change writes skip it (nothing to propagate).
+	if resp.Status == "applied" {
+		s.triggerConfigSyncAsync()
+	}
 	writeJSON(w, http.StatusOK, resp)
+}
+
+// applyConfigLocked serialises the feed.env metadata-gating read and the apply
+// under configMu so both see a consistent view against concurrent webconfig
+// writers, then releases the lock. The caller writes the HTTP response and
+// fires any follow-up (e.g. the config-sync nudge) outside the lock.
+func (s *Server) applyConfigLocked(ctx context.Context, updates map[string]string) (applyFeedResponse, int, error) {
+	s.configMu.Lock()
+	defer s.configMu.Unlock()
+
+	// A concurrent `apl-feed config sync` write is handled by the apply
+	// library's flock + LWW gate — the race is benign (worst case: one
+	// wasted no-op apply round trip).
+	//
+	// A read error is not fatal: fall back to a bare-string payload — every
+	// posted key passes through with no metadata, which matches the
+	// pre-DEV-383 behavior. We must NOT treat the read failure as bootstrap;
+	// that would attach metadata to every tracked key the form posts,
+	// including unchanged ones, and stamp fresh edited_at tuples across the
+	// sidecar on every save.
+	current, readErr := s.feedEnv.ReadAll()
+	var payload map[string]any
+	if readErr != nil {
+		log.Printf("config-post: feed.env pre-read for metadata gating failed; falling back to bare-string payload: %v", readErr)
+		payload = feedmeta.BareStringPayload(updates)
+	} else {
+		payload = feedmeta.BuildApplyPayload(current, updates, s.now())
+	}
+	return s.invokeApplyFeed(ctx, payload)
+}
+
+// triggerConfigSyncAsync starts airplanes-config-sync.service in the background
+// so a saved config change is pushed promptly. Best-effort: failures are
+// logged, never surfaced on the save response, and the ~60s config-sync timer
+// stays the backstop. The unit's own gates (ConditionPathExists on the claim
+// secret + the REMOTE_CONFIG_ENABLED opt-in inside apl-feed) decide whether the
+// run actually contacts the server, so this carries no remote-config logic.
+func (s *Server) triggerConfigSyncAsync() {
+	go func() {
+		if err := s.runSudo(context.Background(), s.priv.SyncConfig, systemctlTimeout); err != nil {
+			log.Printf("config-sync: %v", err)
+		}
+	}()
 }
 
 // applyFeedResponse mirrors the JSON envelope emitted by
