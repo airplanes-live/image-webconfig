@@ -89,6 +89,7 @@ type PrivilegedArgv struct {
 	WifiDelete         []string
 	WifiTest           []string
 	WifiActivate       []string
+	WifiAdopt          []string
 	WifiStatus         []string
 	ExportIdentity     []string // sudo -n /usr/local/lib/airplanes-webconfig/identity-export.sh
 	ImportIdentity     []string // sudo -n /usr/local/lib/airplanes-webconfig/identity-import.sh
@@ -146,6 +147,7 @@ func DefaultPrivilegedArgv() PrivilegedArgv {
 		WifiDelete:    sudo("/usr/local/bin/apl-wifi", "delete", "--json"),
 		WifiTest:      sudo("/usr/local/bin/apl-wifi", "test", "--json"),
 		WifiActivate:  sudo("/usr/local/bin/apl-wifi", "activate", "--json"),
+		WifiAdopt:     sudo("/usr/local/bin/apl-wifi", "adopt", "--json"),
 		WifiStatus:    sudo("/usr/local/bin/apl-wifi", "status", "--json"),
 		// Identity export/import call wrapper scripts (not bare apl-feed)
 		// so each surface is its own fixed argv in sudoers. The wrappers
@@ -279,6 +281,7 @@ func New(d Deps) http.Handler {
 	mux.HandleFunc("PUT /api/wifi/{id}", s.requireSession(s.handleWifiUpdate))
 	mux.HandleFunc("DELETE /api/wifi/{id}", s.requireSession(s.handleWifiDelete))
 	mux.HandleFunc("POST /api/wifi/{id}/activate", s.requireSession(s.handleWifiActivate))
+	mux.HandleFunc("POST /api/wifi/{id}/adopt", s.requireSession(s.handleWifiAdopt))
 
 	// Static assets at /static/*; the SPA shell is served by the GET /
 	// handler below. no-store cache policy: assets are embedded in the

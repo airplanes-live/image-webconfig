@@ -153,6 +153,13 @@ func NewState(p Paths) *State {
 				SSID: "Cafe Wifi", Hidden: false, Priority: 5, HasPSK: false,
 				Managed: true, Autoconnect: "true",
 			},
+			{
+				// A foreign (flash-time / netplan) network so the Adopt flow is
+				// exercisable in the dev UI without a Pi.
+				ID: "foreign-00000000-0000-0000-0000-0000000000f0", UUID: "00000000-0000-0000-0000-0000000000f0",
+				SSID: "GreenKingdom-Homelab", Hidden: false, Priority: 0, HasPSK: true,
+				Managed: false, Autoconnect: "true",
+			},
 		},
 		services: map[string]string{
 			// Monitored services — shown on the dashboard tiles. Seeded active so
@@ -443,6 +450,26 @@ func (s *State) WifiDelete(id string) bool {
 		return true
 	}
 	return false
+}
+
+// WifiAdopt converts a foreign network (foreign-<uuid>) into a managed keyfile:
+// it gets a fresh managed id + uuid and Managed=true, mirroring apl-wifi adopt.
+// Returns the new managed id, or ("", false) if id isn't a foreign network.
+func (s *State) WifiAdopt(id string) (string, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for i := range s.networks {
+		if s.networks[i].ID != id || s.networks[i].Managed {
+			continue
+		}
+		newID := s.uniqueWifiIDLocked(s.networks[i].SSID)
+		s.networks[i].ID = newID
+		s.networks[i].UUID = newWifiUUID()
+		s.networks[i].Managed = true
+		s.networks[i].FirstRunProfile = false
+		return newID, true
+	}
+	return "", false
 }
 
 // WifiActivate flips the `active` flag onto the chosen network and

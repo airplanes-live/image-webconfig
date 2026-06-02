@@ -301,6 +301,16 @@ _apl_wifi_nmcli_delete_inmem() {
 	"$APL_WIFI_NMCLI" connection delete uuid "$uuid" >/dev/null 2>&1 || true
 }
 
+# Strict delete: non-zero if the delete fails OR the connection still resolves
+# afterwards. Used by adopt, which must never leave a foreign profile alongside
+# the managed keyfile it was just re-homed into.
+_apl_wifi_nmcli_delete_strict() {
+	local uuid="$1"
+	"$APL_WIFI_NMCLI" connection delete uuid "$uuid" >/dev/null 2>&1 || return 1
+	"$APL_WIFI_NMCLI" -t -g connection.uuid connection show uuid "$uuid" >/dev/null 2>&1 && return 1
+	return 0
+}
+
 # Classify an nmcli failure from its stderr + exit code.
 _apl_wifi_classify_failure() {
 	local out="$1" rc="$2"
@@ -471,32 +481,64 @@ _apl_wifi_nm_field() {
 	"$APL_WIFI_NMCLI" -e no -g "$2" connection show uuid "$1" 2>/dev/null || true
 }
 
-# Append wifi connections NetworkManager knows about that aren't already in $1
-# (the keyfile-derived array) — e.g. netplan-generated /run profiles from the
+# Single secret read (e.g. the PSK). -s shows secrets; -e no disables escaping.
+# Echoes "" when the secret is not stored / agent-owned / inaccessible — callers
+# MUST treat empty as "no usable secret", never as an open network.
+_apl_wifi_nm_secret() {
+	"$APL_WIFI_NMCLI" -s -e no -g "$2" connection show uuid "$1" 2>/dev/null || true
+}
+
+# Echo (newline-separated) the UUIDs of NM wifi connections that have no backing
+# /etc keyfile — i.e. netplan/flash-time "foreign" profiles. This is the single
+# definition of "foreign wifi" reused by list, adopt, activate, and the delete
+# fallback count, so those surfaces can never drift apart. Echoes nothing (and
+# returns 0) on any nmcli failure so callers fail safe.
+_apl_wifi_foreign_wifi_uuids() {
+	[[ "$NMCLI_AVAILABLE" == true ]] || return 0
+	local keyfile_uuids out uuid type kid
+	keyfile_uuids="$(
+		while IFS= read -r kid; do
+			[[ -n "$kid" ]] || continue
+			_apl_wifi_keyfile_field "$(apl_wifi_keyfile_path "$kid")" connection uuid
+		done < <(_apl_wifi_list_keyfile_ids)
+	)"
+	out="$("$APL_WIFI_NMCLI" -t -g UUID,TYPE connection show 2>/dev/null)" || return 0
+	while IFS=: read -r uuid type; do
+		[[ -n "$uuid" ]] || continue
+		[[ "$type" == "802-11-wireless" ]] || continue
+		grep -qxF "$uuid" <<< "$keyfile_uuids" && continue
+		printf '%s\n' "$uuid"
+	done <<< "$out"
+}
+
+# Returns 0 if $1 is the UUID of a known foreign wifi connection. Gates adopt /
+# activate-foreign so a merely UUID-shaped id can't drive nmcli against an
+# arbitrary (e.g. ethernet or admin-created) connection.
+_apl_wifi_is_foreign_wifi_uuid() {
+	local target="$1" u
+	[[ -n "$target" ]] || return 1
+	while IFS= read -r u; do
+		[[ "$u" == "$target" ]] && return 0
+	done < <(_apl_wifi_foreign_wifi_uuids)
+	return 1
+}
+
+# Append the foreign wifi connections (see _apl_wifi_foreign_wifi_uuids) to the
+# keyfile-derived array $1 — e.g. netplan-generated /run profiles from the
 # flash-time Wi-Fi. They have no /etc keyfile webconfig can edit, so they're
 # surfaced read-only (managed:false) with a synthetic `foreign-<uuid>` id that
-# can never match the managed-id regex (mutation endpoints stay closed). Best-
-# effort: on any nmcli failure the input array is echoed back unchanged so the
-# managed-keyfile path never regresses. Reads NMCLI_AVAILABLE and
-# NMCLI_ACTIVE_WIFI_UUID (set by _apl_wifi_load_nm_state).
+# can never match the managed-id regex (edit/delete endpoints stay closed; adopt
+# and activate-foreign re-validate the uuid against the same predicate). Best-
+# effort: on any nmcli failure the helper yields nothing and $1 is echoed back
+# unchanged. Reads NMCLI_AVAILABLE and NMCLI_ACTIVE_WIFI_UUID.
 _apl_wifi_append_foreign_connections() {
 	local nets="$1"
 	[[ "$NMCLI_AVAILABLE" == true ]] || { printf '%s' "$nets"; return 0; }
 
-	local seen out
-	seen="$(jq -r '.[].uuid' <<< "$nets" 2>/dev/null)" || { printf '%s' "$nets"; return 0; }
-	if ! out="$("$APL_WIFI_NMCLI" -t -g UUID,TYPE connection show 2>/dev/null)"; then
-		printf '%s' "$nets"
-		return 0
-	fi
-
-	local uuid type ssid hidden_raw keymgmt priority autoconnect_raw
+	local uuid ssid hidden_raw keymgmt priority autoconnect_raw
 	local hidden has_psk autoconnect active entry
-	while IFS=: read -r uuid type; do
+	while IFS= read -r uuid; do
 		[[ -n "$uuid" ]] || continue
-		[[ "$type" == "802-11-wireless" ]] || continue
-		# Already represented by the keyfile scan (managed or /etc foreign).
-		grep -qxF "$uuid" <<< "$seen" && continue
 
 		ssid="$(_apl_wifi_nm_field "$uuid" 802-11-wireless.ssid)"
 		hidden_raw="$(_apl_wifi_nm_field "$uuid" 802-11-wireless.hidden)"
@@ -532,7 +574,7 @@ _apl_wifi_append_foreign_connections() {
 			continue
 		fi
 		nets="$(jq -c --argjson e "$entry" '. + [$e]' <<< "$nets")" || continue
-	done <<< "$out"
+	done < <(_apl_wifi_foreign_wifi_uuids)
 
 	printf '%s' "$nets"
 }
@@ -927,16 +969,25 @@ _cmd_delete_locked() {
 
 	_apl_wifi_load_nm_state
 
-	# Count remaining managed profiles after the delete.
-	local total=0 entry_id
+	# Count the Wi-Fi networks that would remain as a fallback after the delete:
+	# any other wifi keyfile (managed or not) plus any foreign netplan profile.
+	# Mirrors the UI's "all other networks" definition so the button state and
+	# the server guard never disagree. A foreign network is a usable fallback,
+	# so its presence releases the last-network lock.
+	local remaining=0 entry_id
 	while IFS= read -r entry_id; do
 		[[ -n "$entry_id" ]] || continue
-		apl_wifi_is_managed_id "$entry_id" || continue
-		total=$((total + 1))
+		[[ "$entry_id" == "$id" ]] && continue
+		_apl_wifi_network_json "$entry_id" >/dev/null 2>&1 || continue
+		remaining=$((remaining + 1))
 	done < <(_apl_wifi_list_keyfile_ids)
-	local remaining=$((total - 1))
+	local fcount
+	fcount="$(_apl_wifi_foreign_wifi_uuids | grep -c . || true)"
+	[[ "$fcount" =~ ^[0-9]+$ ]] || fcount=0
+	remaining=$((remaining + fcount))
 
-	# Last-managed-network check.
+	# Last-network check (counts foreign fallbacks; fails safe to 0 if NM
+	# enumeration is unavailable, keeping the force requirement).
 	if (( remaining <= 0 )) && [[ "$force_last" != true ]]; then
 		_emit_json "$(jq -nc --arg id "$id" \
 			'{status:"rejected", reason:"requires_force_flag", missing:["force_last"], id:$id, message:"this is the last saved Wi-Fi network; set force_last to confirm"}')"
@@ -978,11 +1029,29 @@ cmd_activate() {
 		return 5
 	fi
 	local id; id="$(_apl_wifi_req_string id)"
-	if ! apl_wifi_is_managed_id "$id"; then
-		_emit_json "$(jq -nc --arg id "$id" '{status:"rejected", reason:"unmanaged_id", id:$id}')"
-		return 2
+	if apl_wifi_is_managed_id "$id"; then
+		_apl_wifi_with_lock _cmd_activate_locked "$id"
+		return
 	fi
-	_apl_wifi_with_lock _cmd_activate_locked "$id"
+	# Foreign (read-only netplan) profiles can still be activated — a runtime-only
+	# `nmcli up`, no keyfile change. Resolve the embedded uuid and confirm it's a
+	# real foreign wifi connection before touching NM.
+	if [[ "$id" == foreign-* ]]; then
+		local fuuid="${id#foreign-}"
+		_apl_wifi_load_nm_state
+		if [[ "$NMCLI_AVAILABLE" != true ]]; then
+			_emit_json "$(jq -nc '{status:"rejected", reason:"nm_unavailable"}')"
+			return 2
+		fi
+		if ! _apl_wifi_is_foreign_wifi_uuid "$fuuid"; then
+			_emit_json "$(jq -nc --arg id "$id" '{status:"rejected", reason:"unknown_id", id:$id}')"
+			return 2
+		fi
+		_apl_wifi_with_lock _cmd_activate_foreign_locked "$fuuid"
+		return
+	fi
+	_emit_json "$(jq -nc --arg id "$id" '{status:"rejected", reason:"unmanaged_id", id:$id}')"
+	return 2
 }
 
 _cmd_activate_locked() {
@@ -1007,6 +1076,188 @@ _cmd_activate_locked() {
 	fi
 	_emit_json "$(jq -nc --arg id "$id" --arg uuid "$uuid" \
 		'{status:"applied", id:$id, uuid:$uuid, active:true}')"
+}
+
+_cmd_activate_foreign_locked() {
+	local uuid="$1"
+	_apl_wifi_load_nm_state
+	# Re-validate under the lock: NM state is external to the flock, so the uuid
+	# could have stopped being a foreign wifi connection (adopted by a racing op,
+	# or gone) between the pre-lock check and here.
+	if ! _apl_wifi_is_foreign_wifi_uuid "$uuid"; then
+		_emit_json "$(jq -nc --arg id "foreign-$uuid" '{status:"rejected", reason:"unknown_id", id:$id}')"
+		return 2
+	fi
+	if ! _apl_wifi_nmcli_up "$uuid"; then
+		local reason
+		reason="$(_apl_wifi_classify_failure "${NMCLI_OUT_LAST:-}" "${NMCLI_RC_LAST:-1}")"
+		_emit_json "$(jq -nc --arg id "foreign-$uuid" --arg r "$reason" --arg nm "${NMCLI_OUT_LAST:-}" \
+			'{status:"test_failed", id:$id, reason:$r, nm_reason:$nm}')"
+		return 2
+	fi
+	_emit_json "$(jq -nc --arg id "foreign-$uuid" --arg uuid "$uuid" \
+		'{status:"applied", id:$id, uuid:$uuid, active:true}')"
+}
+
+# Undo a half-finished adoption. If we had switched the live link onto the new
+# managed profile (was_active), bring the original foreign uuid back up first so
+# the control link is never left down, then drop the new in-memory profile +
+# keyfile. Best-effort throughout — this runs on an already-failing path.
+_apl_wifi_adopt_rollback() {
+	local new_uuid="$1" dest="$2" old_uuid="$3" was_active="$4"
+	if [[ "$was_active" == true ]]; then
+		_apl_wifi_nmcli_up "$old_uuid" || true
+	fi
+	_apl_wifi_nmcli_delete_inmem "$new_uuid"
+	apl_wifi_delete_keyfile "$dest" || true
+	_apl_wifi_nmcli_reload || true
+}
+
+# --- subcommand: adopt -----------------------------------------------------
+# Re-home a foreign (netplan/flash-time) wifi profile into a managed keyfile so
+# webconfig can edit/delete it like any other network. Only a foreign-<uuid> id
+# resolving to a real NM wifi connection with no /etc keyfile is accepted; the
+# original PSK is copied verbatim (rpi-imager stores it as the 64-hex PMK, which
+# the keyfile writer takes as-is).
+
+cmd_adopt() {
+	_apl_wifi_read_request "id"
+
+	if ! _apl_wifi_req_has id; then
+		_emit_error parse_error "id is required"
+		return 5
+	fi
+	local id; id="$(_apl_wifi_req_string id)"
+	if [[ "$id" != foreign-* ]]; then
+		_emit_json "$(jq -nc --arg id "$id" '{status:"rejected", reason:"not_foreign", id:$id, message:"only foreign (flash-time) networks can be adopted"}')"
+		return 2
+	fi
+	local uuid="${id#foreign-}"
+
+	_apl_wifi_load_nm_state
+	if [[ "$NMCLI_AVAILABLE" != true ]]; then
+		_emit_json "$(jq -nc '{status:"rejected", reason:"nm_unavailable"}')"
+		return 2
+	fi
+	if ! _apl_wifi_is_foreign_wifi_uuid "$uuid"; then
+		_emit_json "$(jq -nc --arg id "$id" '{status:"rejected", reason:"unknown_id", id:$id}')"
+		return 2
+	fi
+
+	_apl_wifi_with_lock _cmd_adopt_locked "$uuid"
+}
+
+_cmd_adopt_locked() {
+	local uuid="$1"
+	_apl_wifi_load_nm_state
+	# Re-validate under the lock: NM state is external to the flock, so the uuid
+	# could have stopped being a foreign wifi connection (e.g. adopted into a
+	# managed keyfile by a racing op) between the pre-lock check and here. Acting
+	# on it now would mean deleting a connection we don't own.
+	if ! _apl_wifi_is_foreign_wifi_uuid "$uuid"; then
+		_emit_json "$(jq -nc --arg id "foreign-$uuid" '{status:"rejected", reason:"unknown_id", id:$id}')"
+		return 2
+	fi
+
+	local ssid keymgmt hidden_raw priority psk pskflags hidden
+	ssid="$(_apl_wifi_nm_field "$uuid" 802-11-wireless.ssid)"
+	keymgmt="$(_apl_wifi_nm_field "$uuid" 802-11-wireless-security.key-mgmt)"
+	hidden_raw="$(_apl_wifi_nm_field "$uuid" 802-11-wireless.hidden)"
+	priority="$(_apl_wifi_nm_field "$uuid" connection.autoconnect-priority)"
+
+	# Security gate. The shared writer only expresses open or wpa-psk, so refuse
+	# anything else deliberately rather than mangle it.
+	case "$keymgmt" in
+		""|none)
+			# An empty key-mgmt read is ambiguous: a genuinely open network, or a
+			# transient nmcli failure. Confirm the connection is actually readable
+			# (connection.uuid is always present for a live profile) before
+			# trusting "empty" as open — never silently downgrade WPA to open.
+			if ! "$APL_WIFI_NMCLI" -e no -g connection.uuid connection show uuid "$uuid" >/dev/null 2>&1; then
+				_emit_json "$(jq -nc --arg id "foreign-$uuid" '{status:"rejected", reason:"read_failed", id:$id, message:"could not read the network settings"}')"
+				return 2
+			fi
+			psk=""
+			;;
+		wpa-psk)
+			# psk-flags 0 = system-owned (stored in the connection). Agent-owned
+			# / not-saved means the secret isn't ours to copy — refuse rather than
+			# silently downgrade a WPA network to open.
+			pskflags="$(_apl_wifi_nm_field "$uuid" 802-11-wireless-security.psk-flags)"
+			if [[ -n "$pskflags" && "$pskflags" != 0 ]]; then
+				_emit_json "$(jq -nc --arg id "foreign-$uuid" '{status:"rejected", reason:"psk_not_available", id:$id, message:"the Wi-Fi password is not stored in this profile and cannot be adopted"}')"
+				return 2
+			fi
+			psk="$(_apl_wifi_nm_secret "$uuid" 802-11-wireless-security.psk)"
+			if [[ -z "$psk" ]] || ! apl_wifi_valid_psk "$psk"; then
+				_emit_json "$(jq -nc --arg id "foreign-$uuid" '{status:"rejected", reason:"psk_not_available", id:$id, message:"the Wi-Fi password is not stored in this profile and cannot be adopted"}')"
+				return 2
+			fi
+			;;
+		*)
+			_emit_json "$(jq -nc --arg id "foreign-$uuid" --arg k "$keymgmt" '{status:"rejected", reason:"unsupported_security", key_mgmt:$k, id:$id, message:"only WPA-PSK and open networks can be adopted"}')"
+			return 2
+			;;
+	esac
+
+	# Validate the copied fields (NM data is still external input).
+	if ! apl_wifi_valid_ssid "$ssid"; then
+		_emit_json "$(jq -nc --arg id "foreign-$uuid" '{status:"rejected", reason:"invalid_ssid", id:$id}')"
+		return 2
+	fi
+	hidden=false
+	[[ "$hidden_raw" == yes || "$hidden_raw" == true ]] && hidden=true
+	# Validators allow 0..999; NM may report negative or unset — clamp to 0.
+	[[ "$priority" =~ ^[0-9]+$ ]] || priority=0
+	(( priority > 999 )) && priority=0
+
+	local new_id new_uuid dest
+	if ! new_id="$(apl_wifi_unique_id "$ssid")"; then
+		_emit_json "$(jq -nc '{status:"rejected", reason:"slug_exhausted", message:"too many networks with a similar name"}')"
+		return 2
+	fi
+	new_uuid="$(cat "$APL_WIFI_UUID_SOURCE")" || { _emit_error filesystem_error "failed to read uuid source"; return 3; }
+	dest="$(apl_wifi_keyfile_path "$new_id")"
+
+	local was_active=false
+	[[ -n "$NMCLI_ACTIVE_WIFI_UUID" && "$uuid" == "$NMCLI_ACTIVE_WIFI_UUID" ]] && was_active=true
+
+	# Write the managed keyfile and load it. Nothing is active or deleted yet, so
+	# a reload failure just drops the new keyfile (no link to restore).
+	_apl_wifi_write "$dest" "$new_id" "$new_uuid" "$ssid" "$psk" "$hidden" "$priority" true || return $?
+	if ! _apl_wifi_nmcli_reload; then
+		apl_wifi_delete_keyfile "$dest" || true
+		_apl_wifi_nmcli_reload || true
+		_emit_error filesystem_error "failed to reload NetworkManager"
+		return 3
+	fi
+
+	# If the foreign profile was the active uplink, bring up the new managed one
+	# and confirm it activated BEFORE deleting the old, so the control link
+	# (and this very request, over Wi-Fi) doesn't drop.
+	if [[ "$was_active" == true ]]; then
+		if ! _apl_wifi_nmcli_up "$new_uuid"; then
+			local reason
+			reason="$(_apl_wifi_classify_failure "${NMCLI_OUT_LAST:-}" "${NMCLI_RC_LAST:-1}")"
+			_apl_wifi_adopt_rollback "$new_uuid" "$dest" "$uuid" "$was_active"
+			_emit_json "$(jq -nc --arg id "foreign-$uuid" --arg r "$reason" \
+				'{status:"test_failed", id:$id, reason:$r, message:"could not bring up the adopted network; left the original in place"}')"
+			return 2
+		fi
+	fi
+
+	# Strict-delete the old foreign profile (removes its netplan yaml + /run
+	# profile). On failure roll back the adoption so we never leave a duplicate
+	# of the same SSID — and, for the active case, restore the original link.
+	if ! _apl_wifi_nmcli_delete_strict "$uuid"; then
+		_apl_wifi_adopt_rollback "$new_uuid" "$dest" "$uuid" "$was_active"
+		_emit_error filesystem_error "failed to remove the foreign profile; rolled back the adoption"
+		return 3
+	fi
+	_apl_wifi_nmcli_reload || true
+
+	_emit_json "$(jq -nc --arg id "$new_id" --arg uuid "$new_uuid" --arg ssid "$ssid" \
+		'{status:"applied", id:$id, uuid:$uuid, ssid:$ssid, adopted:true, changed:[$id]}')"
 }
 
 # --- subcommand: test ------------------------------------------------------
@@ -1108,7 +1359,7 @@ _cmd_test_locked() {
 
 _apl_wifi_usage() {
 	cat >&2 <<'USAGE'
-usage: apl-wifi {list|add|update|delete|test|activate|status} --json
+usage: apl-wifi {list|add|update|delete|test|activate|adopt|status} --json
 
 Reads JSON on stdin for mutating subcommands; emits a JSON envelope on
 stdout for every status. Exit codes:
@@ -1129,6 +1380,7 @@ main() {
 		delete:--json) cmd_delete ;;
 		test:--json) cmd_test ;;
 		activate:--json) cmd_activate ;;
+		adopt:--json) cmd_adopt ;;
 		status:--json) cmd_status ;;
 		-h:*|--help:*|help:*)
 			_apl_wifi_emitted=1
@@ -1139,7 +1391,7 @@ main() {
 			# JSON only on stdout — the human-readable usage hint stays in
 			# the message field so the caller (webconfig) can render it
 			# without parsing stderr.
-			_emit_error usage_error "unknown subcommand or missing --json: '$sub $mode'. Use: list|add|update|delete|test|activate|status --json"
+			_emit_error usage_error "unknown subcommand or missing --json: '$sub $mode'. Use: list|add|update|delete|test|activate|adopt|status --json"
 			return 5
 			;;
 	esac

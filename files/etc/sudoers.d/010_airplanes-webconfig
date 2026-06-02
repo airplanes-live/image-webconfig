@@ -20,8 +20,8 @@ airplanes-webconfig ALL=(root) NOPASSWD: /usr/local/bin/apl-feed apply --json --
 # /usr/local/bin/apl-wifi reads /etc/NetworkManager/system-connections/* (root
 # 0600) and writes keyfiles + runs nmcli. Each subcommand has its own pinned
 # argv so a compromised webconfig cannot drift between the read-only (list,
-# status) and mutating (add, update, delete, test, activate) surfaces via one
-# grant. `--json` is mandatory in argv so a future text-mode helper variant
+# status) and mutating (add, update, delete, test, activate, adopt) surfaces via
+# one grant. `--json` is mandatory in argv so a future text-mode helper variant
 # can't be reached through this entry.
 airplanes-webconfig ALL=(root) NOPASSWD: /usr/local/bin/apl-wifi list --json
 airplanes-webconfig ALL=(root) NOPASSWD: /usr/local/bin/apl-wifi add --json
@@ -29,6 +29,7 @@ airplanes-webconfig ALL=(root) NOPASSWD: /usr/local/bin/apl-wifi update --json
 airplanes-webconfig ALL=(root) NOPASSWD: /usr/local/bin/apl-wifi delete --json
 airplanes-webconfig ALL=(root) NOPASSWD: /usr/local/bin/apl-wifi test --json
 airplanes-webconfig ALL=(root) NOPASSWD: /usr/local/bin/apl-wifi activate --json
+airplanes-webconfig ALL=(root) NOPASSWD: /usr/local/bin/apl-wifi adopt --json
 airplanes-webconfig ALL=(root) NOPASSWD: /usr/local/bin/apl-wifi status --json
 
 airplanes-webconfig ALL=(root) NOPASSWD: /usr/bin/systemctl reboot

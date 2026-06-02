@@ -70,6 +70,7 @@ func privilegedArgvCases(priv PrivilegedArgv) []privilegedArgvCase {
 		{"WifiDelete", priv.WifiDelete},
 		{"WifiTest", priv.WifiTest},
 		{"WifiActivate", priv.WifiActivate},
+		{"WifiAdopt", priv.WifiAdopt},
 		{"WifiStatus", priv.WifiStatus},
 		{"ExportIdentity", priv.ExportIdentity},
 		{"ImportIdentity", priv.ImportIdentity},
