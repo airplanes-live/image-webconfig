@@ -3547,7 +3547,19 @@
         const privacyBody = buildPrivacyCardBody();
         const configBody = el("div", {}, el("p", { class: "muted" }, "loading…"));
 
-        const identityCard = el("section", { class: "wc-card" }, el("h2", {}, "Identity"), identityBody);
+        // Claim-status indicator in the Identity card header: a colored dot
+        // + label sourced from /api/claim/status. Built here — outside
+        // identityBody, which re-renders on identity change — so its element
+        // refs stay stable and only their color/text update.
+        const claimDot = el("span", { class: "wc-claim-dot wc-claim-dot--na", title: "Checking claim status…" });
+        const claimLabel = el("span", { class: "wc-claim-status__label" }, "Checking…");
+
+        const identityCard = el("section", { class: "wc-card" },
+            el("h2", { class: "wc-card-head" },
+                el("span", {}, "Identity"),
+                el("span", { class: "wc-claim-status", "aria-live": "polite" }, claimDot, claimLabel),
+            ),
+            identityBody);
         const privacyCard = el("section", { class: "wc-card management-card" }, el("h2", {}, "Management"), privacyBody);
         const configCard = el("section", { class: "wc-card" }, el("h2", {}, "Configuration"), configBody);
 
@@ -3571,6 +3583,7 @@
 
         const ctx = {
             heroEl, tileGrid, identityBody, privacyBody, configBody, rebootBanner,
+            claimDot, claimLabel,
             configValues: {},
             lastIdentity: null,
             configDirty: false,
@@ -3604,6 +3617,7 @@
         ctx.lastIdentity = identity && identity.payload ? identity.payload : null;
 
         renderIdentityCard(identityBody, identity);
+        refreshClaimDot(ctx);
         renderConfigCard(configBody, config);
         renderPrivacyCard(privacyBody, config);
         // computeMsgRate is side-effecting (advances its baseline on every
@@ -3666,9 +3680,56 @@
                 renderIdentityCard(ctx.identityBody, identity);
                 ctx.lastIdentity = idPayload;
             }
+            // Fire-and-forget: a claim probe can be slow (network), so don't
+            // let it hold pollInFlight and stall the live tiles. It self-
+            // guards on ctx and the server-side cache bounds real probes.
+            refreshClaimDot(ctx);
         } finally {
             pollInFlight = false;
         }
+    }
+
+    // CLAIM_DOT maps a claim-status verdict to [dotClass, label, tooltip]
+    // for the Identity-card indicator. Unlisted / transient verdicts
+    // (unreachable, rate_limited, unavailable) fall back to the neutral
+    // "na" dot rather than an alarming red.
+    const CLAIM_DOT = {
+        claimed:             ["ok",   "Claimed",        "Claimed — linked to an airplanes.live account"],
+        unclaimed:           ["info", "Registered",     "Registered with airplanes.live — not yet claimed by an account"],
+        unregistered:        ["warn", "Not registered", "Not registered with airplanes.live yet"],
+        no_identity:         ["warn", "Not registered", "No feeder identity yet"],
+        secret_mismatch:     ["err",  "Action needed",  "Claim secret didn’t authenticate — re-register from this page"],
+        server_unregistered: ["err",  "Action needed",  "airplanes.live has no record of this feeder’s secret — re-register"],
+        secret_invalid:      ["err",  "Action needed",  "The local claim secret is malformed — re-register"],
+        blocked:             ["err",  "Blocked",        "This feeder is blocked by an administrator"],
+    };
+
+    function applyClaimDot(ctx, cls, label, title) {
+        if (!ctx.claimDot) return;
+        ctx.claimDot.className = "wc-claim-dot wc-claim-dot--" + cls;
+        ctx.claimDot.title = title;
+        ctx.claimLabel.textContent = label;
+    }
+
+    // refreshClaimDot paints the Identity-card dot from the cached claim
+    // verdict. Self-guards against a torn-down dashboard and never
+    // redirects on auth failure — the main status poll owns that.
+    async function refreshClaimDot(ctx) {
+        if (!ctx || !ctx.claimDot) return;
+        let r;
+        try {
+            r = await getJSON("/api/claim/status");
+        } catch (_) {
+            if (ctx === dashboardCtx) applyClaimDot(ctx, "na", "Status unknown", "Couldn’t reach the claim-status check");
+            return;
+        }
+        if (ctx !== dashboardCtx) return;
+        if (!r || !r.ok || !r.payload || !r.payload.result) {
+            applyClaimDot(ctx, "na", "Status unknown", "Couldn’t load claim status");
+            return;
+        }
+        const view = CLAIM_DOT[r.payload.result] || ["na", "Status unknown", "Couldn’t determine claim status right now"];
+        applyClaimDot(ctx, view[0], view[1], view[2]);
     }
 
     // ===== Setup / login / change-password / log-viewer / corrupt =====
