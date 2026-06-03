@@ -26,6 +26,7 @@ import (
 	"time"
 
 	"github.com/airplanes-live/image-webconfig/internal/auth"
+	"github.com/airplanes-live/image-webconfig/internal/claimstatus"
 	"github.com/airplanes-live/image-webconfig/internal/devfakes"
 	"github.com/airplanes-live/image-webconfig/internal/feedenv"
 	"github.com/airplanes-live/image-webconfig/internal/identity"
@@ -110,6 +111,16 @@ func main() {
 		status.WithWifi(devfakes.NewWifiProbe(state)),
 	)
 
+	// Claim-status probe routed through the same fake runner; the dev-stub
+	// argv lands in devfakes.claimStatusFeed, which reports a verdict
+	// coherent with the simulated identity (unregistered → unclaimed once
+	// the Register button materialises a secret).
+	claimStatusProber := claimstatus.Prober{
+		Runner: devfakes.Runner(state, priv),
+		Argv:   []string{"dev-stub", "apl-feed", "claim", "status", "--json"},
+	}
+	claimStatusCache := claimstatus.NewCache(claimStatusProber.Probe, nil)
+
 	handler := server.New(server.Deps{
 		Version:          "dev",
 		Store:            auth.NewPasswordStore(state.Paths.PasswordHash),
@@ -120,6 +131,7 @@ func main() {
 		Identity:         identity.NewReader(idPaths),
 		FeedEnv:          &feedenv.Reader{Path: state.Paths.FeedEnv},
 		Status:           statusReader,
+		ClaimStatus:      claimStatusCache,
 		Logs:             logs.NewStreamer(devfakes.StreamRunner(state)),
 		Schema:           schema,
 		Runner:           devfakes.Runner(state, priv),

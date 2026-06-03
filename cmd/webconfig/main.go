@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/airplanes-live/image-webconfig/internal/auth"
+	"github.com/airplanes-live/image-webconfig/internal/claimstatus"
 	wexec "github.com/airplanes-live/image-webconfig/internal/exec"
 	"github.com/airplanes-live/image-webconfig/internal/feedenv"
 	"github.com/airplanes-live/image-webconfig/internal/hardware"
@@ -140,6 +141,11 @@ func main() {
 	}
 	loadCancel()
 
+	// Account-claim status: read-only, unprivileged `apl-feed claim status
+	// --json` behind a single-flight, identity-keyed cache.
+	claimStatusProber := claimstatus.Prober{Runner: wexec.RealRunner, Argv: claimstatus.DefaultArgv}
+	claimStatusCache := claimstatus.NewCache(claimStatusProber.Probe, nil)
+
 	effectiveVersion := resolveVersion()
 	srv := &http.Server{
 		Addr: *listen,
@@ -161,9 +167,10 @@ func main() {
 				)),
 				status.WithWifi(wifi.NewSignalReader("/usr/bin/nmcli", nil)),
 			),
-			Logs:       logs.NewStreamer(nil),
-			Schema:     cache,
-			Privileged: priv,
+			Logs:        logs.NewStreamer(nil),
+			Schema:      cache,
+			ClaimStatus: claimStatusCache,
+			Privileged:  priv,
 		}),
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       15 * time.Second,

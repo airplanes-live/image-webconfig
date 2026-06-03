@@ -3925,99 +3925,155 @@
     }
 
     // claimActivityPanel renders the journal stream for
-    // airplanes-claim.service alongside a "Claim status" card sourced
-    // from GET /api/identity. The status card answers "is this feeder
-    // actually claimed?" without depending on what's still in the
-    // journal tail — once the image-side timer stops firing after
-    // first success, the journal becomes empty and the bare log view
-    // would mislead an operator into thinking nothing ever happened.
+    // airplanes-claim.service alongside a "Claim status" card sourced from
+    // GET /api/claim/status — the real account-claim verdict (registered
+    // with the backend vs. claimed by a user account), not a guess from the
+    // local secret file. That probe is a rate-limited network round-trip
+    // cached server-side, so this panel does NOT poll it on a tight loop: it
+    // reads once on open, re-checks on a slow jittered ~50s cadence only
+    // while the verdict is "unclaimed" (the state where the operator is
+    // waiting for a claim to land), and stops once a terminal verdict
+    // arrives. A "Check now" button forces an immediate refresh.
     //
-    // Polls every 5s for the lifetime of the panel — no early-stop on
-    // first claimed response, because feed writes the version sidecar
-    // AFTER the secret file is renamed into place, and an early stop
-    // would freeze the display at "Claimed (no version)" until the
-    // user reopens the panel. 5s polls are trivial server load; the
-    // panel is short-lived.
-    //
-    // Lifecycle hazards (Codex 2026-05-19 review):
-    //   1. The 5s interval can fire while a previous fetch is still
-    //      pending. pollInFlight guards against overlap.
-    //   2. navigate() tears down statusTimer when the user leaves the
-    //      panel, but in-flight getJSON()s can still resolve after.
-    //      Capturing myTimer at panel-mount and comparing against the
-    //      current statusTimer post-await lets a stale resolver bail
-    //      before mutating DOM or — worse — calling handleAuthFailure
-    //      / clearInterval on the next panel's timer.
+    // Lifecycle: navigate() clears statusTimer on leaving the panel. The
+    // panel stores its current (re)scheduled handle in both myTimer and
+    // statusTimer; every async resolver bails when statusTimer no longer
+    // equals myTimer (panel torn down or replaced). pollInFlight guards
+    // against an overlapping in-flight probe.
     function claimActivityPanel() {
         const statusCard = el("section", { class: "wc-card claim-status" },
             el("p", { class: "muted" }, "Loading claim status…"));
 
         let pollInFlight = false;
-        // myTimer is assigned by the setInterval call BELOW the
-        // fetchStatus definition; the first synchronous fetchStatus()
-        // is invoked AFTER that assignment, so by the time any await
-        // resumes the value is set. The capture is by closure, not
-        // value, so a future navigate() that nulls statusTimer is
-        // observable through this reference.
+        // myTimer holds the panel's current (re)scheduled handle, mirrored
+        // into the global statusTimer. The post-await `statusTimer !==
+        // myTimer` guard lets a stale resolver bail after navigate() tears
+        // the panel down (or after a reschedule supersedes it).
         let myTimer = null;
+        // Slow re-check cadence while waiting for a claim to land; jittered
+        // so feeders behind one IP don't align their probes.
+        const RECHECK_MS = 50000;
 
         const replaceCard = (...nodes) => {
             while (statusCard.firstChild) statusCard.removeChild(statusCard.firstChild);
             for (const n of nodes) statusCard.appendChild(n);
         };
 
-        const renderStatus = (id) => {
-            if (!id || !id.claim_secret_present) {
-                replaceCard(
-                    el("h2", {}, "Not yet claimed"),
-                    el("p", { class: "muted" },
-                        "Press Register on the dashboard to attempt now. " +
-                        "The next attempt also runs automatically when the feeder reboots."),
-                );
-                return;
-            }
-            const parts = [];
-            if (id.claim_secret_updated_at) {
-                const d = new Date(id.claim_secret_updated_at);
-                // new Date(bad) returns Invalid Date which doesn't throw
-                // and toLocaleString()s to "Invalid Date" — guard explicitly.
-                if (!Number.isNaN(d.getTime())) {
-                    parts.push("Last updated: " + d.toLocaleString());
-                }
-            }
-            if (id.claim_secret_version > 0) {
-                parts.push("Version: v" + id.claim_secret_version);
-            }
-            const children = [el("h2", {}, "Claimed ✓")];
-            if (parts.length) {
-                children.push(el("p", { class: "muted" }, parts.join(" · ")));
-            }
-            replaceCard(...children);
+        const checkBtn = el("button", {
+            class: "wc-btn-ghost",
+            type: "button",
+            onclick: () => fetchClaim(true),
+        }, "Check now");
+
+        const checkedAgo = (iso) => {
+            if (!iso) return "";
+            const t = new Date(iso);
+            if (Number.isNaN(t.getTime())) return "";
+            const secs = Math.max(0, Math.round((Date.now() - t.getTime()) / 1000));
+            if (secs < 45) return "checked just now";
+            if (secs < 5400) return "checked " + Math.round(secs / 60) + "m ago";
+            return "checked " + Math.round(secs / 3600) + "h ago";
         };
 
-        const fetchStatus = async () => {
+        // Map a verdict to a heading + guidance. The claim-page link lives
+        // on the dashboard Identity card ("Show claim secret"); this panel
+        // describes the state and points back there rather than duplicating
+        // a URL it doesn't carry.
+        const verdictView = (r) => {
+            switch (r.result) {
+                case "claimed":
+                    return { h: "Claimed ✓", muted: r.version ? "Linked to an airplanes.live account · v" + r.version : "Linked to an airplanes.live account." };
+                case "unclaimed":
+                    return { h: "Registered — not yet claimed", muted: "Use “Show claim secret” on the dashboard to claim this feeder to your account." };
+                case "unregistered":
+                case "no_identity":
+                    return { h: "Not yet registered", muted: "Press Register on the dashboard; the feeder also retries on reboot." };
+                case "secret_mismatch":
+                case "server_unregistered":
+                case "secret_invalid":
+                    return { h: "Needs attention", muted: "This feeder’s claim secret didn’t authenticate. Re-register from the dashboard." };
+                case "blocked":
+                    return { h: "Blocked", muted: "This feeder is blocked by an administrator." };
+                case "rate_limited":
+                    return { h: "Status check rate-limited", muted: "airplanes.live is throttling checks; try again shortly." };
+                case "unreachable":
+                    return { h: "Couldn’t reach airplanes.live", muted: "The feeder couldn’t contact the server to check claim status." };
+                default:
+                    return { h: "Claim status unavailable", muted: "Could not determine claim status right now." };
+            }
+        };
+
+        const renderVerdict = (r) => {
+            const v = verdictView(r);
+            const nodes = [el("h2", {}, v.h)];
+            if (v.muted) nodes.push(el("p", { class: "muted" }, v.muted));
+            const meta = [];
+            const stamp = checkedAgo(r.checked_at);
+            if (stamp) meta.push(stamp);
+            if (r.stale) meta.push("couldn’t refresh — showing last known");
+            if (meta.length) nodes.push(el("p", { class: "muted" }, meta.join(" · ")));
+            nodes.push(el("div", { class: "wc-action-grid" }, checkBtn));
+            replaceCard(...nodes);
+        };
+
+        // nextDelayMs maps a verdict to the auto-recheck delay; 0 = stop.
+        // Pending states keep polling — fast for "unregistered" (a just-
+        // clicked Register is about to land a secret locally), slow for
+        // "unclaimed" (waiting on a website action); transient failures
+        // retry; settled verdicts stop and rely on "Check now".
+        const nextDelayMs = (r) => {
+            switch (r.result) {
+                case "unregistered": return 6000;
+                case "unclaimed":    return RECHECK_MS;
+                case "rate_limited": return Math.max(7000, (r.retry_after_seconds || 20) * 1000);
+                case "unreachable":
+                case "error":
+                case "unavailable":  return 20000;
+                default:             return 0;
+            }
+        };
+
+        const scheduleNext = (r) => {
+            if (statusTimer !== myTimer) return;   // panel torn down
+            const delay = nextDelayMs(r);
+            if (delay <= 0) return;                // settled — wait for "Check now"
+            const handle = setTimeout(() => {
+                // Bail if a newer fetch/schedule superseded us or the panel
+                // was torn down — stops stale timers from multiplying.
+                if (statusTimer !== handle) return;
+                fetchClaim(false);
+            }, delay + Math.floor(Math.random() * 5000));
+            myTimer = handle;
+            statusTimer = handle;
+        };
+
+        async function fetchClaim(force) {
             if (pollInFlight) return;
+            // Cancel any pending auto-recheck — this fetch supersedes it.
+            if (myTimer) clearTimeout(myTimer);
             pollInFlight = true;
+            checkBtn.disabled = true;
             let r;
             try {
-                r = await getJSON("/api/identity");
+                r = await getJSON("/api/claim/status" + (force ? "?max_age=0" : ""));
             } finally {
                 pollInFlight = false;
             }
-            // If our timer has been replaced or cleared, this panel was
-            // torn down via navigate(). Bail before mutating state that
-            // belongs to the new panel — clearing the dashboard's
-            // statusTimer or auth-redirecting from a stale poll would
-            // both be user-visible regressions.
-            if (statusTimer !== myTimer) return;
+            if (statusTimer !== myTimer) return;   // torn down mid-flight
+            checkBtn.disabled = false;
             if (handleAuthFailure(r)) return;
-            if (!r.ok) {
-                replaceCard(el("p", { class: "error", role: "alert" },
-                    (r.payload && r.payload.error) || "Could not load claim status."));
+            if (!r.ok || !r.payload || !r.payload.result) {
+                replaceCard(
+                    el("p", { class: "error", role: "alert" },
+                        (r.payload && r.payload.error) || "Could not load claim status."),
+                    el("div", { class: "wc-action-grid" }, checkBtn),
+                );
+                scheduleNext({ result: "unavailable" });   // retry the transient failure
                 return;
             }
-            renderStatus(r.payload);
-        };
+            renderVerdict(r.payload);
+            scheduleNext(r.payload);
+        }
 
         const logPre = streamLog("claim");
         render(
@@ -4031,12 +4087,11 @@
             ),
         );
 
-        // Assign myTimer + statusTimer BEFORE kicking off the initial
-        // fetch so the post-await `statusTimer !== myTimer` check holds
-        // for the very first call too.
-        myTimer = setInterval(fetchStatus, 5000);
+        // Establish the liveness token before the first fetch so the
+        // post-await `statusTimer !== myTimer` guard holds for it too.
+        myTimer = setTimeout(() => {}, 0);
         statusTimer = myTimer;
-        fetchStatus();
+        fetchClaim(false);
     }
 
     function loadingPanel(msg) {

@@ -10,6 +10,7 @@ import (
 	"log"
 	"net/http"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -874,4 +875,60 @@ func (s *Server) handleClaimRegister(w http.ResponseWriter, r *http.Request) {
 		"status": "starting",
 		"unit":   "airplanes-claim.service",
 	})
+}
+
+// defaultClaimStatusMaxAge is the freshness window used when the caller
+// omits max_age (e.g. the dashboard's one-shot read on open). The cache
+// clamps every value up to its floor, so even max_age=0 ("Check now")
+// cannot probe faster than the per-identity rate limit.
+const defaultClaimStatusMaxAge = 60 * time.Second
+
+// /api/claim/status (GET): the feeder's account-claim status, cached
+// server-side. Always consults the apl-feed claim status CLI — the single
+// authority on local + server claim state — via the cache; the cache key
+// is the identity fingerprint so an import / rotation drops a stale
+// verdict. ?max_age=<seconds> sets the freshness window (0 forces a
+// refresh, still floored by the cache). The shared server-side cache means
+// any number of tabs/reloads collapse to one backend probe per window.
+func (s *Server) handleClaimStatus(w http.ResponseWriter, r *http.Request) {
+	if s.claimStatus == nil {
+		writeJSONError(w, http.StatusServiceUnavailable, "claim status unavailable")
+		return
+	}
+	maxAge := parseClaimStatusMaxAge(r.URL.Query().Get("max_age"))
+	resp := s.claimStatus.Get(r.Context(), s.claimStatusKey(), maxAge)
+	writeJSON(w, http.StatusOK, resp)
+}
+
+// claimStatusKey fingerprints the feeder identity so the claim-status cache
+// invalidates when the identity changes (import / rotate / regen). The
+// secret mtime + version come for free from identity.Read() — no extra
+// stat. Any read failure collapses to a single sentinel key; the CLI is
+// still authoritative for the verdict (no_identity etc.).
+func (s *Server) claimStatusKey() string {
+	id, err := s.identity.Read()
+	if err != nil {
+		return "\x00no-identity"
+	}
+	return id.FeederID + "|" + id.ClaimSecretUpdatedAt + "|" + strconv.Itoa(id.ClaimSecretVersion)
+}
+
+// parseClaimStatusMaxAge maps ?max_age=<seconds> to a duration. Absent or
+// malformed → the default window; "0" or negative → 0 (force refresh,
+// still floored by the cache); capped at 1h to bound a hostile value.
+func parseClaimStatusMaxAge(raw string) time.Duration {
+	if raw == "" {
+		return defaultClaimStatusMaxAge
+	}
+	n, err := strconv.Atoi(raw)
+	if err != nil {
+		return defaultClaimStatusMaxAge
+	}
+	if n <= 0 {
+		return 0
+	}
+	if n > 3600 {
+		n = 3600
+	}
+	return time.Duration(n) * time.Second
 }
