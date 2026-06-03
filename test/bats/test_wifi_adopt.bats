@@ -64,6 +64,7 @@ is_deleted() { [[ -f "$NM_DELETED_FILE" ]] && grep -qxF "$1" "$NM_DELETED_FILE";
 
 case "$action" in
     reload) exit 0 ;;
+    load)   exit 0 ;;
     down)   exit 0 ;;
     up)
         [[ -n "$NM_UP_FAIL" ]] && { echo "Error: Connection activation failed: no carrier" >&2; exit 4; }

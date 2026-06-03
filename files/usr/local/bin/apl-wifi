@@ -277,9 +277,15 @@ _apl_wifi_has_non_wifi_uplink() {
 	(( count > 0 ))
 }
 
-_apl_wifi_nmcli_reload() {
+# Load (or reload, or unload) a single connection file. On this hardware a full
+# `nmcli connection reload` is pathologically slow (~11-15s) because NM's netplan
+# integration regenerates everything; loading one file is ~100ms and is enough
+# for every mutation: a new keyfile appears, a rewritten one is re-read, and a
+# deleted one is dropped. Pass the keyfile that was just written or removed.
+_apl_wifi_nmcli_load() {
+	local file="$1"
 	[[ "$NMCLI_AVAILABLE" == true ]] || return 0
-	"$APL_WIFI_NMCLI" connection reload >/dev/null 2>&1 || return 1
+	"$APL_WIFI_NMCLI" connection load "$file" >/dev/null 2>&1 || return 1
 	return 0
 }
 
@@ -712,7 +718,7 @@ _apl_wifi_restore_snapshot() {
 	if [[ -f "$src" ]]; then
 		mv -f "$src" "$dest"
 		chmod 0600 "$dest" 2>/dev/null || true
-		_apl_wifi_nmcli_reload
+		_apl_wifi_nmcli_load "$dest"
 	fi
 }
 
@@ -733,8 +739,8 @@ _apl_wifi_run_test_flow() {
 	# Write the candidate with autoconnect=false so a parallel autoconnect
 	# attempt doesn't fight the test bring-up.
 	_apl_wifi_write "$dest" "$id" "$uuid" "$ssid" "$psk" "$hidden" "$priority" false || return $?
-	_apl_wifi_nmcli_reload || {
-		_emit_error filesystem_error "nmcli reload failed before test"
+	_apl_wifi_nmcli_load "$dest" || {
+		_emit_error filesystem_error "nmcli load failed before test"
 		return 3
 	}
 
@@ -752,7 +758,7 @@ _apl_wifi_run_test_flow() {
 		if [[ "$state" == activated || "$state" == 100* ]]; then
 			# Pass — commit with autoconnect=true.
 			_apl_wifi_write "$dest" "$id" "$uuid" "$ssid" "$psk" "$hidden" "$priority" true || return $?
-			_apl_wifi_nmcli_reload
+			_apl_wifi_nmcli_load "$dest"
 			_apl_wifi_clear_snapshot "$id"
 			return 0
 		fi
@@ -770,7 +776,7 @@ _apl_wifi_run_test_flow() {
 		add)
 			_apl_wifi_nmcli_delete_inmem "$uuid"
 			apl_wifi_delete_keyfile "$dest" || true
-			_apl_wifi_nmcli_reload
+			_apl_wifi_nmcli_load "$dest"
 			;;
 		update)
 			_apl_wifi_restore_snapshot "$id"
@@ -841,7 +847,7 @@ _cmd_add_locked() {
 		(( rc == 0 )) || return "$rc"
 	else
 		_apl_wifi_write "$dest" "$id" "$uuid" "$ssid" "$psk" "$hidden" "$priority" true || return $?
-		_apl_wifi_nmcli_reload || true
+		_apl_wifi_nmcli_load "$dest" || true
 	fi
 
 	local active=false
@@ -928,7 +934,7 @@ _cmd_update_locked() {
 		(( rc == 0 )) || return "$rc"
 	else
 		_apl_wifi_write "$dest" "$id" "$cur_uuid" "$ssid" "$psk" "$hidden" "$priority" true || return $?
-		_apl_wifi_nmcli_reload || true
+		_apl_wifi_nmcli_load "$dest" || true
 		_apl_wifi_clear_snapshot "$id"
 	fi
 
@@ -1014,7 +1020,7 @@ _cmd_delete_locked() {
 		_emit_error filesystem_error "failed to remove keyfile"
 		return 3
 	fi
-	_apl_wifi_nmcli_reload || true
+	_apl_wifi_nmcli_load "$dest" || true
 
 	_emit_json "$(jq -nc --arg id "$id" '{status:"applied", id:$id, deleted:true, changed:[$id]}')"
 }
@@ -1110,7 +1116,7 @@ _apl_wifi_adopt_rollback() {
 	fi
 	_apl_wifi_nmcli_delete_inmem "$new_uuid"
 	apl_wifi_delete_keyfile "$dest" || true
-	_apl_wifi_nmcli_reload || true
+	_apl_wifi_nmcli_load "$dest" || true
 }
 
 # --- subcommand: adopt -----------------------------------------------------
@@ -1223,12 +1229,12 @@ _cmd_adopt_locked() {
 	[[ -n "$NMCLI_ACTIVE_WIFI_UUID" && "$uuid" == "$NMCLI_ACTIVE_WIFI_UUID" ]] && was_active=true
 
 	# Write the managed keyfile and load it. Nothing is active or deleted yet, so
-	# a reload failure just drops the new keyfile (no link to restore).
+	# a load failure just drops the new keyfile (no link to restore).
 	_apl_wifi_write "$dest" "$new_id" "$new_uuid" "$ssid" "$psk" "$hidden" "$priority" true || return $?
-	if ! _apl_wifi_nmcli_reload; then
+	if ! _apl_wifi_nmcli_load "$dest"; then
 		apl_wifi_delete_keyfile "$dest" || true
-		_apl_wifi_nmcli_reload || true
-		_emit_error filesystem_error "failed to reload NetworkManager"
+		_apl_wifi_nmcli_load "$dest" || true
+		_emit_error filesystem_error "failed to load the adopted network into NetworkManager"
 		return 3
 	fi
 
@@ -1254,7 +1260,7 @@ _cmd_adopt_locked() {
 		_emit_error filesystem_error "failed to remove the foreign profile; rolled back the adoption"
 		return 3
 	fi
-	_apl_wifi_nmcli_reload || true
+	_apl_wifi_nmcli_load "$dest" || true
 
 	_emit_json "$(jq -nc --arg id "$new_id" --arg uuid "$new_uuid" --arg ssid "$ssid" \
 		'{status:"applied", id:$id, uuid:$uuid, ssid:$ssid, adopted:true, changed:[$id]}')"
@@ -1307,9 +1313,9 @@ _cmd_test_locked() {
 	local prior_active="$NMCLI_ACTIVE_WIFI_UUID"
 
 	_apl_wifi_write "$dest" "$id" "$uuid" "$ssid" "$psk" "$hidden" "$priority" false || return $?
-	_apl_wifi_nmcli_reload || {
+	_apl_wifi_nmcli_load "$dest" || {
 		apl_wifi_delete_keyfile "$dest" || true
-		_emit_error filesystem_error "nmcli reload failed before test"
+		_emit_error filesystem_error "nmcli load failed before test"
 		return 3
 	}
 
@@ -1335,7 +1341,7 @@ _cmd_test_locked() {
 	_apl_wifi_nmcli_down "$uuid"
 	_apl_wifi_nmcli_delete_inmem "$uuid"
 	apl_wifi_delete_keyfile "$dest" || true
-	_apl_wifi_nmcli_reload || true
+	_apl_wifi_nmcli_load "$dest" || true
 
 	# Bound the prior-active restore; see the matching note in
 	# _apl_wifi_run_test_flow for the timeout rationale.
