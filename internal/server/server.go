@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/airplanes-live/image-webconfig/internal/auth"
+	"github.com/airplanes-live/image-webconfig/internal/claimstatus"
 	wexec "github.com/airplanes-live/image-webconfig/internal/exec"
 	"github.com/airplanes-live/image-webconfig/internal/feedenv"
 	"github.com/airplanes-live/image-webconfig/internal/identity"
@@ -28,6 +29,7 @@ type Server struct {
 	identity      *identity.Reader
 	feedEnv       *feedenv.Reader
 	status        *status.Reader
+	claimStatus   *claimstatus.Cache
 	logs          *logs.Streamer
 	runner        wexec.CommandRunner
 	stdinRunner   wexec.CommandRunnerStdin
@@ -169,6 +171,7 @@ type Deps struct {
 	Identity     *identity.Reader
 	FeedEnv      *feedenv.Reader
 	Status       *status.Reader
+	ClaimStatus  *claimstatus.Cache // account-claim status probe + cache
 	Logs         *logs.Streamer
 	Schema       *schemacache.Cache       // schema cache; required (use schemacache.New)
 	Runner       wexec.CommandRunner      // override for tests; nil → exec.RealRunner
@@ -230,6 +233,7 @@ func New(d Deps) http.Handler {
 		identity:                d.Identity,
 		feedEnv:                 d.FeedEnv,
 		status:                  d.Status,
+		claimStatus:             d.ClaimStatus,
 		logs:                    d.Logs,
 		runner:                  runner,
 		stdinRunner:             stdinRunner,
@@ -268,6 +272,7 @@ func New(d Deps) http.Handler {
 	mux.HandleFunc("POST /api/reboot", s.requireSession(s.handleReboot))
 	mux.HandleFunc("POST /api/poweroff", s.requireSession(s.handlePoweroff))
 	mux.HandleFunc("POST /api/claim/register", s.requireSession(s.handleClaimRegister))
+	mux.HandleFunc("GET /api/claim/status", s.requireSession(s.handleClaimStatus))
 
 	// Wi-Fi network management — privileged subcommands of /usr/local/bin/apl-wifi.
 	// No `s.wifiMu` mutex: the helper's flock at /run/airplanes/wifi.lock is

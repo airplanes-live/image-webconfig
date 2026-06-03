@@ -485,6 +485,38 @@ main {
 .wc-tile__dot--err  { background: var(--wc-status-err); }
 .wc-tile__dot--na   { background: var(--wc-status-na); }
 
+/* Identity-card claim-status indicator: a colored dot + label in the card
+   header. green = claimed, blue = registered (not yet claimed), orange =
+   not registered, red = action needed / blocked, grey = unknown. */
+.wc-card-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
+}
+.wc-claim-status {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+  font-size: 0.8rem;
+  font-weight: 500;
+  color: var(--wc-ink-2);
+}
+.wc-claim-dot {
+  display: inline-block;
+  flex-shrink: 0;
+  width: 0.7rem;
+  height: 0.7rem;
+  border-radius: 999px;
+  background: var(--wc-status-na);
+  box-shadow: 0 0 0 2px var(--wc-surface-1);
+}
+.wc-claim-dot--ok   { background: var(--wc-status-ok); }
+.wc-claim-dot--info { background: var(--wc-accent); }
+.wc-claim-dot--warn { background: var(--wc-status-warn); }
+.wc-claim-dot--err  { background: var(--wc-status-err); }
+.wc-claim-dot--na   { background: var(--wc-status-na); }
+
 /* External-link affordance for app tiles. The chevron is muted at rest
    and pops to accent on hover. */
 .wc-tile__chev {

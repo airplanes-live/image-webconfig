@@ -194,6 +194,8 @@ func dispatchStub(state *State, priv server.PrivilegedArgv, argv []string, body 
 			return applyFeed(state, body)
 		case "schema":
 			return schemaFeed(state)
+		case "claim":
+			return claimStatusFeed(state, argv)
 		}
 	case "identity":
 		switch argv[2] {
@@ -433,6 +435,39 @@ func schemaFeed(state *State) (wexec.Result, error) {
 		"version":       1,
 		"writable_keys": writable,
 		"readable_keys": readable,
+	}
+	b, _ := json.Marshal(env)
+	return wexec.Result{Stdout: b}, nil
+}
+
+// claimStatusFeed fakes `apl-feed claim status --json`. Coherent with the
+// simulated identity: no UUID → no_identity; UUID but no secret →
+// unregistered; secret present → unclaimed (the "registered, not yet
+// claimed" state — the dev-interesting transition the register button
+// drives). Account ownership isn't simulated, so the verdict never reaches
+// "claimed"; that path is exercised by the Go unit tests. argv[3] is the
+// subcommand ("status").
+func claimStatusFeed(state *State, argv []string) (wexec.Result, error) {
+	if len(argv) < 4 || argv[3] != "status" {
+		log.Printf("devfakes: unhandled apl-feed claim %v", argv)
+		return wexec.Result{}, nil
+	}
+	uuid, secret, version := state.Identity()
+	env := map[string]any{"schema_version": 1}
+	switch {
+	case uuid == "":
+		env["result"] = "no_identity"
+	case secret == "":
+		env["result"] = "unregistered"
+	default:
+		v := 1
+		if version != nil {
+			v = *version
+		}
+		env["result"] = "unclaimed"
+		env["registered"] = true
+		env["owner_present"] = false
+		env["version"] = v
 	}
 	b, _ := json.Marshal(env)
 	return wexec.Result{Stdout: b}, nil
