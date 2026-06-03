@@ -17,10 +17,10 @@
     // Showing tiles for those is just systemctl repeating what the user
     // already verified by being on the page.
     // Order mirrors the dashboard layout: row 2 is the 1090 stack
-    // (feed → readsb → mlat), row 3 is the 978 UAT stack.
+    // (readsb → feed → mlat), row 3 is the 978 UAT stack.
     const MONITORED_SERVICES = [
-        "airplanes-feed.service",
         "readsb.service",
+        "airplanes-feed.service",
         "airplanes-mlat.service",
         "dump978-fa.service",
         "airplanes-978.service",
@@ -1199,7 +1199,7 @@
         const wifi = buildWifiTile();
         const row1 = el("div", { class: "wc-grid--tiles" }, hardware.root, wifi.root);
 
-        // Row 2: 1090 stack (feed → readsb → mlat).
+        // Row 2: 1090 stack (readsb → feed → mlat).
         // Row 3: 978 UAT stack (dump978 + airplanes-978).
         const row2 = el("div", { class: "wc-grid--tiles" });
         const row3 = el("div", { class: "wc-grid--tiles" });
