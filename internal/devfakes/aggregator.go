@@ -116,6 +116,11 @@ func aggAdapterFR24(state *State) map[string]any {
 		"secret_fields_present": secretsPresent,
 		"decoder_reachable":     true,
 		"claim_url":             "https://www.flightradar24.com/account/data-sharing",
+		"desired_version":       "1.0.48-0",
+		"version_drift":         false,
+	}
+	if enabled {
+		fr24["version"] = "1.0.48-0"
 	}
 	if installing {
 		fr24["enable"] = map[string]any{"status": "running", "step": "acquiring", "request_id": "dev-fr24"}
@@ -134,7 +139,7 @@ func aggAdapterPiaware(state *State) map[string]any {
 	pw := map[string]any{
 		"id":                      "piaware",
 		"display_name":            "FlightAware",
-		"acquire_method":          "apt-repo",
+		"acquire_method":          "pinned-deb",
 		"service_unit":            "piaware.service",
 		"state":                   aggLifecycle(installing, enabled, configured),
 		"enabled":                 enabled,
@@ -151,6 +156,11 @@ func aggAdapterPiaware(state *State) map[string]any {
 		"secret_fields_present": secretsPresent,
 		"decoder_reachable":     true,
 		"claim_url":             "https://www.flightaware.com/adsb/piaware/claim",
+		"desired_version":       "11.0",
+		"version_drift":         false,
+	}
+	if enabled {
+		pw["version"] = "11.0"
 	}
 	if installing {
 		pw["enable"] = map[string]any{"status": "running", "step": "acquiring", "request_id": "dev-piaware"}

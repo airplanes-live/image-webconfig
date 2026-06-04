@@ -24,6 +24,7 @@ setup() {
     export AGG_FR24_BIN="$WORK/install/fr24/fr24feed"
     export AGG_FR24_INI="$WORK/var/fr24/fr24feed.ini"
     export AGG_DECODER_STATE=up
+    export AGG_LIVENESS_WAIT=0
     export AGG_SELF="$APLAGG"
     export AGG_ENABLE_GRACE=10
     mkdir -p "$AGG_STATE_DIR"

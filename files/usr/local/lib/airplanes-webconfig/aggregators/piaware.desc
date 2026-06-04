@@ -4,7 +4,7 @@
 # Trusted, code-owned data; never user-editable.
 AGG_ID="piaware"
 AGG_DISPLAY_NAME="FlightAware"
-AGG_ACQUIRE_METHOD="apt-repo"
+AGG_ACQUIRE_METHOD="pinned-deb"
 # piaware runs as its own apt-installed unit (root), not the airplanes-aggregator@
 # template — it spawns faup1090 to consume the local readsb Beast feed.
 AGG_SERVICE_UNIT="piaware.service"
@@ -19,22 +19,26 @@ AGG_CLAIM_URL="https://www.flightaware.com/adsb/piaware/claim"
 AGG_SECRET_FIELDS="feeder_id"
 AGG_FIELDS_JSON='[{"id":"feeder_id","label":"Feeder ID (optional — reclaim an existing FlightAware feeder)","required":false,"secret":true}]'
 
-# --- apt-repo acquire parameters (consumed by apl-aggregator enable) --------
-# FlightAware serves a native per-Debian-suite repository; the suite is derived
-# from the running OS at enable time. Component + package are fixed.
-AGG_PIAWARE_REPO_URL="http://apt.svc.flightaware.com/piaware/release"
-AGG_PIAWARE_COMPONENT="piaware"
+# --- pinned-deb acquire parameters (consumed by apl-aggregator enable) -------
+# piaware is installed from a fetched, sha256-verified .deb (the same posture as
+# the FR24 binary) rather than a persisted apt source — so the installed version
+# is frozen to exactly what this descriptor pins and never floats on a later apt
+# run. The package is held after install; an overlay update that bumps the pin
+# re-applies it via `apl-aggregator reconcile`. The .deb's tcl/* runtime deps are
+# plain Debian packages, resolved from the device's normal Debian mirror.
+#
+# Bump deliberately after re-validating install + claim on a feeder: refresh the
+# URL, AGG_PIAWARE_VERSION (the exact dpkg version), and the sha256 together.
+# (FlightAware serves over http; integrity comes from the sha256 pin, not TLS.)
+AGG_PIAWARE_DEB_URL="http://apt.svc.flightaware.com/piaware/release/pool/piaware/p/piaware/piaware_11.0_arm64.deb"
+AGG_PIAWARE_VERSION="11.0"
+AGG_PIAWARE_DEB_SHA256="32f383748602ee4e000f2fe65f76c17c04505bdd0ea9050456e58bff67fe0b39"
 AGG_PIAWARE_PACKAGE="piaware"
-# Code-owned signing key, shipped ASCII-armored alongside this descriptor and
-# dearmored into a keyring at enable time. The primary fingerprint is pinned and
-# re-verified after dearmor before apt is ever pointed at the repo — so a
-# swapped .asc cannot silently change what root apt trusts.
-AGG_PIAWARE_KEY_ASC="flightaware-archive-keyring.asc"
-AGG_PIAWARE_KEY_FPR="5DAC1E3EF2234DD4ED09FA69671AD055972C325B"
-# Availability matrix (the image is arm64-only; FlightAware builds these suites).
+# Availability matrix (the image is arm64-only; the .deb's deps exist on these
+# Debian suites). Codename is a known-good guard, not an apt-suite selector.
 AGG_PIAWARE_SUPPORTED_ARCHES="arm64"
 AGG_PIAWARE_SUPPORTED_CODENAMES="bookworm trixie"
 # Packages the adapter must never allow apt to pull in or remove: the local
-# decoders it could shadow, and readsb itself. The enable simulate aborts if any
-# of these appears in the resolver's Inst/Remv plan.
+# decoders piaware could shadow, and readsb itself. The enable simulate aborts if
+# any of these appears in the resolver's Inst/Remv/Conf plan.
 AGG_PIAWARE_DENY_PKGS="dump1090-fa dump1090 dump1090-mutability dump978-fa readsb"

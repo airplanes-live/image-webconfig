@@ -1345,6 +1345,7 @@ input[aria-invalid="true"] {
 }
 .wc-agg-row__head { display: flex; align-items: center; gap: 0.5rem; }
 .wc-agg-row__name { font-weight: 600; }
+.wc-agg-row__version { margin-left: auto; font-size: 0.85rem; }
 .wc-agg-row__reason { margin: 0.35rem 0 0; font-size: 0.85rem; }
 .wc-agg-row__actions {
   display: flex;

@@ -3552,8 +3552,8 @@
 
     // Vendor data-sharing links come from the (code-owned) adapter descriptor,
     // but we still allowlist the host — only an https link to the vendor's own
-    // domain renders, never arbitrary JSON. FR24 is the only vendor today.
-    const AGGREGATOR_CLAIM_HOSTS = ["flightradar24.com"];
+    // domain renders, never arbitrary JSON.
+    const AGGREGATOR_CLAIM_HOSTS = ["flightradar24.com", "flightaware.com"];
     function vendorClaimHref(url) {
         try {
             const u = new URL(url);
@@ -3695,12 +3695,24 @@
         }
         const reason = (!a.available && a.unavailable_reason)
             ? el("p", { class: "muted wc-agg-row__reason" }, a.unavailable_reason) : null;
+        // Installed version (the build actually running) + a drift hint when the
+        // overlay pins a newer one than is installed — it applies on the next
+        // system update (or a reconcile failed and will retry).
+        const version = a.version
+            ? el("span", { class: "wc-agg-row__version muted" }, "v" + a.version) : null;
+        const drift = a.version_drift
+            ? el("p", { class: "muted wc-agg-row__reason" }, a.desired_version
+                ? "Update to v" + a.desired_version + " pending — applies on the next system update."
+                : "An update is pending — it applies on the next system update.")
+            : null;
         return el("div", { class: "wc-agg-row" },
             el("div", { class: "wc-agg-row__head" },
                 el("span", { class: "wc-agg-row__name" }, a.display_name || a.id),
                 aggStateBadge(a.state),
+                version,
             ),
             reason,
+            drift,
             actions.childNodes.length ? actions : null,
         );
     }
