@@ -11,6 +11,8 @@ setup() {
     WORK="$(mktemp -d)"
     export AGG_STATE_DIR="$WORK/state"
     export AGG_INSTALL_ROOT="$WORK/install"
+    export AGG_ENABLE_STATE="$WORK/enable.state"
+    export AGG_REQ_DIR="$WORK/req"
     export AGG_STATE_HOME="$WORK/var"
     export AGG_DESC_DIR="$BATS_TEST_DIRNAME/../../files/usr/local/lib/airplanes-webconfig/aggregators"
     export AGG_LOCK="$WORK/aggregator.lock"
@@ -26,6 +28,13 @@ setup() {
     ACQ="$WORK/fake-acquire"
     printf '#!/usr/bin/env bash\ninstall -D -m 0755 /dev/null "$1"\n' > "$ACQ"; chmod +x "$ACQ"
     export AGG_FR24_ACQUIRE_OVERRIDE="$ACQ"
+
+    # enable is fire-and-forget: run the worker inline so the restored-key
+    # reuse path is fully exercised in one synchronous call.
+    export AGG_SELF="$APLAGG"
+    SR="$WORK/fake-systemd-run"
+    printf '#!/usr/bin/env bash\nwhile [[ "$1" == --* ]]; do shift; done\n"$@"\nexit 0\n' > "$SR"; chmod +x "$SR"
+    export AGG_SYSTEMD_RUN="$SR"
 }
 
 teardown() { [ -n "${WORK:-}" ] && rm -rf "$WORK"; }

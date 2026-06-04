@@ -24,9 +24,9 @@ import (
 // surfaces as "client thinks input is fine but real Pi 400s" in the
 // field — keep them aligned.
 var (
-	mlatUserRE       = regexp.MustCompile(`^[A-Za-z0-9_-]{1,64}$`)
-	gainNumericRE    = regexp.MustCompile(`^-?[0-9]+(?:\.[0-9]+)?$`)
-	dump978SerialRE  = regexp.MustCompile(`^[0-9A-Za-z_-]{1,32}$`)
+	mlatUserRE      = regexp.MustCompile(`^[A-Za-z0-9_-]{1,64}$`)
+	gainNumericRE   = regexp.MustCompile(`^-?[0-9]+(?:\.[0-9]+)?$`)
+	dump978SerialRE = regexp.MustCompile(`^[0-9A-Za-z_-]{1,32}$`)
 )
 
 // validateGainValue mirrors valid_gain: auto/min/max OR numeric in [0, 60].
@@ -67,23 +67,30 @@ func validateDump978GainValue(v string) string {
 // DefaultPrivilegedArgv().
 func StubPrivilegedArgv() server.PrivilegedArgv {
 	return server.PrivilegedArgv{
-		ApplyFeed:            []string{"dev-stub", "apl-feed", "apply"},
-		SchemaFeed:           []string{"dev-stub", "apl-feed", "schema"},
-		Reboot:               []string{"dev-stub", "systemctl", "reboot"},
-		Poweroff:             []string{"dev-stub", "systemctl", "poweroff"},
-		StartOrchestrator:    []string{"dev-stub", "systemd-run", "airplanes-update-orchestrator"},
-		RegisterClaim:        []string{"dev-stub", "systemctl", "claim-register"},
-		SyncConfig:           []string{"dev-stub", "systemctl", "config-sync"},
-		WifiList:             []string{"dev-stub", "apl-wifi", "list"},
-		WifiAdd:              []string{"dev-stub", "apl-wifi", "add"},
-		WifiUpdate:           []string{"dev-stub", "apl-wifi", "update"},
-		WifiDelete:           []string{"dev-stub", "apl-wifi", "delete"},
-		WifiTest:             []string{"dev-stub", "apl-wifi", "test"},
-		WifiActivate:         []string{"dev-stub", "apl-wifi", "activate"},
-		WifiAdopt:            []string{"dev-stub", "apl-wifi", "adopt"},
-		WifiStatus:           []string{"dev-stub", "apl-wifi", "status"},
-		ExportIdentity:       []string{"dev-stub", "identity", "export"},
-		ImportIdentity:       []string{"dev-stub", "identity", "import"},
+		ApplyFeed:         []string{"dev-stub", "apl-feed", "apply"},
+		SchemaFeed:        []string{"dev-stub", "apl-feed", "schema"},
+		Reboot:            []string{"dev-stub", "systemctl", "reboot"},
+		Poweroff:          []string{"dev-stub", "systemctl", "poweroff"},
+		StartOrchestrator: []string{"dev-stub", "systemd-run", "airplanes-update-orchestrator"},
+		RegisterClaim:     []string{"dev-stub", "systemctl", "claim-register"},
+		SyncConfig:        []string{"dev-stub", "systemctl", "config-sync"},
+		WifiList:          []string{"dev-stub", "apl-wifi", "list"},
+		WifiAdd:           []string{"dev-stub", "apl-wifi", "add"},
+		WifiUpdate:        []string{"dev-stub", "apl-wifi", "update"},
+		WifiDelete:        []string{"dev-stub", "apl-wifi", "delete"},
+		WifiTest:          []string{"dev-stub", "apl-wifi", "test"},
+		WifiActivate:      []string{"dev-stub", "apl-wifi", "activate"},
+		WifiAdopt:         []string{"dev-stub", "apl-wifi", "adopt"},
+		WifiStatus:        []string{"dev-stub", "apl-wifi", "status"},
+		ExportIdentity:    []string{"dev-stub", "identity", "export"},
+		ImportIdentity:    []string{"dev-stub", "identity", "import"},
+		AggregatorStatus:  []string{"dev-stub", "apl-aggregator", "status"},
+		AggregatorEnable:  []string{"dev-stub", "apl-aggregator", "enable"},
+		AggregatorDisable: []string{"dev-stub", "apl-aggregator", "disable"},
+		AggregatorSet:     []string{"dev-stub", "apl-aggregator", "set"},
+		AggregatorReset:   []string{"dev-stub", "apl-aggregator", "reset"},
+		AggregatorExport:  []string{"dev-stub", "apl-aggregator", "export"},
+		AggregatorImport:  []string{"dev-stub", "apl-aggregator", "import"},
 	}
 }
 
@@ -206,6 +213,8 @@ func dispatchStub(state *State, priv server.PrivilegedArgv, argv []string, body 
 		}
 	case "apl-wifi":
 		return wifiCmd(state, argv[2], body)
+	case "apl-aggregator":
+		return aggregatorCmd(state, argv[2], body)
 	case "systemctl":
 		switch argv[2] {
 		case "reboot":

@@ -57,3 +57,18 @@ airplanes-webconfig ALL=(root) NOPASSWD: /usr/bin/systemd-run --unit=airplanes-u
 # across apl-feed subcommands.
 airplanes-webconfig ALL=(root) NOPASSWD: /usr/local/lib/airplanes-webconfig/identity-export.sh
 airplanes-webconfig ALL=(root) NOPASSWD: /usr/local/lib/airplanes-webconfig/identity-import.sh
+
+# /usr/local/bin/apl-aggregator manages optional third-party feed aggregators
+# (FlightRadar24, ...). Each verb is its own pinned argv so a compromised
+# webconfig cannot drift between the read-only (status, export) and mutating
+# (enable, disable, set, reset, import) surfaces via one grant. `--json` is
+# mandatory in argv. The JSON request — including secret values such as an
+# FR24 sharing key — is read on the helper's stdin, never passed on argv
+# (which /proc/<pid>/cmdline would expose).
+airplanes-webconfig ALL=(root) NOPASSWD: /usr/local/bin/apl-aggregator status --json
+airplanes-webconfig ALL=(root) NOPASSWD: /usr/local/bin/apl-aggregator enable --json
+airplanes-webconfig ALL=(root) NOPASSWD: /usr/local/bin/apl-aggregator disable --json
+airplanes-webconfig ALL=(root) NOPASSWD: /usr/local/bin/apl-aggregator set --json
+airplanes-webconfig ALL=(root) NOPASSWD: /usr/local/bin/apl-aggregator reset --json
+airplanes-webconfig ALL=(root) NOPASSWD: /usr/local/bin/apl-aggregator export --json
+airplanes-webconfig ALL=(root) NOPASSWD: /usr/local/bin/apl-aggregator import --json

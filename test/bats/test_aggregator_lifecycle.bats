@@ -15,6 +15,8 @@ setup() {
     WORK="$(mktemp -d)"
     export AGG_STATE_DIR="$WORK/state"
     export AGG_INSTALL_ROOT="$WORK/install"
+    export AGG_ENABLE_STATE="$WORK/enable.state"
+    export AGG_REQ_DIR="$WORK/req"
     export AGG_DESC_DIR="$BATS_TEST_DIRNAME/../../files/usr/local/lib/airplanes-webconfig/aggregators"
     export AGG_LOCK="$WORK/aggregator.lock"
     mkdir -p "$AGG_INSTALL_ROOT"

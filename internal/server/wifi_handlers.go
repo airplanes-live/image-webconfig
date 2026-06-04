@@ -94,6 +94,12 @@ func injectID(body []byte, id string) ([]byte, error) {
 			return nil, errors.New("request body must be a JSON object")
 		}
 	}
+	// json.Unmarshal of a literal `null` leaves m nil (no error); writing to a
+	// nil map panics. Treat null (and any non-object that decoded to nil) as a
+	// bad request rather than crashing the handler.
+	if m == nil {
+		return nil, errors.New("request body must be a JSON object")
+	}
 	idJSON, _ := json.Marshal(id)
 	m["id"] = idJSON
 	return json.Marshal(m)
