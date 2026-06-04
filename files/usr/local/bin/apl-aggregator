@@ -1,0 +1,279 @@
+#!/bin/bash
+# apl-aggregator — privileged management of third-party feed aggregators
+# (FlightRadar24, FlightAware, ...) that a feeder may optionally feed in
+# addition to airplanes.live.
+#
+# Invoked by airplanes-webconfig via a fixed sudoers argv
+# (`sudo -n /usr/local/bin/apl-aggregator <verb> --json`). Emits exactly one
+# JSON envelope on stdout. Exit codes follow the apl-wifi / apl-feed contract:
+#
+#   0  ok
+#   3  filesystem_error / state_error
+#   5  usage_error / parse_error
+#
+# (the mutating verbs and their 2/4 codes arrive with enable/disable/...)
+#
+# Adapter descriptors are trusted, code-owned data sourced from AGG_DESC_DIR —
+# never loaded from /etc, never user-editable. Adapter ids are validated
+# against AGG_ID_RE and must match their descriptor filename before any path
+# interpolation. Per-adapter secret values (e.g. an FR24 sharing key) are read
+# only via jq stdin, never passed on argv (which `/proc/<pid>/cmdline` exposes).
+#
+# Test seams (default to production paths/commands; stripped by sudo env_reset
+# in production, same posture as apl-wifi's APL_WIFI_* seams):
+#   AGG_STATE_DIR      per-adapter JSON state dir
+#   AGG_INSTALL_ROOT   on-demand vendor binary install root
+#   AGG_DESC_DIR       descriptor directory
+#   AGG_SYSTEMCTL      systemctl binary
+#   AGG_DECODER_ADDR   local readsb BEAST endpoint
+#   AGG_DECODER_STATE  "up"/"down" to bypass the TCP probe in tests
+
+set -Eeuo pipefail
+
+AGG_STATE_DIR="${AGG_STATE_DIR:-/etc/airplanes/aggregators}"
+AGG_INSTALL_ROOT="${AGG_INSTALL_ROOT:-/opt/airplanes-aggregators}"
+AGG_DESC_DIR="${AGG_DESC_DIR:-/usr/local/lib/airplanes-webconfig/aggregators}"
+AGG_SYSTEMCTL="${AGG_SYSTEMCTL:-systemctl}"
+AGG_DECODER_ADDR="${AGG_DECODER_ADDR:-127.0.0.1:30005}"
+
+readonly AGG_PROTOCOL_VERSION=1
+readonly AGG_ID_RE='^[a-z0-9_-]+$'
+readonly AGG_STATE_MAX_BYTES=65536
+
+# --- output helpers --------------------------------------------------------
+
+_emitted=0
+
+_emit_json() {
+	_emitted=1
+	printf '%s\n' "$1"
+}
+
+_emit_error() {
+	local code="$1" message="$2" body
+	if ! body="$(jq -nc \
+		--argjson pv "$AGG_PROTOCOL_VERSION" --arg c "$code" --arg m "$message" \
+		'{protocol_version:$pv, result:"error", error_code:$c, message:$m}')"; then
+		printf '{"protocol_version":%d,"result":"error","error_code":"%s","message":"jq emit failed"}\n' \
+			"$AGG_PROTOCOL_VERSION" "$code"
+		_emitted=1
+		return
+	fi
+	_emit_json "$body"
+}
+
+# Last-resort envelope if the script exits without having emitted anything
+# (e.g. an unexpected error under `set -e`). Keeps the JSON contract — callers
+# always get one parseable object — and normalizes the process exit to 3
+# (state_error) so an errexit-propagated 1/127 can't masquerade as some other
+# contract code.
+# shellcheck disable=SC2317  # invoked indirectly via `trap _on_exit EXIT`
+_on_exit() {
+	local rc=$?
+	if (( _emitted == 0 )); then
+		printf '{"protocol_version":%d,"result":"error","error_code":"state_error","message":"apl-aggregator: unexpected error (exit %d)"}\n' \
+			"$AGG_PROTOCOL_VERSION" "$rc"
+		exit 3
+	fi
+}
+trap _on_exit EXIT
+
+# --- probes ----------------------------------------------------------------
+
+# _decoder_reachable: does the local readsb BEAST endpoint accept a connection?
+# host/port are passed as positional args to a single-quoted inner script so a
+# malformed AGG_DECODER_ADDR can never inject into the root shell.
+_decoder_reachable() {
+	case "${AGG_DECODER_STATE:-}" in
+		up) return 0 ;;
+		down) return 1 ;;
+	esac
+	local host="${AGG_DECODER_ADDR%%:*}" port="${AGG_DECODER_ADDR##*:}"
+	[[ -n "$host" && "$port" =~ ^[0-9]+$ ]] || return 1
+	# $1/$2 are the inner bash's positional args (host/port), expanded at its
+	# runtime — deliberately single-quoted so the outer shell does not interpolate.
+	# shellcheck disable=SC2016
+	timeout 1 bash -c 'exec 3<>/dev/tcp/"$1"/"$2"' _ "$host" "$port" 2>/dev/null
+}
+
+# _service_state: the trimmed `systemctl is-active` word for a unit. is-active
+# exits non-zero for any non-active state, so the error is expected; the stdout
+# word is authoritative.
+_service_state() {
+	local unit="$1" out
+	out="$("$AGG_SYSTEMCTL" is-active "$unit" 2>/dev/null || true)"
+	out="${out//[$'\t\r\n ']/}"
+	if [[ -n "$out" ]]; then printf '%s' "$out"; else printf 'unknown'; fi
+}
+
+# _derive_state: availability + service state + persisted/install facts ->
+# reported lifecycle state. Mirrors the documented status enum.
+_derive_state() {
+	local available="$1" svc="$2" enabled="$3" installed="$4"
+	if [[ "$available" != "true" ]]; then printf 'unavailable'; return; fi
+	case "$svc" in
+		active) printf 'running'; return ;;
+		failed) printf 'failed'; return ;;
+	esac
+	if [[ "$enabled" == "true" || "$installed" == "true" ]]; then
+		printf 'stopped'
+	else
+		printf 'not_installed'
+	fi
+}
+
+# --- status ----------------------------------------------------------------
+
+# _adapter_json <desc_file> <decoder_json> -> one compact JSON status object.
+# Sourced descriptor vars are isolated in a subshell so adapters can't leak
+# into one another. Exits non-zero on a malformed descriptor (a code/ship bug);
+# the caller turns that into a loud state_error rather than silently dropping
+# the adapter.
+_adapter_json() {
+	local desc_file="$1" decoder_json="$2"
+	(
+		AGG_ID=""; AGG_DISPLAY_NAME=""; AGG_ACQUIRE_METHOD=""
+		AGG_SERVICE_UNIT=""; AGG_MLAT_CAPABLE="false"; AGG_MLAT_DEFAULT="false"
+		AGG_CLAIM_URL=""; AGG_SECRET_FIELDS=""; AGG_FIELDS_JSON="[]"
+		# shellcheck source=/dev/null
+		source "$desc_file"
+
+		# id must be syntactically valid AND match the filename (also dedups,
+		# since filenames are unique within a directory).
+		local base
+		base="$(basename "$desc_file" .desc)"
+		[[ "$AGG_ID" =~ $AGG_ID_RE && "$AGG_ID" == "$base" ]] || {
+			printf 'apl-aggregator: descriptor id %q != filename %q (%s)\n' "$AGG_ID" "$base" "$desc_file" >&2
+			exit 1
+		}
+		[[ -n "$AGG_DISPLAY_NAME" && -n "$AGG_ACQUIRE_METHOD" && -n "$AGG_SERVICE_UNIT" ]] || {
+			printf 'apl-aggregator: descriptor %s missing required field(s)\n' "$desc_file" >&2
+			exit 1
+		}
+		# AGG_FIELDS_JSON is spliced verbatim into output; it must be valid JSON.
+		jq -e . >/dev/null 2>&1 <<<"$AGG_FIELDS_JSON" || {
+			printf 'apl-aggregator: descriptor %s has invalid AGG_FIELDS_JSON\n' "$desc_file" >&2
+			exit 1
+		}
+
+		local available reason
+		if [[ "$AGG_ACQUIRE_METHOD" == "vendor-installer" ]]; then
+			available="true"; reason=""
+		else
+			available="false"; reason="not yet supported on this device"
+		fi
+
+		# State is JSON, parsed (never sourced) and size-capped. Strict typing:
+		# booleans must be literal true; a non-object document or non-object
+		# .fields degrades to "not configured" rather than failing the report
+		# (runtime data may be transiently corrupt — distinct from a descriptor
+		# bug, which fails loud above).
+		local raw='{}' enabled="false" mlat_enabled="false"
+		local state_path="$AGG_STATE_DIR/$AGG_ID.json"
+		if [[ -f "$state_path" ]]; then
+			local file_raw
+			file_raw="$(head -c "$AGG_STATE_MAX_BYTES" "$state_path" 2>/dev/null || true)"
+			if jq -e 'type == "object"' >/dev/null 2>&1 <<<"$file_raw"; then
+				raw="$file_raw"
+				enabled="$(jq -r '.enabled == true' <<<"$raw")"
+				mlat_enabled="$(jq -r '.mlat_enabled == true' <<<"$raw")"
+			fi
+		fi
+
+		local installed="false"
+		if [[ "$AGG_ACQUIRE_METHOD" == "vendor-installer" && -d "$AGG_INSTALL_ROOT/$AGG_ID" ]]; then
+			installed="true"
+		fi
+
+		local state
+		state="$(_derive_state "$available" "$(_service_state "$AGG_SERVICE_UNIT")" "$enabled" "$installed")"
+
+		# Secret-field presence is derived from state on jq STDIN — the secret
+		# VALUES never travel via argv (where /proc/<pid>/cmdline would expose
+		# them). Only the non-secret field NAMES go through --arg.
+		local secrets_present_json
+		secrets_present_json="$(jq -c --arg secrets "$AGG_SECRET_FIELDS" \
+			'((.fields // {}) | if type == "object" then . else {} end) as $f
+			 | ($secrets | split(" ") | map(select(length > 0)))
+			 | [ .[] | select( ($f[.] // "") != "" ) ]' <<<"$raw")"
+
+		local configured="false"
+		if [[ "$enabled" == "true" ]] || (( $(jq 'length' <<<"$secrets_present_json") > 0 )); then
+			configured="true"
+		fi
+
+		jq -nc \
+			--arg id "$AGG_ID" \
+			--arg name "$AGG_DISPLAY_NAME" \
+			--arg acquire "$AGG_ACQUIRE_METHOD" \
+			--arg unit "$AGG_SERVICE_UNIT" \
+			--arg state "$state" \
+			--argjson enabled "$enabled" \
+			--argjson configured "$configured" \
+			--argjson available "$available" \
+			--arg reason "$reason" \
+			--argjson mlat_capable "$AGG_MLAT_CAPABLE" \
+			--argjson mlat_default "$AGG_MLAT_DEFAULT" \
+			--argjson conf_mlat "$mlat_enabled" \
+			--argjson fields "$AGG_FIELDS_JSON" \
+			--argjson secrets_present "$secrets_present_json" \
+			--argjson decoder "$decoder_json" \
+			--arg claim "$AGG_CLAIM_URL" \
+			'{
+				id: $id, display_name: $name, acquire_method: $acquire, service_unit: $unit,
+				state: $state, enabled: $enabled, configured: $configured,
+				available: $available, unavailable_reason: $reason,
+				mlat_capable: $mlat_capable, mlat_default: $mlat_default,
+				configured_mlat_enabled: $conf_mlat, effective_mlat_enabled: $conf_mlat,
+				config_drift: false, fields: $fields, secret_fields_present: $secrets_present,
+				decoder_reachable: $decoder, claim_url: $claim
+			 }
+			 | (if .unavailable_reason == "" then del(.unavailable_reason) else . end)
+			 | (if .claim_url == "" then del(.claim_url) else . end)'
+	)
+}
+
+cmd_status() {
+	local decoder_json="false"
+	if _decoder_reachable; then decoder_json="true"; fi
+
+	local objs=() f obj
+	if [[ -d "$AGG_DESC_DIR" ]]; then
+		for f in "$AGG_DESC_DIR"/*.desc; do
+			[[ -e "$f" ]] || continue
+			if ! obj="$(_adapter_json "$f" "$decoder_json")"; then
+				# A malformed descriptor is a ship bug, not a runtime condition:
+				# fail loud instead of returning a partial/empty success.
+				_emit_error state_error "aggregator descriptor failed: $(basename "$f")"
+				exit 3
+			fi
+			objs+=("$obj")
+		done
+	fi
+
+	local body
+	if (( ${#objs[@]} == 0 )); then
+		body="$(jq -nc --argjson pv "$AGG_PROTOCOL_VERSION" '{protocol_version:$pv, aggregators:[]}')"
+	else
+		body="$(printf '%s\n' "${objs[@]}" | jq -sc \
+			--argjson pv "$AGG_PROTOCOL_VERSION" '{protocol_version:$pv, aggregators:.}')"
+	fi
+	_emit_json "$body"
+}
+
+# --- dispatch --------------------------------------------------------------
+
+main() {
+	command -v jq >/dev/null 2>&1 || { _emit_error state_error "jq is required"; exit 3; }
+
+	if [[ $# -ne 2 || "${2-}" != "--json" ]]; then
+		_emit_error usage_error "usage: apl-aggregator {status|list} --json"
+		exit 5
+	fi
+	case "$1" in
+		status|list) cmd_status; exit 0 ;;
+		*) _emit_error usage_error "unknown verb '$1'; use status|list --json"; exit 5 ;;
+	esac
+}
+
+main "$@"
