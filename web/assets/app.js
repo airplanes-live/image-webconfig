@@ -44,6 +44,7 @@
         "claim":     "airplanes-claim.service",
         "webconfig":      "airplanes-webconfig.service",
         "update-orchestrator":  "airplanes-update-orchestrator.service",
+        "fr24":      "airplanes-aggregator@fr24.service",
     };
     const UNIT_TO_LOG_SLUG = Object.fromEntries(
         Object.entries(LOG_SLUG_TO_UNIT).map(([s, u]) => [u, s])
@@ -84,6 +85,11 @@
     // Bootstrap-icons wifi glyph (16×16 viewBox).
     const WIFI_ICON =
         "M15.384 6.115a.485.485 0 0 0-.047-.736A12.44 12.44 0 0 0 8 3C5.259 3 2.723 3.882.663 5.379a.485.485 0 0 0-.048.736.518.518 0 0 0 .668.05A11.45 11.45 0 0 1 8 4c2.507 0 4.827.802 6.716 2.164.205.148.49.13.668-.049m-2.55 2.516a.482.482 0 0 0-.063-.745A8.46 8.46 0 0 0 8 7a8.46 8.46 0 0 0-4.77 1.886.482.482 0 0 0-.064.745.525.525 0 0 0 .654.065A7.46 7.46 0 0 1 8 8c1.71 0 3.29.578 4.18 1.696a.525.525 0 0 0 .654-.065zm-2.557 2.514a.483.483 0 0 0-.089-.745A4.47 4.47 0 0 0 8 10c-.83 0-1.605.247-2.188.4a.483.483 0 0 0-.089.745.525.525 0 0 0 .626.085A3.47 3.47 0 0 1 8 11c.488 0 .947.118 1.349.314a.525.525 0 0 0 .626-.085zM9.5 14.25a1.5 1.5 0 1 1-3 0 1.5 1.5 0 0 1 3 0z";
+
+    // Bootstrap-icons share-fill glyph — outbound data-sharing, distinct from
+    // the broadcast/reception geometry the readsb/mlat tiles use.
+    const AGGREGATOR_ICON =
+        "M11 2.5a2.5 2.5 0 1 1 .603 1.628l-6.718 3.12a2.5 2.5 0 0 1 0 1.504l6.718 3.12a2.5 2.5 0 1 1-.488.876l-6.718-3.12a2.5 2.5 0 1 1 0-3.256l6.718-3.12A2.5 2.5 0 0 1 11 2.5";
 
     // Bootstrap-icons clipboard glyph (two subpaths in one d string).
     const COPY_ICON =
@@ -1193,11 +1199,12 @@
         const tiles = {};
         const appTiles = {};
 
-        // Row 1: hardware + Wi-Fi. Two tiles on a 3-col grid; the
-        // third cell is intentionally empty at desktop width.
+        // Row 1: hardware + Wi-Fi + third-party aggregators (fills the
+        // previously-empty third cell on the 3-col grid).
         const hardware = buildHardwareTile();
         const wifi = buildWifiTile();
-        const row1 = el("div", { class: "wc-grid--tiles" }, hardware.root, wifi.root);
+        const aggregators = buildAggregatorTile();
+        const row1 = el("div", { class: "wc-grid--tiles" }, hardware.root, wifi.root, aggregators.root);
 
         // Row 2: 1090 stack (readsb → feed → mlat).
         // Row 3: 978 UAT stack (dump978 + airplanes-978).
@@ -1219,7 +1226,7 @@
         }
 
         const root = el("div", { class: "wc-tiles-stack" }, row1, row2, row3, apps);
-        return { root, tiles, appTiles, hardware, wifi };
+        return { root, tiles, appTiles, hardware, wifi, aggregators };
     }
 
     function buildAppTile(app) {
@@ -3540,6 +3547,438 @@
 
     // ===== Dashboard =====
 
+    // ===== Third-party aggregators =====
+
+    // Vendor data-sharing links come from the (code-owned) adapter descriptor,
+    // but we still allowlist the host — only an https link to the vendor's own
+    // domain renders, never arbitrary JSON. FR24 is the only vendor today.
+    const AGGREGATOR_CLAIM_HOSTS = ["flightradar24.com"];
+    function vendorClaimHref(url) {
+        try {
+            const u = new URL(url);
+            if (u.protocol !== "https:") return null;
+            const host = u.hostname;
+            const ok = AGGREGATOR_CLAIM_HOSTS.some(h => host === h || host.endsWith("." + h));
+            return ok ? u.toString() : null;
+        } catch (_) { return null; }
+    }
+
+    // Advisory client-side validators — fast inline feedback only. apl-aggregator
+    // re-validates everything and is the authority; these mirror its rules so the
+    // form can disable submit and hint before the round-trip.
+    const aggEmailRE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+    function isValidAggEmail(v) { return aggEmailRE.test(String(v == null ? "" : v).trim()); }
+    const fr24KeyRE = /^[A-Za-z0-9]{6,40}$/;
+    function isValidFr24Key(v) { return fr24KeyRE.test(String(v == null ? "" : v).trim()); }
+
+    // AGG_STATE_BADGE maps an adapter `state` to [label, severity-suffix].
+    const AGG_STATE_BADGE = {
+        running:             ["Feeding",            "ok"],
+        installing:          ["Installing…",        "warn"],
+        stopped:             ["Off",                "na"],
+        not_installed:       ["Not set up",         "na"],
+        failed:              ["Setup failed",       "err"],
+        decoder_unavailable: ["Decoder not ready",  "warn"],
+        network_unavailable: ["Network unavailable", "warn"],
+        unavailable:         ["Unavailable",        "na"],
+    };
+    function aggStateBadge(state) {
+        const pair = AGG_STATE_BADGE[state] || [state || "—", "na"];
+        return el("span", { class: "wc-agg-badge wc-agg-badge--" + pair[1] }, pair[0]);
+    }
+
+    // classifyAggregators projects /api/aggregators into a single dashboard-tile
+    // {dot, meta}. installing/failed take precedence; otherwise it summarises
+    // which adapters are feeding.
+    function classifyAggregators(payload) {
+        const adapters = (payload && payload.aggregators) || [];
+        if (!adapters.length) return { dot: "na", meta: "—" };
+        if (adapters.some(a => a.state === "installing")) return { dot: "warn", meta: "installing…" };
+        if (adapters.some(a => a.state === "failed")) return { dot: "err", meta: "setup failed" };
+        const feeding = adapters.filter(a => a.enabled).map(a => a.display_name || a.id);
+        if (feeding.length) return { dot: "ok", meta: feeding.join(", ") };
+        return { dot: "na", meta: "off" };
+    }
+
+    function buildAggregatorTile() {
+        const iconNode = el("span", { class: "wc-tile__icon" }, svgIcon(AGGREGATOR_ICON));
+        const titleEl  = el("span", { class: "wc-tile__title" }, "Aggregators");
+        const metaEl   = el("span", { class: "wc-tile__meta" }, "—");
+        const dotEl    = el("span", { class: "wc-tile__dot wc-tile__dot--na" });
+        const chev     = el("span", { class: "wc-tile__chev", "aria-hidden": "true" }, "›");
+        const root = el("button", {
+            type: "button",
+            class: "wc-tile wc-tile--nav",
+            "data-state": "unknown",
+            onclick: () => navigate(aggregatorsPanel, { title: "Third-party aggregators", showBack: true }),
+        },
+            iconNode,
+            el("span", { class: "wc-tile__body" }, titleEl, metaEl),
+            chev,
+            dotEl,
+        );
+        return { root, titleEl, metaEl, dotEl };
+    }
+
+    function updateAggregatorTile(tile, resp) {
+        if (!tile) return;
+        const c = (resp && resp.ok) ? classifyAggregators(resp.payload) : { dot: "na", meta: "—" };
+        tile.dotEl.className = "wc-tile__dot wc-tile__dot--" + c.dot;
+        tile.metaEl.textContent = c.meta;
+        tile.root.title = c.meta || "";
+        tile.root.setAttribute("data-state", c.dot);
+    }
+
+    // CAVEAT preamble. Org-voice wording is the project owner's call — this is a
+    // clear, accurate placeholder, not final copy. TODO: finalize wording.
+    const AGG_CAVEAT_TEXT =
+        "airplanes.live shares all aircraft data openly. Other networks may filter or hide " +
+        "aircraft and can restrict how your data is used. Feeding a third-party network is " +
+        "optional: it sends your receiver's data to that provider under their own terms, and " +
+        "does not change what you feed to airplanes.live.";
+
+    async function aggregatorsPanel() {
+        render(el("div", { class: "wc-card" }, el("p", { class: "muted" }, "loading aggregators…")));
+        const resp = await getJSON("/api/aggregators");
+        if (handleAuthFailure(resp)) return;
+        const pf = consumePendingFlash();
+        if (!resp.ok) {
+            render(el("section", { class: "wc-card" },
+                el("h2", {}, "Third-party aggregators"),
+                pf && pf.text ? el("div", { class: "wc-flash wc-flash--" + (pf.level || "ok") }, pf.text) : null,
+                el("p", { class: "error", role: "alert" }, "Could not load aggregators."),
+                el("button", { type: "button", class: "wc-btn-primary", onclick: () => aggregatorsPanel() }, "Retry"),
+            ));
+            return;
+        }
+        const adapters = (resp.payload && resp.payload.aggregators) || [];
+
+        const flashEl = el("div", {});
+        if (pf && pf.text) flashEl.appendChild(el("div", { class: "wc-flash wc-flash--" + (pf.level || "ok") }, pf.text));
+
+        const list = el("div", { class: "wc-agg-list" });
+        if (!adapters.length) {
+            list.appendChild(el("p", { class: "muted" }, "No third-party aggregators are available on this image."));
+        }
+        for (const a of adapters) list.appendChild(buildAggregatorRow(a));
+
+        render(el("section", { class: "wc-card" },
+            el("h2", {}, "Third-party aggregators"),
+            el("p", { class: "wc-agg-caveat" }, AGG_CAVEAT_TEXT),
+            flashEl,
+            list,
+            buildAggregatorBackupCard(),
+        ));
+    }
+
+    function buildAggregatorRow(a) {
+        const manageable = a.id === "fr24"; // only adapter with a bespoke panel today
+        const actions = el("div", { class: "wc-agg-row__actions" });
+        // A configured/enabled adapter stays manageable even if it later reports
+        // unavailable, so Disable/Remove are never stranded.
+        if (manageable && (a.available || a.enabled || a.configured)) {
+            actions.appendChild(el("button", {
+                type: "button", class: "wc-btn-ghost",
+                onclick: () => navigate(() => fr24Panel(), { title: a.display_name || "Flightradar24", showBack: true }),
+            }, a.enabled || a.configured ? "Manage" : "Set up"));
+        }
+        const reason = (!a.available && a.unavailable_reason)
+            ? el("p", { class: "muted wc-agg-row__reason" }, a.unavailable_reason) : null;
+        return el("div", { class: "wc-agg-row" },
+            el("div", { class: "wc-agg-row__head" },
+                el("span", { class: "wc-agg-row__name" }, a.display_name || a.id),
+                aggStateBadge(a.state),
+            ),
+            reason,
+            actions.childNodes.length ? actions : null,
+        );
+    }
+
+    function buildAggregatorBackupCard() {
+        const msg = el("div", {});
+        const setMsg = (text, kind) => msg.replaceChildren(text ? el("div", { class: "wc-flash wc-flash--" + (kind || "ok") }, text) : el("span"));
+
+        const exportBtn = el("button", { type: "button", class: "wc-btn-ghost" }, "Download backup");
+        exportBtn.onclick = async () => {
+            setMsg("");
+            const r = await postJSON("/api/aggregators/export", {});
+            if (handleAuthFailure(r)) return;
+            if (!r.ok) { setMsg((r.payload && (r.payload.message || r.payload.error)) || "Backup failed.", "warn"); return; }
+            try {
+                const blob = new Blob([JSON.stringify(r.payload, null, 2)], { type: "application/json" });
+                const url = URL.createObjectURL(blob);
+                const a = el("a", { href: url, download: "airplanes-aggregators-backup.json" });
+                document.body.appendChild(a); a.click(); a.remove();
+                setTimeout(() => URL.revokeObjectURL(url), 1000);
+                setMsg("Backup downloaded — keep it private.", "ok");
+            } catch (_) { setMsg("Could not start the download.", "warn"); }
+        };
+
+        const fileInput = el("input", { type: "file", accept: "application/json,.json", hidden: true });
+        const importBtn = el("button", { type: "button", class: "wc-btn-ghost" }, "Restore from backup");
+        importBtn.onclick = () => fileInput.click();
+        fileInput.onchange = async () => {
+            const file = fileInput.files && fileInput.files[0];
+            fileInput.value = "";
+            if (!file) return;
+            // Guard before reading/parsing so a huge file can't freeze the
+            // browser (the server caps the import body at 64 KiB anyway).
+            if (file.size > 65536) { setMsg("That backup file is too large to be a valid aggregator backup.", "warn"); return; }
+            setMsg("Restoring…");
+            let parsed;
+            try { parsed = JSON.parse(await file.text()); }
+            catch (_) { setMsg("That file isn't a valid backup.", "warn"); return; }
+            const r = await postJSON("/api/aggregators/import", parsed);
+            if (handleAuthFailure(r)) return;
+            if (!r.ok) {
+                setMsg((r.payload && (r.payload.message || r.payload.error)) ||
+                    "Restore failed. Stop an enabled adapter before restoring.", "warn");
+                return;
+            }
+            pendingFlash = { text: "Identities restored. Set up an adapter to start feeding.", level: "ok" };
+            await aggregatorsPanel();
+        };
+
+        return el("section", { class: "wc-card wc-agg-backup" },
+            el("h3", {}, "Back up & restore"),
+            el("p", { class: "muted" },
+                "Download your aggregator sign-in details (including sharing keys) so you can restore them after a reflash. The file is sensitive — keep it private."),
+            el("div", { class: "wc-agg-row__actions" }, exportBtn, importBtn, fileInput),
+            msg,
+        );
+    }
+
+    // aggEnableErrorMessage turns a failed enable/disable/reset response (or a
+    // failed progress overlay) into operator-facing guidance.
+    function aggEnableErrorMessage(r) {
+        const p = (r && r.payload) || {};
+        const code = p.error_code || "";
+        if (code === "decoder_unavailable") return "The local decoder isn't ready yet. Make sure the receiver is running, then try again.";
+        if (code === "lock_timeout") return "Another aggregator operation is in progress. Try again in a moment.";
+        if (code === "rejected" && /lat|lon|alt|latitude|longitude|altitude|location/i.test(p.message || "")) {
+            return "Set your feeder location on the dashboard before setting up an aggregator.";
+        }
+        if (code === "acquire_failed") return "Could not download the Flightradar24 feeder. Check the feeder's internet connection and try again.";
+        if (code === "signup_failed") return "Flightradar24 sign-up didn't return a sharing key. Try again, or paste an existing key.";
+        return p.message || p.error || "Operation failed.";
+    }
+
+    async function fr24Panel() {
+        render(el("div", { class: "wc-card" }, el("p", { class: "muted" }, "loading…")));
+        const resp = await getJSON("/api/aggregators");
+        if (handleAuthFailure(resp)) return;
+        if (!resp.ok) {
+            render(el("section", { class: "wc-card" }, el("h2", {}, "Flightradar24"),
+                el("p", { class: "error", role: "alert" }, "Could not load status."),
+                el("button", { type: "button", class: "wc-btn-primary", onclick: () => fr24Panel() }, "Retry")));
+            return;
+        }
+        const a = ((resp.payload && resp.payload.aggregators) || []).find(x => x.id === "fr24");
+        if (!a) {
+            render(el("section", { class: "wc-card" }, el("h2", {}, "Flightradar24"),
+                el("p", { class: "muted" }, "Flightradar24 is not available on this image.")));
+            return;
+        }
+        // If an enable is already in flight, jump straight to the progress view.
+        if (a.state === "installing" && a.enable && a.enable.request_id) {
+            return aggregatorEnableProgress("fr24", a.enable.request_id);
+        }
+        renderFr24Form(a);
+    }
+
+    function renderFr24Form(a) {
+        const configured = !!(a.configured || a.enabled);
+        const claimUrl = vendorClaimHref(a.claim_url);
+
+        const inlineErr = el("p", { class: "error", role: "alert" });
+        const email = el("input", { type: "email", autocomplete: "email",
+            placeholder: configured ? "(leave blank to keep current)" : "you@example.com" });
+        const key = el("input", { type: "text", autocomplete: "off", spellcheck: "false",
+            placeholder: configured ? "(leave blank to keep current)" : "optional — paste an existing sharing key" });
+        const emailErr = el("p", { class: "field-help wc-field-error", hidden: true, role: "alert" }, "Enter a valid email address.");
+        const keyErr = el("p", { class: "field-help wc-field-error", hidden: true, role: "alert" }, "Sharing keys are 6–40 letters and digits.");
+
+        const submitLabel = a.enabled ? "Replace identity" : (configured ? "Re-run setup" : "Set up Flightradar24");
+        const submit = el("button", { type: "submit", class: "wc-btn-primary" }, submitLabel);
+
+        const recheck = () => {
+            let bad = false;
+            if (email.value.trim() && !isValidAggEmail(email.value)) bad = true;
+            if (!configured && !email.value.trim()) bad = true; // first-time setup needs an email
+            if (key.value.trim() && !isValidFr24Key(key.value)) bad = true;
+            submit.disabled = bad;
+        };
+        email.addEventListener("input", () => { refreshFieldError(email, emailErr, v => v.trim() !== "" && !isValidAggEmail(v)); recheck(); });
+        key.addEventListener("input", () => { refreshFieldError(key, keyErr, v => v.trim() !== "" && !isValidFr24Key(v)); recheck(); });
+
+        const form = el("form", { class: "wc-agg-form", novalidate: true,
+            onsubmit: async (e) => {
+                e.preventDefault();
+                inlineErr.textContent = "";
+                const fields = {};
+                const ev = email.value.trim(), kv = key.value.trim();
+                if (ev) fields.email = ev;            // omit when blank → helper keeps stored email
+                if (kv) fields.sharing_key = kv;       // omit when blank → keeps stored key / signs up
+                if (!configured && !fields.email) { inlineErr.textContent = "An email address is required to set up Flightradar24."; return; }
+                if (fields.email && !isValidAggEmail(fields.email)) { inlineErr.textContent = "Enter a valid email address."; return; }
+                if (fields.sharing_key && !isValidFr24Key(fields.sharing_key)) { inlineErr.textContent = "Sharing keys are 6–40 letters and digits."; return; }
+                submit.disabled = true; submit.textContent = "Submitting…";
+                const r = await postJSON("/api/aggregators/fr24/enable", { fields });
+                if (handleAuthFailure(r)) return;
+                if (r.status === 202) {
+                    navigate(() => aggregatorEnableProgress("fr24", r.payload && r.payload.request_id),
+                        { title: "Setting up Flightradar24", showBack: true });
+                    return;
+                }
+                submit.disabled = false; submit.textContent = submitLabel;
+                inlineErr.textContent = aggEnableErrorMessage(r);
+            },
+        },
+            el("h3", {}, "Sign-in details"),
+            el("div", { class: "field" }, el("label", {}, "Email address"), email, emailErr),
+            el("div", { class: "field" }, el("label", {}, "Sharing key (optional)"), key, keyErr,
+                el("p", { class: "field-help" }, "Leave blank to create a new Flightradar24 sharing key from your email. Paste an existing key to reuse a Flightradar24 account.")),
+            inlineErr,
+            el("div", { class: "wc-agg-row__actions" }, submit),
+        );
+        recheck();
+
+        const actions = el("div", { class: "wc-agg-row__actions" });
+        if (a.enabled) {
+            const disableBtn = el("button", { type: "button", class: "wc-btn-ghost" }, "Stop feeding");
+            disableBtn.onclick = async () => {
+                disableBtn.disabled = true;
+                const r = await postJSON("/api/aggregators/fr24/disable", {});
+                if (handleAuthFailure(r)) return;
+                if (!r.ok) { disableBtn.disabled = false; inlineErr.textContent = aggEnableErrorMessage(r); return; }
+                pendingFlash = { text: "Stopped feeding Flightradar24.", level: "ok" };
+                navigate(aggregatorsPanel, { title: "Third-party aggregators", showBack: true });
+            };
+            actions.appendChild(disableBtn);
+        }
+        if (configured) {
+            const resetBtn = el("button", { type: "button", class: "wc-btn-danger" }, "Remove");
+            resetBtn.onclick = async () => {
+                if (!confirm("Remove Flightradar24? This stops feeding and deletes the installed feeder and its stored sharing key.")) return;
+                resetBtn.disabled = true;
+                const r = await postJSON("/api/aggregators/fr24/reset", {});
+                if (handleAuthFailure(r)) return;
+                if (!r.ok) { resetBtn.disabled = false; inlineErr.textContent = aggEnableErrorMessage(r); return; }
+                pendingFlash = { text: "Removed Flightradar24.", level: "ok" };
+                navigate(aggregatorsPanel, { title: "Third-party aggregators", showBack: true });
+            };
+            actions.appendChild(resetBtn);
+        }
+
+        const links = el("p", { class: "wc-agg-links" });
+        if (claimUrl) links.appendChild(el("a", { href: claimUrl, target: "_blank", rel: "noopener noreferrer" }, "Flightradar24 data-sharing page"));
+        if (a.enabled || a.state === "running" || configured) {
+            if (links.childNodes.length) links.appendChild(el("span", { class: "muted" }, " · "));
+            links.appendChild(el("a", { href: "#", role: "button",
+                onclick: (e) => { e.preventDefault(); navigate(() => logViewer("fr24"), { title: "Logs · fr24", showBack: true }); } }, "View logs"));
+        }
+
+        render(el("section", { class: "wc-card" },
+            el("h2", { class: "wc-card-head" }, el("span", {}, "Flightradar24"), aggStateBadge(a.state)),
+            el("p", { class: "muted" }, a.enabled
+                ? "Feeding Flightradar24 alongside airplanes.live."
+                : "Feed Flightradar24 alongside airplanes.live. Your feeder location is used automatically."),
+            form,
+            actions.childNodes.length ? actions : null,
+            links.childNodes.length ? links : null,
+        ));
+    }
+
+    const AGG_ENABLE_POLL_MS = 2000;
+    const AGG_ENABLE_GRACE_POLLS = 5;
+    // aggregatorEnableProgress polls /api/aggregators after a 202 and shows the
+    // detached worker's progress. It matches the worker's request_id against the
+    // one the 202 returned, so a stale overlay from a prior failed run can't make
+    // this run look failed. Mirrors orchestratorProgress's lifecycle teardown.
+    function aggregatorEnableProgress(id, requestId) {
+        const stepEl = el("p", { class: "muted" }, "Starting…");
+        const errEl = el("div", { class: "wc-flash wc-flash--warn", role: "alert" });
+        errEl.hidden = true;
+        const actions = el("div", { class: "wc-agg-row__actions" });
+        render(el("section", { class: "wc-card" },
+            el("h2", {}, "Setting up Flightradar24"),
+            el("p", { class: "muted" }, "Downloading and configuring the Flightradar24 feeder. This can take a minute — you can leave this page; it keeps running."),
+            stepEl, errEl, actions,
+        ));
+
+        let cancelled = false, sawMine = false, stale = 0, pollTimer = null;
+        const localCtrl = new AbortController();
+        const prevAbort = activeAbort;
+        activeAbort = { abort: () => {
+            cancelled = true;
+            if (pollTimer) { clearTimeout(pollTimer); pollTimer = null; }
+            try { localCtrl.abort(); } catch (_) {}
+            if (prevAbort && typeof prevAbort.abort === "function") prevAbort.abort();
+        }};
+
+        const finishOk = () => {
+            pollTimer = null;
+            pendingFlash = { text: "Flightradar24 is now feeding.", level: "ok" };
+            navigate(aggregatorsPanel, { title: "Third-party aggregators", showBack: true });
+        };
+        const finishFail = (msg) => {
+            pollTimer = null;
+            stepEl.textContent = "Setup failed.";
+            errEl.textContent = msg || "Flightradar24 setup failed.";
+            errEl.hidden = false;
+            actions.replaceChildren(el("button", { type: "button", class: "wc-btn-primary",
+                onclick: () => navigate(() => fr24Panel(), { title: "Flightradar24", showBack: true }) }, "Back to setup"));
+        };
+
+        async function pollOnce() {
+            if (cancelled) return;
+            let r;
+            try {
+                const resp = await fetch("/api/aggregators", { method: "GET", credentials: "same-origin", headers: { Accept: "application/json" }, signal: localCtrl.signal });
+                let payload = null; try { payload = await resp.json(); } catch (_) {}
+                r = { ok: resp.ok, status: resp.status, payload: payload || {} };
+            } catch (e) {
+                if (cancelled) return;
+                pollTimer = setTimeout(pollOnce, AGG_ENABLE_POLL_MS);
+                return;
+            }
+            if (cancelled) return;
+            if (handleAuthFailure(r)) return;
+            const a = ((r.payload && r.payload.aggregators) || []).find(x => x.id === id);
+            const ov = a && a.enable;
+            const mine = !!(ov && ov.request_id === requestId);
+            if (mine && ov.status === "done") return finishOk();
+            if (mine && ov.status === "failed") return finishFail(aggEnableErrorMessage({ payload: ov }));
+            if (mine && (ov.status === "running" || ov.status === "starting")) {
+                sawMine = true;
+                stepEl.textContent = "Working… (" + (ov.step || "starting") + ")";
+                pollTimer = setTimeout(pollOnce, AGG_ENABLE_POLL_MS);
+                return;
+            }
+            // No overlay for OUR run yet (launch latency) or a prior run's
+            // overlay. Keep showing "Starting…" within the grace window.
+            if (!sawMine && stale < AGG_ENABLE_GRACE_POLLS) {
+                stale += 1;
+                stepEl.textContent = "Starting…";
+                pollTimer = setTimeout(pollOnce, AGG_ENABLE_POLL_MS);
+                return;
+            }
+            // We never matched THIS request's overlay (it was superseded, cleared,
+            // or never appeared). Do NOT infer success/failure from the adapter's
+            // unscoped state — for a re-enable of an already-running adapter that
+            // would be wrong. Stop and send the user to the panel, where the
+            // reconciled status is authoritative.
+            pollTimer = null;
+            stepEl.textContent = "Still working — this is taking longer than expected.";
+            errEl.hidden = true;
+            actions.replaceChildren(el("button", {
+                type: "button", class: "wc-btn-primary",
+                onclick: () => navigate(aggregatorsPanel, { title: "Third-party aggregators", showBack: true }),
+            }, "Check status"));
+        }
+        pollOnce();
+    }
+
     async function dashboard() {
         const heroEl = buildHero();
         const tileGrid = buildTileGrid();
@@ -3603,13 +4042,15 @@
         lastMsgRate = null;
 
         // Initial fetch.
-        const [identity, status, config] = await Promise.all([
+        const [identity, status, config, aggregators] = await Promise.all([
             getJSON("/api/identity"),
             getJSON("/api/status"),
             getJSON("/api/config"),
+            getJSON("/api/aggregators"),
         ]);
         if (ctx !== dashboardCtx) return;
         if (handleAuthFailure(identity) || handleAuthFailure(status) || handleAuthFailure(config)) return;
+        updateAggregatorTile(tileGrid.aggregators, aggregators);
 
         const cfgValues = normaliseSavedValues((config && config.payload && config.payload.values) || {});
         ctx.configValues = cfgValues;
@@ -3661,9 +4102,10 @@
 
         pollInFlight = true;
         try {
-            const [identity, status] = await Promise.all([
+            const [identity, status, aggregators] = await Promise.all([
                 getJSON("/api/identity"),
                 getJSON("/api/status"),
+                getJSON("/api/aggregators"),
             ]);
             if (ctx !== dashboardCtx) return;
             if (handleAuthFailure(identity) || handleAuthFailure(status)) return;
@@ -3672,6 +4114,7 @@
             updateMsgRateFromStatus(status);
             updateHero(ctx.heroEl, status, ctx.configValues);
             updateTiles(ctx.tileGrid, status, ctx.configValues);
+            updateAggregatorTile(ctx.tileGrid.aggregators, aggregators);
             updateAppTiles(ctx.tileGrid);
             updateRebootBanner(ctx.rebootBanner, !!(status && status.payload && status.payload.reboot_required));
 

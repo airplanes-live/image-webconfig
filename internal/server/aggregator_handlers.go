@@ -3,10 +3,13 @@ package server
 import (
 	"bytes"
 	"context"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -167,7 +170,7 @@ func (s *Server) handleAggregatorImport(w http.ResponseWriter, r *http.Request) 
 // concurrent caller. The detached enable worker holds that flock for the whole
 // (minutes-long) vendor acquire, so a mutation issued mid-enable gets a prompt
 // lock_timeout rather than blocking an HTTP worker.
-func (s *Server) aggregatorMutate(w http.ResponseWriter, r *http.Request, argv []string, timeout time.Duration, readBody bool) {
+func (s *Server) aggregatorMutate(w http.ResponseWriter, r *http.Request, argv []string, timeout time.Duration, readBody, injectGeo bool) {
 	id := r.PathValue("id")
 	if !aggregator.ValidID(id) {
 		writeJSONError(w, http.StatusBadRequest, "invalid aggregator id")
@@ -187,6 +190,13 @@ func (s *Server) aggregatorMutate(w http.ResponseWriter, r *http.Request, argv [
 		writeJSONError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	if injectGeo {
+		body, err = s.injectFeedEnvGeo(body)
+		if err != nil {
+			writeJSONError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+	}
 	resp, httpStatus, ierr := s.invokeAggregator(r.Context(), argv, body, timeout)
 	if ierr != nil {
 		log.Printf("aggregator %q: %v", id, ierr)
@@ -196,18 +206,49 @@ func (s *Server) aggregatorMutate(w http.ResponseWriter, r *http.Request, argv [
 	s.writeAggregatorResponse(w, resp, httpStatus)
 }
 
+// injectFeedEnvGeo overwrites the lat/lon/alt in an enable payload with the
+// feeder's authoritative location from feed.env (LATITUDE/LONGITUDE/ALTITUDE),
+// so the user never re-types coordinates per aggregator and a client cannot
+// supply its own. A value that is absent or non-numeric is dropped rather than
+// forwarded — the helper's geo validation then rejects with guidance instead
+// of acting on a bad coordinate. ALTITUDE in feed.env is already bare metres.
+func (s *Server) injectFeedEnvGeo(body []byte) ([]byte, error) {
+	m := map[string]json.RawMessage{}
+	if err := json.Unmarshal(body, &m); err != nil || m == nil {
+		return nil, errors.New("request body must be a JSON object")
+	}
+	var values map[string]string
+	if s.feedEnv != nil {
+		values, _ = s.feedEnv.ReadAll() // absent/unreadable → inject nothing, helper rejects on missing geo
+	}
+	for envKey, field := range map[string]string{"LATITUDE": "lat", "LONGITUDE": "lon", "ALTITUDE": "alt"} {
+		if raw, ok := values[envKey]; ok {
+			if f, perr := strconv.ParseFloat(strings.TrimSpace(raw), 64); perr == nil {
+				// json.Marshal rejects NaN/Inf — let those fall through to the
+				// delete below rather than emitting a null coordinate.
+				if jb, merr := json.Marshal(f); merr == nil {
+					m[field] = jb
+					continue
+				}
+			}
+		}
+		delete(m, field) // never forward a client-supplied or malformed coordinate
+	}
+	return json.Marshal(m)
+}
+
 func (s *Server) handleAggregatorEnable(w http.ResponseWriter, r *http.Request) {
-	s.aggregatorMutate(w, r, s.priv.AggregatorEnable, aggregatorHelperTimeout, true)
+	s.aggregatorMutate(w, r, s.priv.AggregatorEnable, aggregatorHelperTimeout, true, true)
 }
 
 func (s *Server) handleAggregatorDisable(w http.ResponseWriter, r *http.Request) {
-	s.aggregatorMutate(w, r, s.priv.AggregatorDisable, aggregatorHelperTimeout, false)
+	s.aggregatorMutate(w, r, s.priv.AggregatorDisable, aggregatorHelperTimeout, false, false)
 }
 
 func (s *Server) handleAggregatorSet(w http.ResponseWriter, r *http.Request) {
-	s.aggregatorMutate(w, r, s.priv.AggregatorSet, aggregatorHelperTimeout, true)
+	s.aggregatorMutate(w, r, s.priv.AggregatorSet, aggregatorHelperTimeout, true, false)
 }
 
 func (s *Server) handleAggregatorReset(w http.ResponseWriter, r *http.Request) {
-	s.aggregatorMutate(w, r, s.priv.AggregatorReset, aggregatorHelperTimeout, false)
+	s.aggregatorMutate(w, r, s.priv.AggregatorReset, aggregatorHelperTimeout, false, false)
 }
