@@ -17,8 +17,10 @@
 # aggregators:[...]}. Mutating verbs (enable, set, disable, reset) read a JSON
 # request object on stdin and emit {protocol_version, result:"ok", id} on
 # success. enable additionally takes {lat, lon, alt, fields:{…}} and, for a
-# vendor-installer adapter, fetches the pinned vendor binary on demand.
-# (export / import land in a follow-up.)
+# vendor-installer adapter, fetches the pinned vendor binary on demand. export
+# emits a backup blob with identities (incl. secret values — the one verb that
+# does); import seeds identities from such a blob (enabled=false; refuses an
+# enabled adapter).
 #
 # Adapter descriptors are trusted, code-owned data sourced from AGG_DESC_DIR —
 # never loaded from /etc, never user-editable. Adapter ids are validated
@@ -549,9 +551,17 @@ _fr24_signup() {
 }
 
 _enable_fr24() {
-	local email key lat lon alt
-	email="$(jq -r '.fields.email // ""' <<<"$REQ_JSON")"
-	key="$(jq -r '.fields.sharing_key // ""' <<<"$REQ_JSON")"
+	local email key lat lon alt fields cur
+	# Existing state fields (e.g. seeded by `import`) are the base; request
+	# fields override. This lets a restored key/email be reused without
+	# re-entry. Both inputs go via jq stdin so secrets never touch argv. A
+	# present-but-corrupt state fails loud rather than being silently dropped.
+	cur="$(_load_state "fr24" 2>/dev/null)" \
+		|| { _emit_error state_error "existing fr24 state is unreadable; reset to clear"; exit 3; }
+	fields="$(printf '%s\n%s\n' "$cur" "$REQ_JSON" \
+		| jq -cn 'input as $cur | input as $req | (($cur.fields // {}) + ($req.fields // {}))')"
+	email="$(jq -r '.email // ""' <<<"$fields")"
+	key="$(jq -r '.sharing_key // ""' <<<"$fields")"
 	lat="$(jq -r 'if has("lat") then .lat else "" end' <<<"$REQ_JSON")"
 	lon="$(jq -r 'if has("lon") then .lon else "" end' <<<"$REQ_JSON")"
 	alt="$(jq -r 'if has("alt") then .alt else "" end' <<<"$REQ_JSON")"
@@ -621,13 +631,112 @@ cmd_enable() {
 	esac
 }
 
+# --- backup / restore ------------------------------------------------------
+
+# cmd_export emits a backup blob with the recoverable identities (INCLUDING
+# secret values) of every adapter that has state. This is the one verb that
+# returns secrets — an explicit, session-authenticated backup. jq reads the
+# state files directly, so secrets never enter a bash variable or jq argv.
+cmd_export() {
+	_acquire_lock
+	local ids=() files=() f id
+	if [[ -d "$AGG_DESC_DIR" ]]; then
+		for f in "$AGG_DESC_DIR"/*.desc; do
+			[[ -e "$f" ]] || continue
+			id="$(basename "$f" .desc)"
+			[[ "$id" =~ $AGG_ID_RE && -f "$AGG_STATE_DIR/$id.json" ]] || continue
+			# Skip a corrupt/empty/multi-doc state file: only single valid
+			# objects are included, keeping the `[inputs]`/ids[] arrays aligned.
+			_load_state "$id" >/dev/null 2>&1 || continue
+			ids+=("$id"); files+=("$AGG_STATE_DIR/$id.json")
+		done
+	fi
+	local body
+	if (( ${#ids[@]} == 0 )); then
+		body="$(jq -nc --argjson pv "$AGG_PROTOCOL_VERSION" --argjson sv "$AGG_STATE_SCHEMA_VERSION" \
+			'{protocol_version:$pv, result:"ok", kind:"aggregator-backup", schema_version:$sv, aggregators:{}}')" \
+			|| { _emit_error state_error "export failed"; exit 3; }
+	else
+		local ids_json
+		ids_json="$(jq -nc --args '$ARGS.positional' "${ids[@]}")"
+		body="$(jq -n --argjson pv "$AGG_PROTOCOL_VERSION" --argjson sv "$AGG_STATE_SCHEMA_VERSION" --argjson ids "$ids_json" \
+			'[inputs] as $st
+			 | {protocol_version:$pv, result:"ok", kind:"aggregator-backup", schema_version:$sv,
+			    aggregators: (reduce range(0; ($ids|length)) as $i ({};
+			      . + {($ids[$i]): {mlat_enabled: ($st[$i].mlat_enabled // false), fields: ($st[$i].fields // {})}}))}' \
+			"${files[@]}")" \
+			|| { _emit_error state_error "export failed"; exit 3; }
+	fi
+	_emit_json "$body"
+}
+
+# cmd_import restores identities from a backup blob on stdin. It validates the
+# whole blob first (all-or-nothing), refuses to overwrite an ENABLED adapter
+# (avoid state/vendor-config split-brain), then seeds each adapter's state with
+# enabled=false — a later enable reuses the restored identity. Secrets stay on
+# jq stdin throughout.
+cmd_import() {
+	_read_request
+	# Thorough structural validation up front: kind/schema, every adapter key
+	# is a syntactically valid id (so the mapfile split below is safe), every
+	# value is an object with object fields, boolean mlat, string key, and the
+	# fr24 sharing key (if present) matches the key alphabet.
+	jq -e --argjson sv "$AGG_STATE_SCHEMA_VERSION" '
+		(.kind == "aggregator-backup")
+		and ((.schema_version // 0) <= $sv)
+		and (.aggregators | type == "object")
+		and (.aggregators | keys | all(test("^[a-z0-9][a-z0-9_-]*$")))
+		and (.aggregators | to_entries | all(.value as $a
+			| ($a | type == "object")
+			and (($a.fields // {}) | type == "object")
+			and (($a.mlat_enabled // false) | type == "boolean")
+			and (($a.fields.sharing_key // "") | type == "string")))
+		and ((.aggregators.fr24.fields.sharing_key // "")
+			| (. == "" or test("^[A-Za-z0-9]{6,40}$")))
+	' >/dev/null 2>&1 <<<"$REQ_JSON" \
+		|| { _emit_error parse_error "not a valid aggregator backup"; exit 5; }
+
+	local ids id
+	mapfile -t ids < <(jq -r '.aggregators | keys[]' <<<"$REQ_JSON")
+	(( ${#ids[@]} > 0 )) || { _emit_error rejected "backup contains no aggregators"; exit 2; }
+
+	_acquire_lock
+	# Validate against on-device state and pre-build every seeded record BEFORE
+	# writing any, so a rejected adapter can't leave a half-applied restore.
+	local -a write_ids=() write_states=()
+	for id in "${ids[@]}"; do
+		[[ -f "$AGG_DESC_DIR/$id.desc" ]] \
+			|| { _emit_error rejected "backup references unknown adapter '$id'"; exit 2; }
+		local cur
+		cur="$(_load_state "$id" 2>/dev/null)" \
+			|| { _emit_error state_error "$id state is unreadable; reset to clear"; exit 3; }
+		if [[ "$(jq -r '.enabled == true' <<<"$cur")" == "true" ]]; then
+			_emit_error rejected "$id is enabled; disable it before importing"; exit 2
+		fi
+		local seeded
+		seeded="$(jq -c --argjson sv "$AGG_STATE_SCHEMA_VERSION" --arg id "$id" \
+			'.aggregators[$id] as $a
+			 | {schema_version:$sv, enabled:false, mlat_enabled:($a.mlat_enabled // false), fields:($a.fields // {})}' \
+			<<<"$REQ_JSON")"
+		write_ids+=("$id"); write_states+=("$seeded")
+	done
+	local i
+	for i in "${!write_ids[@]}"; do
+		_write_state "${write_ids[$i]}" "${write_states[$i]}"
+	done
+	local body
+	body="$(jq -nc --argjson pv "$AGG_PROTOCOL_VERSION" --argjson n "${#write_ids[@]}" \
+		'{protocol_version:$pv, result:"ok", imported:$n}')"
+	_emit_json "$body"
+}
+
 # --- dispatch --------------------------------------------------------------
 
 main() {
 	command -v jq >/dev/null 2>&1 || { _emit_error state_error "jq is required"; exit 3; }
 
 	if [[ $# -ne 2 || "${2-}" != "--json" ]]; then
-		_emit_error usage_error "usage: apl-aggregator {status|list|enable|set|disable|reset} --json"
+		_emit_error usage_error "usage: apl-aggregator {status|list|enable|set|disable|reset|export|import} --json"
 		exit 5
 	fi
 	case "$1" in
@@ -636,7 +745,9 @@ main() {
 		set) cmd_set; exit 0 ;;
 		disable) cmd_disable; exit 0 ;;
 		reset) cmd_reset; exit 0 ;;
-		*) _emit_error usage_error "unknown verb '$1'; use status|list|enable|set|disable|reset --json"; exit 5 ;;
+		export) cmd_export; exit 0 ;;
+		import) cmd_import; exit 0 ;;
+		*) _emit_error usage_error "unknown verb '$1'; use status|list|enable|set|disable|reset|export|import --json"; exit 5 ;;
 	esac
 }
 
