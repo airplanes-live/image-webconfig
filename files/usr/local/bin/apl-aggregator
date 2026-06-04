@@ -8,10 +8,15 @@
 # JSON envelope on stdout. Exit codes follow the apl-wifi / apl-feed contract:
 #
 #   0  ok
+#   2  rejected (unknown id / invalid field value)
 #   3  filesystem_error / state_error
+#   4  lock_timeout
 #   5  usage_error / parse_error
 #
-# (the mutating verbs and their 2/4 codes arrive with enable/disable/...)
+# Read verbs (status, list) take no stdin and emit {protocol_version,
+# aggregators:[...]}. Mutating verbs (set, disable, reset) read a JSON request
+# object on stdin and emit {protocol_version, result:"ok", id} on success.
+# (enable / export / import land in follow-ups.)
 #
 # Adapter descriptors are trusted, code-owned data sourced from AGG_DESC_DIR —
 # never loaded from /etc, never user-editable. Adapter ids are validated
@@ -35,10 +40,13 @@ AGG_INSTALL_ROOT="${AGG_INSTALL_ROOT:-/opt/airplanes-aggregators}"
 AGG_DESC_DIR="${AGG_DESC_DIR:-/usr/local/lib/airplanes-webconfig/aggregators}"
 AGG_SYSTEMCTL="${AGG_SYSTEMCTL:-systemctl}"
 AGG_DECODER_ADDR="${AGG_DECODER_ADDR:-127.0.0.1:30005}"
+AGG_LOCK="${AGG_LOCK:-/run/airplanes/aggregator.lock}"
+AGG_LOCK_TIMEOUT="${AGG_LOCK_TIMEOUT:-5}"
 
 readonly AGG_PROTOCOL_VERSION=1
-readonly AGG_ID_RE='^[a-z0-9_-]+$'
+readonly AGG_ID_RE='^[a-z0-9][a-z0-9_-]*$'
 readonly AGG_STATE_MAX_BYTES=65536
+readonly AGG_STATE_SCHEMA_VERSION=1
 
 # --- output helpers --------------------------------------------------------
 
@@ -261,18 +269,192 @@ cmd_status() {
 	_emit_json "$body"
 }
 
+# --- mutating verbs --------------------------------------------------------
+
+_emit_ok() {
+	# $1 = id, $2 = optional extra-fields JSON object (default {})
+	local id="$1" extra="${2-}" body
+	[[ -n "$extra" ]] || extra='{}'
+	if ! body="$(jq -nc --argjson pv "$AGG_PROTOCOL_VERSION" --arg id "$id" --argjson x "$extra" \
+		'{protocol_version:$pv, result:"ok", id:$id} + $x')"; then
+		_emit_error state_error "ok-envelope build failed"
+		exit 3
+	fi
+	_emit_json "$body"
+}
+
+# _read_request reads the JSON request object from stdin into REQ_JSON. Bad or
+# non-object input is a parse_error. Size-capped so a runaway producer can't
+# exhaust memory.
+REQ_JSON='{}'
+_read_request() {
+	REQ_JSON="$(head -c "$AGG_STATE_MAX_BYTES" || true)"
+	[[ -n "$REQ_JSON" ]] || { _emit_error parse_error "empty request body"; exit 5; }
+	# Slurp-validate: exactly one JSON text, and it is an object. (`jq -e
+	# 'type==...'` in streaming mode would accept a multi-document body whose
+	# last text happens to be an object.)
+	jq -e -s 'length == 1 and (.[0] | type == "object")' >/dev/null 2>&1 <<<"$REQ_JSON" \
+		|| { _emit_error parse_error "request body must be a single JSON object"; exit 5; }
+}
+
+# _request_id validates the adapter id from REQ_JSON into the global REQ_ID. It
+# must be called directly (NOT in a command substitution): on an unknown id it
+# emits not_found and exits the process — an exit inside $(...) would only kill
+# the subshell and leak the error JSON into the caller's capture. The id must
+# be a registered adapter (a descriptor file exists) — the security gate before
+# any path interpolation or systemd call.
+REQ_ID=""
+_request_id() {
+	REQ_ID="$(jq -r '.id // ""' <<<"$REQ_JSON")"
+	[[ "$REQ_ID" =~ $AGG_ID_RE && -f "$AGG_DESC_DIR/$REQ_ID.desc" ]] \
+		|| { _emit_error not_found "unknown aggregator id"; exit 2; }
+}
+
+# _descriptor_unit echoes the systemd unit for a (validated) adapter id.
+_descriptor_unit() {
+	local id="$1"
+	(
+		AGG_SERVICE_UNIT=""
+		# shellcheck source=/dev/null
+		source "$AGG_DESC_DIR/$id.desc"
+		printf '%s' "$AGG_SERVICE_UNIT"
+	)
+}
+
+# _acquire_lock takes the process-wide aggregator lock so a concurrent
+# mutation (or a webconfig restart racing the CLI) cannot interleave with a
+# state write. fd 9 stays open for the process lifetime; the lock releases on
+# exit.
+_acquire_lock() {
+	mkdir -p "$(dirname "$AGG_LOCK")" 2>/dev/null || true
+	exec 9>"$AGG_LOCK" || { _emit_error state_error "cannot open lock $AGG_LOCK"; exit 3; }
+	flock -w "$AGG_LOCK_TIMEOUT" 9 \
+		|| { _emit_error lock_timeout "another aggregator operation is in progress"; exit 4; }
+}
+
+# _load_state echoes the persisted state object for id. An ABSENT file is {}
+# (a fresh adapter); a PRESENT-but-corrupt/wrong-schema file returns non-zero
+# so a mutation refuses to blindly overwrite the operator's prior config
+# (reset is the recovery path). Slurp-validated to a single object.
+_load_state() {
+	local id="$1" raw
+	local path="$AGG_STATE_DIR/$id.json"
+	[[ -f "$path" ]] || { printf '{}'; return 0; }
+	raw="$(head -c "$AGG_STATE_MAX_BYTES" "$path" 2>/dev/null || true)"
+	if jq -e -s 'length == 1 and (.[0] | type == "object" and ((.schema_version // 0) <= '"$AGG_STATE_SCHEMA_VERSION"'))' \
+		>/dev/null 2>&1 <<<"$raw"; then
+		printf '%s' "$raw"
+		return 0
+	fi
+	return 1
+}
+
+# _write_state atomically writes the state object for id at mode 0600.
+_write_state() {
+	local id="$1" json="$2" dir="$AGG_STATE_DIR" tmp
+	install -d -m 0750 "$dir" 2>/dev/null || true
+	tmp="$(mktemp "$dir/.$id.XXXXXX")" || { _emit_error state_error "mktemp failed in $dir"; exit 3; }
+	# Each filesystem step is checked so an ENOSPC/EIO/RO-fs failure emits a
+	# specific envelope and cleans up the temp file rather than relying on the
+	# generic EXIT-trap fallback.
+	if ! { printf '%s\n' "$json" >"$tmp" && chmod 0600 "$tmp" && mv -f "$tmp" "$dir/$id.json"; }; then
+		rm -f -- "$tmp"
+		_emit_error state_error "failed to write state for $id"
+		exit 3
+	fi
+}
+
+# cmd_set merges mlat_enabled / fields into an adapter's state. Service
+# reconciliation (restart + verify) lands with the enable path.
+cmd_set() {
+	_read_request
+	_request_id; local id="$REQ_ID"
+	# mlat_enabled, when present, must be a literal boolean.
+	if jq -e 'has("mlat_enabled") and (.mlat_enabled | type != "boolean")' \
+		>/dev/null 2>&1 <<<"$REQ_JSON"; then
+		_emit_error rejected "mlat_enabled must be a boolean"; exit 2
+	fi
+	# fields, when present, must be an object.
+	if jq -e 'has("fields") and (.fields | type != "object")' >/dev/null 2>&1 <<<"$REQ_JSON"; then
+		_emit_error rejected "fields must be an object"; exit 2
+	fi
+	_acquire_lock
+	local cur merged
+	cur="$(_load_state "$id")" \
+		|| { _emit_error state_error "existing state for $id is unreadable; reset to clear"; exit 3; }
+	merged="$(jq -nc \
+		--argjson cur "$cur" --argjson req "$REQ_JSON" --argjson sv "$AGG_STATE_SCHEMA_VERSION" \
+		'$cur
+		 | .schema_version = $sv
+		 | (if $req | has("mlat_enabled") then .mlat_enabled = $req.mlat_enabled else . end)
+		 | (if $req | has("fields")
+		    then .fields = (((.fields // {}) | if type == "object" then . else {} end) + $req.fields)
+		    else . end)')"
+	_write_state "$id" "$merged"
+	_emit_ok "$id"
+}
+
+# cmd_disable stops + disables the adapter service and flags enabled=false,
+# keeping the installed binary/config so a re-enable needs no re-acquire.
+cmd_disable() {
+	_read_request
+	_request_id; local id="$REQ_ID"
+	_acquire_lock
+	# Validate state + descriptor BEFORE the systemctl side effect so a corrupt
+	# state fails fast with no half-applied change.
+	local cur unit next
+	cur="$(_load_state "$id")" \
+		|| { _emit_error state_error "existing state for $id is unreadable; reset to clear"; exit 3; }
+	if ! unit="$(_descriptor_unit "$id")"; then
+		_emit_error state_error "descriptor read failed for $id"; exit 3
+	fi
+	if [[ -n "$unit" ]]; then
+		"$AGG_SYSTEMCTL" disable --now "$unit" >/dev/null 2>&1 || true
+	fi
+	next="$(jq -nc --argjson cur "$cur" --argjson sv "$AGG_STATE_SCHEMA_VERSION" \
+		'$cur | .schema_version = $sv | .enabled = false')"
+	_write_state "$id" "$next"
+	_emit_ok "$id"
+}
+
+# cmd_reset is the full teardown: stop+disable the unit, drop our state and the
+# on-demand install dir. Vendor-specific teardown (apt purge, keyring/source
+# removal, decoder-unit unmask) is layered in by the per-adapter acquire path.
+cmd_reset() {
+	_read_request
+	_request_id; local id="$REQ_ID"
+	# Guard the recursive delete: an absolute, non-root install root plus a
+	# registry-validated id (AGG_ID_RE forbids leading dash / slash / dots).
+	[[ "$AGG_INSTALL_ROOT" == /* && "$AGG_INSTALL_ROOT" != "/" ]] \
+		|| { _emit_error state_error "unsafe install root"; exit 3; }
+	_acquire_lock
+	local unit
+	if ! unit="$(_descriptor_unit "$id")"; then
+		_emit_error state_error "descriptor read failed for $id"; exit 3
+	fi
+	if [[ -n "$unit" ]]; then
+		"$AGG_SYSTEMCTL" disable --now "$unit" >/dev/null 2>&1 || true
+	fi
+	rm -f -- "$AGG_STATE_DIR/$id.json"
+	rm -rf -- "${AGG_INSTALL_ROOT:?}/$id"
+	_emit_ok "$id"
+}
+
 # --- dispatch --------------------------------------------------------------
 
 main() {
 	command -v jq >/dev/null 2>&1 || { _emit_error state_error "jq is required"; exit 3; }
 
 	if [[ $# -ne 2 || "${2-}" != "--json" ]]; then
-		_emit_error usage_error "usage: apl-aggregator {status|list} --json"
+		_emit_error usage_error "usage: apl-aggregator {status|list|set|disable|reset} --json"
 		exit 5
 	fi
 	case "$1" in
 		status|list) cmd_status; exit 0 ;;
-		*) _emit_error usage_error "unknown verb '$1'; use status|list --json"; exit 5 ;;
+		set) cmd_set; exit 0 ;;
+		disable) cmd_disable; exit 0 ;;
+		reset) cmd_reset; exit 0 ;;
+		*) _emit_error usage_error "unknown verb '$1'; use status|list|set|disable|reset --json"; exit 5 ;;
 	esac
 }
 
