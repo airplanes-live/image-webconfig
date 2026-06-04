@@ -34,10 +34,11 @@ var Whitelist = map[string]string{
 	"claim":               "airplanes-claim.service",
 	"webconfig":           "airplanes-webconfig.service",
 	"update-orchestrator": "airplanes-update-orchestrator.service",
-	// Optional third-party aggregator services. The instance we run is the
-	// templated unit (airplanes-aggregator@<id>.service); the vendor's own
-	// unit (e.g. fr24feed.service) is masked at enable time.
-	"fr24": "airplanes-aggregator@fr24.service",
+	// Optional third-party aggregator services. FR24 runs under our templated
+	// unit (airplanes-aggregator@<id>.service); piaware is delivered as its own
+	// apt-installed unit, so its logs come from piaware.service directly.
+	"fr24":    "airplanes-aggregator@fr24.service",
+	"piaware": "piaware.service",
 }
 
 // JournalctlBinary is overridable for tests.

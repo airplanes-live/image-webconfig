@@ -41,6 +41,12 @@
 #   AGG_FR24_ACQUIRE_OVERRIDE <dest>    stub the .deb fetch+extract in tests
 #   AGG_FR24_SIGNUP_OVERRIDE <ini> <email>  stub the signup wizard in tests
 
+# Adapter descriptors are loaded with `source` (both inside the per-adapter
+# status subshell and at function scope in the apt-repo enable/reset paths). The
+# linter cannot follow that a descriptor var read at function scope was set by
+# `source`, not lost from an unrelated subshell, so SC2030/SC2031 are false
+# positives for this file's descriptor-sourcing pattern; disable them file-wide.
+# shellcheck disable=SC2030,SC2031
 set -Eeuo pipefail
 
 AGG_STATE_DIR="${AGG_STATE_DIR:-/etc/airplanes/aggregators}"
@@ -51,6 +57,24 @@ AGG_DECODER_ADDR="${AGG_DECODER_ADDR:-127.0.0.1:30005}"
 AGG_LOCK="${AGG_LOCK:-/run/airplanes/aggregator.lock}"
 AGG_LOCK_TIMEOUT="${AGG_LOCK_TIMEOUT:-5}"
 AGG_STATE_HOME="${AGG_STATE_HOME:-/var/lib/airplanes-aggregators}"
+
+# --- apt-repo seams (piaware) ----------------------------------------------
+# All system mutations route through these so bats can stub apt/dpkg/piaware-
+# config/systemctl and point /etc apt paths at a temp tree. Defaults are the
+# production paths/commands; sudo env_reset strips the overrides in production.
+AGG_APT_GET="${AGG_APT_GET:-apt-get}"
+AGG_DPKG_QUERY="${AGG_DPKG_QUERY:-dpkg-query}"
+AGG_PIAWARE_CONFIG="${AGG_PIAWARE_CONFIG:-piaware-config}"
+AGG_GPG="${AGG_GPG:-gpg}"
+AGG_OS_RELEASE="${AGG_OS_RELEASE:-/etc/os-release}"
+AGG_DPKG_ARCH="${AGG_DPKG_ARCH:-}"          # empty => `dpkg --print-architecture`
+AGG_APT_SOURCES_DIR="${AGG_APT_SOURCES_DIR:-/etc/apt/sources.list.d}"
+AGG_APT_PREFS_DIR="${AGG_APT_PREFS_DIR:-/etc/apt/preferences.d}"
+AGG_KEYRING_DIR="${AGG_KEYRING_DIR:-/usr/share/keyrings}"
+AGG_POLICY_RCD="${AGG_POLICY_RCD:-/usr/sbin/policy-rc.d}"
+AGG_PIAWARE_FEEDER_ID_FILE="${AGG_PIAWARE_FEEDER_ID_FILE:-/var/cache/piaware/feeder_id}"
+AGG_PIAWARE_CONF="${AGG_PIAWARE_CONF:-/etc/piaware.conf}"
+AGG_PIAWARE_ID_WAIT="${AGG_PIAWARE_ID_WAIT:-15}"   # secs to wait for feeder-id after start
 
 # --- async-enable seams ----------------------------------------------------
 # enable is fire-and-forget: cmd_enable validates synchronously then launches a
@@ -273,6 +297,7 @@ _adapter_json() {
 		AGG_ID=""; AGG_DISPLAY_NAME=""; AGG_ACQUIRE_METHOD=""
 		AGG_SERVICE_UNIT=""; AGG_MLAT_CAPABLE="false"; AGG_MLAT_DEFAULT="false"
 		AGG_CLAIM_URL=""; AGG_SECRET_FIELDS=""; AGG_FIELDS_JSON="[]"
+		AGG_PIAWARE_PACKAGE=""; AGG_PIAWARE_SUPPORTED_ARCHES=""; AGG_PIAWARE_SUPPORTED_CODENAMES=""  # apt-repo descriptor fields
 		# shellcheck source=/dev/null
 		source "$desc_file"
 
@@ -295,11 +320,16 @@ _adapter_json() {
 		}
 
 		local available reason
-		if [[ "$AGG_ACQUIRE_METHOD" == "vendor-installer" ]]; then
-			available="true"; reason=""
-		else
-			available="false"; reason="not yet supported on this device"
-		fi
+		case "$AGG_ACQUIRE_METHOD" in
+			vendor-installer) available="true"; reason="" ;;
+			apt-repo)
+				if _apt_repo_available; then
+					available="true"; reason=""
+				else
+					available="false"; reason="not supported on this OS or architecture"
+				fi ;;
+			*) available="false"; reason="not yet supported on this device" ;;
+		esac
 
 		# State is JSON, parsed (never sourced) and size-capped. Strict typing:
 		# booleans must be literal true; a non-object document or non-object
@@ -323,10 +353,18 @@ _adapter_json() {
 		# installed, or a failed acquire would surface as "stopped" instead of
 		# "not_installed".
 		local installed="false"
-		if [[ "$AGG_ACQUIRE_METHOD" == "vendor-installer" && -d "$AGG_INSTALL_ROOT/$AGG_ID" \
-			&& -n "$(ls -A "$AGG_INSTALL_ROOT/$AGG_ID" 2>/dev/null)" ]]; then
-			installed="true"
-		fi
+		case "$AGG_ACQUIRE_METHOD" in
+			vendor-installer)
+				if [[ -d "$AGG_INSTALL_ROOT/$AGG_ID" \
+					&& -n "$(ls -A "$AGG_INSTALL_ROOT/$AGG_ID" 2>/dev/null)" ]]; then
+					installed="true"
+				fi ;;
+			apt-repo)
+				# Installed = the apt package is present. (Ownership — whether WE
+				# installed it vs. a pre-existing admin install — is tracked
+				# separately and only gates mutating verbs, not this status bit.)
+				if _pkg_installed "${AGG_PIAWARE_PACKAGE:-$AGG_ID}"; then installed="true"; fi ;;
+		esac
 
 		local state
 		state="$(_derive_state "$available" "$(_service_state "$AGG_SERVICE_UNIT")" "$enabled" "$installed")"
@@ -352,6 +390,14 @@ _adapter_json() {
 			'((.fields // {}) | if type == "object" then . else {} end) as $f
 			 | ($secrets | split(" ") | map(select(length > 0)))
 			 | [ .[] | select( ($f[.] // "") != "" ) ]' <<<"$raw")"
+
+		# piaware's feeder-id is authoritatively the vendor cache file, provisioned
+		# on first connect and able to lag our state write. Surface it as present
+		# from the live file so the UI doesn't flap "unconfigured" in the gap
+		# between enable and the id landing in state.
+		if [[ "$AGG_ACQUIRE_METHOD" == "apt-repo" && -s "$AGG_PIAWARE_FEEDER_ID_FILE" ]]; then
+			secrets_present_json="$(jq -c '(. + ["feeder_id"]) | unique' <<<"$secrets_present_json")"
+		fi
 
 		local configured="false"
 		if [[ "$enabled" == "true" ]] || (( $(jq 'length' <<<"$secrets_present_json") > 0 )); then
@@ -491,6 +537,17 @@ _descriptor_unit() {
 	)
 }
 
+# _descriptor_acquire echoes the acquire method for a (validated) adapter id.
+_descriptor_acquire() {
+	local id="$1"
+	(
+		AGG_ACQUIRE_METHOD=""
+		# shellcheck source=/dev/null
+		source "$AGG_DESC_DIR/$id.desc"
+		printf '%s' "$AGG_ACQUIRE_METHOD"
+	)
+}
+
 # _acquire_lock takes the process-wide aggregator lock so a concurrent
 # mutation (or a webconfig restart racing the CLI) cannot interleave with a
 # state write. fd 9 stays open for the process lifetime; the lock releases on
@@ -563,6 +620,15 @@ cmd_set() {
 		 | (if $req | has("fields")
 		    then .fields = (((.fields // {}) | if type == "object" then . else {} end) + $req.fields)
 		    else . end)')"
+	# piaware applies config to the live daemon BEFORE we persist, so state never
+	# claims a setting the daemon didn't accept (a managed+running piaware gets
+	# allow-mlat written + a try-restart; an inactive/unmanaged one is a no-op and
+	# the preference is just stored for the next enable). FR24 config lands only
+	# via enable, so it stays state-only.
+	if [[ "$id" == "piaware" ]]; then
+		_piaware_reconcile_mlat "$merged" \
+			|| { _emit_error state_error "failed to apply the MLAT setting to piaware"; exit 3; }
+	fi
 	_write_state "$id" "$merged"
 	_clear_enable_state "$id"
 	_emit_ok "$id"
@@ -609,15 +675,27 @@ cmd_reset() {
 	if _enable_in_progress; then
 		_emit_error lock_timeout "an enable is in progress; try again shortly"; exit 4
 	fi
-	local unit
-	if ! unit="$(_descriptor_unit "$id")"; then
-		_emit_error state_error "descriptor read failed for $id"; exit 3
-	fi
-	if [[ -n "$unit" ]]; then
-		"$AGG_SYSTEMCTL" disable --now "$unit" >/dev/null 2>&1 || true
+	local acquire
+	acquire="$(_descriptor_acquire "$id")"
+	if [[ "$acquire" == "apt-repo" ]]; then
+		# apt-repo teardown owns its own service-stop + package/apt-file removal,
+		# acting ONLY on what this helper installed — never an admin's piaware.
+		case "$id" in
+			piaware) _piaware_teardown ;;
+			*) _emit_error state_error "no teardown for apt-repo adapter $id"; exit 3 ;;
+		esac
+	else
+		# vendor-installer / default: stop the unit + drop the on-demand install dir.
+		local unit
+		if ! unit="$(_descriptor_unit "$id")"; then
+			_emit_error state_error "descriptor read failed for $id"; exit 3
+		fi
+		if [[ -n "$unit" ]]; then
+			"$AGG_SYSTEMCTL" disable --now "$unit" >/dev/null 2>&1 || true
+		fi
+		rm -rf -- "${AGG_INSTALL_ROOT:?}/$id"
 	fi
 	rm -f -- "$AGG_STATE_DIR/$id.json"
-	rm -rf -- "${AGG_INSTALL_ROOT:?}/$id"
 	_clear_enable_state "$id"
 	_emit_ok "$id"
 }
@@ -816,6 +894,378 @@ _fr24_validate_sync() {
 	_decoder_reachable || { _emit_error decoder_unavailable "local decoder 127.0.0.1:30005 is not reachable"; exit 2; }
 }
 
+# --- piaware (apt-repo) ----------------------------------------------------
+
+# _pkg_installed <pkg>: true iff dpkg reports the package fully installed.
+_pkg_installed() {
+	local st
+	# shellcheck disable=SC2016  # ${db:Status-Abbrev} is a dpkg-query field, not a shell var
+	st="$("$AGG_DPKG_QUERY" -W -f='${db:Status-Abbrev}' "$1" 2>/dev/null || true)"
+	[[ "$st" == ii* ]]
+}
+
+# _host_arch: dpkg architecture (test seam AGG_DPKG_ARCH).
+_host_arch() {
+	if [[ -n "$AGG_DPKG_ARCH" ]]; then printf '%s' "$AGG_DPKG_ARCH"; return; fi
+	dpkg --print-architecture 2>/dev/null || true
+}
+
+# _os_codename: VERSION_CODENAME from the os-release seam, with a VERSION_ID map
+# fallback so a release file lacking CODENAME still resolves.
+_os_codename() {
+	local cn="" vid=""
+	if [[ -r "$AGG_OS_RELEASE" ]]; then
+		# shellcheck source=/dev/null
+		cn="$( . "$AGG_OS_RELEASE" >/dev/null 2>&1; printf '%s' "${VERSION_CODENAME:-}" )"
+		# shellcheck source=/dev/null
+		[[ -n "$cn" ]] || vid="$( . "$AGG_OS_RELEASE" >/dev/null 2>&1; printf '%s' "${VERSION_ID:-}" )"
+	fi
+	if [[ -z "$cn" ]]; then
+		case "$vid" in
+			11) cn=bullseye ;; 12) cn=bookworm ;; 13) cn=trixie ;;
+		esac
+	fi
+	printf '%s' "$cn"
+}
+
+# _apt_repo_available: arch ∈ supported AND codename ∈ supported (descriptor
+# matrix). Requires the apt-repo descriptor to be sourced in scope.
+_apt_repo_available() {
+	local arch cn a c ok_arch=1 ok_cn=1
+	arch="$(_host_arch)"; cn="$(_os_codename)"
+	[[ -n "$arch" && -n "$cn" ]] || return 1
+	for a in ${AGG_PIAWARE_SUPPORTED_ARCHES:-}; do [[ "$a" == "$arch" ]] && ok_arch=0; done
+	for c in ${AGG_PIAWARE_SUPPORTED_CODENAMES:-}; do [[ "$c" == "$cn" ]] && ok_cn=0; done
+	(( ok_arch == 0 && ok_cn == 0 ))
+}
+
+# _valid_feeder_id <s>: piaware feeder-ids are UUIDs.
+_valid_feeder_id() {
+	[[ "$1" =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$ ]]
+}
+
+# _apt <args…>: apt-get with non-interactive + no-restart env pinned, so it can
+# never prompt or bounce the feeder's network mid-install, plus a lock timeout.
+_apt() {
+	DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=l NEEDRESTART_SUSPEND=1 \
+		"$AGG_APT_GET" -o DPkg::Lock::Timeout=120 "$@"
+}
+
+# --- ownership markers ---
+# A sidecar (NOT the backup-exported state file) recording exactly what the
+# enable transaction mutated, so reset undoes ONLY what this helper owns and
+# never an admin's pre-existing piaware / apt source / config.
+_piaware_managed_path() { printf '%s/piaware.managed.json' "$AGG_STATE_DIR"; }
+
+_piaware_managed_read() {
+	local p raw; p="$(_piaware_managed_path)"
+	[[ -f "$p" ]] || { printf '{}'; return 0; }
+	raw="$(head -c "$AGG_STATE_MAX_BYTES" "$p" 2>/dev/null || true)"
+	if jq -e 'type=="object"' >/dev/null 2>&1 <<<"$raw"; then printf '%s' "$raw"; else printf '{}'; fi
+}
+
+# _piaware_managed_merge <patch-obj>: array-valued keys are unioned (so repeated
+# created_paths/installed_pkgs accumulate); scalar keys are overwritten.
+_piaware_managed_merge() {
+	local cur merged p tmp; p="$(_piaware_managed_path)"
+	cur="$(_piaware_managed_read)"
+	merged="$(jq -c --argjson patch "$1" '
+		reduce ($patch|to_entries[]) as $e (.;
+		  if ($e.value|type)=="array"
+		  then .[$e.key] = (((.[$e.key] // []) + $e.value) | unique)
+		  else .[$e.key] = $e.value end)' <<<"$cur")" || return 1
+	install -d -m 0750 "$AGG_STATE_DIR" 2>/dev/null || true
+	tmp="$(mktemp "$AGG_STATE_DIR/.piaware.managed.XXXXXX")" || return 1
+	if printf '%s\n' "$merged" >"$tmp" && chmod 0600 "$tmp" && mv -f "$tmp" "$p"; then :; else rm -f -- "$tmp"; return 1; fi
+}
+
+_piaware_mark_created() { _piaware_managed_merge "$(jq -nc --arg p "$1" '{created_paths:[$p]}')"; }
+
+# policy-rc.d: blocks maintainer-script service autostart during apt install
+# (cleaner than masking piaware.service). Only created/removed if we own it.
+_piaware_set_policy_rcd() {
+	[[ -e "$AGG_POLICY_RCD" ]] && return 0   # respect a pre-existing one
+	# Mark BEFORE creating, so a crash between create and mark still lets reset
+	# find + remove this global install guard (a stray policy-rc.d breaks apt).
+	_piaware_managed_merge "$(jq -nc '{policy_rcd:true}')"
+	install -d -m 0755 "$(dirname "$AGG_POLICY_RCD")" 2>/dev/null || true
+	printf '#!/bin/sh\n# airplanes-webconfig install guard; removed after configure.\nexit 101\n' >"$AGG_POLICY_RCD" || return 1
+	chmod 0755 "$AGG_POLICY_RCD" || return 1
+}
+_piaware_clear_policy_rcd() {
+	[[ "$(jq -r '.policy_rcd == true' <<<"$(_piaware_managed_read)")" == "true" ]] || return 0
+	rm -f -- "$AGG_POLICY_RCD"
+	_piaware_managed_merge "$(jq -nc '{policy_rcd:false}')"
+}
+
+# _piaware_configure <host> <port> <mlat:yes|no> <feeder_id>: point piaware at
+# the local Beast decoder and set MLAT (+ optional reclaim feeder-id).
+_piaware_configure() {
+	local host="$1" port="$2" mlat="$3" feeder_id="$4"
+	"$AGG_PIAWARE_CONFIG" receiver-type other   >/dev/null 2>&1 || return 1
+	"$AGG_PIAWARE_CONFIG" receiver-host "$host"  >/dev/null 2>&1 || return 1
+	"$AGG_PIAWARE_CONFIG" receiver-port "$port"  >/dev/null 2>&1 || return 1
+	"$AGG_PIAWARE_CONFIG" allow-mlat "$mlat"     >/dev/null 2>&1 || return 1
+	if [[ -n "$feeder_id" ]]; then
+		"$AGG_PIAWARE_CONFIG" feeder-id "$feeder_id" >/dev/null 2>&1 || return 1
+	fi
+}
+
+# _piaware_install: keyring + deb822 source + origin pin + apt install. Ownership
+# markers are written BEFORE each mutation so a mid-flight failure is recoverable
+# by reset. Emits the error envelope and exits on any failure.
+_piaware_install() {
+	local arch cn keyring src pin asc ktmp fpr
+	arch="$(_host_arch)"; cn="$(_os_codename)"
+	keyring="$AGG_KEYRING_DIR/airplanes-flightaware-archive-keyring.gpg"
+	src="$AGG_APT_SOURCES_DIR/airplanes-flightaware.sources"
+	pin="$AGG_APT_PREFS_DIR/airplanes-flightaware.pref"
+
+	_piaware_set_policy_rcd || { _emit_error state_error "failed to set up install guard"; exit 3; }
+
+	# Dearmor the shipped, code-owned key and verify its pinned primary
+	# fingerprint BEFORE pointing apt at the repo — a swapped .asc cannot change
+	# what root apt trusts.
+	asc="$AGG_DESC_DIR/${AGG_PIAWARE_KEY_ASC}"
+	[[ -f "$asc" ]] || { _emit_error state_error "FlightAware signing key is missing"; exit 3; }
+	install -d -m 0755 "$AGG_KEYRING_DIR" 2>/dev/null || true
+	ktmp="$(mktemp "${keyring}.XXXXXX")" || { _emit_error state_error "mktemp failed"; exit 3; }
+	if ! "$AGG_GPG" --dearmor <"$asc" >"$ktmp" 2>/dev/null; then rm -f -- "$ktmp"; _emit_error state_error "failed to import the FlightAware key"; exit 3; fi
+	fpr="$("$AGG_GPG" --no-default-keyring --keyring "$ktmp" --with-colons --list-keys 2>/dev/null | awk -F: '/^fpr:/{print $10; exit}')"
+	if [[ "$fpr" != "$AGG_PIAWARE_KEY_FPR" ]]; then rm -f -- "$ktmp"; _emit_error state_error "FlightAware key fingerprint mismatch"; exit 3; fi
+	# These three paths are in our own airplanes- namespace; record them before
+	# writing so reset always removes them (a pre-existing one is our own leftover
+	# from an earlier partial run, not admin content).
+	_piaware_mark_created "$keyring"
+	if ! { chmod 0644 "$ktmp" && mv -f "$ktmp" "$keyring"; }; then rm -f -- "$ktmp"; _emit_error state_error "failed to install the keyring"; exit 3; fi
+
+	_piaware_mark_created "$src"
+	install -d -m 0755 "$AGG_APT_SOURCES_DIR" 2>/dev/null || true
+	cat >"$src" <<EOF
+# Managed by airplanes-webconfig (apl-aggregator). Removed on aggregator reset.
+Types: deb
+URIs: ${AGG_PIAWARE_REPO_URL}
+Suites: ${cn}
+Components: ${AGG_PIAWARE_COMPONENT}
+Architectures: ${arch}
+Signed-By: ${keyring}
+EOF
+	_piaware_mark_created "$pin"
+	install -d -m 0755 "$AGG_APT_PREFS_DIR" 2>/dev/null || true
+	cat >"$pin" <<'EOF'
+# Managed by airplanes-webconfig. Constrains the FlightAware origin so it can
+# provide piaware but never shadow or replace a Debian package.
+Package: *
+Pin: origin apt.svc.flightaware.com
+Pin-Priority: 100
+EOF
+
+	if ! _apt update >/dev/null 2>&1; then _emit_error acquire_failed "apt-get update failed (check connectivity)"; exit 2; fi
+
+	# Simulate first: abort on ANY removal, or on any protected package appearing
+	# in the resolver plan. LC_ALL=C keeps the Inst/Remv prefixes parseable.
+	local sim
+	if ! sim="$(LC_ALL=C _apt -s install --no-install-recommends "$AGG_PIAWARE_PACKAGE" 2>&1)"; then
+		_emit_error acquire_failed "could not resolve piaware (check the FlightAware repository)"; exit 2
+	fi
+	if grep -qE '^Remv ' <<<"$sim"; then _emit_error acquire_failed "installing piaware would remove other packages; aborting"; exit 2; fi
+	local deny
+	for deny in $AGG_PIAWARE_DENY_PKGS; do
+		if grep -qE "^(Inst|Remv|Conf) ${deny}( |:)" <<<"$sim"; then
+			_emit_error acquire_failed "installing piaware would disturb '${deny}'; aborting"; exit 2
+		fi
+	done
+
+	# Record the exact set this install NEWLY adds, for a targeted reset. An
+	# upgrade line is `Inst pkg [oldver] (newver …)` — its 3rd field starts with
+	# `[`; a fresh install is `Inst pkg (ver …)`. Recording only fresh installs
+	# keeps reset from later autoremoving a pre-existing package that piaware
+	# merely upgraded.
+	local newpkgs
+	newpkgs="$(awk '/^Inst / && $3 !~ /^\[/ {print $2}' <<<"$sim" | tr '\n' ' ')"
+	_piaware_managed_merge "$(jq -nc --arg pkgs "$newpkgs" '{we_installed:true, installed_pkgs:($pkgs|split(" ")|map(select(length>0)))}')" || true
+
+	if ! _apt install -y --no-install-recommends "$AGG_PIAWARE_PACKAGE" >/dev/null 2>&1; then
+		_emit_error acquire_failed "failed to install piaware"; exit 2
+	fi
+	_pkg_installed "$AGG_PIAWARE_PACKAGE" || { _emit_error acquire_failed "piaware did not install cleanly"; exit 2; }
+}
+
+# _enable_piaware: worker-context enable for the apt-repo adapter.
+_enable_piaware() {
+	# shellcheck source=/dev/null
+	source "$AGG_DESC_DIR/piaware.desc"
+
+	local cur fields feeder_id mlat host port
+	cur="$(_load_state "piaware" 2>/dev/null)" \
+		|| { _emit_error state_error "existing piaware state is unreadable; reset to clear"; exit 3; }
+	fields="$(printf '%s\n%s\n' "$cur" "$REQ_JSON" \
+		| jq -cn 'input as $cur | input as $req | (($cur.fields // {}) + ($req.fields // {}))')"
+	feeder_id="$(jq -r '.feeder_id // ""' <<<"$fields")"
+	# MLAT preference: the request's mlat_enabled if present, else the descriptor
+	# default. (allow-mlat is the local gate; MLAT only activates once the feeder
+	# is claimed + located on the FlightAware website.)
+	if jq -e 'has("mlat_enabled")' >/dev/null 2>&1 <<<"$REQ_JSON"; then
+		mlat="$(jq -r 'if .mlat_enabled then "yes" else "no" end' <<<"$REQ_JSON")"
+	else
+		mlat="$([[ "$AGG_MLAT_DEFAULT" == "true" ]] && echo yes || echo no)"
+	fi
+
+	_apt_repo_available || { _emit_error rejected "FlightAware is not supported on this OS or architecture"; exit 2; }
+	[[ -z "$feeder_id" ]] || _valid_feeder_id "$feeder_id" || { _emit_error rejected "invalid feeder ID format"; exit 2; }
+	_decoder_reachable || { _emit_error decoder_unavailable "local decoder ${AGG_DECODER_ADDR} is not reachable"; exit 2; }
+
+	# Never touch a piaware this helper did not install or configure.
+	if { _pkg_installed "$AGG_PIAWARE_PACKAGE" || [[ -e "$AGG_PIAWARE_CONF" ]]; } \
+		&& [[ "$(jq -r '.we_installed == true' <<<"$(_piaware_managed_read)")" != "true" ]]; then
+		_emit_error state_error "piaware is already installed or configured on this device and is not managed by airplanes.live"; exit 3
+	fi
+
+	host="${AGG_DECODER_ADDR%%:*}"; port="${AGG_DECODER_ADDR##*:}"
+
+	if ! _pkg_installed "$AGG_PIAWARE_PACKAGE"; then
+		_worker_progress acquiring
+		_piaware_install   # emits + exits on failure
+	fi
+
+	_worker_progress configuring
+	_piaware_configure "$host" "$port" "$mlat" "$feeder_id" \
+		|| { _emit_error state_error "failed to configure piaware"; exit 3; }
+
+	# The local decoder must have survived the apt transaction.
+	if [[ "$(_service_state readsb.service)" != "active" ]] || ! _decoder_reachable; then
+		_emit_error state_error "local readsb decoder is no longer healthy after install"; exit 3
+	fi
+
+	_worker_progress starting-service
+	_piaware_clear_policy_rcd
+	if ! "$AGG_SYSTEMCTL" enable --now "$AGG_SERVICE_UNIT" >/dev/null 2>&1; then
+		_emit_error state_error "piaware installed but the service failed to start"; exit 3
+	fi
+
+	# Settle on the feeder-id to persist. A reclaim id supplied in the request is
+	# authoritative (we set it via piaware-config) — don't race a stale cache file
+	# for it. Otherwise capture the auto-provisioned id with a bounded wait,
+	# accepting only a well-formed UUID; never fail enable on a slow/garbage cache
+	# (status reads the live cache as the fallback).
+	local got_id="" i cache_id
+	if [[ -n "$feeder_id" ]]; then
+		got_id="$feeder_id"
+	else
+		for (( i=0; i<AGG_PIAWARE_ID_WAIT; i++ )); do
+			if [[ -s "$AGG_PIAWARE_FEEDER_ID_FILE" ]]; then
+				cache_id="$(head -c 64 "$AGG_PIAWARE_FEEDER_ID_FILE" 2>/dev/null | tr -d '[:space:]')"
+				if _valid_feeder_id "$cache_id"; then got_id="$cache_id"; break; fi
+			fi
+			sleep 1
+		done
+	fi
+
+	local mlat_bool state
+	mlat_bool="$([[ "$mlat" == "yes" ]] && echo true || echo false)"
+	state="$(printf '%s\n' "$got_id" | jq -Rn --argjson sv "$AGG_STATE_SCHEMA_VERSION" --argjson m "$mlat_bool" \
+		'(input) as $fid
+		 | {schema_version:$sv, enabled:true, mlat_enabled:$m,
+		    fields:(if $fid != "" then {feeder_id:$fid} else {} end)}')"
+	_write_state "piaware" "$state"
+	_emit_ok "piaware" "$(jq -nc --argjson p "$([[ -n "$got_id" ]] && echo true || echo false)" '{feeder_id_present:$p}')"
+}
+
+# _piaware_validate_sync: fast synchronous checks cmd_enable runs before
+# launching the worker (mirrors the head of _enable_piaware).
+_piaware_validate_sync() {
+	# shellcheck source=/dev/null
+	source "$AGG_DESC_DIR/piaware.desc"
+	# Type-check the request fields up front so a malformed mlat_enabled/fields is
+	# a clean rejection, not a downstream jq failure (a JSON string "false" is
+	# truthy in jq and would otherwise flip MLAT on).
+	if jq -e 'has("mlat_enabled") and (.mlat_enabled | type != "boolean")' >/dev/null 2>&1 <<<"$REQ_JSON"; then
+		_emit_error rejected "mlat_enabled must be a boolean"; exit 2
+	fi
+	if jq -e 'has("fields") and (.fields | type != "object")' >/dev/null 2>&1 <<<"$REQ_JSON"; then
+		_emit_error rejected "fields must be an object"; exit 2
+	fi
+	local cur fields feeder_id
+	cur="$(_load_state "piaware" 2>/dev/null)" \
+		|| { _emit_error state_error "existing piaware state is unreadable; reset to clear"; exit 3; }
+	fields="$(printf '%s\n%s\n' "$cur" "$REQ_JSON" \
+		| jq -cn 'input as $cur | input as $req | (($cur.fields // {}) + ($req.fields // {}))')"
+	feeder_id="$(jq -r '.feeder_id // ""' <<<"$fields")"
+	_apt_repo_available || { _emit_error rejected "FlightAware is not supported on this OS or architecture"; exit 2; }
+	[[ -z "$feeder_id" ]] || _valid_feeder_id "$feeder_id" || { _emit_error rejected "invalid feeder ID format"; exit 2; }
+	_decoder_reachable || { _emit_error decoder_unavailable "local decoder ${AGG_DECODER_ADDR} is not reachable"; exit 2; }
+	# Refuse to adopt a piaware this helper did not install OR configure — an
+	# installed package or a leftover /etc/piaware.conf without our marker is
+	# admin-owned. (Our own enable sets we_installed before writing the conf, so
+	# this never blocks a retry of our own in-flight setup.)
+	if { _pkg_installed "$AGG_PIAWARE_PACKAGE" || [[ -e "$AGG_PIAWARE_CONF" ]]; } \
+		&& [[ "$(jq -r '.we_installed == true' <<<"$(_piaware_managed_read)")" != "true" ]]; then
+		_emit_error state_error "piaware is already installed or configured on this device and is not managed by airplanes.live"; exit 3
+	fi
+}
+
+# _piaware_reconcile_mlat <merged-state>: apply allow-mlat live + try-restart, so
+# the UI never reports "saved" while piaware runs stale config. Only acts on a
+# managed, installed piaware.
+_piaware_reconcile_mlat() {
+	local merged="$1" mlat
+	[[ "$(jq -r '.we_installed == true' <<<"$(_piaware_managed_read)")" == "true" ]] || return 0
+	_pkg_installed piaware || return 0
+	mlat="$(jq -r 'if .mlat_enabled == true then "yes" else "no" end' <<<"$merged")"
+	"$AGG_PIAWARE_CONFIG" allow-mlat "$mlat" >/dev/null 2>&1 || return 1
+	"$AGG_SYSTEMCTL" try-restart piaware.service >/dev/null 2>&1 || true
+}
+
+# _piaware_teardown: reset for the apt-repo adapter. Acts ONLY on what we own:
+# the PACKAGE is removed only when we installed it (never an admin's piaware);
+# the apt source/keyring/pin and policy-rc.d we created are ALWAYS removed (even
+# after a partial acquire that failed before the install) so a failed enable
+# never strands a global install guard or third-party apt source on the device.
+_piaware_teardown() {
+	# shellcheck source=/dev/null
+	source "$AGG_DESC_DIR/piaware.desc"
+	local managed; managed="$(_piaware_managed_read)"
+
+	if [[ "$(jq -r '.we_installed == true' <<<"$managed")" == "true" ]]; then
+		"$AGG_SYSTEMCTL" disable --now piaware.service >/dev/null 2>&1 || true
+		_apt purge -y "$AGG_PIAWARE_PACKAGE" >/dev/null 2>&1 || true
+		if _pkg_installed "$AGG_PIAWARE_PACKAGE"; then
+			# Purge failed (apt/dpkg lock?). Stop here and KEEP the markers + apt
+			# files so a retry can resume — don't tear down config/identity into an
+			# installed-but-unmanageable state.
+			_emit_error state_error "could not remove piaware; try again shortly"; exit 3
+		fi
+		# Targeted dependency cleanup: purge EXACTLY the orphaned packages we
+		# recorded installing (and never a protected one), rather than a blanket
+		# autoremove — so a resolver-state change between simulate and execution
+		# can't take an unrelated package.
+		local sim removed recorded pkg d bad; local -a victims=()
+		sim="$(LC_ALL=C _apt -s autoremove --purge 2>&1 || true)"
+		removed="$(awk '/^(Remv|Purg) /{print $2}' <<<"$sim")"
+		recorded=" $(jq -r '(.installed_pkgs // []) | join(" ")' <<<"$managed") "
+		for pkg in $removed; do
+			[[ "$recorded" == *" $pkg "* ]] || continue          # not one we installed
+			bad=0; for d in $AGG_PIAWARE_DENY_PKGS readsb; do [[ "$pkg" == "$d" ]] && bad=1; done
+			(( bad )) && continue
+			victims+=("$pkg")
+		done
+		(( ${#victims[@]} > 0 )) && { _apt purge -y "${victims[@]}" >/dev/null 2>&1 || true; }
+
+		rm -f -- "$AGG_PIAWARE_CONF"
+		rm -rf -- "$(dirname "$AGG_PIAWARE_FEEDER_ID_FILE")"
+	fi
+
+	# Apt files + policy-rc.d are always ours to remove (we created them), whether
+	# or not the package install completed.
+	local p had_apt=0
+	while IFS= read -r p; do [[ -n "$p" ]] && { rm -f -- "$p"; had_apt=1; }; done \
+		< <(jq -r '(.created_paths // [])[]' <<<"$managed")
+	_piaware_clear_policy_rcd
+	(( had_apt )) && { _apt update >/dev/null 2>&1 || true; }
+
+	rm -f -- "$(_piaware_managed_path)"
+}
+
 # _gen_reqid: a filesystem- and argv-safe request id for one enable run.
 _gen_reqid() {
 	local u
@@ -883,6 +1333,7 @@ cmd_enable() {
 	fi
 	case "$id" in
 		fr24) _fr24_validate_sync ;;
+		piaware) _piaware_validate_sync ;;
 		*) _emit_error rejected "enable is not yet supported for $id"; exit 2 ;;
 	esac
 
@@ -953,6 +1404,7 @@ cmd_enable_worker() {
 	_acquire_lock
 	case "$REQ_ID" in
 		fr24) _enable_fr24 ;;
+		piaware) _enable_piaware ;;
 		*) _emit_error rejected "enable is not yet supported for $REQ_ID"; exit 2 ;;
 	esac
 }

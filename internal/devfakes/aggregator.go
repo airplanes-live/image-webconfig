@@ -40,7 +40,7 @@ func aggregatorCmd(state *State, verb string, body []byte) (wexec.Result, error)
 // the fr24 descriptor) recognises. The real helper returns not_found for an
 // unregistered id before any state mutation; the fake mirrors that so dev
 // behaviour matches production.
-func aggKnown(id string) bool { return id == "fr24" }
+func aggKnown(id string) bool { return id == "fr24" || id == "piaware" }
 
 func aggEnvelope(v any) wexec.Result {
 	b, _ := json.Marshal(v)
@@ -64,10 +64,30 @@ func aggOK(id string, extra map[string]any) wexec.Result {
 	return aggEnvelope(m)
 }
 
-// aggStatus emits the single fr24 adapter the dev fake knows about, with its
-// lifecycle state derived from the in-memory record. The descriptor fields
-// mirror files/usr/local/lib/airplanes-webconfig/aggregators/fr24.desc.
+// aggStatus emits the adapters the dev fake knows about (fr24 + piaware), each
+// with its lifecycle state derived from the in-memory record. The descriptor
+// fields mirror files/usr/local/lib/airplanes-webconfig/aggregators/*.desc.
 func aggStatus(state *State) wexec.Result {
+	return aggEnvelope(map[string]any{
+		"protocol_version": aggProtocolVersion,
+		"aggregators":      []any{aggAdapterFR24(state), aggAdapterPiaware(state)},
+	})
+}
+
+// aggLifecycle maps the in-memory record to the status enum the SPA renders.
+func aggLifecycle(installing, enabled, configured bool) string {
+	switch {
+	case installing:
+		return "installing"
+	case enabled:
+		return "running"
+	case configured:
+		return "stopped"
+	}
+	return "not_installed"
+}
+
+func aggAdapterFR24(state *State) map[string]any {
 	enabled, mlat, fields := state.AggregatorRecord("fr24")
 	installing := state.AggregatorInstalling("fr24")
 	secretsPresent := []string{}
@@ -75,21 +95,12 @@ func aggStatus(state *State) wexec.Result {
 		secretsPresent = append(secretsPresent, "sharing_key")
 	}
 	configured := enabled || len(secretsPresent) > 0
-	st := "not_installed"
-	switch {
-	case installing:
-		st = "installing"
-	case enabled:
-		st = "running"
-	case configured:
-		st = "stopped"
-	}
 	fr24 := map[string]any{
 		"id":                      "fr24",
 		"display_name":            "Flightradar24",
 		"acquire_method":          "vendor-installer",
 		"service_unit":            "airplanes-aggregator@fr24.service",
-		"state":                   st,
+		"state":                   aggLifecycle(installing, enabled, configured),
 		"enabled":                 enabled,
 		"configured":              configured,
 		"available":               true,
@@ -109,10 +120,42 @@ func aggStatus(state *State) wexec.Result {
 	if installing {
 		fr24["enable"] = map[string]any{"status": "running", "step": "acquiring", "request_id": "dev-fr24"}
 	}
-	return aggEnvelope(map[string]any{
-		"protocol_version": aggProtocolVersion,
-		"aggregators":      []any{fr24},
-	})
+	return fr24
+}
+
+func aggAdapterPiaware(state *State) map[string]any {
+	enabled, mlat, fields := state.AggregatorRecord("piaware")
+	installing := state.AggregatorInstalling("piaware")
+	secretsPresent := []string{}
+	if fields["feeder_id"] != "" {
+		secretsPresent = append(secretsPresent, "feeder_id")
+	}
+	configured := enabled || len(secretsPresent) > 0
+	pw := map[string]any{
+		"id":                      "piaware",
+		"display_name":            "FlightAware",
+		"acquire_method":          "apt-repo",
+		"service_unit":            "piaware.service",
+		"state":                   aggLifecycle(installing, enabled, configured),
+		"enabled":                 enabled,
+		"configured":              configured,
+		"available":               true,
+		"mlat_capable":            true,
+		"mlat_default":            true,
+		"configured_mlat_enabled": mlat,
+		"effective_mlat_enabled":  mlat,
+		"config_drift":            false,
+		"fields": []map[string]any{
+			{"id": "feeder_id", "label": "Feeder ID (optional — reclaim an existing FlightAware feeder)", "required": false, "secret": true},
+		},
+		"secret_fields_present": secretsPresent,
+		"decoder_reachable":     true,
+		"claim_url":             "https://www.flightaware.com/adsb/piaware/claim",
+	}
+	if installing {
+		pw["enable"] = map[string]any{"status": "running", "step": "acquiring", "request_id": "dev-piaware"}
+	}
+	return pw
 }
 
 func aggEnable(state *State, body []byte) wexec.Result {
@@ -127,7 +170,37 @@ func aggEnable(state *State, body []byte) wexec.Result {
 	if req.ID == "" {
 		return aggError("not_found", "unknown aggregator id")
 	}
-	if req.ID != "fr24" {
+	mlat := false
+	if req.Mlat != nil {
+		mlat = *req.Mlat
+	}
+	switch req.ID {
+	case "fr24":
+		// handled below
+	case "piaware":
+		// FlightAware enable is one-click: no required field. An optional
+		// feeder-id reclaims an existing feeder; otherwise the fake mints one
+		// (production reads it from /var/cache/piaware/feeder_id after start).
+		_, _, stored := state.AggregatorRecord("piaware")
+		feederID := req.Fields["feeder_id"]
+		if feederID == "" {
+			feederID = stored["feeder_id"]
+		}
+		if feederID == "" {
+			feederID = "00000000-0000-4000-8000-00000000dev0"
+		}
+		if req.Mlat == nil {
+			mlat = true // descriptor default
+		}
+		state.AggregatorEnable("piaware", map[string]string{"feeder_id": feederID}, mlat)
+		return aggEnvelope(map[string]any{
+			"protocol_version": aggProtocolVersion,
+			"result":           "accepted",
+			"step":             "starting",
+			"id":               "piaware",
+			"request_id":       "dev-piaware",
+		})
+	default:
 		return aggError("rejected", "enable is not yet supported for "+req.ID)
 	}
 	_, _, stored := state.AggregatorRecord(req.ID)
@@ -145,10 +218,6 @@ func aggEnable(state *State, body []byte) wexec.Result {
 	if key == "" {
 		// Dev: simulate the signup wizard minting a fresh sharing key.
 		key = "DEVFR24KEY01"
-	}
-	mlat := false
-	if req.Mlat != nil {
-		mlat = *req.Mlat
 	}
 	state.AggregatorEnable(req.ID, map[string]string{"email": email, "sharing_key": key}, mlat)
 	// Fire-and-forget, like production: return accepted; the SPA polls status
