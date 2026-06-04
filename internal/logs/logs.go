@@ -34,6 +34,10 @@ var Whitelist = map[string]string{
 	"claim":               "airplanes-claim.service",
 	"webconfig":           "airplanes-webconfig.service",
 	"update-orchestrator": "airplanes-update-orchestrator.service",
+	// Optional third-party aggregator services. The instance we run is the
+	// templated unit (airplanes-aggregator@<id>.service); the vendor's own
+	// unit (e.g. fr24feed.service) is masked at enable time.
+	"fr24": "airplanes-aggregator@fr24.service",
 }
 
 // JournalctlBinary is overridable for tests.

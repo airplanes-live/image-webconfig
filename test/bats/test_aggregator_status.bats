@@ -14,6 +14,8 @@ setup() {
     WORK="$(mktemp -d)"
     export AGG_STATE_DIR="$WORK/state"
     export AGG_INSTALL_ROOT="$WORK/install"
+    export AGG_ENABLE_STATE="$WORK/enable.state"
+    export AGG_REQ_DIR="$WORK/req"
     mkdir -p "$AGG_STATE_DIR" "$AGG_INSTALL_ROOT"
 
     # Exercise the real shipped descriptors.
@@ -79,7 +81,9 @@ EOF
 
 @test "an installed-but-stopped adapter reports stopped" {
     export AGG_DECODER_STATE=up SVC_STATE=inactive
+    # A non-empty install dir = installed; a bare dir reads as not_installed.
     mkdir -p "$AGG_INSTALL_ROOT/fr24"
+    : > "$AGG_INSTALL_ROOT/fr24/fr24feed"
     run "$APLAGG" status --json
     [ "$status" -eq 0 ]
     echo "$output" | jq -e '.aggregators[0].state == "stopped"'

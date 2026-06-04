@@ -111,7 +111,28 @@ type State struct {
 	version   *int              // claim.version (nil unless ImportIdentity supplied one)
 	feedStart time.Time
 	tickStart time.Time
+	// aggregators holds dev-only third-party aggregator records keyed by
+	// adapter id (e.g. "fr24"). Purely in-memory — the production
+	// apl-aggregator helper persists to /etc/airplanes/aggregators; the fake
+	// just lets the SPA exercise enable / disable / config / backup flows
+	// without a Pi.
+	aggregators map[string]*aggRecord
 }
+
+// aggRecord is the dev-fake per-adapter aggregator state the verbs mutate.
+type aggRecord struct {
+	enabled bool
+	mlat    bool
+	fields  map[string]string // includes secret values (e.g. sharing_key)
+	// installUntil mimics the production async enable: status reports the
+	// adapter as "installing" until this time, then "running". Zero = not
+	// installing. Compared by wall clock at status time (no timer/goroutine).
+	installUntil time.Time
+}
+
+// aggInstallDuration is how long the dev fake pretends a vendor acquire takes,
+// so the SPA's 202-accepted → poll-status → running flow is exercisable.
+const aggInstallDuration = 2 * time.Second
 
 const devFakeFeederUUID = "11111111-2222-3333-4444-555555555555"
 
@@ -179,10 +200,145 @@ func NewState(p Paths) *State {
 			// the claim SSE log instead.
 			"airplanes-claim.service": "inactive",
 		},
-		feedStart: now,
-		tickStart: now,
+		feedStart:   now,
+		tickStart:   now,
+		aggregators: map[string]*aggRecord{},
 	}
 }
+
+// AggregatorRecord returns a copy of the dev aggregator record for id:
+// whether it is enabled, whether MLAT is on, and the stored fields (including
+// secret values). A never-touched adapter reports (false, false, empty).
+func (s *State) AggregatorRecord(id string) (enabled, mlat bool, fields map[string]string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	r, ok := s.aggregators[id]
+	if !ok {
+		return false, false, map[string]string{}
+	}
+	f := make(map[string]string, len(r.fields))
+	for k, v := range r.fields {
+		f[k] = v
+	}
+	return r.enabled, r.mlat, f
+}
+
+// aggRecordLocked returns (creating if needed) the record for id. Caller holds s.mu.
+func (s *State) aggRecordLocked(id string) *aggRecord {
+	r := s.aggregators[id]
+	if r == nil {
+		r = &aggRecord{fields: map[string]string{}}
+		s.aggregators[id] = r
+	}
+	return r
+}
+
+// AggregatorEnable marks id enabled, merges non-empty fields, sets MLAT, and
+// flips the templated unit active so the dashboard tile renders running. It
+// stamps a short installing window so status mimics the production async
+// enable (accepted → installing → running).
+func (s *State) AggregatorEnable(id string, fields map[string]string, mlat bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	r := s.aggRecordLocked(id)
+	for k, v := range fields {
+		if v != "" {
+			r.fields[k] = v
+		}
+	}
+	r.enabled = true
+	r.mlat = mlat
+	r.installUntil = time.Now().Add(aggInstallDuration)
+	s.services[aggregatorUnit(id)] = "active"
+}
+
+// AggregatorInstalling reports whether id is within its simulated installing
+// window — the dev analogue of a running enable worker.
+func (s *State) AggregatorInstalling(id string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	r := s.aggregators[id]
+	return r != nil && !r.installUntil.IsZero() && time.Now().Before(r.installUntil)
+}
+
+// AggregatorSet merges config (MLAT toggle + fields) without changing the
+// enabled flag — mirrors the helper's state-only `set` verb.
+func (s *State) AggregatorSet(id string, fields map[string]string, mlat *bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	r := s.aggRecordLocked(id)
+	for k, v := range fields {
+		if v != "" {
+			r.fields[k] = v
+		}
+	}
+	if mlat != nil {
+		r.mlat = *mlat
+	}
+}
+
+// AggregatorDisable clears the enabled flag but keeps the stored identity, and
+// stops the unit. Mirrors `disable`.
+func (s *State) AggregatorDisable(id string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if r := s.aggregators[id]; r != nil {
+		r.enabled = false
+	}
+	s.services[aggregatorUnit(id)] = "inactive"
+}
+
+// AggregatorReset drops the record entirely and stops the unit. Mirrors `reset`.
+func (s *State) AggregatorReset(id string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	delete(s.aggregators, id)
+	s.services[aggregatorUnit(id)] = "inactive"
+}
+
+// AggregatorExport returns a snapshot of every configured adapter's recoverable
+// identity (id → fields incl. secrets, plus MLAT). Mirrors `export`.
+func (s *State) AggregatorExport() map[string]struct {
+	Mlat   bool
+	Fields map[string]string
+} {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := map[string]struct {
+		Mlat   bool
+		Fields map[string]string
+	}{}
+	for id, r := range s.aggregators {
+		if len(r.fields) == 0 {
+			continue
+		}
+		f := make(map[string]string, len(r.fields))
+		for k, v := range r.fields {
+			f[k] = v
+		}
+		out[id] = struct {
+			Mlat   bool
+			Fields map[string]string
+		}{Mlat: r.mlat, Fields: f}
+	}
+	return out
+}
+
+// AggregatorImport seeds id's identity from a backup (enabled stays false).
+// Mirrors `import`.
+func (s *State) AggregatorImport(id string, fields map[string]string, mlat bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	r := s.aggRecordLocked(id)
+	r.enabled = false
+	r.mlat = mlat
+	for k, v := range fields {
+		r.fields[k] = v
+	}
+}
+
+// aggregatorUnit is the templated unit name for an adapter id.
+func aggregatorUnit(id string) string { return "airplanes-aggregator@" + id + ".service" }
 
 // SyncAll seeds every backing file the production readers depend on.
 // Idempotent — re-running it overwrites with the current in-memory
@@ -606,11 +762,11 @@ func (s *State) syncClaimSecretLocked() error {
 
 func (s *State) syncManifestLocked() error {
 	manifest := map[string]any{
-		"version":     "dev",
-		"kind":        "dev",
-		"commit_sha":  "0000000000000000000000000000000000000000",
-		"build_date":  s.feedStart.UTC().Format(time.RFC3339),
-		"arches":      []string{"dev"},
+		"version":    "dev",
+		"kind":       "dev",
+		"commit_sha": "0000000000000000000000000000000000000000",
+		"build_date": s.feedStart.UTC().Format(time.RFC3339),
+		"arches":     []string{"dev"},
 	}
 	b, err := json.Marshal(manifest)
 	if err != nil {

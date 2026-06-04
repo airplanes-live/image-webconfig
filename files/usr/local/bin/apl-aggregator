@@ -52,10 +52,30 @@ AGG_LOCK="${AGG_LOCK:-/run/airplanes/aggregator.lock}"
 AGG_LOCK_TIMEOUT="${AGG_LOCK_TIMEOUT:-5}"
 AGG_STATE_HOME="${AGG_STATE_HOME:-/var/lib/airplanes-aggregators}"
 
+# --- async-enable seams ----------------------------------------------------
+# enable is fire-and-forget: cmd_enable validates synchronously then launches a
+# detached worker via systemd-run, returning {result:"accepted"} in <1s. The
+# worker (a second invocation of this script in __enable-worker mode) does the
+# slow vendor acquire/signup and reports progress through AGG_ENABLE_STATE.
+AGG_SYSTEMD_RUN="${AGG_SYSTEMD_RUN:-systemd-run}"  # test seam: stub to run the worker inline
+AGG_ENABLE_UNIT="${AGG_ENABLE_UNIT:-airplanes-aggregator-enable.service}"
+AGG_REQ_DIR="${AGG_REQ_DIR:-/run/airplanes/aggregator-req}"      # 0700 root; secret request spool
+AGG_ENABLE_STATE="${AGG_ENABLE_STATE:-/run/airplanes/aggregator-enable.state}"  # async progress overlay
+AGG_ENABLE_GRACE="${AGG_ENABLE_GRACE:-10}"  # secs before a unit-less running overlay is reconciled to failed
+AGG_SELF="${AGG_SELF:-/usr/local/bin/apl-aggregator}"  # worker binary path for systemd-run
+
 readonly AGG_PROTOCOL_VERSION=1
 readonly AGG_ID_RE='^[a-z0-9][a-z0-9_-]*$'
 readonly AGG_STATE_MAX_BYTES=65536
 readonly AGG_STATE_SCHEMA_VERSION=1
+
+# WORKER_MODE=1 reroutes _emit_error/_emit_ok to the AGG_ENABLE_STATE progress
+# file instead of stdout (the worker has no HTTP caller). Set by __enable-worker.
+WORKER_MODE=0
+WORKER_ID=""        # adapter id the worker is enabling (for the progress overlay)
+WORKER_REQID=""     # request_id of the in-flight enable
+WORKER_STARTED=0    # epoch secs the enable was launched (for grace-window reconciliation)
+WORKER_STEP=""      # current phase label written into the overlay
 
 # --- output helpers --------------------------------------------------------
 
@@ -68,6 +88,15 @@ _emit_json() {
 
 _emit_error() {
 	local code="$1" message="$2" body
+	# In worker mode there is no HTTP caller: record the failure in the async
+	# progress overlay instead of printing an envelope to stdout. The existing
+	# _enable_fr24 `_emit_error …; exit N` call sites thus become progress
+	# writes with no change to that function.
+	if (( WORKER_MODE == 1 )); then
+		_write_enable_state failed "$code" "$message"
+		_emitted=1
+		return
+	fi
 	if ! body="$(jq -nc \
 		--argjson pv "$AGG_PROTOCOL_VERSION" --arg c "$code" --arg m "$message" \
 		'{protocol_version:$pv, result:"error", error_code:$c, message:$m}')"; then
@@ -87,13 +116,105 @@ _emit_error() {
 # shellcheck disable=SC2317  # invoked indirectly via `trap _on_exit EXIT`
 _on_exit() {
 	local rc=$?
-	if (( _emitted == 0 )); then
-		printf '{"protocol_version":%d,"result":"error","error_code":"state_error","message":"apl-aggregator: unexpected error (exit %d)"}\n' \
-			"$AGG_PROTOCOL_VERSION" "$rc"
-		exit 3
+	if (( _emitted != 0 )); then
+		return
 	fi
+	if (( WORKER_MODE == 1 )); then
+		# The worker died without writing a terminal state (e.g. errexit on an
+		# unexpected failure). Record a generic failure so status reconciles to
+		# failed instead of hanging on "installing". A SIGKILL/RuntimeMaxSec
+		# bypasses this trap entirely; status's grace+unit-liveness check is the
+		# backstop for that.
+		_write_enable_state failed state_error "apl-aggregator worker: unexpected error (exit $rc)"
+		_emitted=1
+		return
+	fi
+	printf '{"protocol_version":%d,"result":"error","error_code":"state_error","message":"apl-aggregator: unexpected error (exit %d)"}\n' \
+		"$AGG_PROTOCOL_VERSION" "$rc"
+	exit 3
 }
 trap _on_exit EXIT
+
+# --- async-enable progress overlay -----------------------------------------
+
+# _write_enable_state <status> [error_code] [message]: atomically write the
+# async progress overlay for the in-flight enable. status ∈
+# starting|running|done|failed; step is the current phase. Mode 0600 root.
+# WORKER_ID/WORKER_REQID identify the adapter; in the synchronous launch path
+# cmd_enable sets them before the first write.
+_write_enable_state() {
+	local status="$1" code="${2-}" message="${3-}" step="${WORKER_STEP:-$1}" tmp body
+	install -d -m 0755 "$(dirname "$AGG_ENABLE_STATE")" 2>/dev/null || true
+	body="$(jq -nc \
+		--argjson pv "$AGG_PROTOCOL_VERSION" --arg id "$WORKER_ID" --arg rid "$WORKER_REQID" \
+		--argjson started "${WORKER_STARTED:-0}" \
+		--arg st "$status" --arg step "$step" --arg c "$code" --arg m "$message" \
+		'{protocol_version:$pv, id:$id, request_id:$rid, started_at:$started, status:$st, step:$step}
+		 | (if $c != "" then .error_code = $c else . end)
+		 | (if $m != "" then .message = $m else . end)' 2>/dev/null)" || return 0
+	tmp="$(mktemp "${AGG_ENABLE_STATE}.XXXXXX" 2>/dev/null)" || return 0
+	if printf '%s\n' "$body" >"$tmp" 2>/dev/null && chmod 0600 "$tmp" 2>/dev/null; then
+		mv -f "$tmp" "$AGG_ENABLE_STATE" 2>/dev/null || rm -f -- "$tmp"
+	else
+		rm -f -- "$tmp"
+	fi
+}
+
+# _clear_enable_state <id> [reqid]: drop the overlay if it belongs to id (so
+# disable / reset / a fresh enable don't leave a stale failed/running overlay
+# shadowing the adapter). When reqid is given, clear only if it also matches —
+# so a rolled-back launch removes its OWN overlay, never one a concurrent enable
+# just published. A no-op if the overlay is for another adapter / request.
+_clear_enable_state() {
+	local id="$1" reqid="${2-}" raw oid orid
+	[[ -f "$AGG_ENABLE_STATE" ]] || return 0
+	raw="$(head -c "$AGG_STATE_MAX_BYTES" "$AGG_ENABLE_STATE" 2>/dev/null || true)"
+	oid="$(jq -r '.id // ""' <<<"$raw" 2>/dev/null || true)"
+	[[ "$oid" == "$id" ]] || return 0
+	if [[ -n "$reqid" ]]; then
+		orid="$(jq -r '.request_id // ""' <<<"$raw" 2>/dev/null || true)"
+		[[ "$orid" == "$reqid" ]] || return 0
+	fi
+	rm -f -- "$AGG_ENABLE_STATE"
+	return 0
+}
+
+# _enable_overlay <id>: echo the overlay JSON for id (reconciled), or empty.
+# A status:"running" overlay whose unit is no longer active/activating AND
+# whose started_at is past the grace window is reconciled to failed (the worker
+# died without writing terminal state). The reconciliation is computed
+# read-only and NOT written back: this runs under `status`, which holds no
+# lock, so persisting here could clobber a fresh overlay a concurrent enable
+# just published. The result is deterministic anyway — a --collect'd dead unit
+# never returns to active — so status reports failed consistently, and the next
+# lock-holding verb (enable/disable/reset) clears the stale file.
+_enable_overlay() {
+	local id="$1" raw oid status
+	[[ -f "$AGG_ENABLE_STATE" ]] || return 0
+	raw="$(head -c "$AGG_STATE_MAX_BYTES" "$AGG_ENABLE_STATE" 2>/dev/null || true)"
+	jq -e 'type == "object"' >/dev/null 2>&1 <<<"$raw" || return 0
+	oid="$(jq -r '.id // ""' <<<"$raw")"
+	[[ "$oid" == "$id" ]] || return 0
+	status="$(jq -r '.status // ""' <<<"$raw")"
+	if [[ "$status" == "running" || "$status" == "starting" ]]; then
+		local svc
+		svc="$(_service_state "$AGG_ENABLE_UNIT")"
+		if [[ "$svc" != "active" && "$svc" != "activating" ]]; then
+			# Worker not running. Within the grace window it may simply not have
+			# been observed by systemd yet; past it, treat as a dead worker.
+			local started age
+			started="$(jq -r '.started_at // 0' <<<"$raw")"
+			[[ "$started" =~ ^[0-9]+$ ]] || started=0
+			age=$(( $(date +%s 2>/dev/null || echo 0) - started ))
+			if (( started > 0 && age > AGG_ENABLE_GRACE )); then
+				raw="$(jq -c '.status = "failed"
+					| .error_code = (.error_code // "state_error")
+					| .message = (.message // "enable worker stopped unexpectedly")' <<<"$raw")"
+			fi
+		fi
+	fi
+	printf '%s' "$raw"
+}
 
 # --- probes ----------------------------------------------------------------
 
@@ -197,13 +318,31 @@ _adapter_json() {
 			fi
 		fi
 
+		# installed = the on-demand vendor dir exists AND is non-empty. A bare
+		# (partially-extracted or pre-created) directory must not read as
+		# installed, or a failed acquire would surface as "stopped" instead of
+		# "not_installed".
 		local installed="false"
-		if [[ "$AGG_ACQUIRE_METHOD" == "vendor-installer" && -d "$AGG_INSTALL_ROOT/$AGG_ID" ]]; then
+		if [[ "$AGG_ACQUIRE_METHOD" == "vendor-installer" && -d "$AGG_INSTALL_ROOT/$AGG_ID" \
+			&& -n "$(ls -A "$AGG_INSTALL_ROOT/$AGG_ID" 2>/dev/null)" ]]; then
 			installed="true"
 		fi
 
 		local state
 		state="$(_derive_state "$available" "$(_service_state "$AGG_SERVICE_UNIT")" "$enabled" "$installed")"
+
+		# Async-enable overlay: an in-flight or recently-failed enable for this
+		# adapter takes precedence over the service-derived state, so the UI can
+		# show installing/failed with progress while the detached worker runs.
+		local overlay ov_json="null" ov_status
+		if overlay="$(_enable_overlay "$AGG_ID")" && [[ -n "$overlay" ]]; then
+			ov_json="$overlay"
+			ov_status="$(jq -r '.status // ""' <<<"$overlay")"
+			case "$ov_status" in
+				starting|running) state="installing" ;;
+				failed) state="failed" ;;
+			esac
+		fi
 
 		# Secret-field presence is derived from state on jq STDIN — the secret
 		# VALUES never travel via argv (where /proc/<pid>/cmdline would expose
@@ -236,6 +375,7 @@ _adapter_json() {
 			--argjson secrets_present "$secrets_present_json" \
 			--argjson decoder "$decoder_json" \
 			--arg claim "$AGG_CLAIM_URL" \
+			--argjson overlay "$ov_json" \
 			'{
 				id: $id, display_name: $name, acquire_method: $acquire, service_unit: $unit,
 				state: $state, enabled: $enabled, configured: $configured,
@@ -246,7 +386,12 @@ _adapter_json() {
 				decoder_reachable: $decoder, claim_url: $claim
 			 }
 			 | (if .unavailable_reason == "" then del(.unavailable_reason) else . end)
-			 | (if .claim_url == "" then del(.claim_url) else . end)'
+			 | (if .claim_url == "" then del(.claim_url) else . end)
+			 | (if $overlay != null
+			    then .enable = ($overlay | {status, step, request_id}
+			         + (if .error_code then {error_code} else {} end)
+			         + (if .message then {message} else {} end))
+			    else . end)'
 	)
 }
 
@@ -280,9 +425,25 @@ cmd_status() {
 
 # --- mutating verbs --------------------------------------------------------
 
+# _worker_progress <step>: in worker mode, advance the progress overlay to a
+# new phase (status stays "running"). A no-op outside the worker.
+_worker_progress() {
+	(( WORKER_MODE == 1 )) || return 0
+	WORKER_STEP="$1"
+	_write_enable_state running
+}
+
 _emit_ok() {
 	# $1 = id, $2 = optional extra-fields JSON object (default {})
 	local id="$1" extra="${2-}" body
+	# In worker mode there is no HTTP caller: record success in the async
+	# progress overlay (status:"done") instead of an envelope on stdout.
+	if (( WORKER_MODE == 1 )); then
+		WORKER_STEP="done"
+		_write_enable_state "done"
+		_emitted=1
+		return
+	fi
 	[[ -n "$extra" ]] || extra='{}'
 	if ! body="$(jq -nc --argjson pv "$AGG_PROTOCOL_VERSION" --arg id "$id" --argjson x "$extra" \
 		'{protocol_version:$pv, result:"ok", id:$id} + $x')"; then
@@ -388,6 +549,9 @@ cmd_set() {
 		_emit_error rejected "fields must be an object"; exit 2
 	fi
 	_acquire_lock
+	if _enable_in_progress; then
+		_emit_error lock_timeout "an enable is in progress; try again shortly"; exit 4
+	fi
 	local cur merged
 	cur="$(_load_state "$id")" \
 		|| { _emit_error state_error "existing state for $id is unreadable; reset to clear"; exit 3; }
@@ -400,6 +564,7 @@ cmd_set() {
 		    then .fields = (((.fields // {}) | if type == "object" then . else {} end) + $req.fields)
 		    else . end)')"
 	_write_state "$id" "$merged"
+	_clear_enable_state "$id"
 	_emit_ok "$id"
 }
 
@@ -409,6 +574,9 @@ cmd_disable() {
 	_read_request
 	_request_id; local id="$REQ_ID"
 	_acquire_lock
+	if _enable_in_progress; then
+		_emit_error lock_timeout "an enable is in progress; try again shortly"; exit 4
+	fi
 	# Validate state + descriptor BEFORE the systemctl side effect so a corrupt
 	# state fails fast with no half-applied change.
 	local cur unit next
@@ -423,6 +591,7 @@ cmd_disable() {
 	next="$(jq -nc --argjson cur "$cur" --argjson sv "$AGG_STATE_SCHEMA_VERSION" \
 		'$cur | .schema_version = $sv | .enabled = false')"
 	_write_state "$id" "$next"
+	_clear_enable_state "$id"
 	_emit_ok "$id"
 }
 
@@ -437,6 +606,9 @@ cmd_reset() {
 	[[ "$AGG_INSTALL_ROOT" == /* && "$AGG_INSTALL_ROOT" != "/" ]] \
 		|| { _emit_error state_error "unsafe install root"; exit 3; }
 	_acquire_lock
+	if _enable_in_progress; then
+		_emit_error lock_timeout "an enable is in progress; try again shortly"; exit 4
+	fi
 	local unit
 	if ! unit="$(_descriptor_unit "$id")"; then
 		_emit_error state_error "descriptor read failed for $id"; exit 3
@@ -446,6 +618,7 @@ cmd_reset() {
 	fi
 	rm -f -- "$AGG_STATE_DIR/$id.json"
 	rm -rf -- "${AGG_INSTALL_ROOT:?}/$id"
+	_clear_enable_state "$id"
 	_emit_ok "$id"
 }
 
@@ -584,6 +757,7 @@ _enable_fr24() {
 	ini="${AGG_FR24_INI:-$AGG_STATE_HOME/fr24/fr24feed.ini}"
 
 	local rc=0
+	_worker_progress acquiring
 	_fr24_acquire_binary "$url" "$sha" "$bin" || rc=$?
 	case "$rc" in
 		0) ;;
@@ -591,6 +765,7 @@ _enable_fr24() {
 		*) _emit_error acquire_failed "could not download or verify fr24feed (check connectivity)"; exit 2 ;;
 	esac
 
+	_worker_progress configuring
 	install -d -m 0750 "$(dirname "$ini")" 2>/dev/null || true
 	if [[ -n "$key" ]]; then
 		_fr24_write_ini "$ini" "$key" || { _emit_error state_error "failed to write fr24feed.ini"; exit 3; }
@@ -612,22 +787,173 @@ _enable_fr24() {
 		 | {schema_version:$sv, enabled:true, mlat_enabled:false, fields:{email:$email, sharing_key:$key}}')"
 	_write_state "fr24" "$state"
 
+	_worker_progress starting-service
 	if ! "$AGG_SYSTEMCTL" enable --now "airplanes-aggregator@fr24.service" >/dev/null 2>&1; then
 		_emit_error state_error "fr24 configured but the service failed to start"; exit 3
 	fi
 	_emit_ok "fr24" '{"sharing_key_present":true}'
 }
 
-# cmd_enable installs + starts an aggregator. The vendor fetch + signup are
-# adapter-specific; the lock is held across the whole acquire so a concurrent
-# mutation cannot interleave.
+# _fr24_validate_sync: the fast synchronous validation cmd_enable runs before
+# launching the worker. Mirrors the head of _enable_fr24 — load + merge state
+# (so a restored email/key counts), then require a valid email/geo, a valid key
+# format if one is present, and a reachable decoder. Emits the error envelope +
+# exits on failure, so a bad request fails immediately instead of after a 202.
+_fr24_validate_sync() {
+	local email key lat lon alt fields cur
+	cur="$(_load_state "fr24" 2>/dev/null)" \
+		|| { _emit_error state_error "existing fr24 state is unreadable; reset to clear"; exit 3; }
+	fields="$(printf '%s\n%s\n' "$cur" "$REQ_JSON" \
+		| jq -cn 'input as $cur | input as $req | (($cur.fields // {}) + ($req.fields // {}))')"
+	email="$(jq -r '.email // ""' <<<"$fields")"
+	key="$(jq -r '.sharing_key // ""' <<<"$fields")"
+	lat="$(jq -r 'if has("lat") then .lat else "" end' <<<"$REQ_JSON")"
+	lon="$(jq -r 'if has("lon") then .lon else "" end' <<<"$REQ_JSON")"
+	alt="$(jq -r 'if has("alt") then .alt else "" end' <<<"$REQ_JSON")"
+	_valid_email "$email" || { _emit_error rejected "a valid email address is required"; exit 2; }
+	_valid_geo "$lat" "$lon" "$alt" || { _emit_error rejected "valid latitude, longitude and altitude are required"; exit 2; }
+	[[ -z "$key" ]] || _valid_fr24_key "$key" || { _emit_error rejected "invalid sharing key format"; exit 2; }
+	_decoder_reachable || { _emit_error decoder_unavailable "local decoder 127.0.0.1:30005 is not reachable"; exit 2; }
+}
+
+# _gen_reqid: a filesystem- and argv-safe request id for one enable run.
+_gen_reqid() {
+	local u
+	u="$(cat /proc/sys/kernel/random/uuid 2>/dev/null || true)"
+	[[ -n "$u" ]] || u="$(date +%s%N 2>/dev/null || echo 0)$$$RANDOM"
+	printf '%s' "${u//[^a-z0-9-]/}"
+}
+
+# _spool_request <id> <reqid>: persist the (already-validated, single-object)
+# REQ_JSON — which carries secrets — to a 0600 root file under a 0700 dir, so
+# the detached worker can read it by id. Atomic temp+rename.
+_spool_request() {
+	local reqid="$1" tmp path="$AGG_REQ_DIR/$1.json"
+	( umask 077; install -d -m 0700 "$AGG_REQ_DIR" ) 2>/dev/null || true
+	tmp="$(mktemp "$AGG_REQ_DIR/.$reqid.XXXXXX" 2>/dev/null)" || return 1
+	if printf '%s\n' "$REQ_JSON" >"$tmp" 2>/dev/null && chmod 0600 "$tmp" 2>/dev/null; then
+		mv -f "$tmp" "$path" 2>/dev/null || { rm -f -- "$tmp"; return 1; }
+	else
+		rm -f -- "$tmp"; return 1
+	fi
+}
+
+_rm_spool() { rm -f -- "$AGG_REQ_DIR/$1.json" 2>/dev/null || true; }
+
+# _enable_in_progress: is an enable worker running (or just launched)? True if
+# the enable unit is active/activating, or a running/starting overlay was
+# published within the grace window (the worker hasn't become visible to
+# systemd yet). A stale overlay past the grace window is NOT in-progress.
+_enable_in_progress() {
+	local svc
+	svc="$(_service_state "$AGG_ENABLE_UNIT")"
+	[[ "$svc" == "active" || "$svc" == "activating" ]] && return 0
+	[[ -f "$AGG_ENABLE_STATE" ]] || return 1
+	local raw st started age
+	raw="$(head -c "$AGG_STATE_MAX_BYTES" "$AGG_ENABLE_STATE" 2>/dev/null || true)"
+	st="$(jq -r '.status // ""' <<<"$raw" 2>/dev/null || true)"
+	[[ "$st" == "running" || "$st" == "starting" ]] || return 1
+	started="$(jq -r '.started_at // 0' <<<"$raw" 2>/dev/null || echo 0)"
+	[[ "$started" =~ ^[0-9]+$ ]] || started=0
+	age=$(( $(date +%s 2>/dev/null || echo 0) - started ))
+	(( started > 0 && age <= AGG_ENABLE_GRACE ))
+}
+
+# _emit_accepted <id> <reqid>: the fire-and-forget enable response.
+_emit_accepted() {
+	local id="$1" reqid="$2" body
+	if ! body="$(jq -nc --argjson pv "$AGG_PROTOCOL_VERSION" --arg id "$id" --arg rid "$reqid" \
+		'{protocol_version:$pv, result:"accepted", step:"starting", id:$id, request_id:$rid}')"; then
+		_emit_error state_error "accepted-envelope build failed"; exit 3
+	fi
+	_emit_json "$body"
+}
+
+# cmd_enable validates synchronously, then launches the slow vendor acquire as a
+# detached transient unit (systemd-run) and returns {result:"accepted"} in <1s.
+# The flock guards validation + spool; it is released before the worker is
+# launched (the worker re-acquires it for its whole transaction). One enable at
+# a time is enforced by _enable_in_progress + the fixed unit name.
 cmd_enable() {
 	_read_request
 	_request_id; local id="$REQ_ID"
 	_acquire_lock
+	if _enable_in_progress; then
+		_emit_error lock_timeout "an enable is already in progress; try again shortly"; exit 4
+	fi
 	case "$id" in
-		fr24) _enable_fr24 ;;
+		fr24) _fr24_validate_sync ;;
 		*) _emit_error rejected "enable is not yet supported for $id"; exit 2 ;;
+	esac
+
+	local reqid; reqid="$(_gen_reqid)"
+	[[ -n "$reqid" ]] || { _emit_error state_error "could not generate a request id"; exit 3; }
+	WORKER_ID="$id"; WORKER_REQID="$reqid"
+	WORKER_STARTED="$(date +%s 2>/dev/null || echo 0)"
+	# We hold the lock and no enable is in progress, so any spool file still on
+	# disk is orphaned (a prior worker that died, or a launch that never execed
+	# its worker). Sweep before spooling so a never-consumed secret can't
+	# accumulate in /run across enables.
+	rm -f -- "$AGG_REQ_DIR"/*.json 2>/dev/null || true
+	_spool_request "$reqid" || { _emit_error state_error "failed to spool enable request"; exit 3; }
+
+	# Clear any stale terminal unit so the fixed systemd-run name is free, then
+	# publish the running overlay BEFORE launch — the grace window in
+	# _enable_overlay covers the launch-to-active latency so this can't read as a
+	# dead worker.
+	"$AGG_SYSTEMCTL" reset-failed "$AGG_ENABLE_UNIT" >/dev/null 2>&1 || true
+	WORKER_STEP="starting"; _write_enable_state running
+	exec 9>&-  # release the flock so the worker can take it
+
+	# Pass both the request id and the adapter id: the id lets the worker stamp
+	# a correctly-attributed progress overlay even if it dies before reading the
+	# spool (the id is not a secret; only reqid indexes the secret payload).
+	if ! "$AGG_SYSTEMD_RUN" --unit="$AGG_ENABLE_UNIT" --collect \
+		"$AGG_SELF" __enable-worker "$reqid" "$id" >/dev/null 2>&1; then
+		# Launch failed (e.g. the unit already exists → a racing enable won). Roll
+		# back ONLY our own overlay (reqid-matched) + spool and report
+		# transient-busy.
+		_rm_spool "$reqid"
+		_clear_enable_state "$id" "$reqid"
+		_emit_error lock_timeout "could not launch enable (another may be in progress)"; exit 4
+	fi
+	_emit_accepted "$id" "$reqid"
+}
+
+# cmd_enable_worker is the detached worker (systemd-run target, root). It is not
+# a sudoers verb — webconfig can only invoke `enable --json`. It reads the
+# spooled request, unlinks the secret spool immediately, then runs the adapter
+# acquire under the lock, reporting progress through the overlay.
+cmd_enable_worker() {
+	local reqid="$1" id="$2"
+	WORKER_MODE=1
+	WORKER_REQID="$reqid"
+	WORKER_STARTED="$(date +%s 2>/dev/null || echo 0)"
+	# Set WORKER_ID up front (from the trusted argv, not the spool) so EVERY
+	# failure path below — including a missing/corrupt spool — writes a progress
+	# overlay attributed to the right adapter, not an unattached id:"" record
+	# that status would ignore.
+	[[ "$reqid" =~ ^[a-z0-9-]+$ ]] || { _emit_error usage_error "invalid worker request id"; exit 5; }
+	[[ "$id" =~ $AGG_ID_RE && -f "$AGG_DESC_DIR/$id.desc" ]] || { _emit_error not_found "unknown aggregator id"; exit 2; }
+	WORKER_ID="$id"
+	local path="$AGG_REQ_DIR/$reqid.json"
+	if [[ ! -f "$path" ]]; then
+		_emit_error state_error "enable request spool missing"; exit 3
+	fi
+	# Load into memory, then delete the secret spool BEFORE the slow work so a
+	# SIGKILL / RuntimeMaxSec mid-acquire leaves no secret on disk.
+	REQ_JSON="$(head -c "$AGG_STATE_MAX_BYTES" "$path" 2>/dev/null || true)"
+	_rm_spool "$reqid"
+	jq -e -s 'length == 1 and (.[0] | type == "object")' >/dev/null 2>&1 <<<"$REQ_JSON" \
+		|| { _emit_error parse_error "spooled request is not a single JSON object"; exit 5; }
+	# Defence in depth: the spool's id must match the id we were launched with.
+	_request_id
+	[[ "$REQ_ID" == "$id" ]] || { _emit_error rejected "spooled request id mismatch"; exit 2; }
+	WORKER_STEP="starting"; _write_enable_state running
+	_acquire_lock
+	case "$REQ_ID" in
+		fr24) _enable_fr24 ;;
+		*) _emit_error rejected "enable is not yet supported for $REQ_ID"; exit 2 ;;
 	esac
 }
 
@@ -701,6 +1027,9 @@ cmd_import() {
 	(( ${#ids[@]} > 0 )) || { _emit_error rejected "backup contains no aggregators"; exit 2; }
 
 	_acquire_lock
+	if _enable_in_progress; then
+		_emit_error lock_timeout "an enable is in progress; try again shortly"; exit 4
+	fi
 	# Validate against on-device state and pre-build every seeded record BEFORE
 	# writing any, so a rejected adapter can't leave a half-applied restore.
 	local -a write_ids=() write_states=()
@@ -723,6 +1052,8 @@ cmd_import() {
 	local i
 	for i in "${!write_ids[@]}"; do
 		_write_state "${write_ids[$i]}" "${write_states[$i]}"
+		# A restored identity supersedes any prior failed-enable overlay.
+		_clear_enable_state "${write_ids[$i]}"
 	done
 	local body
 	body="$(jq -nc --argjson pv "$AGG_PROTOCOL_VERSION" --argjson n "${#write_ids[@]}" \
@@ -734,6 +1065,13 @@ cmd_import() {
 
 main() {
 	command -v jq >/dev/null 2>&1 || { _emit_error state_error "jq is required"; exit 3; }
+
+	# Internal worker mode (not a sudoers verb; launched only by systemd-run as
+	# root). Argv is `__enable-worker <request_id> <id>`, no --json.
+	if [[ "${1-}" == "__enable-worker" ]]; then
+		[[ $# -eq 3 ]] || { _emit_error usage_error "usage: apl-aggregator __enable-worker <request_id> <id>"; exit 5; }
+		cmd_enable_worker "$2" "$3"; exit 0
+	fi
 
 	if [[ $# -ne 2 || "${2-}" != "--json" ]]; then
 		_emit_error usage_error "usage: apl-aggregator {status|list|enable|set|disable|reset|export|import} --json"

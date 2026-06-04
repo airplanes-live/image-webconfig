@@ -74,6 +74,13 @@ func privilegedArgvCases(priv PrivilegedArgv) []privilegedArgvCase {
 		{"WifiStatus", priv.WifiStatus},
 		{"ExportIdentity", priv.ExportIdentity},
 		{"ImportIdentity", priv.ImportIdentity},
+		{"AggregatorStatus", priv.AggregatorStatus},
+		{"AggregatorEnable", priv.AggregatorEnable},
+		{"AggregatorDisable", priv.AggregatorDisable},
+		{"AggregatorSet", priv.AggregatorSet},
+		{"AggregatorReset", priv.AggregatorReset},
+		{"AggregatorExport", priv.AggregatorExport},
+		{"AggregatorImport", priv.AggregatorImport},
 	}
 }
 

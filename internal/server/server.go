@@ -20,22 +20,22 @@ import (
 
 // Server holds the runtime auth components. Constructed in cmd/webconfig.
 type Server struct {
-	version       string
-	store         *auth.PasswordStore
-	sessions      *auth.Sessions
-	lockout       *auth.Lockout
-	guard         *auth.HashGuard
-	argon2Params  auth.Params
-	identity      *identity.Reader
-	feedEnv       *feedenv.Reader
-	status        *status.Reader
-	claimStatus   *claimstatus.Cache
-	logs          *logs.Streamer
-	runner        wexec.CommandRunner
-	stdinRunner   wexec.CommandRunnerStdin
-	schema        *schemacache.Cache
-	priv          PrivilegedArgv
-	nowFunc       func() time.Time // injected for tests; defaults to time.Now
+	version      string
+	store        *auth.PasswordStore
+	sessions     *auth.Sessions
+	lockout      *auth.Lockout
+	guard        *auth.HashGuard
+	argon2Params auth.Params
+	identity     *identity.Reader
+	feedEnv      *feedenv.Reader
+	status       *status.Reader
+	claimStatus  *claimstatus.Cache
+	logs         *logs.Streamer
+	runner       wexec.CommandRunner
+	stdinRunner  wexec.CommandRunnerStdin
+	schema       *schemacache.Cache
+	priv         PrivilegedArgv
+	nowFunc      func() time.Time // injected for tests; defaults to time.Now
 	// upgradeStatePath is the on-disk file the runtime overlay's update
 	// path writes with "clean" / "in-progress" / "failed". Defaults to
 	// DefaultUpgradeStatePath; tests override via Deps.UpgradeStatePath.
@@ -54,9 +54,9 @@ type Server struct {
 	// GET / and GET /static/*. Default (nil) keeps production behavior:
 	// assets are served from the binary's go:embed FS. cmd/devserver sets
 	// this to a disk-backed os.DirFS so UI edits don't require a rebuild.
-	assetsFS         fs.FS
-	configMu         sync.Mutex // serializes POST /api/config transactions
-	maintenanceMu    sync.Mutex // serializes the is-active guard + transient-unit kickoff
+	assetsFS      fs.FS
+	configMu      sync.Mutex // serializes POST /api/config transactions
+	maintenanceMu sync.Mutex // serializes the is-active guard + transient-unit kickoff
 }
 
 // now returns the current time via the injected clock so tests can pin
@@ -78,23 +78,36 @@ func (s *Server) now() time.Time { return s.nowFunc() }
 // status) and mutating (add / update / delete / test / activate) surfaces
 // via the same grant.
 type PrivilegedArgv struct {
-	ApplyFeed          []string // sudo -n /usr/local/bin/apl-feed apply --json --lock-timeout 5
-	SchemaFeed         []string // /usr/local/bin/apl-feed schema --json (no sudo: read-only)
-	Reboot             []string // sudo -n /usr/bin/systemctl reboot
-	Poweroff           []string // sudo -n /usr/bin/systemctl poweroff
-	StartOrchestrator    []string // sudo systemd-run --unit=airplanes-update-orchestrator ...
-	RegisterClaim      []string // sudo systemctl start --no-block airplanes-claim.service
-	SyncConfig         []string // sudo systemctl start --no-block airplanes-config-sync.service
-	WifiList           []string
-	WifiAdd            []string
-	WifiUpdate         []string
-	WifiDelete         []string
-	WifiTest           []string
-	WifiActivate       []string
-	WifiAdopt          []string
-	WifiStatus         []string
-	ExportIdentity     []string // sudo -n /usr/local/lib/airplanes-webconfig/identity-export.sh
-	ImportIdentity     []string // sudo -n /usr/local/lib/airplanes-webconfig/identity-import.sh
+	ApplyFeed         []string // sudo -n /usr/local/bin/apl-feed apply --json --lock-timeout 5
+	SchemaFeed        []string // /usr/local/bin/apl-feed schema --json (no sudo: read-only)
+	Reboot            []string // sudo -n /usr/bin/systemctl reboot
+	Poweroff          []string // sudo -n /usr/bin/systemctl poweroff
+	StartOrchestrator []string // sudo systemd-run --unit=airplanes-update-orchestrator ...
+	RegisterClaim     []string // sudo systemctl start --no-block airplanes-claim.service
+	SyncConfig        []string // sudo systemctl start --no-block airplanes-config-sync.service
+	WifiList          []string
+	WifiAdd           []string
+	WifiUpdate        []string
+	WifiDelete        []string
+	WifiTest          []string
+	WifiActivate      []string
+	WifiAdopt         []string
+	WifiStatus        []string
+	ExportIdentity    []string // sudo -n /usr/local/lib/airplanes-webconfig/identity-export.sh
+	ImportIdentity    []string // sudo -n /usr/local/lib/airplanes-webconfig/identity-import.sh
+	// Aggregator* target the apl-aggregator helper installed by the runtime
+	// overlay. As with apl-wifi, one entry per verb keeps the sudoers grant
+	// pinned to a single subcommand so a compromised webconfig cannot drift
+	// between the read-only (status, export) and mutating (enable, disable,
+	// set, reset, import) surfaces via the same grant. Secret values (e.g. an
+	// FR24 sharing key) travel on the helper's stdin, never on argv.
+	AggregatorStatus  []string
+	AggregatorEnable  []string
+	AggregatorDisable []string
+	AggregatorSet     []string
+	AggregatorReset   []string
+	AggregatorExport  []string
+	AggregatorImport  []string
 }
 
 // DefaultPrivilegedArgv returns the production argv shapes for the
@@ -142,21 +155,32 @@ func DefaultPrivilegedArgv() PrivilegedArgv {
 		// round-trip; enqueue and return rather than risk systemctlTimeout.
 		// The unit self-gates (claim secret + REMOTE_CONFIG_ENABLED opt-in),
 		// so a redundant trigger is a no-op.
-		SyncConfig:    sudo("/usr/bin/systemctl", "start", "--no-block", "airplanes-config-sync.service"),
-		WifiList:      sudo("/usr/local/bin/apl-wifi", "list", "--json"),
-		WifiAdd:       sudo("/usr/local/bin/apl-wifi", "add", "--json"),
-		WifiUpdate:    sudo("/usr/local/bin/apl-wifi", "update", "--json"),
-		WifiDelete:    sudo("/usr/local/bin/apl-wifi", "delete", "--json"),
-		WifiTest:      sudo("/usr/local/bin/apl-wifi", "test", "--json"),
-		WifiActivate:  sudo("/usr/local/bin/apl-wifi", "activate", "--json"),
-		WifiAdopt:     sudo("/usr/local/bin/apl-wifi", "adopt", "--json"),
-		WifiStatus:    sudo("/usr/local/bin/apl-wifi", "status", "--json"),
+		SyncConfig:   sudo("/usr/bin/systemctl", "start", "--no-block", "airplanes-config-sync.service"),
+		WifiList:     sudo("/usr/local/bin/apl-wifi", "list", "--json"),
+		WifiAdd:      sudo("/usr/local/bin/apl-wifi", "add", "--json"),
+		WifiUpdate:   sudo("/usr/local/bin/apl-wifi", "update", "--json"),
+		WifiDelete:   sudo("/usr/local/bin/apl-wifi", "delete", "--json"),
+		WifiTest:     sudo("/usr/local/bin/apl-wifi", "test", "--json"),
+		WifiActivate: sudo("/usr/local/bin/apl-wifi", "activate", "--json"),
+		WifiAdopt:    sudo("/usr/local/bin/apl-wifi", "adopt", "--json"),
+		WifiStatus:   sudo("/usr/local/bin/apl-wifi", "status", "--json"),
 		// Identity export/import call wrapper scripts (not bare apl-feed)
 		// so each surface is its own fixed argv in sudoers. The wrappers
 		// invoke `apl-feed backup -` and `apl-feed restore /dev/stdin
 		// --force` internally.
 		ExportIdentity: sudo("/usr/local/lib/airplanes-webconfig/identity-export.sh"),
 		ImportIdentity: sudo("/usr/local/lib/airplanes-webconfig/identity-import.sh"),
+		// apl-aggregator manages optional third-party feed aggregators. One
+		// pinned argv per verb; the JSON request (and any secret field) is
+		// read on stdin, not argv. The helper is laid down by the runtime
+		// overlay at the same fixed path on every release.
+		AggregatorStatus:  sudo("/usr/local/bin/apl-aggregator", "status", "--json"),
+		AggregatorEnable:  sudo("/usr/local/bin/apl-aggregator", "enable", "--json"),
+		AggregatorDisable: sudo("/usr/local/bin/apl-aggregator", "disable", "--json"),
+		AggregatorSet:     sudo("/usr/local/bin/apl-aggregator", "set", "--json"),
+		AggregatorReset:   sudo("/usr/local/bin/apl-aggregator", "reset", "--json"),
+		AggregatorExport:  sudo("/usr/local/bin/apl-aggregator", "export", "--json"),
+		AggregatorImport:  sudo("/usr/local/bin/apl-aggregator", "import", "--json"),
 	}
 }
 
@@ -287,6 +311,20 @@ func New(d Deps) http.Handler {
 	mux.HandleFunc("DELETE /api/wifi/{id}", s.requireSession(s.handleWifiDelete))
 	mux.HandleFunc("POST /api/wifi/{id}/activate", s.requireSession(s.handleWifiActivate))
 	mux.HandleFunc("POST /api/wifi/{id}/adopt", s.requireSession(s.handleWifiAdopt))
+
+	// Third-party aggregators — privileged subcommands of
+	// /usr/local/bin/apl-aggregator. As with Wi-Fi, no Go-side mutex: the
+	// helper's flock at /run/airplanes/aggregator.lock serializes across
+	// processes (and a webconfig restart racing the CLI) and returns a fast
+	// lock_timeout 503 to the second caller. export/import are POST so they
+	// route through the origin check; export is the one secret-bearing read.
+	mux.HandleFunc("GET /api/aggregators", s.requireSession(s.handleAggregatorList))
+	mux.HandleFunc("POST /api/aggregators/export", s.requireSession(s.handleAggregatorExport))
+	mux.HandleFunc("POST /api/aggregators/import", s.requireSession(s.handleAggregatorImport))
+	mux.HandleFunc("POST /api/aggregators/{id}/enable", s.requireSession(s.handleAggregatorEnable))
+	mux.HandleFunc("POST /api/aggregators/{id}/disable", s.requireSession(s.handleAggregatorDisable))
+	mux.HandleFunc("POST /api/aggregators/{id}/set", s.requireSession(s.handleAggregatorSet))
+	mux.HandleFunc("POST /api/aggregators/{id}/reset", s.requireSession(s.handleAggregatorReset))
 
 	// Static assets at /static/*; the SPA shell is served by the GET /
 	// handler below. no-store cache policy: assets are embedded in the
