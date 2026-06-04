@@ -45,6 +45,7 @@
         "webconfig":      "airplanes-webconfig.service",
         "update-orchestrator":  "airplanes-update-orchestrator.service",
         "fr24":      "airplanes-aggregator@fr24.service",
+        "piaware":   "piaware.service",
     };
     const UNIT_TO_LOG_SLUG = Object.fromEntries(
         Object.entries(LOG_SLUG_TO_UNIT).map(([s, u]) => [u, s])
@@ -3571,6 +3572,16 @@
     const fr24KeyRE = /^[A-Za-z0-9]{6,40}$/;
     function isValidFr24Key(v) { return fr24KeyRE.test(String(v == null ? "" : v).trim()); }
 
+    const feederIdRE = /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/;
+    function isValidFeederId(v) { return feederIdRE.test(String(v == null ? "" : v).trim()); }
+
+    // Adapters with a bespoke config panel, and the display name used where only
+    // the id is in hand (the enable-progress view). Keep in sync with the .desc
+    // files and the panel dispatcher below.
+    const ADAPTER_NAMES = { fr24: "Flightradar24", piaware: "FlightAware" };
+    function adapterManageable(id) { return id === "fr24" || id === "piaware"; }
+    function adapterPanel(id) { return id === "piaware" ? piawarePanel() : fr24Panel(); }
+
     // AGG_STATE_BADGE maps an adapter `state` to [label, severity-suffix].
     const AGG_STATE_BADGE = {
         running:             ["Feeding",            "ok"],
@@ -3672,14 +3683,14 @@
     }
 
     function buildAggregatorRow(a) {
-        const manageable = a.id === "fr24"; // only adapter with a bespoke panel today
+        const manageable = adapterManageable(a.id);
         const actions = el("div", { class: "wc-agg-row__actions" });
         // A configured/enabled adapter stays manageable even if it later reports
         // unavailable, so Disable/Remove are never stranded.
         if (manageable && (a.available || a.enabled || a.configured)) {
             actions.appendChild(el("button", {
                 type: "button", class: "wc-btn-ghost",
-                onclick: () => navigate(() => fr24Panel(), { title: a.display_name || "Flightradar24", showBack: true }),
+                onclick: () => navigate(() => adapterPanel(a.id), { title: a.display_name || a.id, showBack: true }),
             }, a.enabled || a.configured ? "Manage" : "Set up"));
         }
         const reason = (!a.available && a.unavailable_reason)
@@ -3758,7 +3769,7 @@
         if (code === "rejected" && /lat|lon|alt|latitude|longitude|altitude|location/i.test(p.message || "")) {
             return "Set your feeder location on the dashboard before setting up an aggregator.";
         }
-        if (code === "acquire_failed") return "Could not download the Flightradar24 feeder. Check the feeder's internet connection and try again.";
+        if (code === "acquire_failed") return "Could not download or install the third-party feeder. Check the feeder's internet connection and try again.";
         if (code === "signup_failed") return "Flightradar24 sign-up didn't return a sharing key. Try again, or paste an existing key.";
         return p.message || p.error || "Operation failed.";
     }
@@ -3889,6 +3900,127 @@
         ));
     }
 
+    async function piawarePanel() {
+        render(el("div", { class: "wc-card" }, el("p", { class: "muted" }, "loading…")));
+        const resp = await getJSON("/api/aggregators");
+        if (handleAuthFailure(resp)) return;
+        if (!resp.ok) {
+            render(el("section", { class: "wc-card" }, el("h2", {}, "FlightAware"),
+                el("p", { class: "error", role: "alert" }, "Could not load status."),
+                el("button", { type: "button", class: "wc-btn-primary", onclick: () => piawarePanel() }, "Retry")));
+            return;
+        }
+        const a = ((resp.payload && resp.payload.aggregators) || []).find(x => x.id === "piaware");
+        if (!a) {
+            render(el("section", { class: "wc-card" }, el("h2", {}, "FlightAware"),
+                el("p", { class: "muted" }, "FlightAware is not available on this image.")));
+            return;
+        }
+        if (a.state === "installing" && a.enable && a.enable.request_id) {
+            return aggregatorEnableProgress("piaware", a.enable.request_id);
+        }
+        renderPiawareForm(a);
+    }
+
+    function renderPiawareForm(a) {
+        const configured = !!(a.configured || a.enabled);
+        const claimUrl = vendorClaimHref(a.claim_url);
+        const inlineErr = el("p", { class: "error", role: "alert" });
+
+        const feederId = el("input", { type: "text", autocomplete: "off", spellcheck: "false",
+            placeholder: "optional — paste a Feeder ID to reclaim an existing feeder" });
+        const feederErr = el("p", { class: "field-help wc-field-error", hidden: true, role: "alert" },
+            "A Feeder ID looks like 00000000-0000-0000-0000-000000000000.");
+
+        const mlatOn = a.configured_mlat_enabled != null ? !!a.configured_mlat_enabled : !!a.mlat_default;
+        const mlat = el("input", { type: "checkbox" });
+        mlat.checked = mlatOn;
+
+        const submitLabel = a.enabled ? "Update settings" : (configured ? "Re-run setup" : "Set up FlightAware");
+        const submit = el("button", { type: "submit", class: "wc-btn-primary" }, submitLabel);
+
+        const recheck = () => { submit.disabled = feederId.value.trim() !== "" && !isValidFeederId(feederId.value); };
+        feederId.addEventListener("input", () => { refreshFieldError(feederId, feederErr, v => v.trim() !== "" && !isValidFeederId(v)); recheck(); });
+
+        const form = el("form", { class: "wc-agg-form", novalidate: true,
+            onsubmit: async (e) => {
+                e.preventDefault();
+                inlineErr.textContent = "";
+                const fields = {};
+                const fv = feederId.value.trim();
+                if (fv) {
+                    if (!isValidFeederId(fv)) { inlineErr.textContent = "Enter a valid Feeder ID, or leave it blank."; return; }
+                    fields.feeder_id = fv;       // omit when blank → new feeder is provisioned
+                }
+                submit.disabled = true; submit.textContent = "Submitting…";
+                const r = await postJSON("/api/aggregators/piaware/enable", { fields, mlat_enabled: mlat.checked });
+                if (handleAuthFailure(r)) return;
+                if (r.status === 202) {
+                    navigate(() => aggregatorEnableProgress("piaware", r.payload && r.payload.request_id),
+                        { title: "Setting up FlightAware", showBack: true });
+                    return;
+                }
+                submit.disabled = false; submit.textContent = submitLabel;
+                inlineErr.textContent = aggEnableErrorMessage(r);
+            },
+        },
+            el("h3", {}, "FlightAware settings"),
+            el("div", { class: "field" },
+                el("label", { class: "wc-checkbox" }, mlat, el("span", {}, "Participate in MLAT (multilateration)")),
+                el("p", { class: "field-help" }, "MLAT starts once you claim this feeder and set its location on FlightAware.")),
+            el("div", { class: "field" }, el("label", {}, "Feeder ID (optional)"), feederId, feederErr,
+                el("p", { class: "field-help" }, "Leave blank to register a new FlightAware feeder. Paste an existing Feeder ID to reclaim a feeder you already own.")),
+            inlineErr,
+            el("div", { class: "wc-agg-row__actions" }, submit),
+        );
+        recheck();
+
+        const actions = el("div", { class: "wc-agg-row__actions" });
+        if (a.enabled) {
+            const disableBtn = el("button", { type: "button", class: "wc-btn-ghost" }, "Stop feeding");
+            disableBtn.onclick = async () => {
+                disableBtn.disabled = true;
+                const r = await postJSON("/api/aggregators/piaware/disable", {});
+                if (handleAuthFailure(r)) return;
+                if (!r.ok) { disableBtn.disabled = false; inlineErr.textContent = aggEnableErrorMessage(r); return; }
+                pendingFlash = { text: "Stopped feeding FlightAware.", level: "ok" };
+                navigate(aggregatorsPanel, { title: "Third-party aggregators", showBack: true });
+            };
+            actions.appendChild(disableBtn);
+        }
+        if (configured) {
+            const resetBtn = el("button", { type: "button", class: "wc-btn-danger" }, "Remove");
+            resetBtn.onclick = async () => {
+                if (!confirm("Remove FlightAware? This stops feeding, uninstalls piaware, and forgets this feeder's identity. Download a backup first if you want to keep its Feeder ID.")) return;
+                resetBtn.disabled = true;
+                const r = await postJSON("/api/aggregators/piaware/reset", {});
+                if (handleAuthFailure(r)) return;
+                if (!r.ok) { resetBtn.disabled = false; inlineErr.textContent = aggEnableErrorMessage(r); return; }
+                pendingFlash = { text: "Removed FlightAware.", level: "ok" };
+                navigate(aggregatorsPanel, { title: "Third-party aggregators", showBack: true });
+            };
+            actions.appendChild(resetBtn);
+        }
+
+        const links = el("p", { class: "wc-agg-links" });
+        if (claimUrl) links.appendChild(el("a", { href: claimUrl, target: "_blank", rel: "noopener noreferrer" }, "Claim this feeder on FlightAware"));
+        if (a.enabled || a.state === "running" || configured) {
+            if (links.childNodes.length) links.appendChild(el("span", { class: "muted" }, " · "));
+            links.appendChild(el("a", { href: "#", role: "button",
+                onclick: (e) => { e.preventDefault(); navigate(() => logViewer("piaware"), { title: "Logs · piaware", showBack: true }); } }, "View logs"));
+        }
+
+        render(el("section", { class: "wc-card" },
+            el("h2", { class: "wc-card-head" }, el("span", {}, "FlightAware"), aggStateBadge(a.state)),
+            el("p", { class: "muted" }, a.enabled
+                ? "Feeding FlightAware alongside airplanes.live. Claim this feeder on FlightAware to see your statistics and enable MLAT."
+                : "Feed FlightAware (piaware) alongside airplanes.live. After setup, claim the feeder on FlightAware to enable MLAT and see your statistics."),
+            form,
+            actions.childNodes.length ? actions : null,
+            links.childNodes.length ? links : null,
+        ));
+    }
+
     const AGG_ENABLE_POLL_MS = 2000;
     const AGG_ENABLE_GRACE_POLLS = 5;
     // aggregatorEnableProgress polls /api/aggregators after a 202 and shows the
@@ -3896,13 +4028,14 @@
     // one the 202 returned, so a stale overlay from a prior failed run can't make
     // this run look failed. Mirrors orchestratorProgress's lifecycle teardown.
     function aggregatorEnableProgress(id, requestId) {
+        const name = ADAPTER_NAMES[id] || id;
         const stepEl = el("p", { class: "muted" }, "Starting…");
         const errEl = el("div", { class: "wc-flash wc-flash--warn", role: "alert" });
         errEl.hidden = true;
         const actions = el("div", { class: "wc-agg-row__actions" });
         render(el("section", { class: "wc-card" },
-            el("h2", {}, "Setting up Flightradar24"),
-            el("p", { class: "muted" }, "Downloading and configuring the Flightradar24 feeder. This can take a minute — you can leave this page; it keeps running."),
+            el("h2", {}, "Setting up " + name),
+            el("p", { class: "muted" }, "Installing and configuring the " + name + " feeder. This can take a minute — you can leave this page; it keeps running."),
             stepEl, errEl, actions,
         ));
 
@@ -3918,16 +4051,16 @@
 
         const finishOk = () => {
             pollTimer = null;
-            pendingFlash = { text: "Flightradar24 is now feeding.", level: "ok" };
+            pendingFlash = { text: name + " is now feeding.", level: "ok" };
             navigate(aggregatorsPanel, { title: "Third-party aggregators", showBack: true });
         };
         const finishFail = (msg) => {
             pollTimer = null;
             stepEl.textContent = "Setup failed.";
-            errEl.textContent = msg || "Flightradar24 setup failed.";
+            errEl.textContent = msg || (name + " setup failed.");
             errEl.hidden = false;
             actions.replaceChildren(el("button", { type: "button", class: "wc-btn-primary",
-                onclick: () => navigate(() => fr24Panel(), { title: "Flightradar24", showBack: true }) }, "Back to setup"));
+                onclick: () => navigate(() => adapterPanel(id), { title: name, showBack: true }) }, "Back to setup"));
         };
 
         async function pollOnce() {

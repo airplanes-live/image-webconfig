@@ -41,7 +41,8 @@ teardown() {
     run "$APLAGG" status --json
     [ "$status" -eq 0 ]
     echo "$output" | jq -e '.protocol_version == 1'
-    echo "$output" | jq -e '.aggregators | length == 1'
+    # fr24 + piaware ship as the two adapters; fr24 sorts first (descriptor glob).
+    echo "$output" | jq -e '.aggregators | length == 2'
     echo "$output" | jq -e '.aggregators[0].id == "fr24"'
     echo "$output" | jq -e '.aggregators[0].state == "not_installed"'
     echo "$output" | jq -e '.aggregators[0].available == true'
@@ -57,7 +58,7 @@ teardown() {
     export AGG_DECODER_STATE=down
     run "$APLAGG" list --json
     [ "$status" -eq 0 ]
-    echo "$output" | jq -e '.aggregators | length == 1'
+    echo "$output" | jq -e '.aggregators | length == 2'
     echo "$output" | jq -e '.aggregators[0].decoder_reachable == false'
 }
 

@@ -1374,3 +1374,6 @@ input[aria-invalid="true"] {
 .wc-agg-form { margin-top: 0.5rem; }
 .wc-agg-backup { margin-top: 1rem; }
 .wc-agg-links { margin-top: 0.8rem; font-size: 0.9rem; }
+/* Inline checkbox + label (e.g. the FlightAware MLAT toggle). */
+.wc-checkbox { display: flex; align-items: center; gap: 0.5rem; cursor: pointer; }
+.wc-checkbox input[type="checkbox"] { width: auto; margin: 0; flex: 0 0 auto; }
