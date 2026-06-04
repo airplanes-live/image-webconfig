@@ -1,0 +1,27 @@
+[Unit]
+Description=airplanes.live third-party aggregator feed: %i
+Documentation=https://airplanes.live
+After=readsb.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/lib/airplanes-webconfig/aggregator-run %i
+Restart=always
+RestartSec=10
+
+# Vendor feeder code runs as a dedicated unprivileged account, not root. The
+# account + state dir are provisioned by the image build (airplanes-live/image).
+User=airplanes-aggregator
+Group=airplanes-aggregator
+StateDirectory=airplanes-aggregators
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ProtectControlGroups=true
+ProtectKernelTunables=true
+RestrictSUIDSGID=true
+
+[Install]
+WantedBy=multi-user.target

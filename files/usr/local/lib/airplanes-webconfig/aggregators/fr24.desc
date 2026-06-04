@@ -13,3 +13,14 @@ AGG_CLAIM_URL="https://www.flightradar24.com/account/data-sharing"
 AGG_SECRET_FIELDS="sharing_key"
 # UI capability descriptor, spliced verbatim into status output.
 AGG_FIELDS_JSON='[{"id":"email","label":"Email address","required":true,"secret":false},{"id":"sharing_key","label":"Sharing key (optional)","required":false,"secret":true}]'
+
+# --- vendor acquire parameters (consumed by apl-aggregator enable) ----------
+# Pinned fr24feed: static_arm64 build, validated on Debian 13 (trixie) aarch64.
+# Bump deliberately after re-validating the signup wizard prompt sequence on a
+# feeder (NOT always-latest — a vendor update could shift the prompts).
+AGG_FR24_DEB_URL="https://repo-feed.flightradar24.com/rpi_binaries/fr24feed_1.0.48-0_arm64.deb"
+AGG_FR24_VERSION="1.0.48-0"
+# sha256 of the pinned .deb (a root-executed binary — verified before extract).
+AGG_FR24_DEB_SHA256="1a440dc7c4f9d4f675d9990f4858259a1d93d65302402cab2dc67478af56d0f9"
+# Receiver fr24feed consumes: the overlay's local readsb BEAST output.
+AGG_BEAST_INPUT="127.0.0.1:30005"

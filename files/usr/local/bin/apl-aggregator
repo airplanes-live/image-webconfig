@@ -14,9 +14,11 @@
 #   5  usage_error / parse_error
 #
 # Read verbs (status, list) take no stdin and emit {protocol_version,
-# aggregators:[...]}. Mutating verbs (set, disable, reset) read a JSON request
-# object on stdin and emit {protocol_version, result:"ok", id} on success.
-# (enable / export / import land in follow-ups.)
+# aggregators:[...]}. Mutating verbs (enable, set, disable, reset) read a JSON
+# request object on stdin and emit {protocol_version, result:"ok", id} on
+# success. enable additionally takes {lat, lon, alt, fields:{…}} and, for a
+# vendor-installer adapter, fetches the pinned vendor binary on demand.
+# (export / import land in a follow-up.)
 #
 # Adapter descriptors are trusted, code-owned data sourced from AGG_DESC_DIR —
 # never loaded from /etc, never user-editable. Adapter ids are validated
@@ -32,6 +34,10 @@
 #   AGG_SYSTEMCTL      systemctl binary
 #   AGG_DECODER_ADDR   local readsb BEAST endpoint
 #   AGG_DECODER_STATE  "up"/"down" to bypass the TCP probe in tests
+#   AGG_STATE_HOME     vendor runtime/config home (e.g. fr24feed.ini)
+#   AGG_FR24_BIN / AGG_FR24_INI         installed-binary / ini paths (enable)
+#   AGG_FR24_ACQUIRE_OVERRIDE <dest>    stub the .deb fetch+extract in tests
+#   AGG_FR24_SIGNUP_OVERRIDE <ini> <email>  stub the signup wizard in tests
 
 set -Eeuo pipefail
 
@@ -42,6 +48,7 @@ AGG_SYSTEMCTL="${AGG_SYSTEMCTL:-systemctl}"
 AGG_DECODER_ADDR="${AGG_DECODER_ADDR:-127.0.0.1:30005}"
 AGG_LOCK="${AGG_LOCK:-/run/airplanes/aggregator.lock}"
 AGG_LOCK_TIMEOUT="${AGG_LOCK_TIMEOUT:-5}"
+AGG_STATE_HOME="${AGG_STATE_HOME:-/var/lib/airplanes-aggregators}"
 
 readonly AGG_PROTOCOL_VERSION=1
 readonly AGG_ID_RE='^[a-z0-9][a-z0-9_-]*$'
@@ -440,21 +447,196 @@ cmd_reset() {
 	_emit_ok "$id"
 }
 
+# --- enable: on-demand vendor acquire + service start ----------------------
+
+_valid_email() {
+	[[ "$1" =~ ^[^[:space:]@]+@[^[:space:]@]+\.[^[:space:]@]+$ ]]
+}
+
+# _valid_geo lat lon alt(metres): numeric + sane ranges.
+_valid_geo() {
+	local lat="$1" lon="$2" alt="$3"
+	[[ "$lat" =~ ^-?[0-9]+(\.[0-9]+)?$ && "$lon" =~ ^-?[0-9]+(\.[0-9]+)?$ && "$alt" =~ ^-?[0-9]+(\.[0-9]+)?$ ]] || return 1
+	awk -v la="$lat" -v lo="$lon" -v al="$alt" \
+		'BEGIN { exit !(la >= -90 && la <= 90 && lo >= -180 && lo <= 180 && al >= -500 && al <= 12000) }'
+}
+
+# fr24 sharing keys are short alphanumerics. Validating before a key reaches an
+# ini line or the state file blocks ini-injection (a key bearing a quote or
+# newline) on both the provided-key and signup-extracted paths.
+_valid_fr24_key() {
+	[[ "$1" =~ ^[A-Za-z0-9]{6,40}$ ]]
+}
+
+# _fr24_acquire_binary <url> <sha256> <dest>: download the pinned fr24feed .deb,
+# verify its sha256 (a root-executed binary), extract just the binary (NOT the
+# vendor cron-updater or unit), and install it at <dest>.
+# Returns: 0 ok, 1 download/integrity failure (network class), 2 local fs/tool
+# failure. Test seam: AGG_FR24_ACQUIRE_OVERRIDE <dest>.
+_fr24_acquire_binary() {
+	local url="$1" sha="$2" dest="$3"
+	if [[ -n "${AGG_FR24_ACQUIRE_OVERRIDE:-}" ]]; then
+		"$AGG_FR24_ACQUIRE_OVERRIDE" "$dest"; return
+	fi
+	[[ "$url" == https://* ]] || return 1
+	local tmp deb got src
+	tmp="$(mktemp -d)" || return 2
+	deb="$tmp/fr24.deb"
+	if ! curl -fsSL --max-time 120 -o "$deb" "$url"; then rm -rf "$tmp"; return 1; fi
+	got="$(sha256sum "$deb" 2>/dev/null | cut -d' ' -f1)"
+	printf 'apl-aggregator: fetched %s sha256=%s\n' "$url" "$got" >&2
+	if [[ -z "$got" || ( -n "$sha" && "$got" != "$sha" ) ]]; then rm -rf "$tmp"; return 1; fi
+	if ! dpkg -x "$deb" "$tmp/root" 2>/dev/null; then rm -rf "$tmp"; return 2; fi
+	src="$tmp/root/usr/bin/fr24feed"
+	[[ -f "$src" ]] || { rm -rf "$tmp"; return 1; }
+	install -D -m 0755 "$src" "$dest" || { rm -rf "$tmp"; return 2; }
+	rm -rf "$tmp"
+}
+
+# _fr24_write_ini <ini> <key>: configure fr24feed as a BEAST-TCP consumer of
+# the local decoder with the operator's sharing key (MLAT off, per the
+# adapter's FR24-MLAT-default-off contract).
+_fr24_write_ini() {
+	local ini="$1" key="$2" tmp
+	tmp="$(mktemp "${ini}.XXXXXX")" || return 1
+	if ! cat >"$tmp" <<EOF
+receiver="beast-tcp"
+host="127.0.0.1:30005"
+fr24key="$key"
+bs="no"
+raw="no"
+mlat="no"
+mlat-without-gps="no"
+EOF
+	then rm -f -- "$tmp"; return 1; fi
+	if ! { chmod 0640 "$tmp" && mv -f -- "$tmp" "$ini"; }; then
+		rm -f -- "$tmp"; return 1
+	fi
+}
+
+# _fr24_read_key <ini>: extract the quoted fr24key value (empty if absent or
+# malformed — strict, so a bare `fr24key=` never yields a bogus non-empty key).
+_fr24_read_key() {
+	sed -n 's/^fr24key="\([^"]*\)".*/\1/p' "$1" 2>/dev/null | head -1
+}
+
+# _fr24_finalize_perms <ini>: hand the ini + its dir to the service account if
+# it exists (created by the image build); on CI / older images it stays root.
+_fr24_finalize_perms() {
+	local ini="$1"
+	id -u airplanes-aggregator >/dev/null 2>&1 || return 0
+	chown airplanes-aggregator:airplanes-aggregator "$ini" 2>/dev/null || true
+	chown airplanes-aggregator:airplanes-aggregator "$(dirname "$ini")" 2>/dev/null || true
+}
+
+# _fr24_signup <bin> <ini> <email> <lat> <lon> <alt_m>: mint a fresh sharing
+# key by driving `fr24feed --signup --adsb` via piped stdin (validated on a
+# feeder: the wizard reads stdin, no tty/expect needed). Answer order matches
+# the wizard. Test seam: AGG_FR24_SIGNUP_OVERRIDE <ini> <email>.
+_fr24_signup() {
+	local bin="$1" ini="$2" email="$3" lat="$4" lon="$5" alt_m="$6" alt_ft
+	if [[ -n "${AGG_FR24_SIGNUP_OVERRIDE:-}" ]]; then
+		"$AGG_FR24_SIGNUP_OVERRIDE" "$ini" "$email"
+	else
+		alt_ft="$(awk -v m="$alt_m" 'BEGIN { printf "%d", m * 82 / 25 }')"
+		printf '%s\n' \
+			"$email" "" "no" "" "$lat" "$lon" "$alt_ft" "yes" "no" \
+			"4" "1" "127.0.0.1" "30005" "no" "no" "0" \
+			| timeout "${AGG_FR24_SIGNUP_TIMEOUT:-180}" "$bin" --signup --adsb --config-file="$ini" >/dev/null 2>&1 || true
+	fi
+	# Success is judged by a key landing in the ini, not the wizard's exit code.
+	[[ -f "$ini" ]] && grep -qs '^fr24key' "$ini"
+}
+
+_enable_fr24() {
+	local email key lat lon alt
+	email="$(jq -r '.fields.email // ""' <<<"$REQ_JSON")"
+	key="$(jq -r '.fields.sharing_key // ""' <<<"$REQ_JSON")"
+	lat="$(jq -r 'if has("lat") then .lat else "" end' <<<"$REQ_JSON")"
+	lon="$(jq -r 'if has("lon") then .lon else "" end' <<<"$REQ_JSON")"
+	alt="$(jq -r 'if has("alt") then .alt else "" end' <<<"$REQ_JSON")"
+
+	_valid_email "$email" || { _emit_error rejected "a valid email address is required"; exit 2; }
+	_valid_geo "$lat" "$lon" "$alt" || { _emit_error rejected "valid latitude, longitude and altitude are required"; exit 2; }
+	[[ -z "$key" ]] || _valid_fr24_key "$key" || { _emit_error rejected "invalid sharing key format"; exit 2; }
+	_decoder_reachable || { _emit_error decoder_unavailable "local decoder 127.0.0.1:30005 is not reachable"; exit 2; }
+
+	# Pinned vendor URL + checksum from the (trusted) descriptor, captured in a
+	# subshell so descriptor sourcing cannot clobber locals or write to stdout.
+	local desc_out url sha
+	# shellcheck source=/dev/null
+	desc_out="$( source "$AGG_DESC_DIR/fr24.desc" >/dev/null 2>&1; printf '%s\n%s\n' "${AGG_FR24_DEB_URL:-}" "${AGG_FR24_DEB_SHA256:-}" )"
+	url="$(sed -n 1p <<<"$desc_out")"
+	sha="$(sed -n 2p <<<"$desc_out")"
+
+	local bin ini
+	bin="${AGG_FR24_BIN:-$AGG_INSTALL_ROOT/fr24/fr24feed}"
+	ini="${AGG_FR24_INI:-$AGG_STATE_HOME/fr24/fr24feed.ini}"
+
+	local rc=0
+	_fr24_acquire_binary "$url" "$sha" "$bin" || rc=$?
+	case "$rc" in
+		0) ;;
+		2) _emit_error state_error "failed to install fr24feed locally"; exit 3 ;;
+		*) _emit_error acquire_failed "could not download or verify fr24feed (check connectivity)"; exit 2 ;;
+	esac
+
+	install -d -m 0750 "$(dirname "$ini")" 2>/dev/null || true
+	if [[ -n "$key" ]]; then
+		_fr24_write_ini "$ini" "$key" || { _emit_error state_error "failed to write fr24feed.ini"; exit 3; }
+	else
+		if ! _fr24_signup "$bin" "$ini" "$email" "$lat" "$lon" "$alt"; then
+			_emit_error signup_failed "fr24 signup did not return a sharing key"; exit 2
+		fi
+		key="$(_fr24_read_key "$ini")"
+		_valid_fr24_key "$key" || { _emit_error signup_failed "fr24 signup did not return a usable key"; exit 2; }
+	fi
+	_fr24_finalize_perms "$ini"
+
+	# Persist state BEFORE starting the unit, so a start failure leaves a
+	# visible enabled+stopped record rather than a running service with no
+	# state. Secrets travel via stdin to jq, never on its argv.
+	local state
+	state="$(printf '%s\n%s\n' "$email" "$key" | jq -Rn --argjson sv "$AGG_STATE_SCHEMA_VERSION" \
+		'(input) as $email | (input) as $key
+		 | {schema_version:$sv, enabled:true, mlat_enabled:false, fields:{email:$email, sharing_key:$key}}')"
+	_write_state "fr24" "$state"
+
+	if ! "$AGG_SYSTEMCTL" enable --now "airplanes-aggregator@fr24.service" >/dev/null 2>&1; then
+		_emit_error state_error "fr24 configured but the service failed to start"; exit 3
+	fi
+	_emit_ok "fr24" '{"sharing_key_present":true}'
+}
+
+# cmd_enable installs + starts an aggregator. The vendor fetch + signup are
+# adapter-specific; the lock is held across the whole acquire so a concurrent
+# mutation cannot interleave.
+cmd_enable() {
+	_read_request
+	_request_id; local id="$REQ_ID"
+	_acquire_lock
+	case "$id" in
+		fr24) _enable_fr24 ;;
+		*) _emit_error rejected "enable is not yet supported for $id"; exit 2 ;;
+	esac
+}
+
 # --- dispatch --------------------------------------------------------------
 
 main() {
 	command -v jq >/dev/null 2>&1 || { _emit_error state_error "jq is required"; exit 3; }
 
 	if [[ $# -ne 2 || "${2-}" != "--json" ]]; then
-		_emit_error usage_error "usage: apl-aggregator {status|list|set|disable|reset} --json"
+		_emit_error usage_error "usage: apl-aggregator {status|list|enable|set|disable|reset} --json"
 		exit 5
 	fi
 	case "$1" in
 		status|list) cmd_status; exit 0 ;;
+		enable) cmd_enable; exit 0 ;;
 		set) cmd_set; exit 0 ;;
 		disable) cmd_disable; exit 0 ;;
 		reset) cmd_reset; exit 0 ;;
-		*) _emit_error usage_error "unknown verb '$1'; use status|list|set|disable|reset --json"; exit 5 ;;
+		*) _emit_error usage_error "unknown verb '$1'; use status|list|enable|set|disable|reset --json"; exit 5 ;;
 	esac
 }
 
