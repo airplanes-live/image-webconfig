@@ -69,6 +69,7 @@ jobs:
         run: |
           shellcheck -x install.sh scripts/lib/install-common.sh \
             files/usr/local/lib/airplanes-webconfig/*.sh \
+            files/usr/local/lib/airplanes-webconfig/aggregator-run \
             files/usr/local/bin/apl-wifi \
             files/usr/local/bin/apl-aggregator \
             files/usr/local/lib/airplanes-webconfig/aggregators/*.desc \
@@ -77,6 +78,7 @@ jobs:
         run: |
           for f in install.sh scripts/lib/install-common.sh \
                    files/usr/local/lib/airplanes-webconfig/*.sh \
+                   files/usr/local/lib/airplanes-webconfig/aggregator-run \
                    files/usr/local/bin/apl-wifi \
                    files/usr/local/bin/apl-aggregator \
                    files/usr/local/lib/airplanes-webconfig/aggregators/*.desc \
