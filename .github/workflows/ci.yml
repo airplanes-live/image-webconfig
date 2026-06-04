@@ -70,12 +70,16 @@ jobs:
           shellcheck -x install.sh scripts/lib/install-common.sh \
             files/usr/local/lib/airplanes-webconfig/*.sh \
             files/usr/local/bin/apl-wifi \
+            files/usr/local/bin/apl-aggregator \
+            files/usr/local/lib/airplanes-webconfig/aggregators/*.desc \
             files/usr/local/lib/airplanes/*.sh
       - name: bash -n
         run: |
           for f in install.sh scripts/lib/install-common.sh \
                    files/usr/local/lib/airplanes-webconfig/*.sh \
                    files/usr/local/bin/apl-wifi \
+                   files/usr/local/bin/apl-aggregator \
+                   files/usr/local/lib/airplanes-webconfig/aggregators/*.desc \
                    files/usr/local/lib/airplanes/*.sh; do
             bash -n "$f"
           done

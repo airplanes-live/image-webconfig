@@ -1,0 +1,15 @@
+# shellcheck shell=bash
+# shellcheck disable=SC2034  # descriptor vars are consumed by apl-aggregator after sourcing
+# Flightradar24 aggregator descriptor — sourced by apl-aggregator.
+# Trusted, code-owned data; never user-editable.
+AGG_ID="fr24"
+AGG_DISPLAY_NAME="Flightradar24"
+AGG_ACQUIRE_METHOD="vendor-installer"
+AGG_SERVICE_UNIT="airplanes-aggregator@fr24.service"
+AGG_MLAT_CAPABLE="false"
+AGG_MLAT_DEFAULT="false"
+AGG_CLAIM_URL="https://www.flightradar24.com/account/data-sharing"
+# Space-separated field ids whose values are secret (never echoed in status).
+AGG_SECRET_FIELDS="sharing_key"
+# UI capability descriptor, spliced verbatim into status output.
+AGG_FIELDS_JSON='[{"id":"email","label":"Email address","required":true,"secret":false},{"id":"sharing_key","label":"Sharing key (optional)","required":false,"secret":true}]'
