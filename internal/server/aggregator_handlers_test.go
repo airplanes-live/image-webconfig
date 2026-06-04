@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"net/http"
+	"os"
 	"reflect"
 	"strings"
 	"testing"
@@ -355,6 +356,62 @@ func TestAggregator_UnknownResultMapsTo500(t *testing.T) {
 	defer r.Body.Close()
 	if r.StatusCode != http.StatusInternalServerError {
 		t.Fatalf("status = %d, want 500", r.StatusCode)
+	}
+}
+
+func TestAggregatorEnable_InjectsFeedEnvGeoOverClient(t *testing.T) {
+	t.Parallel()
+	h := newWriteHarness(t)
+	// Authoritative feeder location from feed.env (quoted, as feed.env writes it).
+	if err := os.WriteFile(h.feedEnvPath, []byte("LATITUDE=\"51.5\"\nLONGITUDE=\"-0.12\"\nALTITUDE=\"30\"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	h.stdinResult = wexec.Result{Stdout: []byte(`{"protocol_version":1,"result":"accepted","step":"starting","id":"fr24","request_id":"r1"}`)}
+	// Client supplies BOGUS geo; the server must overwrite it from feed.env.
+	r := postJSON(t, h.client, h.ts.URL+"/api/aggregators/fr24/enable",
+		map[string]any{"lat": 1.0, "lon": 2.0, "alt": 9999, "fields": map[string]string{"email": "a@b.c"}})
+	defer r.Body.Close()
+	if r.StatusCode != http.StatusAccepted {
+		t.Fatalf("status = %d, want 202; body=%s", r.StatusCode, mustReadAll(t, r.Body))
+	}
+	calls := h.stdinCallsCopy()
+	if len(calls) != 1 {
+		t.Fatalf("stdinCalls = %d", len(calls))
+	}
+	var sent map[string]any
+	if err := json.Unmarshal(calls[0].stdin, &sent); err != nil {
+		t.Fatalf("stdin not JSON: %s", calls[0].stdin)
+	}
+	if sent["lat"] != 51.5 || sent["lon"] != -0.12 || sent["alt"] != float64(30) {
+		t.Fatalf("geo not injected from feed.env (client geo must be overwritten): %v", sent)
+	}
+	if fields, _ := sent["fields"].(map[string]any); fields["email"] != "a@b.c" {
+		t.Fatalf("fields lost during geo inject: %v", sent)
+	}
+}
+
+func TestAggregatorEnable_DropsGeoWhenLocationUnset(t *testing.T) {
+	t.Parallel()
+	h := newWriteHarness(t)
+	// feed.env without any location → inject nothing; the client's geo must be
+	// dropped (not forwarded), so the helper rejects with a geo error.
+	if err := os.WriteFile(h.feedEnvPath, []byte("UAT_INPUT=\"\"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	h.stdinResult = wexec.Result{Stdout: []byte(`{"protocol_version":1,"result":"accepted","id":"fr24","request_id":"r1"}`)}
+	r := postJSON(t, h.client, h.ts.URL+"/api/aggregators/fr24/enable",
+		map[string]any{"lat": 1.0, "lon": 2.0, "alt": 9999, "fields": map[string]string{"email": "a@b.c"}})
+	defer r.Body.Close()
+	calls := h.stdinCallsCopy()
+	if len(calls) != 1 {
+		t.Fatalf("stdinCalls = %d", len(calls))
+	}
+	var sent map[string]any
+	_ = json.Unmarshal(calls[0].stdin, &sent)
+	for _, k := range []string{"lat", "lon", "alt"} {
+		if _, ok := sent[k]; ok {
+			t.Fatalf("%s must be dropped when feed.env has no location: %v", k, sent)
+		}
 	}
 }
 
