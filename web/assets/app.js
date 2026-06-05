@@ -108,6 +108,7 @@
     const themeBtn = document.getElementById("wc-theme-btn");
     const refreshBtn = document.getElementById("wc-refresh-btn");
     const userMenu = document.getElementById("wc-user-menu");
+    const userMenuAggregators = document.getElementById("wc-user-aggregators");
     const userMenuChangePw = document.getElementById("wc-user-change-pw");
     const userMenuLogout = document.getElementById("wc-user-logout");
     const userMenuReboot = document.getElementById("wc-user-reboot");
@@ -1210,12 +1211,14 @@
         const tiles = {};
         const appTiles = {};
 
-        // Row 1: hardware + Wi-Fi + third-party aggregators (fills the
-        // previously-empty third cell on the 3-col grid).
+        // Row 1: hardware + Wi-Fi.
         const hardware = buildHardwareTile();
         const wifi = buildWifiTile();
-        const aggregators = buildAggregatorTile();
-        const row1 = el("div", { class: "wc-grid--tiles" }, hardware.root, wifi.root, aggregators.root);
+        const row1 = el("div", { class: "wc-grid--tiles" }, hardware.root, wifi.root);
+
+        // Per-aggregator tiles, populated from /api/aggregators. Hidden
+        // until at least one configured/active adapter exists.
+        const aggTiles = el("div", { class: "wc-grid--tiles wc-agg-tiles", hidden: true });
 
         // Row 2: 1090 stack (readsb → feed → mlat).
         // Row 3: 978 UAT stack (dump978 + airplanes-978).
@@ -1236,8 +1239,8 @@
             apps.appendChild(t.root);
         }
 
-        const root = el("div", { class: "wc-tiles-stack" }, row1, row2, row3, apps);
-        return { root, tiles, appTiles, hardware, wifi, aggregators };
+        const root = el("div", { class: "wc-tiles-stack" }, row1, row2, row3, apps, aggTiles);
+        return { root, tiles, appTiles, hardware, wifi, aggTiles };
     }
 
     function buildAppTile(app) {
@@ -3560,20 +3563,6 @@
 
     // ===== Third-party aggregators =====
 
-    // Vendor data-sharing links come from the (code-owned) adapter descriptor,
-    // but we still allowlist the host — only an https link to the vendor's own
-    // domain renders, never arbitrary JSON.
-    const AGGREGATOR_CLAIM_HOSTS = ["flightradar24.com", "flightaware.com"];
-    function vendorClaimHref(url) {
-        try {
-            const u = new URL(url);
-            if (u.protocol !== "https:") return null;
-            const host = u.hostname;
-            const ok = AGGREGATOR_CLAIM_HOSTS.some(h => host === h || host.endsWith("." + h));
-            return ok ? u.toString() : null;
-        } catch (_) { return null; }
-    }
-
     // The aggregator field validators (isValidAggEmail / isValidFr24Key /
     // isValidFeederId) live in the @validator-parity block above, parity-tested
     // against apl-aggregator's bash twins.
@@ -3601,55 +3590,62 @@
         return el("span", { class: "wc-agg-badge wc-agg-badge--" + pair[1] }, pair[0]);
     }
 
-    // classifyAggregators projects /api/aggregators into a single dashboard-tile
-    // {dot, meta}. installing/failed take precedence; otherwise it summarises
-    // which adapters are feeding.
-    function classifyAggregators(payload) {
-        const adapters = (payload && payload.aggregators) || [];
-        if (!adapters.length) return { dot: "na", meta: "—" };
-        if (adapters.some(a => a.state === "installing")) return { dot: "warn", meta: "installing…" };
-        if (adapters.some(a => a.state === "failed")) return { dot: "err", meta: "setup failed" };
-        const feeding = adapters.filter(a => a.enabled).map(a => a.display_name || a.id);
-        if (feeding.length) return { dot: "ok", meta: feeding.join(", ") };
-        return { dot: "na", meta: "off" };
-    }
-
-    function buildAggregatorTile() {
+    // buildAdapterTile renders one configured/active adapter as a nav tile that
+    // opens its manage page. The state label + dot come from AGG_STATE_BADGE.
+    function buildAdapterTile(a) {
+        const pair = AGG_STATE_BADGE[a.state] || [a.state || "—", "na"];
         const iconNode = el("span", { class: "wc-tile__icon" }, svgIcon(AGGREGATOR_ICON));
-        const titleEl  = el("span", { class: "wc-tile__title" }, "Aggregators");
-        const metaEl   = el("span", { class: "wc-tile__meta" }, "—");
-        const dotEl    = el("span", { class: "wc-tile__dot wc-tile__dot--na" });
+        const titleEl  = el("span", { class: "wc-tile__title" }, a.display_name || a.id);
+        const metaEl   = el("span", { class: "wc-tile__meta" }, pair[0]);
         const chev     = el("span", { class: "wc-tile__chev", "aria-hidden": "true" }, "›");
+        const dotEl    = el("span", { class: "wc-tile__dot wc-tile__dot--" + pair[1] });
         const root = el("button", {
             type: "button",
             class: "wc-tile wc-tile--nav",
-            "data-state": "unknown",
-            onclick: () => navigate(aggregatorsPanel, { title: "Third-party aggregators", showBack: true }),
+            "data-state": pair[1],
+            title: pair[0],
+            onclick: () => navigate(() => adapterPanel(a.id), { title: a.display_name || a.id, showBack: true }),
         },
             iconNode,
             el("span", { class: "wc-tile__body" }, titleEl, metaEl),
             chev,
             dotEl,
         );
-        return { root, titleEl, metaEl, dotEl };
+        return root;
     }
 
-    function updateAggregatorTile(tile, resp) {
-        if (!tile) return;
-        const c = (resp && resp.ok) ? classifyAggregators(resp.payload) : { dot: "na", meta: "—" };
-        tile.dotEl.className = "wc-tile__dot wc-tile__dot--" + c.dot;
-        tile.metaEl.textContent = c.meta;
-        tile.root.title = c.meta || "";
-        tile.root.setAttribute("data-state", c.dot);
+    // renderAggregatorTiles repopulates the dashboard's per-aggregator tile row
+    // from /api/aggregators. Only configured/active adapters get a tile; an
+    // ids+states signature short-circuits the rebuild so a steady poll doesn't
+    // flicker the row.
+    function renderAggregatorTiles(container, resp) {
+        if (!container) return;
+        const all = (resp && resp.ok && resp.payload && resp.payload.aggregators) || [];
+        const adapters = all.filter(a =>
+            a.configured || a.enabled ||
+            a.state === "installing" || a.state === "removing" || a.state === "failed");
+        // Signature covers everything a tile renders + membership flags, so a
+        // change to any of them re-renders rather than going stale behind state.
+        const sig = adapters.map(a =>
+            [a.id, a.state || "", a.display_name || "", a.configured ? 1 : 0, a.enabled ? 1 : 0].join(":")
+        ).join("|");
+        if (container.__sig === sig) return;
+        container.__sig = sig;
+        container.replaceChildren(...adapters.map(buildAdapterTile));
+        container.hidden = adapters.length === 0;
     }
 
     // CAVEAT preamble. Org-voice wording is the project owner's call — this is a
     // clear, accurate placeholder, not final copy. TODO: finalize wording.
     const AGG_CAVEAT_TEXT =
-        "airplanes.live shares all aircraft data openly. Other networks may filter or hide " +
-        "aircraft and can restrict how your data is used. Feeding a third-party network is " +
-        "optional: it sends your receiver's data to that provider under their own terms, and " +
-        "does not change what you feed to airplanes.live.";
+        "airplanes.live shares all aircraft data openly and never filters or restricts it. " +
+        "Other networks may filter or hide aircraft and set their own terms — feeding them is " +
+        "your choice.";
+
+    // Intro shown above the caveat: what this section is for.
+    const AGG_INTRO_TEXT =
+        "Feed your receiver's data to other tracking networks in addition to airplanes.live. " +
+        "Adding a network here does not change or reduce what you feed to airplanes.live.";
 
     async function aggregatorsPanel() {
         render(el("div", { class: "wc-card" }, el("p", { class: "muted" }, "loading aggregators…")));
@@ -3678,6 +3674,7 @@
 
         render(el("section", { class: "wc-card" },
             el("h2", {}, "Third-party aggregators"),
+            el("p", { class: "wc-agg-intro" }, AGG_INTRO_TEXT),
             el("p", { class: "wc-agg-caveat" }, AGG_CAVEAT_TEXT),
             flashEl,
             list,
@@ -3687,37 +3684,25 @@
 
     function buildAggregatorRow(a) {
         const manageable = adapterManageable(a.id);
-        const actions = el("div", { class: "wc-agg-row__actions" });
-        // A configured/enabled adapter stays manageable even if it later reports
-        // unavailable, so Disable/Remove are never stranded.
-        if (manageable && (a.available || a.enabled || a.configured)) {
-            actions.appendChild(el("button", {
-                type: "button", class: "wc-btn-ghost",
-                onclick: () => navigate(() => adapterPanel(a.id), { title: a.display_name || a.id, showBack: true }),
-            }, a.enabled || a.configured ? "Manage" : "Set up"));
-        }
-        const reason = (!a.available && a.unavailable_reason)
-            ? el("p", { class: "muted wc-agg-row__reason" }, a.unavailable_reason) : null;
-        // Installed version (the build actually running) + a drift hint when the
-        // overlay pins a newer one than is installed — it applies on the next
-        // system update (or a reconcile failed and will retry).
-        const version = a.version
-            ? el("span", { class: "wc-agg-row__version muted" }, "v" + a.version) : null;
-        const drift = a.version_drift
-            ? el("p", { class: "muted wc-agg-row__reason" }, a.desired_version
-                ? "Update to v" + a.desired_version + " pending — applies on the next system update."
-                : "An update is pending — it applies on the next system update.")
-            : null;
-        return el("div", { class: "wc-agg-row" },
-            el("div", { class: "wc-agg-row__head" },
-                el("span", { class: "wc-agg-row__name" }, a.display_name || a.id),
-                aggStateBadge(a.state),
-                version,
-            ),
-            reason,
-            drift,
-            actions.childNodes.length ? actions : null,
+        const pair = AGG_STATE_BADGE[a.state] || [a.state || "—", "na"];
+        const status = a.version ? pair[0] + " · v" + a.version : pair[0];
+
+        const icon = el("span", { class: "wc-agg-row__icon" }, svgIcon(AGGREGATOR_ICON));
+        const body = el("div", { class: "wc-agg-row__body" },
+            el("span", { class: "wc-agg-row__name" }, a.display_name || a.id),
+            el("span", { class: "wc-agg-row__status" }, status),
         );
+        const dot = el("span", { class: "wc-tile__dot wc-tile__dot--" + pair[1] });
+
+        if (manageable) {
+            const chev = el("span", { class: "wc-agg-row__chev", "aria-hidden": "true" }, "›");
+            return el("button", {
+                type: "button",
+                class: "wc-agg-row wc-agg-row--clickable",
+                onclick: () => navigate(() => adapterPanel(a.id), { title: a.display_name || a.id, showBack: true }),
+            }, icon, body, dot, chev);
+        }
+        return el("div", { class: "wc-agg-row" }, icon, body, dot);
     }
 
     function buildAggregatorBackupCard() {
@@ -3791,7 +3776,10 @@
 
     async function fr24Panel() {
         render(el("div", { class: "wc-card" }, el("p", { class: "muted" }, "loading…")));
-        const resp = await getJSON("/api/aggregators");
+        const [resp, config] = await Promise.all([
+            getJSON("/api/aggregators"),
+            getJSON("/api/config"),
+        ]);
         if (handleAuthFailure(resp)) return;
         if (!resp.ok) {
             render(el("section", { class: "wc-card" }, el("h2", {}, "Flightradar24"),
@@ -3809,33 +3797,142 @@
         if (a.enable && a.enable.request_id && (a.state === "installing" || a.state === "removing" || a.state === "applying")) {
             return aggregatorMutationProgress("fr24", a.enable.request_id, a.enable.op || "enable");
         }
-        renderFr24Form(a);
+        const cfg = (config.payload && config.payload.values) || {};
+        renderFr24Form(a, cfg);
     }
 
-    function renderFr24Form(a) {
-        const configured = !!(a.configured || a.enabled);
-        const claimUrl = vendorClaimHref(a.claim_url);
+    // aggDetailHead: card title with the status chip right after the name
+    // (left-aligned), e.g. "FlightAware (Feeding)".
+    function aggDetailHead(name, state) {
+        return el("h2", { class: "wc-card-head wc-agg-detail-head" },
+            el("span", { class: "wc-agg-detail-head__name" }, name),
+            aggStateBadge(state));
+    }
 
+    // buildAggStatusBlock: the "Status" card on a manage page — installed
+    // version plus the per-adapter status lines the helper surfaces from the
+    // vendor status command (piaware-status / fr24feed). Null when empty.
+    function aggStatusRow(label, value, sev) {
+        return el("div", { class: "wc-agg-status__row" },
+            el("span", { class: "wc-tile__dot wc-tile__dot--" + (sev || "na") }),
+            el("span", { class: "wc-agg-status__label" }, label),
+            el("span", { class: "wc-agg-status__value" }, value));
+    }
+    const AGG_STATUS_SEV = { ok: 1, warn: 1, err: 1, na: 1 };
+    function buildAggStatusBlock(a) {
+        const rows = el("div", { class: "wc-agg-status" });
+        if (a.version) rows.appendChild(aggStatusRow("Installed version", "v" + a.version, "na"));
+        // status_detail is helper-provided JSON forwarded verbatim — guard the
+        // shape (non-array, odd severity) rather than trust it.
+        const detail = Array.isArray(a.status_detail) ? a.status_detail : [];
+        for (const d of detail) {
+            if (!d || !d.label) continue;
+            const sev = AGG_STATUS_SEV[d.severity] ? d.severity : "na";
+            rows.appendChild(aggStatusRow(String(d.label), d.value != null ? String(d.value) : "—", sev));
+        }
+        if (!rows.childNodes.length) return null;
+        return el("section", { class: "wc-card wc-agg-status-card" }, el("h3", {}, "Status"), rows);
+    }
+
+    function renderFr24Form(a, cfg) {
+        cfg = cfg || {};
+        const configured = !!(a.configured || a.enabled);
         const inlineErr = el("p", { class: "error", role: "alert" });
-        const email = el("input", { type: "email", autocomplete: "email",
-            placeholder: configured ? "(leave blank to keep current)" : "you@example.com" });
+
+        const viewLogs = el("button", { type: "button", class: "wc-btn-ghost",
+            onclick: () => navigate(() => logViewer("fr24"), { title: "Logs · fr24", showBack: true }) }, "View logs");
+
+        // Already set up: status card + a single action row, no inputs.
+        if (configured) {
+            const actions = el("div", { class: "wc-agg-row__actions" });
+            if (a.enabled) {
+                const stop = el("button", { type: "button", class: "wc-btn-ghost" }, "Stop feeding");
+                stop.onclick = async () => {
+                    stop.disabled = true;
+                    const r = await postJSON("/api/aggregators/fr24/disable", {});
+                    if (handleAuthFailure(r)) return;
+                    if (!r.ok) { stop.disabled = false; inlineErr.textContent = aggEnableErrorMessage(r); return; }
+                    pendingFlash = { text: "Stopped feeding Flightradar24.", level: "ok" };
+                    navigate(aggregatorsPanel, { title: "Third-party aggregators", showBack: true });
+                };
+                actions.appendChild(stop);
+            } else {
+                const start = el("button", { type: "button", class: "wc-btn-primary" }, "Start feeding");
+                start.onclick = async () => {
+                    start.disabled = true;
+                    const r = await postJSON("/api/aggregators/fr24/enable", { fields: {} });
+                    if (handleAuthFailure(r)) return;
+                    if (r.status === 202) {
+                        navigate(() => aggregatorEnableProgress("fr24", r.payload && r.payload.request_id),
+                            { title: "Starting Flightradar24", showBack: true });
+                        return;
+                    }
+                    start.disabled = false; inlineErr.textContent = aggEnableErrorMessage(r);
+                };
+                actions.appendChild(start);
+            }
+            const remove = el("button", { type: "button", class: "wc-btn-danger" }, "Remove");
+            remove.onclick = async () => {
+                if (!confirm("Remove Flightradar24? This stops feeding and deletes the installed feeder and its stored sharing key.")) return;
+                remove.disabled = true;
+                const r = await postJSON("/api/aggregators/fr24/reset", {});
+                if (handleAuthFailure(r)) return;
+                if (r.status === 202) {
+                    navigate(() => aggregatorMutationProgress("fr24", r.payload && r.payload.request_id, "reset"),
+                        { title: "Removing Flightradar24", showBack: true });
+                    return;
+                }
+                remove.disabled = false; inlineErr.textContent = aggEnableErrorMessage(r);
+            };
+            actions.appendChild(remove);
+            actions.appendChild(viewLogs);
+
+            render(el("section", { class: "wc-card" },
+                aggDetailHead("Flightradar24", a.state),
+                el("p", { class: "muted" }, a.enabled ? "Feeding Flightradar24." : "Set up but not feeding right now."),
+                buildAggStatusBlock(a),
+                inlineErr,
+                actions,
+            ));
+            return;
+        }
+
+        // Not set up: collect sign-in details + location; the actions row lives
+        // inside the form so "Set up" and "View logs" stay on one line.
+        const email = el("input", { type: "email", autocomplete: "email", placeholder: "you@example.com" });
         const key = el("input", { type: "text", autocomplete: "off", spellcheck: "false",
-            placeholder: configured ? "(leave blank to keep current)" : "optional — paste an existing sharing key" });
+            placeholder: "optional — paste an existing sharing key" });
         const emailErr = el("p", { class: "field-help wc-field-error", hidden: true, role: "alert" }, "Enter a valid email address.");
         const keyErr = el("p", { class: "field-help wc-field-error", hidden: true, role: "alert" }, "Sharing keys are 6–40 letters and digits.");
 
-        const submitLabel = a.enabled ? "Replace identity" : (configured ? "Re-run setup" : "Set up Flightradar24");
+        const lat = el("input", { type: "text", inputmode: "decimal", autocomplete: "off", spellcheck: "false", value: cfg.LATITUDE || "" });
+        const lon = el("input", { type: "text", inputmode: "decimal", autocomplete: "off", spellcheck: "false", value: cfg.LONGITUDE || "" });
+        const alt = el("input", { type: "text", inputmode: "decimal", autocomplete: "off", spellcheck: "false", value: cfg.ALTITUDE || "" });
+
+        const submitLabel = "Set up Flightradar24";
         const submit = el("button", { type: "submit", class: "wc-btn-primary" }, submitLabel);
 
+        // Range-check the coordinates to match the helper's _valid_geo, so the
+        // form never submits values the helper would reject (which would surface
+        // a misleading "set your feeder location" error).
+        const inRange = (v, lo, hi) => {
+            const s = String(v).trim();
+            const n = Number(s);
+            return s !== "" && Number.isFinite(n) && n >= lo && n <= hi;
+        };
+        const validGeo = () => inRange(lat.value, -90, 90) && inRange(lon.value, -180, 180) && inRange(alt.value, -500, 12000);
         const recheck = () => {
             let bad = false;
-            if (email.value.trim() && !isValidAggEmail(email.value)) bad = true;
-            if (!configured && !email.value.trim()) bad = true; // first-time setup needs an email
+            if (!email.value.trim() || !isValidAggEmail(email.value)) bad = true;
             if (key.value.trim() && !isValidFr24Key(key.value)) bad = true;
+            if (!validGeo()) bad = true;
             submit.disabled = bad;
         };
         email.addEventListener("input", () => { refreshFieldError(email, emailErr, v => v.trim() !== "" && !isValidAggEmail(v)); recheck(); });
         key.addEventListener("input", () => { refreshFieldError(key, keyErr, v => v.trim() !== "" && !isValidFr24Key(v)); recheck(); });
+        lat.addEventListener("input", recheck);
+        lon.addEventListener("input", recheck);
+        alt.addEventListener("input", recheck);
 
         const form = el("form", { class: "wc-agg-form", novalidate: true,
             onsubmit: async (e) => {
@@ -3843,13 +3940,19 @@
                 inlineErr.textContent = "";
                 const fields = {};
                 const ev = email.value.trim(), kv = key.value.trim();
-                if (ev) fields.email = ev;            // omit when blank → helper keeps stored email
-                if (kv) fields.sharing_key = kv;       // omit when blank → keeps stored key / signs up
-                if (!configured && !fields.email) { inlineErr.textContent = "An email address is required to set up Flightradar24."; return; }
-                if (fields.email && !isValidAggEmail(fields.email)) { inlineErr.textContent = "Enter a valid email address."; return; }
+                if (ev) fields.email = ev;
+                if (kv) fields.sharing_key = kv;
+                if (!fields.email) { inlineErr.textContent = "An email address is required to set up Flightradar24."; return; }
+                if (!isValidAggEmail(fields.email)) { inlineErr.textContent = "Enter a valid email address."; return; }
                 if (fields.sharing_key && !isValidFr24Key(fields.sharing_key)) { inlineErr.textContent = "Sharing keys are 6–40 letters and digits."; return; }
+                if (!validGeo()) { inlineErr.textContent = "Enter a valid latitude (−90 to 90), longitude (−180 to 180), and altitude (−500 to 12000 m)."; return; }
                 submit.disabled = true; submit.textContent = "Submitting…";
-                const r = await postJSON("/api/aggregators/fr24/enable", { fields });
+                const r = await postJSON("/api/aggregators/fr24/enable", {
+                    fields,
+                    lat: Number(lat.value),
+                    lon: Number(lon.value),
+                    alt: Number(alt.value),
+                });
                 if (handleAuthFailure(r)) return;
                 if (r.status === 202) {
                     navigate(() => aggregatorEnableProgress("fr24", r.payload && r.payload.request_id),
@@ -3864,57 +3967,19 @@
             el("div", { class: "field" }, el("label", {}, "Email address"), email, emailErr),
             el("div", { class: "field" }, el("label", {}, "Sharing key (optional)"), key, keyErr,
                 el("p", { class: "field-help" }, "Leave blank to create a new Flightradar24 sharing key from your email. Paste an existing key to reuse a Flightradar24 account.")),
+            el("div", { class: "field" }, el("label", {}, "Latitude"), lat),
+            el("div", { class: "field" }, el("label", {}, "Longitude"), lon),
+            el("div", { class: "field" }, el("label", {}, "Altitude (m)"), alt,
+                el("p", { class: "field-help" }, "Sent to Flightradar24 at sign-up. Prefilled from your feeder location; edit to send a different location.")),
             inlineErr,
-            el("div", { class: "wc-agg-row__actions" }, submit),
+            el("div", { class: "wc-agg-row__actions" }, submit, viewLogs),
         );
         recheck();
 
-        const actions = el("div", { class: "wc-agg-row__actions" });
-        if (a.enabled) {
-            const disableBtn = el("button", { type: "button", class: "wc-btn-ghost" }, "Stop feeding");
-            disableBtn.onclick = async () => {
-                disableBtn.disabled = true;
-                const r = await postJSON("/api/aggregators/fr24/disable", {});
-                if (handleAuthFailure(r)) return;
-                if (!r.ok) { disableBtn.disabled = false; inlineErr.textContent = aggEnableErrorMessage(r); return; }
-                pendingFlash = { text: "Stopped feeding Flightradar24.", level: "ok" };
-                navigate(aggregatorsPanel, { title: "Third-party aggregators", showBack: true });
-            };
-            actions.appendChild(disableBtn);
-        }
-        if (configured) {
-            const resetBtn = el("button", { type: "button", class: "wc-btn-danger" }, "Remove");
-            resetBtn.onclick = async () => {
-                if (!confirm("Remove Flightradar24? This stops feeding and deletes the installed feeder and its stored sharing key.")) return;
-                resetBtn.disabled = true;
-                const r = await postJSON("/api/aggregators/fr24/reset", {});
-                if (handleAuthFailure(r)) return;
-                if (r.status === 202) {
-                    navigate(() => aggregatorMutationProgress("fr24", r.payload && r.payload.request_id, "reset"),
-                        { title: "Removing Flightradar24", showBack: true });
-                    return;
-                }
-                resetBtn.disabled = false; inlineErr.textContent = aggEnableErrorMessage(r);
-            };
-            actions.appendChild(resetBtn);
-        }
-
-        const links = el("p", { class: "wc-agg-links" });
-        if (claimUrl) links.appendChild(el("a", { href: claimUrl, target: "_blank", rel: "noopener noreferrer" }, "Flightradar24 data-sharing page"));
-        if (a.enabled || a.state === "running" || configured) {
-            if (links.childNodes.length) links.appendChild(el("span", { class: "muted" }, " · "));
-            links.appendChild(el("a", { href: "#", role: "button",
-                onclick: (e) => { e.preventDefault(); navigate(() => logViewer("fr24"), { title: "Logs · fr24", showBack: true }); } }, "View logs"));
-        }
-
         render(el("section", { class: "wc-card" },
-            el("h2", { class: "wc-card-head" }, el("span", {}, "Flightradar24"), aggStateBadge(a.state)),
-            el("p", { class: "muted" }, a.enabled
-                ? "Feeding Flightradar24 alongside airplanes.live."
-                : "Feed Flightradar24 alongside airplanes.live. Your feeder location is used automatically."),
+            aggDetailHead("Flightradar24", a.state),
+            el("p", { class: "muted" }, "Send your receiver's data to Flightradar24."),
             form,
-            actions.childNodes.length ? actions : null,
-            links.childNodes.length ? links : null,
         ));
     }
 
@@ -3942,19 +4007,77 @@
 
     function renderPiawareForm(a) {
         const configured = !!(a.configured || a.enabled);
-        const claimUrl = vendorClaimHref(a.claim_url);
         const inlineErr = el("p", { class: "error", role: "alert" });
+        const mlatOn = a.configured_mlat_enabled != null ? !!a.configured_mlat_enabled : !!a.mlat_default;
 
+        const viewLogs = el("button", { type: "button", class: "wc-btn-ghost",
+            onclick: () => navigate(() => logViewer("piaware"), { title: "Logs · piaware", showBack: true }) }, "View logs");
+
+        // Already set up: status card + a single action row, no inputs.
+        if (configured) {
+            const actions = el("div", { class: "wc-agg-row__actions" });
+            if (a.enabled) {
+                const stop = el("button", { type: "button", class: "wc-btn-ghost" }, "Stop feeding");
+                stop.onclick = async () => {
+                    stop.disabled = true;
+                    const r = await postJSON("/api/aggregators/piaware/disable", {});
+                    if (handleAuthFailure(r)) return;
+                    if (!r.ok) { stop.disabled = false; inlineErr.textContent = aggEnableErrorMessage(r); return; }
+                    pendingFlash = { text: "Stopped feeding FlightAware.", level: "ok" };
+                    navigate(aggregatorsPanel, { title: "Third-party aggregators", showBack: true });
+                };
+                actions.appendChild(stop);
+            } else {
+                const start = el("button", { type: "button", class: "wc-btn-primary" }, "Start feeding");
+                start.onclick = async () => {
+                    start.disabled = true;
+                    const r = await postJSON("/api/aggregators/piaware/enable", { fields: {}, mlat_enabled: mlatOn });
+                    if (handleAuthFailure(r)) return;
+                    if (r.status === 202) {
+                        navigate(() => aggregatorEnableProgress("piaware", r.payload && r.payload.request_id),
+                            { title: "Starting FlightAware", showBack: true });
+                        return;
+                    }
+                    start.disabled = false; inlineErr.textContent = aggEnableErrorMessage(r);
+                };
+                actions.appendChild(start);
+            }
+            const remove = el("button", { type: "button", class: "wc-btn-danger" }, "Remove");
+            remove.onclick = async () => {
+                if (!confirm("Remove FlightAware? This stops feeding, uninstalls piaware, and forgets this feeder's identity. Download a backup first if you want to keep its Feeder ID.")) return;
+                remove.disabled = true;
+                const r = await postJSON("/api/aggregators/piaware/reset", {});
+                if (handleAuthFailure(r)) return;
+                if (r.status === 202) {
+                    navigate(() => aggregatorMutationProgress("piaware", r.payload && r.payload.request_id, "reset"),
+                        { title: "Removing FlightAware", showBack: true });
+                    return;
+                }
+                remove.disabled = false; inlineErr.textContent = aggEnableErrorMessage(r);
+            };
+            actions.appendChild(remove);
+            actions.appendChild(viewLogs);
+
+            render(el("section", { class: "wc-card" },
+                aggDetailHead("FlightAware", a.state),
+                el("p", { class: "muted" }, a.enabled ? "Feeding FlightAware." : "Set up but not feeding right now."),
+                buildAggStatusBlock(a),
+                inlineErr,
+                actions,
+            ));
+            return;
+        }
+
+        // Not set up: Feeder ID (optional) + MLAT toggle; actions in the form.
         const feederId = el("input", { type: "text", autocomplete: "off", spellcheck: "false",
             placeholder: "optional — paste a Feeder ID to reclaim an existing feeder" });
         const feederErr = el("p", { class: "field-help wc-field-error", hidden: true, role: "alert" },
             "A Feeder ID looks like 00000000-0000-0000-0000-000000000000.");
 
-        const mlatOn = a.configured_mlat_enabled != null ? !!a.configured_mlat_enabled : !!a.mlat_default;
         const mlat = el("input", { type: "checkbox" });
         mlat.checked = mlatOn;
 
-        const submitLabel = a.enabled ? "Update settings" : (configured ? "Re-run setup" : "Set up FlightAware");
+        const submitLabel = "Set up FlightAware";
         const submit = el("button", { type: "submit", class: "wc-btn-primary" }, submitLabel);
 
         const recheck = () => { submit.disabled = feederId.value.trim() !== "" && !isValidFeederId(feederId.value); };
@@ -3983,62 +4106,20 @@
             },
         },
             el("h3", {}, "FlightAware settings"),
-            el("div", { class: "field" },
-                el("label", { class: "wc-checkbox" }, mlat, el("span", {}, "Participate in MLAT (multilateration)")),
-                el("p", { class: "field-help" }, "MLAT starts once you claim this feeder and set its location on FlightAware.")),
             el("div", { class: "field" }, el("label", {}, "Feeder ID (optional)"), feederId, feederErr,
                 el("p", { class: "field-help" }, "Leave blank to register a new FlightAware feeder. Paste an existing Feeder ID to reclaim a feeder you already own.")),
+            el("div", { class: "field" },
+                el("label", { class: "wc-checkbox" }, mlat, el("span", {}, "Participate in MLAT (multilateration)")),
+                el("p", { class: "field-help" }, "MLAT antenna location is set on flightaware.com for this feeder — not here.")),
             inlineErr,
-            el("div", { class: "wc-agg-row__actions" }, submit),
+            el("div", { class: "wc-agg-row__actions" }, submit, viewLogs),
         );
         recheck();
 
-        const actions = el("div", { class: "wc-agg-row__actions" });
-        if (a.enabled) {
-            const disableBtn = el("button", { type: "button", class: "wc-btn-ghost" }, "Stop feeding");
-            disableBtn.onclick = async () => {
-                disableBtn.disabled = true;
-                const r = await postJSON("/api/aggregators/piaware/disable", {});
-                if (handleAuthFailure(r)) return;
-                if (!r.ok) { disableBtn.disabled = false; inlineErr.textContent = aggEnableErrorMessage(r); return; }
-                pendingFlash = { text: "Stopped feeding FlightAware.", level: "ok" };
-                navigate(aggregatorsPanel, { title: "Third-party aggregators", showBack: true });
-            };
-            actions.appendChild(disableBtn);
-        }
-        if (configured) {
-            const resetBtn = el("button", { type: "button", class: "wc-btn-danger" }, "Remove");
-            resetBtn.onclick = async () => {
-                if (!confirm("Remove FlightAware? This stops feeding, uninstalls piaware, and forgets this feeder's identity. Download a backup first if you want to keep its Feeder ID.")) return;
-                resetBtn.disabled = true;
-                const r = await postJSON("/api/aggregators/piaware/reset", {});
-                if (handleAuthFailure(r)) return;
-                if (r.status === 202) {
-                    navigate(() => aggregatorMutationProgress("piaware", r.payload && r.payload.request_id, "reset"),
-                        { title: "Removing FlightAware", showBack: true });
-                    return;
-                }
-                resetBtn.disabled = false; inlineErr.textContent = aggEnableErrorMessage(r);
-            };
-            actions.appendChild(resetBtn);
-        }
-
-        const links = el("p", { class: "wc-agg-links" });
-        if (claimUrl) links.appendChild(el("a", { href: claimUrl, target: "_blank", rel: "noopener noreferrer" }, "Claim this feeder on FlightAware"));
-        if (a.enabled || a.state === "running" || configured) {
-            if (links.childNodes.length) links.appendChild(el("span", { class: "muted" }, " · "));
-            links.appendChild(el("a", { href: "#", role: "button",
-                onclick: (e) => { e.preventDefault(); navigate(() => logViewer("piaware"), { title: "Logs · piaware", showBack: true }); } }, "View logs"));
-        }
-
         render(el("section", { class: "wc-card" },
-            el("h2", { class: "wc-card-head" }, el("span", {}, "FlightAware"), aggStateBadge(a.state)),
-            el("p", { class: "muted" }, a.enabled
-                ? "Feeding FlightAware alongside airplanes.live. Claim this feeder on FlightAware to see your statistics and enable MLAT."
-                : "Feed FlightAware (piaware) alongside airplanes.live. After setup, claim the feeder on FlightAware to enable MLAT and see your statistics."),
+            aggDetailHead("FlightAware", a.state),
+            el("p", { class: "muted" }, "Send your receiver's data to FlightAware."),
             form,
-            actions.childNodes.length ? actions : null,
-            links.childNodes.length ? links : null,
         ));
     }
 
@@ -4230,7 +4311,7 @@
         ]);
         if (ctx !== dashboardCtx) return;
         if (handleAuthFailure(identity) || handleAuthFailure(status) || handleAuthFailure(config)) return;
-        updateAggregatorTile(tileGrid.aggregators, aggregators);
+        renderAggregatorTiles(tileGrid.aggTiles, aggregators);
 
         const cfgValues = normaliseSavedValues((config && config.payload && config.payload.values) || {});
         ctx.configValues = cfgValues;
@@ -4294,7 +4375,7 @@
             updateMsgRateFromStatus(status);
             updateHero(ctx.heroEl, status, ctx.configValues);
             updateTiles(ctx.tileGrid, status, ctx.configValues);
-            updateAggregatorTile(ctx.tileGrid.aggregators, aggregators);
+            renderAggregatorTiles(ctx.tileGrid.aggTiles, aggregators);
             updateAppTiles(ctx.tileGrid);
             updateRebootBanner(ctx.rebootBanner, !!(status && status.payload && status.payload.reboot_required));
 
@@ -4841,6 +4922,10 @@
             else closeUserMenu();
         });
     }
+    if (userMenuAggregators) userMenuAggregators.addEventListener("click", () => {
+        closeUserMenu();
+        navigate(aggregatorsPanel, { title: "Third-party aggregators", showBack: true });
+    });
     if (userMenuChangePw) userMenuChangePw.addEventListener("click", () => {
         closeUserMenu();
         navigate(changePasswordPanel, { title: "Change password", showBack: true });

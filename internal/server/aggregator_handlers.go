@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math"
 	"net/http"
 	"strconv"
 	"strings"
@@ -206,12 +207,14 @@ func (s *Server) aggregatorMutate(w http.ResponseWriter, r *http.Request, argv [
 	s.writeAggregatorResponse(w, resp, httpStatus)
 }
 
-// injectFeedEnvGeo overwrites the lat/lon/alt in an enable payload with the
-// feeder's authoritative location from feed.env (LATITUDE/LONGITUDE/ALTITUDE),
-// so the user never re-types coordinates per aggregator and a client cannot
-// supply its own. A value that is absent or non-numeric is dropped rather than
-// forwarded — the helper's geo validation then rejects with guidance instead
-// of acting on a bad coordinate. ALTITUDE in feed.env is already bare metres.
+// injectFeedEnvGeo resolves the lat/lon/alt for an enable payload. A
+// client-supplied finite numeric coordinate wins (the Flightradar24 setup form
+// lets the user enter or override the location it sends, and set it up before
+// the feeder's own location is configured); any coordinate the client omits is
+// filled from the feeder's location in feed.env (LATITUDE/LONGITUDE/ALTITUDE);
+// anything malformed is dropped — the helper's geo validation then rejects with
+// guidance rather than acting on a bad coordinate. The helper range-validates
+// whatever it receives. ALTITUDE in feed.env is already bare metres.
 func (s *Server) injectFeedEnvGeo(body []byte) ([]byte, error) {
 	m := map[string]json.RawMessage{}
 	if err := json.Unmarshal(body, &m); err != nil || m == nil {
@@ -222,6 +225,20 @@ func (s *Server) injectFeedEnvGeo(body []byte) ([]byte, error) {
 		values, _ = s.feedEnv.ReadAll() // absent/unreadable → inject nothing, helper rejects on missing geo
 	}
 	for envKey, field := range map[string]string{"LATITUDE": "lat", "LONGITUDE": "lon", "ALTITUDE": "alt"} {
+		// A client-supplied finite numeric coordinate wins, so the user can send
+		// an explicit location (e.g. a different one to Flightradar24, or one set
+		// before the feeder's own location is configured). feed.env fills any
+		// coordinate the client omitted; anything malformed is dropped (the helper
+		// rejects on missing geo where it's required).
+		if cv, ok := m[field]; ok {
+			var f float64
+			if err := json.Unmarshal(cv, &f); err == nil && !math.IsNaN(f) && !math.IsInf(f, 0) {
+				if jb, merr := json.Marshal(f); merr == nil {
+					m[field] = jb
+					continue
+				}
+			}
+		}
 		if raw, ok := values[envKey]; ok {
 			if f, perr := strconv.ParseFloat(strings.TrimSpace(raw), 64); perr == nil {
 				// json.Marshal rejects NaN/Inf — let those fall through to the
@@ -232,7 +249,7 @@ func (s *Server) injectFeedEnvGeo(body []byte) ([]byte, error) {
 				}
 			}
 		}
-		delete(m, field) // never forward a client-supplied or malformed coordinate
+		delete(m, field) // never forward a malformed coordinate
 	}
 	return json.Marshal(m)
 }

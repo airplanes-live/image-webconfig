@@ -878,10 +878,10 @@ textarea:focus {
    sits between fieldsets. .field-help renders inside a .field, between
    the <label> and the <input>. */
 .field-help {
-  margin: 0.15rem 0 0.35rem;
+  margin: 0.45rem 0 0.1rem;
   color: var(--wc-ink-3);
-  font-size: 0.8rem;
-  line-height: 1.35;
+  font-size: 0.76rem;
+  line-height: 1.4;
 }
 
 /* Compact neutral helper link rendered as a small button under an input
@@ -1326,6 +1326,12 @@ input[aria-invalid="true"] {
 
 /* ========== Third-party aggregators ========== */
 
+.wc-agg-intro {
+  color: var(--wc-ink-2);
+  font-size: 0.9rem;
+  margin: 0 0 0.75rem;
+}
+
 .wc-agg-caveat {
   color: var(--wc-ink-2);
   font-size: 0.9rem;
@@ -1338,15 +1344,54 @@ input[aria-invalid="true"] {
 
 .wc-agg-list { display: flex; flex-direction: column; gap: 0.6rem; }
 
+/* Aggregator rows reuse the .wc-tile--nav visual language: bordered card,
+   icon + body + state dot, with a chevron when the whole row navigates. */
 .wc-agg-row {
-  border: 1px solid var(--wc-line);
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+  border: 1px solid var(--wc-line-soft);
   border-radius: 0.5rem;
   padding: 0.7rem 0.8rem;
 }
-.wc-agg-row__head { display: flex; align-items: center; gap: 0.5rem; }
+/* A clickable row is a <button>; reset the global button appearance to the
+   card look and add the tile hover treatment. */
+.wc-agg-row--clickable {
+  width: 100%;
+  background: transparent;
+  color: var(--wc-ink-1);
+  text-align: left;
+  font-weight: inherit;
+  cursor: pointer;
+  transition: border-color 0.12s ease, background 0.12s ease;
+}
+.wc-agg-row--clickable:hover,
+.wc-agg-row--clickable:focus-visible {
+  background: var(--wc-surface-3);
+  border-color: var(--wc-line-strong);
+  outline: none;
+}
+.wc-agg-row__icon {
+  flex: 0 0 auto;
+  width: 1.5rem;
+  height: 1.5rem;
+  color: var(--wc-ink-2);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+.wc-agg-row__body { display: flex; flex-direction: column; min-width: 0; flex: 1; line-height: 1.25; }
 .wc-agg-row__name { font-weight: 600; }
-.wc-agg-row__version { margin-left: auto; font-size: 0.85rem; }
-.wc-agg-row__reason { margin: 0.35rem 0 0; font-size: 0.85rem; }
+.wc-agg-row__status {
+  font-size: 0.85rem;
+  color: var(--wc-ink-3);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.wc-agg-row__chev { flex: 0 0 auto; color: var(--wc-ink-3); font-size: 0.95rem; line-height: 1; }
+.wc-agg-row--clickable:hover .wc-agg-row__chev,
+.wc-agg-row--clickable:focus-visible .wc-agg-row__chev { color: var(--wc-accent); }
 .wc-agg-row__actions {
   display: flex;
   flex-wrap: wrap;
@@ -1374,7 +1419,18 @@ input[aria-invalid="true"] {
 
 .wc-agg-form { margin-top: 0.5rem; }
 .wc-agg-backup { margin-top: 1rem; }
-.wc-agg-links { margin-top: 0.8rem; font-size: 0.9rem; }
 /* Inline checkbox + label (e.g. the FlightAware MLAT toggle). */
 .wc-checkbox { display: flex; align-items: center; gap: 0.5rem; cursor: pointer; }
 .wc-checkbox input[type="checkbox"] { width: auto; margin: 0; flex: 0 0 auto; }
+
+/* Manage-page title: name + status chip sit together, left-aligned, rather
+   than pushing the chip to the far edge (overrides .wc-card-head). */
+.wc-agg-detail-head { justify-content: flex-start; gap: 0.55rem; }
+.wc-agg-detail-head__name { font-weight: 600; }
+
+/* Status card on a manage page: installed version + per-adapter status lines. */
+.wc-agg-status-card { margin-top: 1rem; }
+.wc-agg-status { display: flex; flex-direction: column; gap: 0.45rem; }
+.wc-agg-status__row { display: flex; align-items: center; gap: 0.55rem; }
+.wc-agg-status__label { color: var(--wc-ink-3); flex: 0 0 9.5rem; }
+.wc-agg-status__value { color: var(--wc-ink-1); font-weight: 500; min-width: 0; }
