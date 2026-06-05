@@ -268,14 +268,15 @@ main {
 /* Banner notifications. .wc-flash is the neutral baseline; .wc-flash--ok
    paints a success-accent strip for completed-action confirmations;
    .wc-flash--warn paints a warm-toned strip for actionable warnings
-   like "reboot required". Margin-bottom keeps the banner from touching
-   the first dashboard tile below it. */
+   like "reboot required". Symmetric vertical margin so it never touches
+   neighbouring content, whether it's a top banner or a result message
+   shown below a row of buttons. */
 .wc-flash {
   display: flex;
   align-items: center;
   justify-content: space-between;
   gap: 0.75rem;
-  margin: 0 0 1rem;
+  margin: 1rem 0;
   padding: 0.75rem 1rem;
   border-radius: var(--wc-radius);
   border: 1px solid var(--wc-line-soft);
