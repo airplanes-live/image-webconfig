@@ -66,6 +66,9 @@ const exportedNames = [
     "isValidWifiPSK",
     "isValidWifiCountry",
     "isValidWifiPriority",
+    "isValidAggEmail",
+    "isValidFr24Key",
+    "isValidFeederId",
 ];
 
 const moduleSource = '"use strict";\n' +

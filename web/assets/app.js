@@ -710,6 +710,16 @@
     function isValidWifiPriority(v) {
         return wifiPriorityRE.test(String(v == null ? "" : v));
     }
+
+    // Third-party aggregator field validators — advisory client-side hints that
+    // mirror apl-aggregator's bash twins (_valid_email / _valid_fr24_key /
+    // _valid_feeder_id). The helper re-validates everything and is the authority.
+    const aggEmailRE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+    function isValidAggEmail(v) { return aggEmailRE.test(String(v == null ? "" : v).trim()); }
+    const fr24KeyRE = /^[A-Za-z0-9]{6,40}$/;
+    function isValidFr24Key(v) { return fr24KeyRE.test(String(v == null ? "" : v).trim()); }
+    const feederIdRE = /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/;
+    function isValidFeederId(v) { return feederIdRE.test(String(v == null ? "" : v).trim()); }
     /* @validator-parity end */
 
     // viewerUsesImperialLength reads the browser locale and applies the
@@ -3564,16 +3574,9 @@
         } catch (_) { return null; }
     }
 
-    // Advisory client-side validators — fast inline feedback only. apl-aggregator
-    // re-validates everything and is the authority; these mirror its rules so the
-    // form can disable submit and hint before the round-trip.
-    const aggEmailRE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
-    function isValidAggEmail(v) { return aggEmailRE.test(String(v == null ? "" : v).trim()); }
-    const fr24KeyRE = /^[A-Za-z0-9]{6,40}$/;
-    function isValidFr24Key(v) { return fr24KeyRE.test(String(v == null ? "" : v).trim()); }
-
-    const feederIdRE = /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/;
-    function isValidFeederId(v) { return feederIdRE.test(String(v == null ? "" : v).trim()); }
+    // The aggregator field validators (isValidAggEmail / isValidFr24Key /
+    // isValidFeederId) live in the @validator-parity block above, parity-tested
+    // against apl-aggregator's bash twins.
 
     // Adapters with a bespoke config panel, and the display name used where only
     // the id is in hand (the enable-progress view). Keep in sync with the .desc
