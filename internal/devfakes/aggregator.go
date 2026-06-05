@@ -148,8 +148,20 @@ func aggAdapterFR24(state *State) map[string]any {
 		"desired_version":       "1.0.48-0",
 		"version_drift":         false,
 	}
-	if enabled {
+	if configured {
 		fr24["version"] = "1.0.48-0"
+		// status_detail mocks what the helper would surface from fr24feed's status.
+		if enabled {
+			fr24["status_detail"] = []map[string]any{
+				{"label": "Connection", "value": "Connected to Flightradar24", "severity": "ok"},
+				{"label": "ADS-B", "value": "Receiving from local readsb", "severity": "ok"},
+				{"label": "Sharing key", "value": "Configured", "severity": "ok"},
+			}
+		} else {
+			fr24["status_detail"] = []map[string]any{
+				{"label": "Service", "value": "Stopped", "severity": "na"},
+			}
+		}
 	}
 	if installing {
 		fr24["enable"] = map[string]any{"status": "running", "step": "acquiring", "request_id": "dev-fr24"}
@@ -188,8 +200,25 @@ func aggAdapterPiaware(state *State) map[string]any {
 		"desired_version":       "11.0",
 		"version_drift":         false,
 	}
-	if enabled {
+	if configured {
 		pw["version"] = "11.0"
+		// status_detail mocks what the helper would surface from `piaware-status`.
+		if enabled {
+			mlatVal, mlatSev := "Off", "na"
+			if mlat {
+				mlatVal, mlatSev = "Enabled", "ok"
+			}
+			pw["status_detail"] = []map[string]any{
+				{"label": "Connection", "value": "Connected to FlightAware", "severity": "ok"},
+				{"label": "ADS-B", "value": "Receiving from local readsb", "severity": "ok"},
+				{"label": "MLAT", "value": mlatVal, "severity": mlatSev},
+				{"label": "Feeder ID", "value": fields["feeder_id"], "severity": "na"},
+			}
+		} else {
+			pw["status_detail"] = []map[string]any{
+				{"label": "Service", "value": "Stopped", "severity": "na"},
+			}
+		}
 	}
 	if installing {
 		pw["enable"] = map[string]any{"status": "running", "step": "acquiring", "request_id": "dev-piaware"}

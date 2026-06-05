@@ -200,9 +200,18 @@ func NewState(p Paths) *State {
 			// the claim SSE log instead.
 			"airplanes-claim.service": "inactive",
 		},
-		feedStart:   now,
-		tickStart:   now,
-		aggregators: map[string]*aggRecord{},
+		feedStart: now,
+		tickStart: now,
+		aggregators: map[string]*aggRecord{
+			// Seed FlightAware as already set up so first load shows an aggregator
+			// dashboard tile + the configured manage page; Flightradar24 stays
+			// not-set-up so the setup form (with prefilled location) is exercisable.
+			"piaware": {
+				enabled: true,
+				mlat:    true,
+				fields:  map[string]string{"feeder_id": "e03c81bd-dbab-4237-8b2f-bea1c6dfb74f"},
+			},
+		},
 	}
 }
 

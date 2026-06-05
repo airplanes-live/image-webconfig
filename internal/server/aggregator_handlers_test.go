@@ -359,15 +359,16 @@ func TestAggregator_UnknownResultMapsTo500(t *testing.T) {
 	}
 }
 
-func TestAggregatorEnable_InjectsFeedEnvGeoOverClient(t *testing.T) {
+func TestAggregatorEnable_ClientGeoWinsOverFeedEnv(t *testing.T) {
 	t.Parallel()
 	h := newWriteHarness(t)
-	// Authoritative feeder location from feed.env (quoted, as feed.env writes it).
+	// feed.env has a location, but a client that supplies its own coordinates
+	// wins — the user can send an explicit (e.g. different) location to
+	// Flightradar24. The helper still range-validates what it receives.
 	if err := os.WriteFile(h.feedEnvPath, []byte("LATITUDE=\"51.5\"\nLONGITUDE=\"-0.12\"\nALTITUDE=\"30\"\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	h.stdinResult = wexec.Result{Stdout: []byte(`{"protocol_version":1,"result":"accepted","step":"starting","id":"fr24","request_id":"r1"}`)}
-	// Client supplies BOGUS geo; the server must overwrite it from feed.env.
 	r := postJSON(t, h.client, h.ts.URL+"/api/aggregators/fr24/enable",
 		map[string]any{"lat": 1.0, "lon": 2.0, "alt": 9999, "fields": map[string]string{"email": "a@b.c"}})
 	defer r.Body.Close()
@@ -382,19 +383,43 @@ func TestAggregatorEnable_InjectsFeedEnvGeoOverClient(t *testing.T) {
 	if err := json.Unmarshal(calls[0].stdin, &sent); err != nil {
 		t.Fatalf("stdin not JSON: %s", calls[0].stdin)
 	}
-	if sent["lat"] != 51.5 || sent["lon"] != -0.12 || sent["alt"] != float64(30) {
-		t.Fatalf("geo not injected from feed.env (client geo must be overwritten): %v", sent)
+	if sent["lat"] != float64(1) || sent["lon"] != float64(2) || sent["alt"] != float64(9999) {
+		t.Fatalf("client geo must win over feed.env: %v", sent)
 	}
 	if fields, _ := sent["fields"].(map[string]any); fields["email"] != "a@b.c" {
-		t.Fatalf("fields lost during geo inject: %v", sent)
+		t.Fatalf("fields lost during geo handling: %v", sent)
 	}
 }
 
-func TestAggregatorEnable_DropsGeoWhenLocationUnset(t *testing.T) {
+func TestAggregatorEnable_FillsGeoFromFeedEnvWhenClientOmits(t *testing.T) {
 	t.Parallel()
 	h := newWriteHarness(t)
-	// feed.env without any location → inject nothing; the client's geo must be
-	// dropped (not forwarded), so the helper rejects with a geo error.
+	// A client that omits geo (e.g. piaware, or any caller without coordinates)
+	// gets the feeder location filled in from feed.env.
+	if err := os.WriteFile(h.feedEnvPath, []byte("LATITUDE=\"51.5\"\nLONGITUDE=\"-0.12\"\nALTITUDE=\"30\"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	h.stdinResult = wexec.Result{Stdout: []byte(`{"protocol_version":1,"result":"accepted","step":"starting","id":"fr24","request_id":"r1"}`)}
+	r := postJSON(t, h.client, h.ts.URL+"/api/aggregators/fr24/enable",
+		map[string]any{"fields": map[string]string{"email": "a@b.c"}})
+	defer r.Body.Close()
+	calls := h.stdinCallsCopy()
+	if len(calls) != 1 {
+		t.Fatalf("stdinCalls = %d", len(calls))
+	}
+	var sent map[string]any
+	_ = json.Unmarshal(calls[0].stdin, &sent)
+	if sent["lat"] != 51.5 || sent["lon"] != -0.12 || sent["alt"] != float64(30) {
+		t.Fatalf("geo not filled from feed.env when client omits it: %v", sent)
+	}
+}
+
+func TestAggregatorEnable_KeepsClientGeoWhenLocationUnset(t *testing.T) {
+	t.Parallel()
+	h := newWriteHarness(t)
+	// feed.env has no location yet, but the client supplies coordinates — they're
+	// forwarded so a user can set up Flightradar24 before configuring the feeder
+	// location.
 	if err := os.WriteFile(h.feedEnvPath, []byte("UAT_INPUT=\"\"\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -408,10 +433,8 @@ func TestAggregatorEnable_DropsGeoWhenLocationUnset(t *testing.T) {
 	}
 	var sent map[string]any
 	_ = json.Unmarshal(calls[0].stdin, &sent)
-	for _, k := range []string{"lat", "lon", "alt"} {
-		if _, ok := sent[k]; ok {
-			t.Fatalf("%s must be dropped when feed.env has no location: %v", k, sent)
-		}
+	if sent["lat"] != float64(1) || sent["lon"] != float64(2) || sent["alt"] != float64(9999) {
+		t.Fatalf("client geo must be forwarded when feed.env has none: %v", sent)
 	}
 }
 
