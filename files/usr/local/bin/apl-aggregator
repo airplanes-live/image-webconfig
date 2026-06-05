@@ -412,6 +412,24 @@ _adapter_json() {
 			version_drift="true"
 		fi
 
+		# reconcile_error: a failed background auto-apply (the post-overlay-update
+		# reconcile) stamps {error_code, message} into state. Surface it ONLY when
+		# well-formed — an object with a non-empty string error_code — and cap
+		# message, so a corrupt or root-written oversized state value can't inject
+		# arbitrary nested JSON or an unbounded string into every status reply.
+		# Absent/malformed degrades to null (dropped below), matching the tolerant
+		# posture the rest of this report takes with runtime state.
+		local reconcile_error_json
+		reconcile_error_json="$(jq -c '
+			(.reconcile_error // null)
+			| if (type == "object"
+			      and (.error_code | type == "string")
+			      and (.error_code | test("^[a-z][a-z_]*$"))
+			      and (.error_code | length <= 64))
+			  then {error_code: .error_code, message: ((.message // "") | tostring | .[0:300])}
+			  else null end' <<<"$raw" 2>/dev/null)"
+		[[ -n "$reconcile_error_json" ]] || reconcile_error_json="null"
+
 		local state
 		state="$(_derive_state "$available" "$(_service_state "$AGG_SERVICE_UNIT")" "$enabled" "$installed")"
 
@@ -478,6 +496,7 @@ _adapter_json() {
 			--arg version "$installed_version" \
 			--arg desired_version "$desired_version" \
 			--argjson version_drift "$version_drift" \
+			--argjson reconcile_error "$reconcile_error_json" \
 			--argjson overlay "$ov_json" \
 			'{
 				id: $id, display_name: $name, acquire_method: $acquire, service_unit: $unit,
@@ -487,12 +506,14 @@ _adapter_json() {
 				configured_mlat_enabled: $conf_mlat, effective_mlat_enabled: $conf_mlat,
 				config_drift: false, fields: $fields, secret_fields_present: $secrets_present,
 				decoder_reachable: $decoder, claim_url: $claim,
-				version: $version, desired_version: $desired_version, version_drift: $version_drift
+				version: $version, desired_version: $desired_version, version_drift: $version_drift,
+				reconcile_error: $reconcile_error
 			 }
 			 | (if .unavailable_reason == "" then del(.unavailable_reason) else . end)
 			 | (if .claim_url == "" then del(.claim_url) else . end)
 			 | (if .version == "" then del(.version) else . end)
 			 | (if .desired_version == "" then del(.desired_version) else . end)
+			 | (if .reconcile_error == null then del(.reconcile_error) else . end)
 			 | (if $overlay != null
 			    then .enable = ($overlay | {status, step, request_id, op}
 			         + (if .error_code then {error_code} else {} end)

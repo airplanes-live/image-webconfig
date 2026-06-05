@@ -3596,7 +3596,7 @@
         const pair = AGG_STATE_BADGE[a.state] || [a.state || "—", "na"];
         const iconNode = el("span", { class: "wc-tile__icon" }, svgIcon(AGGREGATOR_ICON));
         const titleEl  = el("span", { class: "wc-tile__title" }, a.display_name || a.id);
-        const metaEl   = el("span", { class: "wc-tile__meta" }, pair[0]);
+        const metaEl   = el("span", { class: "wc-tile__meta" }, a.reconcile_error ? pair[0] + " · Update failed" : pair[0]);
         const chev     = el("span", { class: "wc-tile__chev", "aria-hidden": "true" }, "›");
         const dotEl    = el("span", { class: "wc-tile__dot wc-tile__dot--" + pair[1] });
         const root = el("button", {
@@ -3627,7 +3627,8 @@
         // Signature covers everything a tile renders + membership flags, so a
         // change to any of them re-renders rather than going stale behind state.
         const sig = adapters.map(a =>
-            [a.id, a.state || "", a.display_name || "", a.configured ? 1 : 0, a.enabled ? 1 : 0].join(":")
+            [a.id, a.state || "", a.display_name || "", a.configured ? 1 : 0, a.enabled ? 1 : 0,
+             (a.reconcile_error && a.reconcile_error.error_code) || ""].join(":")
         ).join("|");
         if (container.__sig === sig) return;
         container.__sig = sig;
@@ -3685,7 +3686,10 @@
     function buildAggregatorRow(a) {
         const manageable = adapterManageable(a.id);
         const pair = AGG_STATE_BADGE[a.state] || [a.state || "—", "na"];
-        const status = a.version ? pair[0] + " · v" + a.version : pair[0];
+        // A failed auto-update is sticky and easy to miss on the manage page, so
+        // surface it on the row too; a pending (self-healing) drift is not noisy here.
+        let status = a.version ? pair[0] + " · v" + a.version : pair[0];
+        if (a.reconcile_error) status += " · Update failed";
 
         const icon = el("span", { class: "wc-agg-row__icon" }, svgIcon(AGGREGATOR_ICON));
         const body = el("div", { class: "wc-agg-row__body" },
@@ -3774,6 +3778,17 @@
         return p.message || p.error || "Operation failed.";
     }
 
+    // aggReconcileErrorMessage turns a recorded reconcile_error — a failed
+    // background auto-update applied after a system update — into operator
+    // guidance. Kept separate from aggEnableErrorMessage: the user didn't trigger
+    // this, so the copy points at Update System / logs, not "try again".
+    function aggReconcileErrorMessage(err) {
+        const code = (err && err.error_code) || "";
+        if (code === "acquire_failed") return "Automatic update failed — check the feeder's internet connection and run Update System again.";
+        if (code === "state_error") return "Updated, but the service didn't stay running — view logs.";
+        return "The last automatic update didn't finish — run Update System again, or view logs.";
+    }
+
     async function fr24Panel() {
         render(el("div", { class: "wc-card" }, el("p", { class: "muted" }, "loading…")));
         const [resp, config] = await Promise.all([
@@ -3822,6 +3837,14 @@
     function buildAggStatusBlock(a) {
         const rows = el("div", { class: "wc-agg-status" });
         if (a.version) rows.appendChild(aggStatusRow("Installed version", "v" + a.version, "na"));
+        // Auto-update state: a recorded reconcile_error (a failed background
+        // update) is sticky and takes precedence; plain version_drift is a pending
+        // update that self-heals on the next reconcile.
+        if (a.reconcile_error) {
+            rows.appendChild(aggStatusRow("Update", "Failed — " + aggReconcileErrorMessage(a.reconcile_error), "err"));
+        } else if (a.version_drift) {
+            rows.appendChild(aggStatusRow("Update", a.desired_version ? "Pending — updating to v" + a.desired_version : "Pending", "warn"));
+        }
         // status_detail is helper-provided JSON forwarded verbatim — guard the
         // shape (non-array, odd severity) rather than trust it.
         const detail = Array.isArray(a.status_detail) ? a.status_detail : [];
@@ -3979,6 +4002,7 @@
         render(el("section", { class: "wc-card" },
             aggDetailHead("Flightradar24", a.state),
             el("p", { class: "muted" }, "Send your receiver's data to Flightradar24."),
+            buildAggStatusBlock(a),
             form,
         ));
     }
@@ -4119,6 +4143,7 @@
         render(el("section", { class: "wc-card" },
             aggDetailHead("FlightAware", a.state),
             el("p", { class: "muted" }, "Send your receiver's data to FlightAware."),
+            buildAggStatusBlock(a),
             form,
         ));
     }

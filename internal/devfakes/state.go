@@ -128,6 +128,10 @@ type aggRecord struct {
 	// adapter as "installing" until this time, then "running". Zero = not
 	// installing. Compared by wall clock at status time (no timer/goroutine).
 	installUntil time.Time
+	// reconcileError mimics a failed background auto-update: the production
+	// helper stamps {error_code, message} into state when a post-update
+	// reconcile fails, and surfaces it via _adapter_json. nil = no failure.
+	reconcileError map[string]string
 }
 
 // aggInstallDuration is how long the dev fake pretends a vendor acquire takes,
@@ -210,6 +214,13 @@ func NewState(p Paths) *State {
 				enabled: true,
 				mlat:    true,
 				fields:  map[string]string{"feeder_id": "e03c81bd-dbab-4237-8b2f-bea1c6dfb74f"},
+				// Seed a failed background auto-update so the "Update — Failed" row
+				// and the manage-page / list-row / dashboard-tile "Update failed"
+				// hint are exercisable in the dev UI without a Pi.
+				reconcileError: map[string]string{
+					"error_code": "state_error",
+					"message":    "piaware did not stay running after the update",
+				},
 			},
 		},
 	}
@@ -230,6 +241,23 @@ func (s *State) AggregatorRecord(id string) (enabled, mlat bool, fields map[stri
 		f[k] = v
 	}
 	return r.enabled, r.mlat, f
+}
+
+// AggregatorReconcileError returns a copy of the dev adapter's seeded
+// reconcile_error ({error_code, message}), or nil when there is none. Mirrors
+// the production helper, which surfaces a failed background auto-update.
+func (s *State) AggregatorReconcileError(id string) map[string]string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	r, ok := s.aggregators[id]
+	if !ok || r.reconcileError == nil {
+		return nil
+	}
+	out := make(map[string]string, len(r.reconcileError))
+	for k, v := range r.reconcileError {
+		out[k] = v
+	}
+	return out
 }
 
 // aggRecordLocked returns (creating if needed) the record for id. Caller holds s.mu.

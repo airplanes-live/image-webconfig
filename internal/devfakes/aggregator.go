@@ -166,6 +166,9 @@ func aggAdapterFR24(state *State) map[string]any {
 	if installing {
 		fr24["enable"] = map[string]any{"status": "running", "step": "acquiring", "request_id": "dev-fr24"}
 	}
+	if re := state.AggregatorReconcileError("fr24"); re != nil {
+		fr24["reconcile_error"] = re
+	}
 	return fr24
 }
 
@@ -222,6 +225,9 @@ func aggAdapterPiaware(state *State) map[string]any {
 	}
 	if installing {
 		pw["enable"] = map[string]any{"status": "running", "step": "acquiring", "request_id": "dev-piaware"}
+	}
+	if re := state.AggregatorReconcileError("piaware"); re != nil {
+		pw["reconcile_error"] = re
 	}
 	return pw
 }
