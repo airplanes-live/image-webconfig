@@ -144,3 +144,66 @@ EOF
     echo "$output" | jq -e '.result == "error"'
     echo "$output" | jq -e '.error_code == "state_error"'
 }
+
+@test "a well-formed reconcile_error surfaces in status" {
+    export AGG_DECODER_STATE=up SVC_STATE=active
+    cat > "$AGG_STATE_DIR/fr24.json" <<'EOF'
+{"schema_version":1,"enabled":true,"mlat_enabled":false,"fields":{"email":"a@b.c","sharing_key":"K"},"reconcile_error":{"error_code":"acquire_failed","message":"could not download or verify fr24feed"}}
+EOF
+    run "$APLAGG" status --json
+    [ "$status" -eq 0 ]
+    echo "$output" | jq -e '.aggregators[0].reconcile_error.error_code == "acquire_failed"'
+    echo "$output" | jq -e '.aggregators[0].reconcile_error.message == "could not download or verify fr24feed"'
+}
+
+@test "no reconcile_error key when state has none (e.g. after an ok reconcile)" {
+    export AGG_DECODER_STATE=up SVC_STATE=active
+    cat > "$AGG_STATE_DIR/fr24.json" <<'EOF'
+{"schema_version":1,"enabled":true,"fields":{"email":"a@b.c","sharing_key":"K"}}
+EOF
+    run "$APLAGG" status --json
+    [ "$status" -eq 0 ]
+    echo "$output" | jq -e '.aggregators[0] | has("reconcile_error") | not'
+}
+
+@test "a non-object reconcile_error is dropped from status" {
+    export AGG_DECODER_STATE=up SVC_STATE=active
+    cat > "$AGG_STATE_DIR/fr24.json" <<'EOF'
+{"schema_version":1,"enabled":true,"fields":{"email":"a@b.c"},"reconcile_error":"boom"}
+EOF
+    run "$APLAGG" status --json
+    [ "$status" -eq 0 ]
+    echo "$output" | jq -e '.aggregators[0] | has("reconcile_error") | not'
+}
+
+@test "a reconcile_error without a string error_code is dropped from status" {
+    export AGG_DECODER_STATE=up SVC_STATE=active
+    cat > "$AGG_STATE_DIR/fr24.json" <<'EOF'
+{"schema_version":1,"enabled":true,"fields":{"email":"a@b.c"},"reconcile_error":{"error_code":123,"message":"x"}}
+EOF
+    run "$APLAGG" status --json
+    [ "$status" -eq 0 ]
+    echo "$output" | jq -e '.aggregators[0] | has("reconcile_error") | not'
+}
+
+@test "reconcile_error message is length-capped" {
+    export AGG_DECODER_STATE=up SVC_STATE=active
+    long="$(printf 'x%.0s' {1..600})"
+    cat > "$AGG_STATE_DIR/fr24.json" <<EOF
+{"schema_version":1,"enabled":true,"fields":{"email":"a@b.c"},"reconcile_error":{"error_code":"state_error","message":"$long"}}
+EOF
+    run "$APLAGG" status --json
+    [ "$status" -eq 0 ]
+    echo "$output" | jq -e '.aggregators[0].reconcile_error.message | length == 300'
+}
+
+@test "a reconcile_error with a non-code-shaped error_code is dropped" {
+    export AGG_DECODER_STATE=up SVC_STATE=active
+    # Uppercase / spaces / punctuation are not valid error-code shape → drop.
+    cat > "$AGG_STATE_DIR/fr24.json" <<'EOF'
+{"schema_version":1,"enabled":true,"fields":{"email":"a@b.c"},"reconcile_error":{"error_code":"Big Scary <b>HTML</b>","message":"x"}}
+EOF
+    run "$APLAGG" status --json
+    [ "$status" -eq 0 ]
+    echo "$output" | jq -e '.aggregators[0] | has("reconcile_error") | not'
+}
