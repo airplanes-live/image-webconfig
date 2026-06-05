@@ -25,7 +25,9 @@ func aggregatorCmd(state *State, verb string, body []byte) (wexec.Result, error)
 	case "disable":
 		return aggMutateID(body, func(id string) { state.AggregatorDisable(id) }), nil
 	case "reset":
-		return aggMutateID(body, func(id string) { state.AggregatorReset(id) }), nil
+		// reset is fire-and-forget like enable: production runs the teardown in a
+		// detached worker (to escape the webconfig sandbox) and returns accepted.
+		return aggMutateAccepted(body, func(id string) { state.AggregatorReset(id) }), nil
 	case "set":
 		return aggSet(state, body), nil
 	case "export":
@@ -62,6 +64,33 @@ func aggOK(id string, extra map[string]any) wexec.Result {
 		m[k] = v
 	}
 	return aggEnvelope(m)
+}
+
+// aggAccepted is the fire-and-forget envelope production returns for the async
+// mutations (enable/reset/set); the SPA polls status until the overlay settles.
+func aggAccepted(id string) wexec.Result {
+	return aggEnvelope(map[string]any{
+		"protocol_version": aggProtocolVersion,
+		"result":           "accepted",
+		"step":             "starting",
+		"id":               id,
+		"request_id":       "dev-" + id,
+	})
+}
+
+// aggMutateAccepted applies the in-memory mutation, then returns accepted.
+func aggMutateAccepted(body []byte, fn func(id string)) wexec.Result {
+	var req struct {
+		ID string `json:"id"`
+	}
+	if err := json.Unmarshal(body, &req); err != nil {
+		return aggError("parse_error", "request body must be a JSON object")
+	}
+	if !aggKnown(req.ID) {
+		return aggError("not_found", "unknown aggregator id")
+	}
+	fn(req.ID)
+	return aggAccepted(req.ID)
 }
 
 // aggStatus emits the adapters the dev fake knows about (fr24 + piaware), each
@@ -268,7 +297,7 @@ func aggSet(state *State, body []byte) wexec.Result {
 		return aggError("not_found", "unknown aggregator id")
 	}
 	state.AggregatorSet(req.ID, req.Fields, req.Mlat)
-	return aggOK(req.ID, nil)
+	return aggAccepted(req.ID)
 }
 
 func aggExport(state *State) wexec.Result {

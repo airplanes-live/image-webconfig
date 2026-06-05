@@ -3805,9 +3805,9 @@
                 el("p", { class: "muted" }, "Flightradar24 is not available on this image.")));
             return;
         }
-        // If an enable is already in flight, jump straight to the progress view.
-        if (a.state === "installing" && a.enable && a.enable.request_id) {
-            return aggregatorEnableProgress("fr24", a.enable.request_id);
+        // If a mutation (enable/reset) is already in flight, resume its progress.
+        if (a.enable && a.enable.request_id && (a.state === "installing" || a.state === "removing" || a.state === "applying")) {
+            return aggregatorMutationProgress("fr24", a.enable.request_id, a.enable.op || "enable");
         }
         renderFr24Form(a);
     }
@@ -3889,9 +3889,12 @@
                 resetBtn.disabled = true;
                 const r = await postJSON("/api/aggregators/fr24/reset", {});
                 if (handleAuthFailure(r)) return;
-                if (!r.ok) { resetBtn.disabled = false; inlineErr.textContent = aggEnableErrorMessage(r); return; }
-                pendingFlash = { text: "Removed Flightradar24.", level: "ok" };
-                navigate(aggregatorsPanel, { title: "Third-party aggregators", showBack: true });
+                if (r.status === 202) {
+                    navigate(() => aggregatorMutationProgress("fr24", r.payload && r.payload.request_id, "reset"),
+                        { title: "Removing Flightradar24", showBack: true });
+                    return;
+                }
+                resetBtn.disabled = false; inlineErr.textContent = aggEnableErrorMessage(r);
             };
             actions.appendChild(resetBtn);
         }
@@ -3931,8 +3934,8 @@
                 el("p", { class: "muted" }, "FlightAware is not available on this image.")));
             return;
         }
-        if (a.state === "installing" && a.enable && a.enable.request_id) {
-            return aggregatorEnableProgress("piaware", a.enable.request_id);
+        if (a.enable && a.enable.request_id && (a.state === "installing" || a.state === "removing" || a.state === "applying")) {
+            return aggregatorMutationProgress("piaware", a.enable.request_id, a.enable.op || "enable");
         }
         renderPiawareForm(a);
     }
@@ -4010,9 +4013,12 @@
                 resetBtn.disabled = true;
                 const r = await postJSON("/api/aggregators/piaware/reset", {});
                 if (handleAuthFailure(r)) return;
-                if (!r.ok) { resetBtn.disabled = false; inlineErr.textContent = aggEnableErrorMessage(r); return; }
-                pendingFlash = { text: "Removed FlightAware.", level: "ok" };
-                navigate(aggregatorsPanel, { title: "Third-party aggregators", showBack: true });
+                if (r.status === 202) {
+                    navigate(() => aggregatorMutationProgress("piaware", r.payload && r.payload.request_id, "reset"),
+                        { title: "Removing FlightAware", showBack: true });
+                    return;
+                }
+                resetBtn.disabled = false; inlineErr.textContent = aggEnableErrorMessage(r);
             };
             actions.appendChild(resetBtn);
         }
@@ -4038,19 +4044,41 @@
 
     const AGG_ENABLE_POLL_MS = 2000;
     const AGG_ENABLE_GRACE_POLLS = 5;
-    // aggregatorEnableProgress polls /api/aggregators after a 202 and shows the
+    // Per-op copy for the shared mutation-progress view. enable and reset both run
+    // as detached workers (reset escapes the webconfig sandbox the same way enable
+    // does); the SPA polls until the worker's overlay reaches done/failed.
+    const AGG_MUTATION_COPY = {
+        enable: {
+            heading: n => "Setting up " + n,
+            blurb:   n => "Installing and configuring the " + n + " feeder. This can take a minute — you can leave this page; it keeps running.",
+            working: "Working",
+            okFlash: n => n + " is now feeding.",
+            failHeading: "Setup failed.",
+            failDefault: n => n + " setup failed.",
+        },
+        reset: {
+            heading: n => "Removing " + n,
+            blurb:   n => "Removing the " + n + " feeder. This can take a minute — you can leave this page; it keeps running.",
+            working: "Removing",
+            okFlash: n => "Removed " + n + ".",
+            failHeading: "Removal failed.",
+            failDefault: n => n + " could not be removed.",
+        },
+    };
+    // aggregatorMutationProgress polls /api/aggregators after a 202 and shows the
     // detached worker's progress. It matches the worker's request_id against the
-    // one the 202 returned, so a stale overlay from a prior failed run can't make
-    // this run look failed. Mirrors orchestratorProgress's lifecycle teardown.
-    function aggregatorEnableProgress(id, requestId) {
+    // one the 202 returned, so a stale overlay from a prior run can't make this
+    // run look done/failed. Mirrors orchestratorProgress's lifecycle teardown.
+    function aggregatorMutationProgress(id, requestId, op) {
+        const copy = AGG_MUTATION_COPY[op] || AGG_MUTATION_COPY.enable;
         const name = ADAPTER_NAMES[id] || id;
         const stepEl = el("p", { class: "muted" }, "Starting…");
         const errEl = el("div", { class: "wc-flash wc-flash--warn", role: "alert" });
         errEl.hidden = true;
         const actions = el("div", { class: "wc-agg-row__actions" });
         render(el("section", { class: "wc-card" },
-            el("h2", {}, "Setting up " + name),
-            el("p", { class: "muted" }, "Installing and configuring the " + name + " feeder. This can take a minute — you can leave this page; it keeps running."),
+            el("h2", {}, copy.heading(name)),
+            el("p", { class: "muted" }, copy.blurb(name)),
             stepEl, errEl, actions,
         ));
 
@@ -4066,13 +4094,13 @@
 
         const finishOk = () => {
             pollTimer = null;
-            pendingFlash = { text: name + " is now feeding.", level: "ok" };
+            pendingFlash = { text: copy.okFlash(name), level: "ok" };
             navigate(aggregatorsPanel, { title: "Third-party aggregators", showBack: true });
         };
         const finishFail = (msg) => {
             pollTimer = null;
-            stepEl.textContent = "Setup failed.";
-            errEl.textContent = msg || (name + " setup failed.");
+            stepEl.textContent = copy.failHeading;
+            errEl.textContent = msg || copy.failDefault(name);
             errEl.hidden = false;
             actions.replaceChildren(el("button", { type: "button", class: "wc-btn-primary",
                 onclick: () => navigate(() => adapterPanel(id), { title: name, showBack: true }) }, "Back to setup"));
@@ -4099,7 +4127,7 @@
             if (mine && ov.status === "failed") return finishFail(aggEnableErrorMessage({ payload: ov }));
             if (mine && (ov.status === "running" || ov.status === "starting")) {
                 sawMine = true;
-                stepEl.textContent = "Working… (" + (ov.step || "starting") + ")";
+                stepEl.textContent = copy.working + "… (" + (ov.step || "starting") + ")";
                 pollTimer = setTimeout(pollOnce, AGG_ENABLE_POLL_MS);
                 return;
             }
@@ -4113,7 +4141,7 @@
             }
             // We never matched THIS request's overlay (it was superseded, cleared,
             // or never appeared). Do NOT infer success/failure from the adapter's
-            // unscoped state — for a re-enable of an already-running adapter that
+            // unscoped state — for a re-run against an already-running adapter that
             // would be wrong. Stop and send the user to the panel, where the
             // reconciled status is authoritative.
             pollTimer = null;
@@ -4125,6 +4153,10 @@
             }, "Check status"));
         }
         pollOnce();
+    }
+    // Thin wrapper preserving the enable call sites.
+    function aggregatorEnableProgress(id, requestId) {
+        return aggregatorMutationProgress(id, requestId, "enable");
     }
 
     async function dashboard() {
