@@ -19,17 +19,34 @@ setup() {
     export AGG_REQ_DIR="$WORK/req"
     export AGG_DESC_DIR="$BATS_TEST_DIRNAME/../../files/usr/local/lib/airplanes-webconfig/aggregators"
     export AGG_LOCK="$WORK/aggregator.lock"
+    export AGG_SELF="$APLAGG"
     mkdir -p "$AGG_INSTALL_ROOT"
 
     # Record systemctl invocations so disable/reset wiring can be asserted.
+    # is-active reports inactive so the shared worker unit never reads as a
+    # mutation-in-progress and self-blocks the next verb.
     SYSTEMCTL="$WORK/fake-systemctl"
     cat > "$SYSTEMCTL" <<EOF
 #!/usr/bin/env bash
 printf '%s\n' "\$*" >> "$WORK/systemctl.log"
+[[ "\$1" == is-active ]] && echo inactive
 exit 0
 EOF
     chmod +x "$SYSTEMCTL"
     export AGG_SYSTEMCTL="$SYSTEMCTL"
+
+    # set/reset are fire-and-forget: the verb validates then launches a detached
+    # worker via systemd-run. Stub it to run the worker INLINE so the whole
+    # transaction (state merge / teardown + overlay) is exercised deterministically.
+    SR="$WORK/fake-systemd-run"
+    cat > "$SR" <<'EOF'
+#!/usr/bin/env bash
+while [[ "$1" == --* ]]; do shift; done
+"$@"
+exit 0
+EOF
+    chmod +x "$SR"
+    export AGG_SYSTEMD_RUN="$SR"
 }
 
 teardown() {
@@ -42,10 +59,14 @@ agg() {
     run bash -c 'printf "%s" "$3" | "$1" "$2" --json' _ "$APLAGG" "$1" "$2"
 }
 
+overlay_status() { jq -r '.status // ""' "$AGG_ENABLE_STATE" 2>/dev/null; }
+overlay_code() { jq -r '.error_code // ""' "$AGG_ENABLE_STATE" 2>/dev/null; }
+
 @test "set merges mlat_enabled and fields into 0600 state" {
     agg set '{"id":"fr24","mlat_enabled":true,"fields":{"email":"a@b.c"}}'
     [ "$status" -eq 0 ]
-    echo "$output" | jq -e '.result == "ok" and .id == "fr24"'
+    echo "$output" | jq -e '.result == "accepted" and .id == "fr24"'
+    [ "$(overlay_status)" = "done" ]
     [ "$(stat -c '%a' "$AGG_STATE_DIR/fr24.json")" = "600" ]
     jq -e '.mlat_enabled == true and .fields.email == "a@b.c" and .schema_version == 1' "$AGG_STATE_DIR/fr24.json"
 }
@@ -53,8 +74,10 @@ agg() {
 @test "set merges without dropping previously stored fields" {
     agg set '{"id":"fr24","fields":{"email":"a@b.c"}}'
     [ "$status" -eq 0 ]
+    [ "$(overlay_status)" = "done" ]
     agg set '{"id":"fr24","fields":{"sharing_key":"K"}}'
     [ "$status" -eq 0 ]
+    [ "$(overlay_status)" = "done" ]
     jq -e '.fields.email == "a@b.c" and .fields.sharing_key == "K"' "$AGG_STATE_DIR/fr24.json"
 }
 
@@ -92,12 +115,32 @@ agg() {
 
 @test "reset removes state and the install dir" {
     agg set '{"id":"fr24","mlat_enabled":true}'
+    [ "$status" -eq 0 ]
     mkdir -p "$AGG_INSTALL_ROOT/fr24"
     agg reset '{"id":"fr24"}'
     [ "$status" -eq 0 ]
+    echo "$output" | jq -e '.result == "accepted"'
+    [ "$(overlay_status)" = "done" ]
     [ ! -e "$AGG_STATE_DIR/fr24.json" ]
     [ ! -e "$AGG_INSTALL_ROOT/fr24" ]
     grep -q 'disable --now airplanes-aggregator@fr24.service' "$WORK/systemctl.log"
+}
+
+@test "a worker launch failure rolls back the overlay + spool and reports busy" {
+    agg set '{"id":"fr24","mlat_enabled":true}'
+    [ "$status" -eq 0 ]
+    # systemd-run that fails to launch the worker (e.g. the unit name is taken).
+    printf '#!/usr/bin/env bash\nexit 1\n' > "$WORK/fail-run"
+    chmod +x "$WORK/fail-run"
+    export AGG_SYSTEMD_RUN="$WORK/fail-run"
+    agg reset '{"id":"fr24"}'
+    [ "$status" -eq 4 ]
+    echo "$output" | jq -e '.error_code == "lock_timeout"'
+    # The foreground rolled back ITS overlay + secret spool — nothing left stuck.
+    [ -z "$(ls -A "$AGG_REQ_DIR" 2>/dev/null)" ]
+    [ "$(overlay_status)" != "running" ]
+    # The worker never ran, so the adapter state is untouched.
+    [ -f "$AGG_STATE_DIR/fr24.json" ]
 }
 
 @test "set fails with lock_timeout when the lock is already held" {
@@ -112,12 +155,15 @@ agg() {
     echo "$output" | jq -e '.error_code == "lock_timeout"'
 }
 
-@test "set refuses to overwrite corrupt existing state" {
+@test "set surfaces corrupt existing state as a failed overlay" {
     mkdir -p "$AGG_STATE_DIR"
     printf '%s' 'this is not json' > "$AGG_STATE_DIR/fr24.json"
     agg set '{"id":"fr24","mlat_enabled":true}'
-    [ "$status" -eq 3 ]
-    echo "$output" | jq -e '.error_code == "state_error"'
+    # The foreground accepts; the detached worker reports the failure in the overlay.
+    [ "$status" -eq 0 ]
+    echo "$output" | jq -e '.result == "accepted"'
+    [ "$(overlay_status)" = "failed" ]
+    [ "$(overlay_code)" = "state_error" ]
     # the corrupt file is left untouched for the operator to reset
     [ -f "$AGG_STATE_DIR/fr24.json" ]
 }

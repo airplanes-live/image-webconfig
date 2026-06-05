@@ -104,9 +104,10 @@ readonly AGG_STATE_SCHEMA_VERSION=1
 # WORKER_MODE=1 reroutes _emit_error/_emit_ok to the AGG_ENABLE_STATE progress
 # file instead of stdout (the worker has no HTTP caller). Set by __enable-worker.
 WORKER_MODE=0
-WORKER_ID=""        # adapter id the worker is enabling (for the progress overlay)
-WORKER_REQID=""     # request_id of the in-flight enable
-WORKER_STARTED=0    # epoch secs the enable was launched (for grace-window reconciliation)
+WORKER_OP="enable"  # mutation the worker is running: enable|reset|set (overlay tag)
+WORKER_ID=""        # adapter id the worker is acting on (for the progress overlay)
+WORKER_REQID=""     # request_id of the in-flight mutation
+WORKER_STARTED=0    # epoch secs the mutation was launched (for grace-window reconciliation)
 WORKER_STEP=""      # current phase label written into the overlay
 
 # --- output helpers --------------------------------------------------------
@@ -179,9 +180,9 @@ _write_enable_state() {
 	install -d -m 0755 "$(dirname "$AGG_ENABLE_STATE")" 2>/dev/null || true
 	body="$(jq -nc \
 		--argjson pv "$AGG_PROTOCOL_VERSION" --arg id "$WORKER_ID" --arg rid "$WORKER_REQID" \
-		--argjson started "${WORKER_STARTED:-0}" \
+		--argjson started "${WORKER_STARTED:-0}" --arg op "${WORKER_OP:-enable}" \
 		--arg st "$status" --arg step "$step" --arg c "$code" --arg m "$message" \
-		'{protocol_version:$pv, id:$id, request_id:$rid, started_at:$started, status:$st, step:$step}
+		'{protocol_version:$pv, id:$id, request_id:$rid, started_at:$started, op:$op, status:$st, step:$step}
 		 | (if $c != "" then .error_code = $c else . end)
 		 | (if $m != "" then .message = $m else . end)' 2>/dev/null)" || return 0
 	tmp="$(mktemp "${AGG_ENABLE_STATE}.XXXXXX" 2>/dev/null)" || return 0
@@ -414,15 +415,23 @@ _adapter_json() {
 		local state
 		state="$(_derive_state "$available" "$(_service_state "$AGG_SERVICE_UNIT")" "$enabled" "$installed")"
 
-		# Async-enable overlay: an in-flight or recently-failed enable for this
-		# adapter takes precedence over the service-derived state, so the UI can
-		# show installing/failed with progress while the detached worker runs.
-		local overlay ov_json="null" ov_status
+		# Async-mutation overlay: an in-flight or recently-failed enable/reset/set
+		# for this adapter takes precedence over the service-derived state, so the
+		# UI can show progress while the detached worker runs. The in-flight label
+		# is op-specific (installing/removing/applying); a failure of any op maps to
+		# "failed" with the worker's error_code/message carried in the raw overlay.
+		local overlay ov_json="null" ov_status ov_op
 		if overlay="$(_enable_overlay "$AGG_ID")" && [[ -n "$overlay" ]]; then
 			ov_json="$overlay"
 			ov_status="$(jq -r '.status // ""' <<<"$overlay")"
+			ov_op="$(jq -r '.op // "enable"' <<<"$overlay")"
 			case "$ov_status" in
-				starting|running) state="installing" ;;
+				starting|running)
+					case "$ov_op" in
+						reset) state="removing" ;;
+						set) state="applying" ;;
+						*) state="installing" ;;
+					esac ;;
 				failed) state="failed" ;;
 			esac
 		fi
@@ -485,7 +494,7 @@ _adapter_json() {
 			 | (if .version == "" then del(.version) else . end)
 			 | (if .desired_version == "" then del(.desired_version) else . end)
 			 | (if $overlay != null
-			    then .enable = ($overlay | {status, step, request_id}
+			    then .enable = ($overlay | {status, step, request_id, op}
 			         + (if .error_code then {error_code} else {} end)
 			         + (if .message then {message} else {} end))
 			    else . end)'
@@ -642,8 +651,11 @@ _write_state() {
 	fi
 }
 
-# cmd_set merges mlat_enabled / fields into an adapter's state. Service
-# reconciliation (restart + verify) lands with the enable path.
+# cmd_set merges mlat_enabled / fields into an adapter's state. The merge + the
+# live-daemon reconcile (for piaware, piaware-config writes /etc/piaware.conf and
+# try-restarts) run in a detached worker so they escape the webconfig
+# ProtectSystem=strict sandbox; the foreground validates synchronously and
+# returns {result:"accepted"}. The worker carries the work in cmd_set_worker.
 cmd_set() {
 	_read_request
 	_request_id; local id="$REQ_ID"
@@ -657,32 +669,10 @@ cmd_set() {
 		_emit_error rejected "fields must be an object"; exit 2
 	fi
 	_acquire_lock
-	if _enable_in_progress; then
-		_emit_error lock_timeout "an enable is in progress; try again shortly"; exit 4
+	if _mutation_in_progress; then
+		_emit_error lock_timeout "another aggregator operation is in progress; try again shortly"; exit 4
 	fi
-	local cur merged
-	cur="$(_load_state "$id")" \
-		|| { _emit_error state_error "existing state for $id is unreadable; reset to clear"; exit 3; }
-	merged="$(jq -nc \
-		--argjson cur "$cur" --argjson req "$REQ_JSON" --argjson sv "$AGG_STATE_SCHEMA_VERSION" \
-		'$cur
-		 | .schema_version = $sv
-		 | (if $req | has("mlat_enabled") then .mlat_enabled = $req.mlat_enabled else . end)
-		 | (if $req | has("fields")
-		    then .fields = (((.fields // {}) | if type == "object" then . else {} end) + $req.fields)
-		    else . end)')"
-	# piaware applies config to the live daemon BEFORE we persist, so state never
-	# claims a setting the daemon didn't accept (a managed+running piaware gets
-	# allow-mlat written + a try-restart; an inactive/unmanaged one is a no-op and
-	# the preference is just stored for the next enable). FR24 config lands only
-	# via enable, so it stays state-only.
-	if [[ "$id" == "piaware" ]]; then
-		_piaware_reconcile_mlat "$merged" \
-			|| { _emit_error state_error "failed to apply the MLAT setting to piaware"; exit 3; }
-	fi
-	_write_state "$id" "$merged"
-	_clear_enable_state "$id"
-	_emit_ok "$id"
+	_spawn_worker set "$id"
 }
 
 # cmd_disable stops + disables the adapter service and flags enabled=false,
@@ -691,8 +681,8 @@ cmd_disable() {
 	_read_request
 	_request_id; local id="$REQ_ID"
 	_acquire_lock
-	if _enable_in_progress; then
-		_emit_error lock_timeout "an enable is in progress; try again shortly"; exit 4
+	if _mutation_in_progress; then
+		_emit_error lock_timeout "another aggregator operation is in progress; try again shortly"; exit 4
 	fi
 	# Validate state + descriptor BEFORE the systemctl side effect so a corrupt
 	# state fails fast with no half-applied change.
@@ -723,32 +713,13 @@ cmd_reset() {
 	[[ "$AGG_INSTALL_ROOT" == /* && "$AGG_INSTALL_ROOT" != "/" ]] \
 		|| { _emit_error state_error "unsafe install root"; exit 3; }
 	_acquire_lock
-	if _enable_in_progress; then
-		_emit_error lock_timeout "an enable is in progress; try again shortly"; exit 4
+	if _mutation_in_progress; then
+		_emit_error lock_timeout "another aggregator operation is in progress; try again shortly"; exit 4
 	fi
-	local acquire
-	acquire="$(_descriptor_acquire "$id")"
-	if [[ "$acquire" == "pinned-deb" ]]; then
-		# pinned-deb teardown owns its own service-stop + package removal (unhold +
-		# purge), acting ONLY on what this helper installed — never an admin's piaware.
-		case "$id" in
-			piaware) _piaware_teardown ;;
-			*) _emit_error state_error "no teardown for pinned-deb adapter $id"; exit 3 ;;
-		esac
-	else
-		# vendor-installer / default: stop the unit + drop the on-demand install dir.
-		local unit
-		if ! unit="$(_descriptor_unit "$id")"; then
-			_emit_error state_error "descriptor read failed for $id"; exit 3
-		fi
-		if [[ -n "$unit" ]]; then
-			"$AGG_SYSTEMCTL" disable --now "$unit" >/dev/null 2>&1 || true
-		fi
-		rm -rf -- "${AGG_INSTALL_ROOT:?}/$id"
-	fi
-	rm -f -- "$AGG_STATE_DIR/$id.json"
-	_clear_enable_state "$id"
-	_emit_ok "$id"
+	# The teardown (apt purge / rm under the install root / conf removal) runs in a
+	# detached worker so it escapes the webconfig ProtectSystem=strict sandbox; the
+	# foreground returns {result:"accepted"}. Work carried in cmd_reset_worker.
+	_spawn_worker reset "$id"
 }
 
 # --- enable: on-demand vendor acquire + service start ----------------------
@@ -1439,11 +1410,12 @@ _spool_request() {
 
 _rm_spool() { rm -f -- "$AGG_REQ_DIR/$1.json" 2>/dev/null || true; }
 
-# _enable_in_progress: is an enable worker running (or just launched)? True if
-# the enable unit is active/activating, or a running/starting overlay was
-# published within the grace window (the worker hasn't become visible to
-# systemd yet). A stale overlay past the grace window is NOT in-progress.
-_enable_in_progress() {
+# _mutation_in_progress: is a mutation worker (enable/reset/set) running, or just
+# launched? True if the shared worker unit is active/activating, or a
+# running/starting overlay was published within the grace window (the worker
+# hasn't become visible to systemd yet). A stale overlay past the grace window is
+# NOT in-progress. Op-agnostic — one mutation at a time across every verb.
+_mutation_in_progress() {
 	local svc
 	svc="$(_service_state "$AGG_ENABLE_UNIT")"
 	[[ "$svc" == "active" || "$svc" == "activating" ]] && return 0
@@ -1458,7 +1430,8 @@ _enable_in_progress() {
 	(( started > 0 && age <= AGG_ENABLE_GRACE ))
 }
 
-# _emit_accepted <id> <reqid>: the fire-and-forget enable response.
+# _emit_accepted <id> <reqid>: the fire-and-forget response shared by every async
+# mutation (enable/reset/set).
 _emit_accepted() {
 	local id="$1" reqid="$2" body
 	if ! body="$(jq -nc --argjson pv "$AGG_PROTOCOL_VERSION" --arg id "$id" --arg rid "$reqid" \
@@ -1468,80 +1441,72 @@ _emit_accepted() {
 	_emit_json "$body"
 }
 
-# cmd_enable validates synchronously, then launches the slow vendor acquire as a
-# detached transient unit (systemd-run) and returns {result:"accepted"} in <1s.
-# The flock guards validation + spool; it is released before the worker is
-# launched (the worker re-acquires it for its whole transaction). One enable at
-# a time is enforced by _enable_in_progress + the fixed unit name.
-cmd_enable() {
-	_read_request
-	_request_id; local id="$REQ_ID"
-	_acquire_lock
-	if _enable_in_progress; then
-		_emit_error lock_timeout "an enable is already in progress; try again shortly"; exit 4
-	fi
-	case "$id" in
-		fr24) _fr24_validate_sync ;;
-		piaware) _piaware_validate_sync ;;
-		*) _emit_error rejected "enable is not yet supported for $id"; exit 2 ;;
+# _spawn_worker <op> <id>: shared async-launch tail for enable/reset/set. The
+# caller holds the lock, has confirmed no other mutation is in progress, and has
+# finished synchronous validation. Generates a reqid, spools the (already-read)
+# REQ_JSON, publishes the op-tagged running overlay BEFORE releasing the lock —
+# so the launch-to-active window reads as in-progress, never as a dead worker —
+# launches the detached worker, and returns {result:"accepted"}; on a launch
+# failure it rolls back ONLY its own overlay + spool and reports transient-busy.
+_spawn_worker() {
+	local op="$1" id="$2" reqid worker
+	case "$op" in
+		enable) worker="__enable-worker" ;;
+		reset)  worker="__reset-worker" ;;
+		set)    worker="__set-worker" ;;
+		*) _emit_error state_error "unknown worker op $op"; exit 3 ;;
 	esac
-
-	local reqid; reqid="$(_gen_reqid)"
+	reqid="$(_gen_reqid)"
 	[[ -n "$reqid" ]] || { _emit_error state_error "could not generate a request id"; exit 3; }
-	WORKER_ID="$id"; WORKER_REQID="$reqid"
+	WORKER_OP="$op"; WORKER_ID="$id"; WORKER_REQID="$reqid"
 	WORKER_STARTED="$(date +%s 2>/dev/null || echo 0)"
-	# We hold the lock and no enable is in progress, so any spool file still on
-	# disk is orphaned (a prior worker that died, or a launch that never execed
-	# its worker). Sweep before spooling so a never-consumed secret can't
-	# accumulate in /run across enables.
+	# We hold the lock and no mutation is in progress, so any spool file still on
+	# disk is orphaned (a prior worker that died, or a launch that never execed its
+	# worker). Sweep before spooling so a never-consumed secret can't accumulate.
 	rm -f -- "$AGG_REQ_DIR"/*.json 2>/dev/null || true
-	_spool_request "$reqid" || { _emit_error state_error "failed to spool enable request"; exit 3; }
+	_spool_request "$reqid" || { _emit_error state_error "failed to spool $op request"; exit 3; }
 
 	# Clear any stale terminal unit so the fixed systemd-run name is free, then
-	# publish the running overlay BEFORE launch — the grace window in
-	# _enable_overlay covers the launch-to-active latency so this can't read as a
-	# dead worker.
+	# publish the running overlay BEFORE launch (the grace window in _enable_overlay
+	# covers the launch-to-active latency so this can't read as a dead worker).
 	"$AGG_SYSTEMCTL" reset-failed "$AGG_ENABLE_UNIT" >/dev/null 2>&1 || true
 	WORKER_STEP="starting"; _write_enable_state running
 	exec 9>&-  # release the flock so the worker can take it
 
-	# Pass both the request id and the adapter id: the id lets the worker stamp
-	# a correctly-attributed progress overlay even if it dies before reading the
-	# spool (the id is not a secret; only reqid indexes the secret payload).
+	# Pass the request id AND the adapter id: the id lets the worker stamp a
+	# correctly-attributed overlay even if it dies before reading the spool (the id
+	# is not a secret; only reqid indexes the secret payload).
 	if ! "$AGG_SYSTEMD_RUN" --unit="$AGG_ENABLE_UNIT" --collect \
-		"$AGG_SELF" __enable-worker "$reqid" "$id" >/dev/null 2>&1; then
-		# Launch failed (e.g. the unit already exists → a racing enable won). Roll
-		# back ONLY our own overlay (reqid-matched) + spool and report
-		# transient-busy.
+		"$AGG_SELF" "$worker" "$reqid" "$id" >/dev/null 2>&1; then
 		_rm_spool "$reqid"
 		_clear_enable_state "$id" "$reqid"
-		_emit_error lock_timeout "could not launch enable (another may be in progress)"; exit 4
+		_emit_error lock_timeout "could not launch $op (another may be in progress)"; exit 4
 	fi
 	_emit_accepted "$id" "$reqid"
 }
 
-# cmd_enable_worker is the detached worker (systemd-run target, root). It is not
-# a sudoers verb — webconfig can only invoke `enable --json`. It reads the
-# spooled request, unlinks the secret spool immediately, then runs the adapter
-# acquire under the lock, reporting progress through the overlay.
-cmd_enable_worker() {
+# _worker_init <reqid> <id>: shared detached-worker preamble (systemd-run target,
+# root). Validates reqid+id from the trusted argv, loads the spooled REQ_JSON and
+# unlinks the secret spool BEFORE the work (a SIGKILL mid-op leaves no secret on
+# disk), confirms the spool's id matches, republishes the running overlay, and
+# takes the lock. The caller sets WORKER_OP before calling.
+_worker_init() {
 	local reqid="$1" id="$2"
 	WORKER_MODE=1
 	WORKER_REQID="$reqid"
 	WORKER_STARTED="$(date +%s 2>/dev/null || echo 0)"
 	# Set WORKER_ID up front (from the trusted argv, not the spool) so EVERY
-	# failure path below — including a missing/corrupt spool — writes a progress
-	# overlay attributed to the right adapter, not an unattached id:"" record
-	# that status would ignore.
+	# failure path below — including a missing/corrupt spool — writes an overlay
+	# attributed to the right adapter, not an id:"" record status would ignore.
 	[[ "$reqid" =~ ^[a-z0-9-]+$ ]] || { _emit_error usage_error "invalid worker request id"; exit 5; }
 	[[ "$id" =~ $AGG_ID_RE && -f "$AGG_DESC_DIR/$id.desc" ]] || { _emit_error not_found "unknown aggregator id"; exit 2; }
 	WORKER_ID="$id"
 	local path="$AGG_REQ_DIR/$reqid.json"
 	if [[ ! -f "$path" ]]; then
-		_emit_error state_error "enable request spool missing"; exit 3
+		_emit_error state_error "${WORKER_OP} request spool missing"; exit 3
 	fi
 	# Load into memory, then delete the secret spool BEFORE the slow work so a
-	# SIGKILL / RuntimeMaxSec mid-acquire leaves no secret on disk.
+	# SIGKILL / RuntimeMaxSec mid-op leaves no secret on disk.
 	REQ_JSON="$(head -c "$AGG_STATE_MAX_BYTES" "$path" 2>/dev/null || true)"
 	_rm_spool "$reqid"
 	jq -e -s 'length == 1 and (.[0] | type == "object")' >/dev/null 2>&1 <<<"$REQ_JSON" \
@@ -1551,11 +1516,101 @@ cmd_enable_worker() {
 	[[ "$REQ_ID" == "$id" ]] || { _emit_error rejected "spooled request id mismatch"; exit 2; }
 	WORKER_STEP="starting"; _write_enable_state running
 	_acquire_lock
+}
+
+# cmd_enable validates synchronously, then launches the slow vendor acquire as a
+# detached transient unit (systemd-run) and returns {result:"accepted"} in <1s.
+# The flock guards validation + spool; it is released before the worker is
+# launched (the worker re-acquires it for its whole transaction). One mutation at
+# a time is enforced by _mutation_in_progress + the fixed unit name.
+cmd_enable() {
+	_read_request
+	_request_id; local id="$REQ_ID"
+	_acquire_lock
+	if _mutation_in_progress; then
+		_emit_error lock_timeout "another aggregator operation is in progress; try again shortly"; exit 4
+	fi
+	case "$id" in
+		fr24) _fr24_validate_sync ;;
+		piaware) _piaware_validate_sync ;;
+		*) _emit_error rejected "enable is not yet supported for $id"; exit 2 ;;
+	esac
+	_spawn_worker enable "$id"
+}
+
+# cmd_enable_worker is the detached worker for enable (systemd-run target, root).
+# Not a sudoers verb — webconfig can only invoke `enable --json`.
+cmd_enable_worker() {
+	local reqid="$1" id="$2"
+	WORKER_OP="enable"
+	_worker_init "$reqid" "$id"
 	case "$REQ_ID" in
 		fr24) _enable_fr24 ;;
 		piaware) _enable_piaware ;;
 		*) _emit_error rejected "enable is not yet supported for $REQ_ID"; exit 2 ;;
 	esac
+}
+
+# cmd_reset_worker / cmd_set_worker are the detached workers for reset and set.
+# They run unsandboxed (a PID1-spawned transient unit) so their privileged
+# filesystem mutations — apt purge / rm under the install root / piaware-config
+# writing /etc/piaware.conf — are not blocked by the webconfig service's
+# ProtectSystem=strict mount namespace, which the old synchronous (in-sandbox)
+# path could not write through.
+cmd_reset_worker() {
+	local reqid="$1" id="$2"
+	WORKER_OP="reset"
+	_worker_init "$reqid" "$id"
+	# Guard the recursive delete again in the worker context (defence in depth).
+	[[ "$AGG_INSTALL_ROOT" == /* && "$AGG_INSTALL_ROOT" != "/" ]] \
+		|| { _emit_error state_error "unsafe install root"; exit 3; }
+	local acquire; acquire="$(_descriptor_acquire "$id")"
+	if [[ "$acquire" == "pinned-deb" ]]; then
+		# pinned-deb teardown owns its own service-stop + package removal (unhold +
+		# purge), acting ONLY on what this helper installed — never an admin's piaware.
+		case "$id" in
+			piaware) _piaware_teardown ;;
+			*) _emit_error state_error "no teardown for pinned-deb adapter $id"; exit 3 ;;
+		esac
+	else
+		# vendor-installer / default: stop the unit + drop the on-demand install dir.
+		local unit
+		if ! unit="$(_descriptor_unit "$id")"; then
+			_emit_error state_error "descriptor read failed for $id"; exit 3
+		fi
+		if [[ -n "$unit" ]]; then
+			"$AGG_SYSTEMCTL" disable --now "$unit" >/dev/null 2>&1 || true
+		fi
+		rm -rf -- "${AGG_INSTALL_ROOT:?}/$id"
+	fi
+	rm -f -- "$AGG_STATE_DIR/$id.json"
+	_emit_ok "$id"
+}
+
+cmd_set_worker() {
+	local reqid="$1" id="$2"
+	WORKER_OP="set"
+	_worker_init "$reqid" "$id"
+	local cur merged
+	cur="$(_load_state "$id")" \
+		|| { _emit_error state_error "existing state for $id is unreadable; reset to clear"; exit 3; }
+	merged="$(jq -nc \
+		--argjson cur "$cur" --argjson req "$REQ_JSON" --argjson sv "$AGG_STATE_SCHEMA_VERSION" \
+		'$cur
+		 | .schema_version = $sv
+		 | (if $req | has("mlat_enabled") then .mlat_enabled = $req.mlat_enabled else . end)
+		 | (if $req | has("fields")
+		    then .fields = (((.fields // {}) | if type == "object" then . else {} end) + $req.fields)
+		    else . end)')"
+	# piaware applies config to the live daemon BEFORE we persist, so state never
+	# claims a setting the daemon didn't accept. piaware-config writes
+	# /etc/piaware.conf — reachable only because this worker runs unsandboxed.
+	if [[ "$id" == "piaware" ]]; then
+		_piaware_reconcile_mlat "$merged" \
+			|| { _emit_error state_error "failed to apply the MLAT setting to piaware"; exit 3; }
+	fi
+	_write_state "$id" "$merged"
+	_emit_ok "$id"
 }
 
 # --- backup / restore ------------------------------------------------------
@@ -1628,8 +1683,8 @@ cmd_import() {
 	(( ${#ids[@]} > 0 )) || { _emit_error rejected "backup contains no aggregators"; exit 2; }
 
 	_acquire_lock
-	if _enable_in_progress; then
-		_emit_error lock_timeout "an enable is in progress; try again shortly"; exit 4
+	if _mutation_in_progress; then
+		_emit_error lock_timeout "another aggregator operation is in progress; try again shortly"; exit 4
 	fi
 	# Validate against on-device state and pre-build every seeded record BEFORE
 	# writing any, so a rejected adapter can't leave a half-applied restore.
@@ -1801,7 +1856,7 @@ cmd_reconcile() {
 	exec 9>"$AGG_LOCK" || _reconcile_skip lock_error
 	flock -w "$AGG_LOCK_TIMEOUT" 9 || _reconcile_skip busy
 	# Don't fight an enable the user just kicked off.
-	_enable_in_progress && _reconcile_skip enable_in_progress
+	_mutation_in_progress && _reconcile_skip enable_in_progress
 	local results=() f id obj
 	if [[ -d "$AGG_DESC_DIR" ]]; then
 		for f in "$AGG_DESC_DIR"/*.desc; do
@@ -1827,11 +1882,20 @@ cmd_reconcile() {
 main() {
 	command -v jq >/dev/null 2>&1 || { _emit_error state_error "jq is required"; exit 3; }
 
-	# Internal worker mode (not a sudoers verb; launched only by systemd-run as
-	# root). Argv is `__enable-worker <request_id> <id>`, no --json.
+	# Internal worker modes (not sudoers verbs; launched only by systemd-run as
+	# root). Argv is `__<op>-worker <request_id> <id>`, no --json. These run
+	# unsandboxed so the privileged filesystem work escapes the webconfig sandbox.
 	if [[ "${1-}" == "__enable-worker" ]]; then
 		[[ $# -eq 3 ]] || { _emit_error usage_error "usage: apl-aggregator __enable-worker <request_id> <id>"; exit 5; }
 		cmd_enable_worker "$2" "$3"; exit 0
+	fi
+	if [[ "${1-}" == "__reset-worker" ]]; then
+		[[ $# -eq 3 ]] || { _emit_error usage_error "usage: apl-aggregator __reset-worker <request_id> <id>"; exit 5; }
+		cmd_reset_worker "$2" "$3"; exit 0
+	fi
+	if [[ "${1-}" == "__set-worker" ]]; then
+		[[ $# -eq 3 ]] || { _emit_error usage_error "usage: apl-aggregator __set-worker <request_id> <id>"; exit 5; }
+		cmd_set_worker "$2" "$3"; exit 0
 	fi
 
 	if [[ $# -ne 2 || "${2-}" != "--json" ]]; then
