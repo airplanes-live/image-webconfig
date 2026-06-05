@@ -18,6 +18,7 @@ import (
 const (
 	feedValidatorsURL  = "https://raw.githubusercontent.com/airplanes-live/feed/dev/scripts/lib/configure-validators.sh"
 	wifiValidatorsRel  = "../../files/usr/local/lib/airplanes/wifi-validators.sh"
+	aplAggregatorRel   = "../../files/usr/local/bin/apl-aggregator"
 	appJSRel           = "../../web/assets/app.js"
 	altitudeFixtureRel = "../feedmeta/testdata/altitude-canonicalization.json"
 	nodeRunnerRel      = "testdata/run_js_validators.js"
@@ -32,8 +33,9 @@ const (
 type bashSource int
 
 const (
-	sourceFeed bashSource = iota // fetched from airplanes-live/feed/dev
-	sourceWifi                   // in-repo files/usr/local/lib/airplanes/wifi-validators.sh
+	sourceFeed       bashSource = iota // fetched from airplanes-live/feed/dev
+	sourceWifi                         // in-repo files/usr/local/lib/airplanes/wifi-validators.sh
+	sourceAggregator                   // extracted from files/usr/local/bin/apl-aggregator
 )
 
 // vector is one test input with per-side expected outcomes. ExpectedJSValid
@@ -230,7 +232,7 @@ func wifiSpecs() []validatorSpec {
 				vecWifi(tooBigSSID, false),
 				vecWifi("with space", true),
 				vecWifi(" leading-space", true),
-				vecWifi("ñ", true),     // 2 bytes; well under 32
+				vecWifi("ñ", true),              // 2 bytes; well under 32
 				vecWifi("with\nnewline", false), // control char rejected
 				vecWifi("\x7f", false),          // DEL is a control char
 			},
@@ -271,6 +273,114 @@ func wifiSpecs() []validatorSpec {
 			},
 		},
 	}
+}
+
+// vecAgg: aggregator vectors. The JS validators .trim() internally and the form
+// posts trimmed values, so the bash twin sees the trimmed input — model that with
+// TrimSpace, like the feed validators.
+func vecAgg(input string, valid bool) vector {
+	return vector{
+		Input:             input,
+		ExpectedJSValid:   valid,
+		ExpectedBashValid: valid,
+		Transform:         strings.TrimSpace,
+	}
+}
+
+// aggregatorSpecs covers the third-party-aggregator field validators whose bash
+// twin lives in the apl-aggregator helper (_valid_email / _valid_fr24_key /
+// _valid_feeder_id).
+func aggregatorSpecs() []validatorSpec {
+	key40 := strings.Repeat("a", 40)
+	key41 := strings.Repeat("a", 41)
+	return []validatorSpec{
+		{
+			JSName: "isValidAggEmail", BashName: "_valid_email", Source: sourceAggregator,
+			Vectors: []vector{
+				vecAgg("a@b.co", true),
+				vecAgg("alice@example.com", true),
+				vecAgg(" a@b.co ", true), // trimmed both sides
+				vecAgg("", false),
+				vecAgg("noat", false),
+				vecAgg("no@domain", false), // no dot after @
+				vecAgg("a@b@c.com", false), // two @
+				vecAgg("a b@c.com", false), // space inside
+			},
+		},
+		{
+			JSName: "isValidFr24Key", BashName: "_valid_fr24_key", Source: sourceAggregator,
+			Vectors: []vector{
+				vecAgg("ABC123", true), // 6 alnum
+				vecAgg(key40, true),
+				vecAgg("abcde", false), // 5, too short
+				vecAgg(key41, false),   // 41, too long
+				vecAgg("ABC-123", false),
+				vecAgg("", false),
+			},
+		},
+		{
+			JSName: "isValidFeederId", BashName: "_valid_feeder_id", Source: sourceAggregator,
+			Vectors: []vector{
+				vecAgg("00000000-0000-4000-8000-000000000000", true),
+				vecAgg("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee", true),
+				vecAgg("AAAAAAAA-BBBB-CCCC-DDDD-EEEEEEEEEEEE", true), // hex is case-insensitive
+				vecAgg("not-a-uuid", false),
+				vecAgg("", false),
+				vecAgg("00000000-0000-4000-8000-00000000000", false),  // last group only 11
+				vecAgg("gggggggg-0000-4000-8000-000000000000", false), // non-hex
+			},
+		},
+	}
+}
+
+// extractAggregatorValidators pulls the three _valid_* functions out of the
+// apl-aggregator helper into a temp, sourceable script. The helper itself can't
+// be sourced wholesale — it runs `main "$@"` at the bottom — so callBashValidator
+// (which sources its script) needs the functions isolated. Each function is a
+// top-level `_valid_X() {` … line through a column-0 `}`.
+func extractAggregatorValidators(t *testing.T) string {
+	t.Helper()
+	raw, err := os.ReadFile(aplAggregatorRel)
+	if err != nil {
+		t.Fatalf("read apl-aggregator: %v", err)
+	}
+	want := map[string]bool{"_valid_email": true, "_valid_fr24_key": true, "_valid_feeder_id": true}
+	found := map[string]bool{}
+	lines := strings.Split(string(raw), "\n")
+	var out strings.Builder
+	out.WriteString("#!/usr/bin/env bash\n")
+	for i := 0; i < len(lines); i++ {
+		name := strings.TrimSuffix(lines[i], "() {")
+		if name == lines[i] || want[name] == false {
+			continue
+		}
+		out.WriteString(lines[i] + "\n")
+		for j := i + 1; j < len(lines); j++ {
+			out.WriteString(lines[j] + "\n")
+			if lines[j] == "}" {
+				i = j
+				break
+			}
+		}
+		found[name] = true
+	}
+	for n := range want {
+		if !found[n] {
+			t.Fatalf("could not extract %s from %s", n, aplAggregatorRel)
+		}
+	}
+	tmp, err := os.CreateTemp(t.TempDir(), "agg-validators-*.sh")
+	if err != nil {
+		t.Fatalf("create temp aggregator validators: %v", err)
+	}
+	if _, err := tmp.WriteString(out.String()); err != nil {
+		tmp.Close()
+		t.Fatalf("write temp aggregator validators: %v", err)
+	}
+	if err := tmp.Close(); err != nil {
+		t.Fatalf("close temp aggregator validators: %v", err)
+	}
+	return tmp.Name()
 }
 
 // altitudeCase mirrors one entry in altitude-canonicalization.json.
@@ -356,8 +466,8 @@ func fetchFeedValidators(t *testing.T) (string, bool) {
 
 // jsResults collects the Node runner's output, keyed for fast lookup.
 type jsResults struct {
-	bools        map[string]bool       // key: validator|input → ok
-	altitude     map[string]altResult  // key: input → result
+	bools        map[string]bool      // key: validator|input → ok
+	altitude     map[string]altResult // key: input → result
 	runnerErrors []string
 }
 
@@ -499,8 +609,10 @@ func TestValidatorParity(t *testing.T) {
 		t.Fatalf("wifi-validators.sh not found at %s: %v", wifiPath, err)
 	}
 	feedPath, feedReady := fetchFeedValidators(t)
+	aggPath := extractAggregatorValidators(t)
 
 	allSpecs := append([]validatorSpec{}, wifiSpecs()...)
+	allSpecs = append(allSpecs, aggregatorSpecs()...)
 	if feedReady {
 		allSpecs = append(allSpecs, feedSpecs()...)
 	}
@@ -519,6 +631,8 @@ func TestValidatorParity(t *testing.T) {
 			script = feedPath
 		case sourceWifi:
 			script = wifiPath
+		case sourceAggregator:
+			script = aggPath
 		default:
 			t.Fatalf("unknown bash source for %s", spec.JSName)
 		}
@@ -550,6 +664,11 @@ func TestValidatorParity(t *testing.T) {
 
 	t.Run("wifi", func(t *testing.T) {
 		for _, spec := range wifiSpecs() {
+			runSpec(t, spec)
+		}
+	})
+	t.Run("aggregator", func(t *testing.T) {
+		for _, spec := range aggregatorSpecs() {
 			runSpec(t, spec)
 		}
 	})
