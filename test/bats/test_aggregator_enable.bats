@@ -157,6 +157,74 @@ overlay_code() { jq -r '.error_code // ""' "$AGG_ENABLE_STATE" 2>/dev/null; }
     [ "$(overlay_code)" = "signup_failed" ]
 }
 
+# Exercises the REAL _fr24_signup (the override is unset), driving a fake
+# fr24feed that emulates the 1.0.48 wizard. The fake reads its answers from the
+# controlling TTY — exactly like the real binary — so this only passes if the
+# helper hands it a PTY (a bare stdin pipe would stall on the email prompt and
+# time out). It guards three things together: the PTY wrapper, the 1.0.48 answer
+# order (the fake aborts on a non-numeric latitude, mirroring fr24feed's
+# std::invalid_argument crash if the order drifts), and the post-signup ini
+# rewrite (the wizard writes a dvbt receiver; the result must be BEAST-TCP).
+@test "enable without a key drives the real signup wizard through a PTY and rewrites the ini" {
+    command -v script >/dev/null || skip "util-linux script not installed"
+    unset AGG_FR24_SIGNUP_OVERRIDE
+    # Fail fast if a regression loses the PTY and /dev/tty happens to be readable
+    # (interactive local bats run) — the fake would otherwise block for input.
+    export AGG_FR24_SIGNUP_TIMEOUT=10
+
+    FAKE="$WORK/fake-fr24feed"
+    cat > "$FAKE" <<'FR24FAKE'
+#!/usr/bin/env bash
+# Minimal fr24feed 1.0.48 --signup emulator: reads from the controlling TTY in
+# prompt order, rejects an empty email, aborts on a non-numeric latitude, and
+# writes its own (dvbt) receiver config + a minted key on a clean run. Every
+# prompt MUST be answered (premature EOF or an extra trailing answer => the
+# helper's sequence drifted), so the fake pins both the order and the count.
+ini=""
+for a in "$@"; do case "$a" in --config-file=*) ini="${a#--config-file=}";; esac; done
+exec </dev/tty 2>/dev/null || { echo "no controlling tty" >&2; exit 1; }
+rd() { IFS= read -r "$1" || { echo "premature EOF at $1 (prompt order drift)" >&2; exit 7; }; }
+rd email;   [ -n "$email" ] || { echo "Invalid email  provided" >&2; exit 1; }
+rd _key       # 1.2 sharing key (blank = skip)
+rd _mlat      # 1.3 MLAT yes/no
+rd lat; [[ "$lat" =~ ^-?[0-9]+([.][0-9]+)?$ ]] || { echo "terminate ... std::invalid_argument" >&2; exit 134; }
+rd _lon       # 3.B longitude
+rd _alt       # 3.C altitude
+rd _confirm   # confirm coords yes/no
+rd _recv      # 4.1 receiver type 1-6
+rd _args      # 4.3 dump1090 args
+rd _raw       # 5.1 RAW yes/no
+rd _bs        # 5.2 Basestation yes/no
+# 1.0.48 has no further prompts; a non-empty trailing answer means too many.
+if IFS= read -r extra && [ -n "$extra" ]; then echo "unexpected trailing answer: $extra" >&2; exit 8; fi
+mkdir -p "$(dirname "$ini")"
+printf 'receiver="dvbt"\nfr24key="EMULKEY0001"\n' > "$ini"
+echo "Congratulations!"
+FR24FAKE
+    chmod +x "$FAKE"
+
+    # acquire installs the tty-reading fake at the binary path the worker runs.
+    ACQ2="$WORK/acq-fake"
+    cat > "$ACQ2" <<EOF
+#!/usr/bin/env bash
+install -D -m 0755 "$FAKE" "\$1"
+EOF
+    chmod +x "$ACQ2"
+    export AGG_FR24_ACQUIRE_OVERRIDE="$ACQ2"
+
+    agg enable '{"id":"fr24","lat":47.0,"lon":8.0,"alt":400,"fields":{"email":"a@b.c"}}'
+    [ "$status" -eq 0 ]
+    [ "$(overlay_status)" = "done" ]
+    # The minted key is harvested and the ini is rewritten to feed local readsb.
+    grep -q 'fr24key="EMULKEY0001"' "$AGG_FR24_INI"
+    grep -q 'receiver="beast-tcp"' "$AGG_FR24_INI"
+    grep -q 'host="127.0.0.1:30005"' "$AGG_FR24_INI"
+    ! grep -q 'receiver="dvbt"' "$AGG_FR24_INI"
+    jq -e '.fields.sharing_key == "EMULKEY0001"' "$AGG_STATE_DIR/fr24.json"
+    # script's transcript is discarded to /dev/null — no stray typescript file.
+    [ ! -e typescript ] && [ ! -e "$WORK/typescript" ]
+}
+
 # --- synchronous validation (no worker launched) ---------------------------
 
 @test "enable rejects a missing or invalid email synchronously" {
