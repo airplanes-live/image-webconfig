@@ -845,20 +845,30 @@ _fr24_finalize_perms() {
 	chown airplanes-aggregator:airplanes-aggregator "$(dirname "$ini")" 2>/dev/null || true
 }
 
-# _fr24_signup <bin> <ini> <email> <lat> <lon> <alt_m>: mint a fresh sharing
-# key by driving `fr24feed --signup --adsb` via piped stdin (validated on a
-# feeder: the wizard reads stdin, no tty/expect needed). Answer order matches
-# the wizard. Test seam: AGG_FR24_SIGNUP_OVERRIDE <ini> <email>.
+# _fr24_signup <bin> <ini> <email> <lat> <lon> <alt_m>: mint a fresh sharing key
+# by driving `fr24feed --signup --adsb`. fr24feed reads the wizard answers from
+# its controlling terminal, NOT stdin, so the answers are piped through a PTY
+# (`script`); a bare stdin pipe stalls forever on the first prompt. The answer
+# order tracks fr24feed 1.0.48's wizard: email, sharing-key (blank = skip),
+# MLAT yes/no, latitude, longitude, altitude (feet), confirm-position yes/no,
+# receiver type (1 = dump1090), additional dump1090 args (blank), RAW feed
+# yes/no, Basestation feed yes/no. Only the minted key is harvested — the caller
+# rewrites the ini as a BEAST-TCP consumer of the local decoder, so the wizard's
+# own receiver config is discarded. The binary/ini paths travel via the
+# environment so the `script -c` command stays a static literal (no path
+# injection into the shell string). Test seam: AGG_FR24_SIGNUP_OVERRIDE <ini> <email>.
 _fr24_signup() {
 	local bin="$1" ini="$2" email="$3" lat="$4" lon="$5" alt_m="$6" alt_ft
 	if [[ -n "${AGG_FR24_SIGNUP_OVERRIDE:-}" ]]; then
 		"$AGG_FR24_SIGNUP_OVERRIDE" "$ini" "$email"
 	else
 		alt_ft="$(awk -v m="$alt_m" 'BEGIN { printf "%d", m * 82 / 25 }')"
+		# shellcheck disable=SC2016  # $FR24_* are expanded by script's inner sh, by design
 		printf '%s\n' \
-			"$email" "" "no" "" "$lat" "$lon" "$alt_ft" "yes" "no" \
-			"4" "1" "127.0.0.1" "30005" "no" "no" "0" \
-			| timeout "${AGG_FR24_SIGNUP_TIMEOUT:-180}" "$bin" --signup --adsb --config-file="$ini" >/dev/null 2>&1 || true
+			"$email" "" "no" "$lat" "$lon" "$alt_ft" "yes" "1" "" "no" "no" \
+			| FR24_BIN="$bin" FR24_INI="$ini" timeout --kill-after=5s "${AGG_FR24_SIGNUP_TIMEOUT:-180}" \
+				script -qec 'exec "$FR24_BIN" --signup --adsb --config-file="$FR24_INI"' /dev/null \
+				>/dev/null 2>&1 || true
 	fi
 	# Success is judged by a key landing in the ini, not the wizard's exit code.
 	[[ -f "$ini" ]] && grep -qs '^fr24key' "$ini"
@@ -917,6 +927,10 @@ _enable_fr24() {
 		fi
 		key="$(_fr24_read_key "$ini")"
 		_valid_fr24_key "$key" || { _emit_error signup_failed "fr24 signup did not return a usable key"; exit 2; }
+		# The wizard writes its own receiver config (dvbt/auto); overwrite it so the
+		# signup and keyed paths produce identical BEAST-TCP-to-local config. Only
+		# the minted key is kept from the wizard's run.
+		_fr24_write_ini "$ini" "$key" || { _emit_error state_error "failed to write fr24feed.ini"; exit 3; }
 	fi
 	_fr24_finalize_perms "$ini"
 
