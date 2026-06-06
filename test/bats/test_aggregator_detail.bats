@@ -1,13 +1,15 @@
 #!/usr/bin/env bats
 #
 # Unit tests for `apl-aggregator detail` — the on-demand per-adapter status that
-# carries status_detail parsed from the vendor status tool. systemctl is stubbed
-# via AGG_SYSTEMCTL (SVC_STATE); the vendor tools via the AGG_PIAWARE_STATUS /
-# AGG_FR24_STATUS seams; the local decoder probe via AGG_DECODER_STATE. The real
-# shipped descriptors are exercised so descriptor + helper stay in sync.
+# carries status_detail. The status SOURCES are JSON: piaware's
+# /run/piaware/status.json (seamed via AGG_PIAWARE_STATUS_JSON) and fr24feed's
+# monitor.json API (seamed via AGG_FR24_MONITOR_URL, pointed at a file:// fixture
+# here). systemctl is stubbed via AGG_SYSTEMCTL (SVC_STATE). The real shipped
+# descriptors are exercised so descriptor + helper stay in sync.
 
 setup() {
     command -v jq >/dev/null || skip "jq not installed"
+    command -v curl >/dev/null || skip "curl not installed"
     APLAGG="$BATS_TEST_DIRNAME/../../files/usr/local/bin/apl-aggregator"
     [ -x "$APLAGG" ] || skip "apl-aggregator missing"
 
@@ -28,10 +30,6 @@ EOF
     chmod +x "$SYSTEMCTL"
     export AGG_SYSTEMCTL="$SYSTEMCTL"
     export AGG_DECODER_STATE=up
-
-    # A marker the vendor stubs touch, so a test can assert the vendor tool was
-    # NOT invoked (inactive service / overlay in flight / not configured).
-    export VENDOR_MARKER="$WORK/vendor-called"
 }
 
 teardown() { [ -n "${WORK:-}" ] && rm -rf "$WORK"; }
@@ -50,51 +48,32 @@ seed_fr24_enabled() {
 EOF
 }
 
-# A stub piaware-status echoing real-feeder output — note the benign
-# "Local ADS-B receiver (dump1090) is not running" line (expected: the decoder
-# is readsb) and the feeder-id line (identity-bearing, must not leak).
-stub_piaware_status() {
-    local f="$WORK/piaware-status"
-    cat > "$f" <<EOF
-#!/usr/bin/env bash
-: > "$VENDOR_MARKER"
-cat <<'OUT'
-PiAware master process (piaware) is running with pid 13859.
-PiAware ADS-B client (faup1090) is running with pid 13875.
-PiAware ADS-B UAT client (faup978) is not running (disabled by configuration settings)
-PiAware mlat client (fa-mlat-client) is running with pid 13878.
-Local ADS-B receiver (dump1090) is not running.
-readsb (pid 29262) is listening for ES connections on port 30005.
-faup1090 is connected to the ADS-B receiver.
-piaware is connected to FlightAware.
-dump1090 is producing data on localhost:30005.
-Your feeder ID is 8bb46ddf-d507-4c18-9724-0b5f94cba900 (from /var/cache/piaware/feeder_id)
-OUT
+# piaware status.json fixture (the real shape: per-component {status,message}).
+# $1 = mlat status (default red, the normal pre-claim state). Includes
+# unclaimed_feeder_id to prove the producer does NOT surface it.
+stub_piaware_json() {
+    cat > "$WORK/piaware-status.json" <<EOF
+{"expiry":99999999999999,
+ "piaware":{"status":"green","message":"PiAware 11.0 is running"},
+ "adept":{"status":"green","message":"Connected to FlightAware and logged in"},
+ "radio":{"status":"green","message":"Received Mode S data recently"},
+ "mlat":{"status":"${1:-red}","message":"Multilateration is not enabled"},
+ "unclaimed_feeder_id":"8bb46ddf-d507-4c18-9724-0b5f94cba900"}
 EOF
-    chmod +x "$f"
-    export AGG_PIAWARE_STATUS="$f"
+    export AGG_PIAWARE_STATUS_JSON="$WORK/piaware-status.json"
 }
 
-stub_fr24_status() {
-    local f="$WORK/fr24feed-status"
-    cat > "$f" <<EOF
-#!/usr/bin/env bash
-: > "$VENDOR_MARKER"
-cat <<'OUT'
-[ ok ] FR24 Feeder/Decoder Process: running.
-[ ok ] FR24 Stats Timestamp: 2026-06-06 00:06:24.
-[ ok ] FR24 Link: connected [UDP].
-[ ok ] FR24 Radar: T-EDKA146.
-[ ok ] FR24 Tracked AC: 17.
-[ ok ] Receiver: connected (174255916 MSGS/0 SYNC).
-OUT
+# fr24 monitor.json fixture, served to the producer via a file:// URL.
+# $1 = rx_connected (default 1), $2 = feed_num_ac_tracked (default 7).
+stub_fr24_json() {
+    cat > "$WORK/monitor.json" <<EOF
+{"rx_connected":"${1:-1}","feed_num_ac_tracked":"${2:-7}","feed_last_config_result":"error","fr24key":"KEY123"}
 EOF
-    chmod +x "$f"
-    export AGG_FR24_STATUS="$f"
+    export AGG_FR24_MONITOR_URL="file://$WORK/monitor.json"
 }
 
 @test "detail wraps a single adapter in the status envelope" {
-    seed_piaware_enabled; stub_piaware_status; export SVC_STATE=active
+    seed_piaware_enabled; stub_piaware_json; export SVC_STATE=active
     run detail piaware
     [ "$status" -eq 0 ]
     echo "$output" | jq -e '.protocol_version == 1'
@@ -108,50 +87,61 @@ EOF
     echo "$output" | jq -e '.error_code == "not_found"'
 }
 
-@test "piaware detail surfaces connection/ADS-B/MLAT, never the dump1090 false-alarm or the feeder id" {
-    seed_piaware_enabled; stub_piaware_status; export SVC_STATE=active
+@test "piaware detail maps status.json to fixed-text rows; mlat-red is na; nothing vendor-derived leaks" {
+    seed_piaware_enabled; stub_piaware_json; export SVC_STATE=active
     run detail piaware
     [ "$status" -eq 0 ]
     echo "$output" | jq -e '.aggregators[0].status_detail[] | select(.label=="FlightAware") | .value=="Connected" and .severity=="ok"'
-    echo "$output" | jq -e '.aggregators[0].status_detail | map(.label) | index("ADS-B") != null'
-    echo "$output" | jq -e '.aggregators[0].status_detail[] | select(.label=="MLAT") | .severity=="ok"'
-    # The benign "dump1090 is not running" line must NOT yield an error row.
+    echo "$output" | jq -e '.aggregators[0].status_detail[] | select(.label=="ADS-B") | .value=="Receiving" and .severity=="ok"'
+    # mlat "red" is the normal unclaimed state -> na, never err.
+    echo "$output" | jq -e '.aggregators[0].status_detail[] | select(.label=="MLAT") | .value=="Off" and .severity=="na"'
     echo "$output" | jq -e '.aggregators[0].status_detail | all(.severity != "err")'
-    # Vendor noise (dump1090) and the identity-bearing feeder id must not leak.
-    if echo "$output" | grep -qiE 'dump1090|8bb46ddf'; then echo "leaked vendor noise / feeder id" >&2; return 1; fi
+    # Fixed text only: the raw vendor message and the unclaimed_feeder_id in
+    # status.json must never reach the response.
+    if echo "$output" | grep -qE 'logged in|8bb46ddf'; then echo "vendor message / feeder id leaked" >&2; return 1; fi
 }
 
-@test "fr24 detail parses [ ok ] lines into whitelisted rows" {
-    seed_fr24_enabled; stub_fr24_status; export SVC_STATE=active
-    run detail fr24
-    [ "$status" -eq 0 ]
-    echo "$output" | jq -e '.aggregators[0].status_detail[] | select(.label=="Connection") | .value=="connected [UDP]" and .severity=="ok"'
-    echo "$output" | jq -e '.aggregators[0].status_detail[] | select(.label=="Tracked aircraft") | .value=="17"'
-    echo "$output" | jq -e '.aggregators[0].status_detail | map(.label) | index("Receiver") != null'
-    # Process / timestamp lines are not surfaced (not on the whitelist).
-    echo "$output" | jq -e '.aggregators[0].status_detail | map(.label) | index("FR24 Stats Timestamp") == null'
-    echo "$output" | jq -e '.aggregators[0].status_detail | map(.label) | index("FR24 Feeder/Decoder Process") == null'
-}
-
-@test "fr24 [ fail ] prefix maps to err severity" {
-    seed_fr24_enabled; export SVC_STATE=active
-    local f="$WORK/fr24feed-status"
-    cat > "$f" <<'EOF'
-#!/usr/bin/env bash
-echo "[ fail ] FR24 Link: disconnected."
-EOF
-    chmod +x "$f"; export AGG_FR24_STATUS="$f"
-    run detail fr24
-    [ "$status" -eq 0 ]
-    echo "$output" | jq -e '.aggregators[0].status_detail[] | select(.label=="Connection") | .severity=="err"'
-}
-
-@test "an inactive service yields a Service: Stopped row and does not run the vendor tool" {
-    seed_piaware_enabled; stub_piaware_status; export SVC_STATE=inactive
+@test "piaware mlat green maps to MLAT Synchronized/ok" {
+    seed_piaware_enabled; stub_piaware_json green; export SVC_STATE=active
     run detail piaware
     [ "$status" -eq 0 ]
+    echo "$output" | jq -e '.aggregators[0].status_detail[] | select(.label=="MLAT") | .value=="Synchronized" and .severity=="ok"'
+}
+
+@test "piaware adept red maps FlightAware to err" {
+    seed_piaware_enabled; export SVC_STATE=active
+    cat > "$WORK/piaware-status.json" <<'EOF'
+{"adept":{"status":"red","message":"Not connected to FlightAware"},
+ "radio":{"status":"green","message":"Received Mode S data recently"}}
+EOF
+    export AGG_PIAWARE_STATUS_JSON="$WORK/piaware-status.json"
+    run detail piaware
+    [ "$status" -eq 0 ]
+    echo "$output" | jq -e '.aggregators[0].status_detail[] | select(.label=="FlightAware") | .value=="Not connected" and .severity=="err"'
+}
+
+@test "fr24 detail surfaces receiver + aircraft from monitor.json" {
+    seed_fr24_enabled; stub_fr24_json 1 7; export SVC_STATE=active
+    run detail fr24
+    [ "$status" -eq 0 ]
+    echo "$output" | jq -e '.aggregators[0].status_detail[] | select(.label=="Receiver") | .value=="Connected" and .severity=="ok"'
+    echo "$output" | jq -e '.aggregators[0].status_detail[] | select(.label=="Aircraft tracked") | .value=="7" and .severity=="ok"'
+}
+
+@test "fr24 rx_connected=0 maps receiver to err" {
+    seed_fr24_enabled; stub_fr24_json 0 0; export SVC_STATE=active
+    run detail fr24
+    [ "$status" -eq 0 ]
+    echo "$output" | jq -e '.aggregators[0].status_detail[] | select(.label=="Receiver") | .value=="Not connected" and .severity=="err"'
+    echo "$output" | jq -e '.aggregators[0].status_detail[] | select(.label=="Aircraft tracked") | .value=="0" and .severity=="na"'
+}
+
+@test "an inactive service yields only a Service: Stopped row (no status source read)" {
+    seed_piaware_enabled; stub_piaware_json; export SVC_STATE=inactive
+    run detail piaware
+    [ "$status" -eq 0 ]
+    # If the producer had run, we'd see FlightAware/ADS-B rows; the gate means we don't.
     echo "$output" | jq -e '.aggregators[0].status_detail == [{"label":"Service","value":"Stopped","severity":"na"}]'
-    [ ! -e "$VENDOR_MARKER" ]
 }
 
 @test "a failed service yields a Service: Failed err row" {
@@ -161,68 +151,57 @@ EOF
     echo "$output" | jq -e '.aggregators[0].status_detail == [{"label":"Service","value":"Failed","severity":"err"}]'
 }
 
-@test "an enable in flight yields an Updating row, not stale vendor status" {
-    seed_piaware_enabled; stub_piaware_status; export SVC_STATE=active
+@test "an enable in flight yields an Updating row, not stale status" {
+    seed_piaware_enabled; stub_piaware_json; export SVC_STATE=active
     printf '%s' '{"id":"piaware","status":"running"}' > "$AGG_ENABLE_STATE"
     run detail piaware
     [ "$status" -eq 0 ]
     echo "$output" | jq -e '.aggregators[0].status_detail[0].label == "Status"'
-    [ ! -e "$VENDOR_MARKER" ]
 }
 
-@test "a missing vendor binary yields a Status unavailable row, still HTTP-ok envelope" {
+@test "a missing status source yields Status unavailable (still HTTP-ok)" {
     seed_piaware_enabled; export SVC_STATE=active
-    export AGG_PIAWARE_STATUS="$WORK/does-not-exist"
+    export AGG_PIAWARE_STATUS_JSON="$WORK/does-not-exist.json"
     run detail piaware
     [ "$status" -eq 0 ]
     echo "$output" | jq -e '.protocol_version == 1'
     echo "$output" | jq -e '.aggregators[0].status_detail == [{"label":"Status","value":"Status unavailable","severity":"warn"}]'
 }
 
-@test "ANSI escapes and control chars are stripped from values" {
+@test "a missing fr24 monitor endpoint yields Status unavailable" {
     seed_fr24_enabled; export SVC_STATE=active
-    local f="$WORK/fr24feed-status"
-    printf '#!/usr/bin/env bash\nprintf "[ ok ] FR24 Radar: \\033[31mT-EDKA146\\033[0m.\\n"\n' > "$f"
-    chmod +x "$f"; export AGG_FR24_STATUS="$f"
+    export AGG_FR24_MONITOR_URL="file://$WORK/no-such-monitor.json"
     run detail fr24
     [ "$status" -eq 0 ]
-    echo "$output" | jq -e '.aggregators[0].status_detail[] | select(.label=="Radar") | .value=="T-EDKA146"'
-    if printf '%s' "$output" | grep -q $'\033'; then echo "ESC leaked into output" >&2; return 1; fi
+    echo "$output" | jq -e '.aggregators[0].status_detail == [{"label":"Status","value":"Status unavailable","severity":"warn"}]'
 }
 
-@test "a not-configured adapter has no status_detail and runs no vendor tool" {
-    stub_piaware_status; export SVC_STATE=active
+@test "malformed status JSON yields Status unavailable" {
+    seed_piaware_enabled; export SVC_STATE=active
+    printf '%s' 'this is not json' > "$WORK/piaware-status.json"
+    export AGG_PIAWARE_STATUS_JSON="$WORK/piaware-status.json"
+    run detail piaware
+    [ "$status" -eq 0 ]
+    echo "$output" | jq -e '.aggregators[0].status_detail == [{"label":"Status","value":"Status unavailable","severity":"warn"}]'
+}
+
+@test "a stale piaware status.json (expiry in the past) yields Status unavailable" {
+    # A wedged-but-still-active piaware can leave a stale snapshot; the expiry
+    # check must reject it rather than show stale green.
+    seed_piaware_enabled; export SVC_STATE=active
+    cat > "$WORK/piaware-status.json" <<'EOF'
+{"expiry":1,"adept":{"status":"green","message":"Connected"},"radio":{"status":"green","message":"Receiving"}}
+EOF
+    export AGG_PIAWARE_STATUS_JSON="$WORK/piaware-status.json"
+    run detail piaware
+    [ "$status" -eq 0 ]
+    echo "$output" | jq -e '.aggregators[0].status_detail == [{"label":"Status","value":"Status unavailable","severity":"warn"}]'
+}
+
+@test "a not-configured adapter has no status_detail" {
+    stub_piaware_json; export SVC_STATE=active
     run detail piaware
     [ "$status" -eq 0 ]
     echo "$output" | jq -e '.aggregators[0].configured == false'
     echo "$output" | jq -e '.aggregators[0] | has("status_detail") | not'
-    [ ! -e "$VENDOR_MARKER" ]
-}
-
-@test "a vendor tool that hangs after partial output yields Status unavailable, not stale healthy rows" {
-    seed_piaware_enabled; export SVC_STATE=active AGG_STATUS_TIMEOUT=1
-    local f="$WORK/piaware-status"
-    cat > "$f" <<'EOF'
-#!/usr/bin/env bash
-echo "piaware is connected to FlightAware."
-sleep 10
-EOF
-    chmod +x "$f"; export AGG_PIAWARE_STATUS="$f"
-    run detail piaware
-    [ "$status" -eq 0 ]
-    echo "$output" | jq -e '.aggregators[0].status_detail == [{"label":"Status","value":"Status unavailable","severity":"warn"}]'
-}
-
-@test "non-empty but unrecognized vendor output yields Status unavailable" {
-    seed_fr24_enabled; export SVC_STATE=active
-    local f="$WORK/fr24feed-status"
-    cat > "$f" <<'EOF'
-#!/usr/bin/env bash
-echo "some unexpected text that matches no whitelist label"
-echo "[ ok ] FR24 Stats Timestamp: 2026-01-01."
-EOF
-    chmod +x "$f"; export AGG_FR24_STATUS="$f"
-    run detail fr24
-    [ "$status" -eq 0 ]
-    echo "$output" | jq -e '.aggregators[0].status_detail == [{"label":"Status","value":"Status unavailable","severity":"warn"}]'
 }
