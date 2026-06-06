@@ -148,20 +148,20 @@ func aggStatusDetail(id string, adapter map[string]any) []map[string]any {
 	}
 	switch id {
 	case "fr24":
+		// Mirrors the monitor.json producer: receiver connection + aircraft count.
 		return []map[string]any{
-			{"label": "Connection", "value": "connected [UDP]", "severity": "ok"},
-			{"label": "Receiver", "value": "connected", "severity": "ok"},
-			{"label": "Tracked aircraft", "value": "17", "severity": "ok"},
-			{"label": "Radar", "value": "T-EDKA146", "severity": "na"},
+			{"label": "Receiver", "value": "Connected", "severity": "ok"},
+			{"label": "Aircraft tracked", "value": "7", "severity": "ok"},
 		}
 	case "piaware":
-		mlatVal, mlatSev := "Off", "na"
+		// Mirrors the status.json producer (per-component message); mlat off = na.
+		mlatVal, mlatSev := "Multilateration is not enabled", "na"
 		if m, _ := adapter["configured_mlat_enabled"].(bool); m {
-			mlatVal, mlatSev = "Running", "ok"
+			mlatVal, mlatSev = "Multilateration synchronized", "ok"
 		}
 		return []map[string]any{
-			{"label": "FlightAware", "value": "Connected", "severity": "ok"},
-			{"label": "ADS-B", "value": "Receiving from local decoder", "severity": "ok"},
+			{"label": "FlightAware", "value": "Connected to FlightAware and logged in", "severity": "ok"},
+			{"label": "ADS-B", "value": "Received Mode S data recently", "severity": "ok"},
 			{"label": "MLAT", "value": mlatVal, "severity": mlatSev},
 		}
 	}

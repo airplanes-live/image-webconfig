@@ -523,17 +523,18 @@ _adapter_json() {
 }
 
 # --- status_detail (on-demand vendor status, the `detail` verb) -------------
-# These run the vendor status tool and turn it into a small whitelist of
+# Each producer reads the adapter's own status source (piaware's status.json /
+# fr24feed's monitor.json API) and turns it into a small whitelist of
 # {label,value,severity} rows for the manage page. They are deliberately NOT in
-# cmd_status (the 30s dashboard poll) — the vendor binaries are comparatively
-# slow and the dashboard never renders status_detail.
+# cmd_status (the 30s dashboard poll) — the probe is comparatively slow and the
+# dashboard never renders status_detail.
 #
 # Hard rules, because vendor output is undocumented, version-specific, and can
 # carry feeder IDs / coordinates / paths:
-#   - whitelist only recognized signals; never pass a raw line through;
+#   - whitelist only recognized fields; never pass raw vendor text through;
 #   - _sd_clean every value (strip ANSI/control, length-cap);
 #   - the producer always returns a JSON array (possibly with a single
-#     "Unavailable" row), never fails the verb.
+#     "Status unavailable" row), never fails the verb.
 
 # _sd_clean <str>: strip ANSI escapes + control chars and cap length, so a value
 # can't smuggle escape sequences or an unbounded string into the report.
@@ -558,86 +559,77 @@ _sd_array() {
 # timeout / missing binary never looks like a healthy adapter with no detail.
 _sd_unavailable() { _sd_array "$(_sd_obj "Status" "Status unavailable" warn)"; }
 
-# _sd_run <bin>: run a vendor status tool bounded by both time AND output size,
-# capturing the tool's REAL exit code (a pipe would only give head's). Echoes the
-# capped stdout and returns 0 only when the tool ran to completion with usable
-# output; returns 1 on timeout (124), kill (137, timeout --kill), missing binary
-# (127), or empty output — so partial/hung output is never parsed as authoritative.
-_sd_run() {
-	local bin="$1" tmp rc raw
-	tmp="$(mktemp 2>/dev/null)" || return 1
-	timeout "${AGG_STATUS_TIMEOUT:-5}" "$bin" >"$tmp" 2>/dev/null
-	rc=$?
-	raw="$(head -c "${AGG_STATUS_MAX_BYTES:-16384}" "$tmp" 2>/dev/null)"
-	rm -f -- "$tmp"
-	[[ "$rc" == 124 || "$rc" == 137 || "$rc" == 127 || -z "$raw" ]] && return 1
-	printf '%s' "$raw"
-}
-
-# _status_detail_piaware: parse `piaware-status`. Only the meaningful signals are
-# surfaced — NOT the per-process pid lines, NOT the feeder-id value (identity-
-# bearing), and NOT the "Local ADS-B receiver (dump1090) is not running" line,
-# which is EXPECTED on an airplanes.live feeder (the decoder is readsb, and the
-# adjacent lines confirm piaware is in fact fed and connected).
+# _status_detail_piaware: read piaware's machine-readable status file
+# (/run/piaware/status.json, rewritten every few seconds while piaware runs) and
+# map its per-component status code into rows. Far more robust than scraping
+# `piaware-status` text: the `radio` component reflects the real decoder health
+# directly, so there is no dump1090-vs-readsb false-alarm to special-case. A "red"
+# mlat is the normal pre-claim state (mlat only runs once the feeder is claimed),
+# so it is surfaced as informational (na), not an error. Each row's text is fixed
+# and controlled — the vendor `message` is never surfaced, so a future message
+# wording (or an identifier inside it) can neither leak nor break the UI.
 _status_detail_piaware() {
-	local raw rows=()
-	raw="$(_sd_run "$AGG_PIAWARE_STATUS_BIN")" || { _sd_unavailable; return 0; }
-
-	if grep -qiE 'piaware is connected to FlightAware' <<<"$raw"; then
-		rows+=("$(_sd_obj "FlightAware" "Connected" ok)")
-	elif grep -qiE 'piaware is (not connected|disconnected)' <<<"$raw"; then
-		rows+=("$(_sd_obj "FlightAware" "Not connected" err)")
+	local sj raw rows=() comp
+	sj="${AGG_PIAWARE_STATUS_JSON:-/run/piaware/status.json}"
+	raw="$(head -c "${AGG_STATUS_MAX_BYTES:-16384}" "$sj" 2>/dev/null)"
+	jq -e 'type == "object"' >/dev/null 2>&1 <<<"$raw" || { _sd_unavailable; return 0; }
+	# Reject a stale snapshot: piaware stamps `expiry` (ms epoch) on each write, so
+	# a wedged-but-still-active piaware can't show stale green. Missing/non-numeric
+	# expiry (or a clock that can't be read) is tolerated for compatibility.
+	local expiry now_ms
+	expiry="$(jq -r '.expiry // ""' <<<"$raw" 2>/dev/null)"
+	if [[ "$expiry" =~ ^[0-9]+$ ]]; then
+		now_ms="$(date +%s%3N 2>/dev/null || echo 0)"
+		[[ "$now_ms" =~ ^[0-9]+$ ]] && (( now_ms > expiry )) && { _sd_unavailable; return 0; }
 	fi
-
-	if grep -qiE 'faup1090 is connected to the ADS-B receiver' <<<"$raw"; then
-		rows+=("$(_sd_obj "ADS-B" "Receiving from local decoder" ok)")
-	elif grep -qiE 'faup1090 is not connected' <<<"$raw"; then
-		rows+=("$(_sd_obj "ADS-B" "No data from local decoder" err)")
-	fi
-
-	if grep -qiE 'mlat.client.*(using multilateration results|synchronized)' <<<"$raw"; then
-		rows+=("$(_sd_obj "MLAT" "Synchronized" ok)")
-	elif grep -qiE 'mlat client \(fa-mlat-client\) is running' <<<"$raw"; then
-		rows+=("$(_sd_obj "MLAT" "Running" ok)")
-	elif grep -qiE 'mlat client \(fa-mlat-client\) is not running' <<<"$raw"; then
-		rows+=("$(_sd_obj "MLAT" "Off" na)")
-	fi
-
-	# Non-empty but unrecognized output (a format we don't know) → unavailable,
-	# not a silent empty card.
+	# "<json-key>:<label>". Fixed text per (component, status); mlat "red" means
+	# MLAT is off (normal pre-claim), which is informational, not a fault.
+	for comp in "adept:FlightAware" "radio:ADS-B" "mlat:MLAT"; do
+		local key="${comp%%:*}" label="${comp#*:}" st value sev
+		st="$(jq -r --arg k "$key" '.[$k].status // ""' <<<"$raw" 2>/dev/null)"
+		[[ -n "$st" ]] || continue
+		case "$key:$st" in
+			adept:green) value="Connected";     sev=ok ;;
+			adept:red)   value="Not connected"; sev=err ;;
+			radio:green) value="Receiving";     sev=ok ;;
+			radio:red)   value="No data";       sev=err ;;
+			mlat:green)  value="Synchronized";  sev=ok ;;
+			mlat:red)    value="Off";           sev=na ;;
+			*:amber|*:yellow) value="Starting"; sev=warn ;;
+			*)           value="Unknown";       sev=na ;;
+		esac
+		rows+=("$(_sd_obj "$label" "$value" "$sev")")
+	done
 	(( ${#rows[@]} > 0 )) || { _sd_unavailable; return 0; }
 	_sd_array "${rows[@]}"
 }
 
-# _status_detail_fr24: parse `fr24feed-status` lines of the form
-# "[ ok ] <Label>: <value>." (the prefix gives severity). Only a whitelist of
-# labels is surfaced; the process/timestamp lines (redundant with service state)
-# are skipped.
+# _status_detail_fr24: query fr24feed's local monitor API (monitor.json on
+# 127.0.0.1:8754, served by default) and surface the real signals it exposes. The
+# vendor `fr24feed-status` tool is NOT used: it hard-codes a `systemctl status
+# fr24feed` check, so it always reports "failed" for our airplanes-aggregator@fr24
+# unit. monitor.json (1.0.48) has no explicit feed-server-link field, so we report
+# what it does expose — the receiver connection and the tracked-aircraft count.
 _status_detail_fr24() {
-	local raw line rows=()
-	raw="$(_sd_run "$AGG_FR24_STATUS_BIN")" || { _sd_unavailable; return 0; }
+	local url raw rows=() rx ac
+	url="${AGG_FR24_MONITOR_URL:-http://127.0.0.1:8754/monitor.json}"
+	# `if !` (not `; rc=$?`) so a curl failure is handled even under set -e.
+	if ! raw="$(curl -fsS --max-time "${AGG_STATUS_TIMEOUT:-5}" "$url" 2>/dev/null)"; then
+		_sd_unavailable; return 0
+	fi
+	raw="${raw:0:${AGG_STATUS_MAX_BYTES:-16384}}"
+	jq -e 'type == "object"' >/dev/null 2>&1 <<<"$raw" || { _sd_unavailable; return 0; }
 
-	while IFS= read -r line; do
-		# Bound the row count so a repetitive/noisy tool can't grow the response.
-		(( ${#rows[@]} >= 12 )) && break
-		local sev
-		if [[ "$line" =~ ^\[[[:space:]]*ok[[:space:]]*\] ]]; then sev=ok
-		elif [[ "$line" =~ ^\[[[:space:]]*(fail|FAIL|error|down)[[:space:]]*\] ]]; then sev=err
-		else continue; fi
-		local rest label value
-		rest="${line#*]}"; rest="${rest# }"
-		[[ "$rest" == *:* ]] || continue
-		label="${rest%%:*}"
-		value="${rest#*:}"; value="${value# }"; value="${value%.}"
-		case "$label" in
-			"FR24 Link")       rows+=("$(_sd_obj "Connection" "$value" "$sev")") ;;
-			"Receiver")        rows+=("$(_sd_obj "Receiver" "$value" "$sev")") ;;
-			"FR24 Tracked AC") rows+=("$(_sd_obj "Tracked aircraft" "$value" "$sev")") ;;
-			"FR24 Radar")      rows+=("$(_sd_obj "Radar" "$value" "$sev")") ;;
-			"FR24 MLAT")       rows+=("$(_sd_obj "MLAT" "$value" "$sev")") ;;
-			*) : ;;
-		esac
-	done <<<"$raw"
+	rx="$(jq -r '.rx_connected // ""' <<<"$raw" 2>/dev/null)"
+	case "$rx" in
+		1) rows+=("$(_sd_obj "Receiver" "Connected" ok)") ;;
+		0) rows+=("$(_sd_obj "Receiver" "Not connected" err)") ;;
+	esac
+	ac="$(jq -r '.feed_num_ac_tracked // ""' <<<"$raw" 2>/dev/null)"
+	if [[ "$ac" =~ ^[0-9]+$ ]]; then
+		if (( ac > 0 )); then rows+=("$(_sd_obj "Aircraft tracked" "$ac" ok)")
+		else rows+=("$(_sd_obj "Aircraft tracked" "$ac" na)"); fi
+	fi
 
 	(( ${#rows[@]} > 0 )) || { _sd_unavailable; return 0; }
 	_sd_array "${rows[@]}"
@@ -675,12 +667,9 @@ _status_detail() {
 			return 0
 		fi
 
-		# Vendor status command seams (overridable in tests). piaware ships
-		# piaware-status in the package; the fr24 acquire installs fr24feed-status
-		# next to the binary.
-		local AGG_PIAWARE_STATUS_BIN="${AGG_PIAWARE_STATUS:-/usr/bin/piaware-status}"
-		local AGG_FR24_STATUS_BIN="${AGG_FR24_STATUS:-$AGG_INSTALL_ROOT/fr24/fr24feed-status}"
-
+		# Each producer reads its own status source (piaware's status.json /
+		# fr24feed's monitor API), seamed via AGG_PIAWARE_STATUS_JSON /
+		# AGG_FR24_MONITOR_URL for tests.
 		case "$AGG_ACQUIRE_METHOD" in
 			pinned-deb)       _status_detail_piaware ;;
 			vendor-installer) _status_detail_fr24 ;;
@@ -998,12 +987,6 @@ _fr24_acquire_binary() {
 	src="$tmp/root/usr/bin/fr24feed"
 	[[ -f "$src" ]] || { rm -rf "$tmp"; return 1; }
 	install -D -m 0755 "$src" "$dest" || { rm -rf "$tmp"; return 2; }
-	# Also install the vendor status tool next to the binary so the `detail` verb
-	# can surface real feed status. Best-effort: its absence is non-fatal (the
-	# producer falls back to a "Status unavailable" row).
-	if [[ -f "$tmp/root/usr/bin/fr24feed-status" ]]; then
-		install -D -m 0755 "$tmp/root/usr/bin/fr24feed-status" "$(dirname "$dest")/fr24feed-status" 2>/dev/null || true
-	fi
 	rm -rf "$tmp"
 }
 
