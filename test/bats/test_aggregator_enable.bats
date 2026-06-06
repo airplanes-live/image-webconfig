@@ -240,10 +240,37 @@ EOF
     echo "$output" | jq -e '.error_code == "rejected"'
 }
 
-@test "enable rejects out-of-range geo synchronously" {
-    agg enable '{"id":"fr24","lat":999,"lon":8.0,"alt":400,"fields":{"email":"a@b.c","sharing_key":"VALIDKEY12"}}'
+@test "enable without a key rejects out-of-range geo synchronously" {
+    # Geo is required only on the signup (no-key) path, where the wizard uses it.
+    agg enable '{"id":"fr24","lat":999,"lon":8.0,"alt":400,"fields":{"email":"a@b.c"}}'
     [ "$status" -eq 2 ]
     echo "$output" | jq -e '.error_code == "rejected"'
+}
+
+@test "a keyed re-enable (Start feeding) does not require geo" {
+    # A configured-but-stopped adapter: stored email + key. The SPA's "Start
+    # feeding" posts {fields:{}} with no location; the keyed path skips signup,
+    # so it must not be rejected for missing geo.
+    cat > "$AGG_STATE_DIR/fr24.json" <<'EOF'
+{"schema_version":1,"enabled":false,"mlat_enabled":false,"fields":{"email":"a@b.c","sharing_key":"STOREDKEY12"}}
+EOF
+    agg enable '{"id":"fr24","fields":{}}'
+    [ "$status" -eq 0 ]
+    echo "$output" | jq -e '.result == "accepted"'
+    # The worker (run inline by the stub) reused the stored key, no signup.
+    grep -q 'fr24key="STOREDKEY12"' "$AGG_FR24_INI"
+}
+
+@test "a key-only restored identity (no email) can be enabled" {
+    # cmd_import permits an fr24 backup carrying only a sharing_key; the keyed
+    # path uses neither email nor geo, so such an identity must start.
+    cat > "$AGG_STATE_DIR/fr24.json" <<'EOF'
+{"schema_version":1,"enabled":false,"mlat_enabled":false,"fields":{"sharing_key":"KEYONLY1234"}}
+EOF
+    agg enable '{"id":"fr24","fields":{}}'
+    [ "$status" -eq 0 ]
+    echo "$output" | jq -e '.result == "accepted"'
+    grep -q 'fr24key="KEYONLY1234"' "$AGG_FR24_INI"
 }
 
 @test "enable fails cleanly when the local decoder is unreachable" {
