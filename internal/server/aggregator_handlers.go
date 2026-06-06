@@ -110,6 +110,33 @@ func (s *Server) handleAggregatorList(w http.ResponseWriter, r *http.Request) {
 	s.writeAggregatorResponse(w, body, httpStatus)
 }
 
+// handleAggregatorDetail (GET /api/aggregators/{id}) returns one adapter's full
+// status object PLUS status_detail — the per-adapter status lines the helper
+// surfaces by running the vendor status tool. It is deliberately a separate,
+// on-demand fetch (not part of the list verb): the vendor probe is comparatively
+// slow, and the dashboard's 30s poll renders only state/version, never
+// status_detail. The path id is gated here before the helper runs; the helper
+// re-validates it and returns not_found / 404 for an unregistered adapter.
+func (s *Server) handleAggregatorDetail(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if !aggregator.ValidID(id) {
+		writeJSONError(w, http.StatusBadRequest, "invalid aggregator id")
+		return
+	}
+	body, err := injectID([]byte("{}"), id)
+	if err != nil {
+		writeJSONError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	resp, httpStatus, ierr := s.invokeAggregator(r.Context(), s.priv.AggregatorDetail, body, aggregatorHelperTimeout)
+	if ierr != nil {
+		log.Printf("aggregator detail %q: %v", id, ierr)
+		writeJSONError(w, http.StatusInternalServerError, "aggregator detail failed")
+		return
+	}
+	s.writeAggregatorResponse(w, resp, httpStatus)
+}
+
 // handleAggregatorExport (POST /api/aggregators/export) returns the
 // recoverable identities INCLUDING secret values as a backup blob. POST (not
 // GET) so it routes through the origin check and never lands in browser

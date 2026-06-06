@@ -522,6 +522,206 @@ _adapter_json() {
 	)
 }
 
+# --- status_detail (on-demand vendor status, the `detail` verb) -------------
+# These run the vendor status tool and turn it into a small whitelist of
+# {label,value,severity} rows for the manage page. They are deliberately NOT in
+# cmd_status (the 30s dashboard poll) — the vendor binaries are comparatively
+# slow and the dashboard never renders status_detail.
+#
+# Hard rules, because vendor output is undocumented, version-specific, and can
+# carry feeder IDs / coordinates / paths:
+#   - whitelist only recognized signals; never pass a raw line through;
+#   - _sd_clean every value (strip ANSI/control, length-cap);
+#   - the producer always returns a JSON array (possibly with a single
+#     "Unavailable" row), never fails the verb.
+
+# _sd_clean <str>: strip ANSI escapes + control chars and cap length, so a value
+# can't smuggle escape sequences or an unbounded string into the report.
+_sd_clean() {
+	local s
+	s="$(LC_ALL=C sed -E $'s/\033\\[[0-9;]*[A-Za-z]//g' <<<"$1" | tr -d '[:cntrl:]')"
+	printf '%s' "${s:0:120}"
+}
+
+# _sd_obj <label> <value> <severity>: one cleaned status row as compact JSON.
+_sd_obj() {
+	jq -nc --arg l "$1" --arg v "$(_sd_clean "$2")" --arg s "$3" \
+		'{label:$l, value:$v, severity:$s}'
+}
+
+# _sd_array <obj>...: assemble the rows into a JSON array ([] when none).
+_sd_array() {
+	if (( $# == 0 )); then printf '[]'; else printf '%s\n' "$@" | jq -sc .; fi
+}
+
+# _sd_unavailable: the explicit "the vendor tool didn't answer" row, so a
+# timeout / missing binary never looks like a healthy adapter with no detail.
+_sd_unavailable() { _sd_array "$(_sd_obj "Status" "Status unavailable" warn)"; }
+
+# _sd_run <bin>: run a vendor status tool bounded by both time AND output size,
+# capturing the tool's REAL exit code (a pipe would only give head's). Echoes the
+# capped stdout and returns 0 only when the tool ran to completion with usable
+# output; returns 1 on timeout (124), kill (137, timeout --kill), missing binary
+# (127), or empty output — so partial/hung output is never parsed as authoritative.
+_sd_run() {
+	local bin="$1" tmp rc raw
+	tmp="$(mktemp 2>/dev/null)" || return 1
+	timeout "${AGG_STATUS_TIMEOUT:-5}" "$bin" >"$tmp" 2>/dev/null
+	rc=$?
+	raw="$(head -c "${AGG_STATUS_MAX_BYTES:-16384}" "$tmp" 2>/dev/null)"
+	rm -f -- "$tmp"
+	[[ "$rc" == 124 || "$rc" == 137 || "$rc" == 127 || -z "$raw" ]] && return 1
+	printf '%s' "$raw"
+}
+
+# _status_detail_piaware: parse `piaware-status`. Only the meaningful signals are
+# surfaced — NOT the per-process pid lines, NOT the feeder-id value (identity-
+# bearing), and NOT the "Local ADS-B receiver (dump1090) is not running" line,
+# which is EXPECTED on an airplanes.live feeder (the decoder is readsb, and the
+# adjacent lines confirm piaware is in fact fed and connected).
+_status_detail_piaware() {
+	local raw rows=()
+	raw="$(_sd_run "$AGG_PIAWARE_STATUS_BIN")" || { _sd_unavailable; return 0; }
+
+	if grep -qiE 'piaware is connected to FlightAware' <<<"$raw"; then
+		rows+=("$(_sd_obj "FlightAware" "Connected" ok)")
+	elif grep -qiE 'piaware is (not connected|disconnected)' <<<"$raw"; then
+		rows+=("$(_sd_obj "FlightAware" "Not connected" err)")
+	fi
+
+	if grep -qiE 'faup1090 is connected to the ADS-B receiver' <<<"$raw"; then
+		rows+=("$(_sd_obj "ADS-B" "Receiving from local decoder" ok)")
+	elif grep -qiE 'faup1090 is not connected' <<<"$raw"; then
+		rows+=("$(_sd_obj "ADS-B" "No data from local decoder" err)")
+	fi
+
+	if grep -qiE 'mlat.client.*(using multilateration results|synchronized)' <<<"$raw"; then
+		rows+=("$(_sd_obj "MLAT" "Synchronized" ok)")
+	elif grep -qiE 'mlat client \(fa-mlat-client\) is running' <<<"$raw"; then
+		rows+=("$(_sd_obj "MLAT" "Running" ok)")
+	elif grep -qiE 'mlat client \(fa-mlat-client\) is not running' <<<"$raw"; then
+		rows+=("$(_sd_obj "MLAT" "Off" na)")
+	fi
+
+	# Non-empty but unrecognized output (a format we don't know) → unavailable,
+	# not a silent empty card.
+	(( ${#rows[@]} > 0 )) || { _sd_unavailable; return 0; }
+	_sd_array "${rows[@]}"
+}
+
+# _status_detail_fr24: parse `fr24feed-status` lines of the form
+# "[ ok ] <Label>: <value>." (the prefix gives severity). Only a whitelist of
+# labels is surfaced; the process/timestamp lines (redundant with service state)
+# are skipped.
+_status_detail_fr24() {
+	local raw line rows=()
+	raw="$(_sd_run "$AGG_FR24_STATUS_BIN")" || { _sd_unavailable; return 0; }
+
+	while IFS= read -r line; do
+		# Bound the row count so a repetitive/noisy tool can't grow the response.
+		(( ${#rows[@]} >= 12 )) && break
+		local sev
+		if [[ "$line" =~ ^\[[[:space:]]*ok[[:space:]]*\] ]]; then sev=ok
+		elif [[ "$line" =~ ^\[[[:space:]]*(fail|FAIL|error|down)[[:space:]]*\] ]]; then sev=err
+		else continue; fi
+		local rest label value
+		rest="${line#*]}"; rest="${rest# }"
+		[[ "$rest" == *:* ]] || continue
+		label="${rest%%:*}"
+		value="${rest#*:}"; value="${value# }"; value="${value%.}"
+		case "$label" in
+			"FR24 Link")       rows+=("$(_sd_obj "Connection" "$value" "$sev")") ;;
+			"Receiver")        rows+=("$(_sd_obj "Receiver" "$value" "$sev")") ;;
+			"FR24 Tracked AC") rows+=("$(_sd_obj "Tracked aircraft" "$value" "$sev")") ;;
+			"FR24 Radar")      rows+=("$(_sd_obj "Radar" "$value" "$sev")") ;;
+			"FR24 MLAT")       rows+=("$(_sd_obj "MLAT" "$value" "$sev")") ;;
+			*) : ;;
+		esac
+	done <<<"$raw"
+
+	(( ${#rows[@]} > 0 )) || { _sd_unavailable; return 0; }
+	_sd_array "${rows[@]}"
+}
+
+# _status_detail <id>: the status_detail array for one adapter. Sources the
+# descriptor in its OWN scope (it cannot read vars back out of _adapter_json's
+# subshell) to pick the producer + the vendor command paths. The vendor binary
+# runs ONLY when the service is active and no async op is in flight — otherwise a
+# synthetic Service/Updating row, so an in-progress install or a stopped adapter
+# never shows stale vendor status.
+_status_detail() {
+	local id="$1"
+	(
+		AGG_ACQUIRE_METHOD=""; AGG_SERVICE_UNIT=""
+		# shellcheck source=/dev/null
+		source "$AGG_DESC_DIR/$id.desc"
+		local unit="$AGG_SERVICE_UNIT"
+
+		local ov ovs
+		if ov="$(_enable_overlay "$id")" && [[ -n "$ov" ]]; then
+			ovs="$(jq -r '.status // ""' <<<"$ov")"
+			case "$ovs" in
+				starting|running) _sd_array "$(_sd_obj "Status" "Updating…" na)"; return 0 ;;
+			esac
+		fi
+
+		local svc; svc="$(_service_state "$unit")"
+		if [[ "$svc" != "active" ]]; then
+			if [[ "$svc" == "failed" ]]; then
+				_sd_array "$(_sd_obj "Service" "Failed" err)"
+			else
+				_sd_array "$(_sd_obj "Service" "Stopped" na)"
+			fi
+			return 0
+		fi
+
+		# Vendor status command seams (overridable in tests). piaware ships
+		# piaware-status in the package; the fr24 acquire installs fr24feed-status
+		# next to the binary.
+		local AGG_PIAWARE_STATUS_BIN="${AGG_PIAWARE_STATUS:-/usr/bin/piaware-status}"
+		local AGG_FR24_STATUS_BIN="${AGG_FR24_STATUS:-$AGG_INSTALL_ROOT/fr24/fr24feed-status}"
+
+		case "$AGG_ACQUIRE_METHOD" in
+			pinned-deb)       _status_detail_piaware ;;
+			vendor-installer) _status_detail_fr24 ;;
+			*) printf '[]' ;;
+		esac
+	)
+}
+
+# cmd_detail (verb `detail`): one adapter's full status object PLUS status_detail.
+# id arrives on stdin like the per-id mutating verbs; _request_id is the security
+# gate (regex + descriptor-exists) before any path interpolation. The reply uses
+# the same envelope shape as `status` with a single-element aggregators array, so
+# the SPA's existing `.find(id)` consumption is unchanged.
+cmd_detail() {
+	_read_request
+	_request_id; local id="$REQ_ID"
+
+	local decoder_json="false"
+	if _decoder_reachable; then decoder_json="true"; fi
+
+	local obj
+	if ! obj="$(_adapter_json "$AGG_DESC_DIR/$id.desc" "$decoder_json")"; then
+		_emit_error state_error "aggregator descriptor failed: $id"; exit 3
+	fi
+
+	# Only run the vendor probe for a configured adapter — a never-set-up adapter
+	# has nothing to report and its manage page shows the setup form, where a
+	# "Service: Stopped" row would just be noise.
+	local detail="[]"
+	if [[ "$(jq -r '.configured == true' <<<"$obj" 2>/dev/null)" == "true" ]]; then
+		detail="$(_status_detail "$id" 2>/dev/null)"
+		jq -e 'type == "array"' >/dev/null 2>&1 <<<"$detail" || detail="[]"
+	fi
+
+	local body
+	body="$(jq -nc --argjson pv "$AGG_PROTOCOL_VERSION" --argjson a "$obj" --argjson d "$detail" \
+		'{protocol_version:$pv,
+		  aggregators:[ $a + (if ($d | length) > 0 then {status_detail:$d} else {} end) ]}')"
+	_emit_json "$body"
+}
+
 cmd_status() {
 	local decoder_json="false"
 	if _decoder_reachable; then decoder_json="true"; fi
@@ -798,6 +998,12 @@ _fr24_acquire_binary() {
 	src="$tmp/root/usr/bin/fr24feed"
 	[[ -f "$src" ]] || { rm -rf "$tmp"; return 1; }
 	install -D -m 0755 "$src" "$dest" || { rm -rf "$tmp"; return 2; }
+	# Also install the vendor status tool next to the binary so the `detail` verb
+	# can surface real feed status. Best-effort: its absence is non-fatal (the
+	# producer falls back to a "Status unavailable" row).
+	if [[ -f "$tmp/root/usr/bin/fr24feed-status" ]]; then
+		install -D -m 0755 "$tmp/root/usr/bin/fr24feed-status" "$(dirname "$dest")/fr24feed-status" 2>/dev/null || true
+	fi
 	rm -rf "$tmp"
 }
 
@@ -1920,11 +2126,12 @@ main() {
 	fi
 
 	if [[ $# -ne 2 || "${2-}" != "--json" ]]; then
-		_emit_error usage_error "usage: apl-aggregator {status|list|enable|set|disable|reset|reconcile|export|import} --json"
+		_emit_error usage_error "usage: apl-aggregator {status|list|detail|enable|set|disable|reset|reconcile|export|import} --json"
 		exit 5
 	fi
 	case "$1" in
 		status|list) cmd_status; exit 0 ;;
+		detail) cmd_detail; exit 0 ;;
 		enable) cmd_enable; exit 0 ;;
 		set) cmd_set; exit 0 ;;
 		disable) cmd_disable; exit 0 ;;
@@ -1933,7 +2140,7 @@ main() {
 		reconcile) cmd_reconcile; exit 0 ;;
 		export) cmd_export; exit 0 ;;
 		import) cmd_import; exit 0 ;;
-		*) _emit_error usage_error "unknown verb '$1'; use status|list|enable|set|disable|reset|reconcile|export|import --json"; exit 5 ;;
+		*) _emit_error usage_error "unknown verb '$1'; use status|list|detail|enable|set|disable|reset|reconcile|export|import --json"; exit 5 ;;
 	esac
 }
 

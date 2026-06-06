@@ -102,6 +102,7 @@ type PrivilegedArgv struct {
 	// set, reset, import) surfaces via the same grant. Secret values (e.g. an
 	// FR24 sharing key) travel on the helper's stdin, never on argv.
 	AggregatorStatus  []string
+	AggregatorDetail  []string
 	AggregatorEnable  []string
 	AggregatorDisable []string
 	AggregatorSet     []string
@@ -175,6 +176,7 @@ func DefaultPrivilegedArgv() PrivilegedArgv {
 		// read on stdin, not argv. The helper is laid down by the runtime
 		// overlay at the same fixed path on every release.
 		AggregatorStatus:  sudo("/usr/local/bin/apl-aggregator", "status", "--json"),
+		AggregatorDetail:  sudo("/usr/local/bin/apl-aggregator", "detail", "--json"),
 		AggregatorEnable:  sudo("/usr/local/bin/apl-aggregator", "enable", "--json"),
 		AggregatorDisable: sudo("/usr/local/bin/apl-aggregator", "disable", "--json"),
 		AggregatorSet:     sudo("/usr/local/bin/apl-aggregator", "set", "--json"),
@@ -319,6 +321,7 @@ func New(d Deps) http.Handler {
 	// lock_timeout 503 to the second caller. export/import are POST so they
 	// route through the origin check; export is the one secret-bearing read.
 	mux.HandleFunc("GET /api/aggregators", s.requireSession(s.handleAggregatorList))
+	mux.HandleFunc("GET /api/aggregators/{id}", s.requireSession(s.handleAggregatorDetail))
 	mux.HandleFunc("POST /api/aggregators/export", s.requireSession(s.handleAggregatorExport))
 	mux.HandleFunc("POST /api/aggregators/import", s.requireSession(s.handleAggregatorImport))
 	mux.HandleFunc("POST /api/aggregators/{id}/enable", s.requireSession(s.handleAggregatorEnable))

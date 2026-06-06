@@ -20,6 +20,8 @@ func aggregatorCmd(state *State, verb string, body []byte) (wexec.Result, error)
 	switch verb {
 	case "status", "list":
 		return aggStatus(state), nil
+	case "detail":
+		return aggDetail(state, body), nil
 	case "enable":
 		return aggEnable(state, body), nil
 	case "disable":
@@ -103,6 +105,69 @@ func aggStatus(state *State) wexec.Result {
 	})
 }
 
+// aggDetail fakes the `detail` verb: the one adapter named by the id injected
+// into the body, wrapped in the same envelope as the list, PLUS the mock
+// status_detail the production helper builds by running the vendor status tool.
+// status_detail lives only on the detail verb (the list/dashboard poll stays
+// light), so dev mirrors production.
+func aggDetail(state *State, body []byte) wexec.Result {
+	var req struct {
+		ID string `json:"id"`
+	}
+	if err := json.Unmarshal(body, &req); err != nil {
+		return aggError("parse_error", "request body must be a JSON object")
+	}
+	var adapter map[string]any
+	switch req.ID {
+	case "fr24":
+		adapter = aggAdapterFR24(state)
+	case "piaware":
+		adapter = aggAdapterPiaware(state)
+	default:
+		return aggError("not_found", "unknown aggregator id")
+	}
+	if sd := aggStatusDetail(req.ID, adapter); sd != nil {
+		adapter["status_detail"] = sd
+	}
+	return aggEnvelope(map[string]any{
+		"protocol_version": aggProtocolVersion,
+		"aggregators":      []any{adapter},
+	})
+}
+
+// aggStatusDetail returns the mock status_detail rows for a configured adapter,
+// mirroring the production helper's whitelist (and the real values seen on a
+// feeder). nil for a not-configured adapter — the helper attaches nothing there.
+// enabled ≈ the service is active.
+func aggStatusDetail(id string, adapter map[string]any) []map[string]any {
+	if adapter["configured"] != true {
+		return nil
+	}
+	if enabled, _ := adapter["enabled"].(bool); !enabled {
+		return []map[string]any{{"label": "Service", "value": "Stopped", "severity": "na"}}
+	}
+	switch id {
+	case "fr24":
+		return []map[string]any{
+			{"label": "Connection", "value": "connected [UDP]", "severity": "ok"},
+			{"label": "Receiver", "value": "connected", "severity": "ok"},
+			{"label": "Tracked aircraft", "value": "17", "severity": "ok"},
+			{"label": "Radar", "value": "T-EDKA146", "severity": "na"},
+		}
+	case "piaware":
+		mlatVal, mlatSev := "Off", "na"
+		if m, _ := adapter["configured_mlat_enabled"].(bool); m {
+			mlatVal, mlatSev = "Running", "ok"
+		}
+		return []map[string]any{
+			{"label": "FlightAware", "value": "Connected", "severity": "ok"},
+			{"label": "ADS-B", "value": "Receiving from local decoder", "severity": "ok"},
+			{"label": "MLAT", "value": mlatVal, "severity": mlatSev},
+		}
+	}
+	return nil
+}
+
 // aggLifecycle maps the in-memory record to the status enum the SPA renders.
 func aggLifecycle(installing, enabled, configured bool) string {
 	switch {
@@ -150,18 +215,6 @@ func aggAdapterFR24(state *State) map[string]any {
 	}
 	if configured {
 		fr24["version"] = "1.0.48-0"
-		// status_detail mocks what the helper would surface from fr24feed's status.
-		if enabled {
-			fr24["status_detail"] = []map[string]any{
-				{"label": "Connection", "value": "Connected to Flightradar24", "severity": "ok"},
-				{"label": "ADS-B", "value": "Receiving from local readsb", "severity": "ok"},
-				{"label": "Sharing key", "value": "Configured", "severity": "ok"},
-			}
-		} else {
-			fr24["status_detail"] = []map[string]any{
-				{"label": "Service", "value": "Stopped", "severity": "na"},
-			}
-		}
 	}
 	if installing {
 		fr24["enable"] = map[string]any{"status": "running", "step": "acquiring", "request_id": "dev-fr24"}
@@ -205,23 +258,6 @@ func aggAdapterPiaware(state *State) map[string]any {
 	}
 	if configured {
 		pw["version"] = "11.0"
-		// status_detail mocks what the helper would surface from `piaware-status`.
-		if enabled {
-			mlatVal, mlatSev := "Off", "na"
-			if mlat {
-				mlatVal, mlatSev = "Enabled", "ok"
-			}
-			pw["status_detail"] = []map[string]any{
-				{"label": "Connection", "value": "Connected to FlightAware", "severity": "ok"},
-				{"label": "ADS-B", "value": "Receiving from local readsb", "severity": "ok"},
-				{"label": "MLAT", "value": mlatVal, "severity": mlatSev},
-				{"label": "Feeder ID", "value": fields["feeder_id"], "severity": "na"},
-			}
-		} else {
-			pw["status_detail"] = []map[string]any{
-				{"label": "Service", "value": "Stopped", "severity": "na"},
-			}
-		}
 	}
 	if installing {
 		pw["enable"] = map[string]any{"status": "running", "step": "acquiring", "request_id": "dev-piaware"}
