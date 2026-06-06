@@ -1088,8 +1088,14 @@ _enable_fr24() {
 	lon="$(jq -r 'if has("lon") then .lon else "" end' <<<"$REQ_JSON")"
 	alt="$(jq -r 'if has("alt") then .alt else "" end' <<<"$REQ_JSON")"
 
-	_valid_email "$email" || { _emit_error rejected "a valid email address is required"; exit 2; }
-	_valid_geo "$lat" "$lon" "$alt" || { _emit_error rejected "valid latitude, longitude and altitude are required"; exit 2; }
+	# Email and geo are consumed only by the signup wizard (the no-key path). A
+	# keyed enable — a provided or restored key, e.g. "Start feeding" on a
+	# configured adapter, or a key-only restored backup (cmd_import permits one) —
+	# skips signup, so it needs neither.
+	if [[ -z "$key" ]]; then
+		_valid_email "$email" || { _emit_error rejected "a valid email address is required"; exit 2; }
+		_valid_geo "$lat" "$lon" "$alt" || { _emit_error rejected "valid latitude, longitude and altitude are required"; exit 2; }
+	fi
 	[[ -z "$key" ]] || _valid_fr24_key "$key" || { _emit_error rejected "invalid sharing key format"; exit 2; }
 	_decoder_reachable || { _emit_error decoder_unavailable "local decoder 127.0.0.1:30005 is not reachable"; exit 2; }
 
@@ -1165,8 +1171,14 @@ _fr24_validate_sync() {
 	lat="$(jq -r 'if has("lat") then .lat else "" end' <<<"$REQ_JSON")"
 	lon="$(jq -r 'if has("lon") then .lon else "" end' <<<"$REQ_JSON")"
 	alt="$(jq -r 'if has("alt") then .alt else "" end' <<<"$REQ_JSON")"
-	_valid_email "$email" || { _emit_error rejected "a valid email address is required"; exit 2; }
-	_valid_geo "$lat" "$lon" "$alt" || { _emit_error rejected "valid latitude, longitude and altitude are required"; exit 2; }
+	# Email and geo are consumed only by the signup wizard (the no-key path). A
+	# keyed enable — a provided or restored key, e.g. "Start feeding" on a
+	# configured adapter, or a key-only restored backup (cmd_import permits one) —
+	# skips signup, so it needs neither.
+	if [[ -z "$key" ]]; then
+		_valid_email "$email" || { _emit_error rejected "a valid email address is required"; exit 2; }
+		_valid_geo "$lat" "$lon" "$alt" || { _emit_error rejected "valid latitude, longitude and altitude are required"; exit 2; }
+	fi
 	[[ -z "$key" ]] || _valid_fr24_key "$key" || { _emit_error rejected "invalid sharing key format"; exit 2; }
 	_decoder_reachable || { _emit_error decoder_unavailable "local decoder 127.0.0.1:30005 is not reachable"; exit 2; }
 }
