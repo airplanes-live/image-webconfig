@@ -85,6 +85,7 @@ func StubPrivilegedArgv() server.PrivilegedArgv {
 		ExportIdentity:    []string{"dev-stub", "identity", "export"},
 		ImportIdentity:    []string{"dev-stub", "identity", "import"},
 		AggregatorStatus:  []string{"dev-stub", "apl-aggregator", "status"},
+		AggregatorDetail:  []string{"dev-stub", "apl-aggregator", "detail"},
 		AggregatorEnable:  []string{"dev-stub", "apl-aggregator", "enable"},
 		AggregatorDisable: []string{"dev-stub", "apl-aggregator", "disable"},
 		AggregatorSet:     []string{"dev-stub", "apl-aggregator", "set"},

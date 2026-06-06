@@ -58,6 +58,69 @@ func TestAggregatorList_ForwardsEnvelope(t *testing.T) {
 	}
 }
 
+func TestAggregatorDetail_ForwardsAndInjectsID(t *testing.T) {
+	t.Parallel()
+	h := newWriteHarness(t)
+	h.stdinResult = wexec.Result{Stdout: []byte(`{"protocol_version":1,"aggregators":[{"id":"fr24","display_name":"Flightradar24","state":"running","enabled":true,"status_detail":[{"label":"Connection","value":"connected","severity":"ok"}]}]}`)}
+
+	r, err := h.client.Do(httpRequest(t, http.MethodGet, h.ts.URL+"/api/aggregators/fr24", ""))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r.Body.Close()
+	if r.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", r.StatusCode, mustReadAll(t, r.Body))
+	}
+	if body := mustReadAll(t, r.Body); !strings.Contains(body, "status_detail") {
+		t.Fatalf("detail body lacked status_detail: %s", body)
+	}
+	calls := h.stdinCallsCopy()
+	if len(calls) != 1 {
+		t.Fatalf("stdinCalls = %d, want 1", len(calls))
+	}
+	want := []string{"sudo-stub", "apl-aggregator", "detail", "--json"}
+	if !equalSlice(calls[0].argv, want) {
+		t.Fatalf("argv = %v, want %v", calls[0].argv, want)
+	}
+	var sent map[string]any
+	if err := json.Unmarshal(calls[0].stdin, &sent); err != nil {
+		t.Fatalf("stdin not JSON: %s", calls[0].stdin)
+	}
+	if sent["id"] != "fr24" {
+		t.Fatalf("detail stdin did not carry id from path: %v", sent)
+	}
+}
+
+func TestAggregatorDetail_InvalidIDRejectedBeforeHelper(t *testing.T) {
+	t.Parallel()
+	h := newWriteHarness(t)
+	r, err := h.client.Do(httpRequest(t, http.MethodGet, h.ts.URL+"/api/aggregators/BadID", ""))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r.Body.Close()
+	if r.StatusCode != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400", r.StatusCode)
+	}
+	if calls := h.stdinCallsCopy(); len(calls) != 0 {
+		t.Fatalf("helper was invoked for an invalid id: %v", calls)
+	}
+}
+
+func TestAggregatorDetail_UnknownAdapterMapsTo404(t *testing.T) {
+	t.Parallel()
+	h := newWriteHarness(t)
+	h.stdinResult = wexec.Result{Stdout: []byte(`{"protocol_version":1,"result":"error","error_code":"not_found","message":"unknown aggregator id"}`)}
+	r, err := h.client.Do(httpRequest(t, http.MethodGet, h.ts.URL+"/api/aggregators/ghost", ""))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r.Body.Close()
+	if r.StatusCode != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404; body=%s", r.StatusCode, mustReadAll(t, r.Body))
+	}
+}
+
 func TestAggregatorEnable_PipesBodyAndInjectsID(t *testing.T) {
 	t.Parallel()
 	h := newWriteHarness(t)

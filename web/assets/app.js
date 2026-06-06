@@ -3791,8 +3791,10 @@
 
     async function fr24Panel() {
         render(el("div", { class: "wc-card" }, el("p", { class: "muted" }, "loading…")));
+        // Per-adapter detail fetch (not the list): it carries status_detail from
+        // the vendor status tool, which is too slow to run on the dashboard poll.
         const [resp, config] = await Promise.all([
-            getJSON("/api/aggregators"),
+            getJSON("/api/aggregators/fr24"),
             getJSON("/api/config"),
         ]);
         if (handleAuthFailure(resp)) return;
@@ -4009,7 +4011,8 @@
 
     async function piawarePanel() {
         render(el("div", { class: "wc-card" }, el("p", { class: "muted" }, "loading…")));
-        const resp = await getJSON("/api/aggregators");
+        // Per-adapter detail fetch (carries vendor status_detail); see fr24Panel.
+        const resp = await getJSON("/api/aggregators/piaware");
         if (handleAuthFailure(resp)) return;
         if (!resp.ok) {
             render(el("section", { class: "wc-card" }, el("h2", {}, "FlightAware"),
