@@ -1256,6 +1256,12 @@ textarea:focus {
 .wc-metrics__summary-dot--warn { background: var(--wc-status-warn); }
 .wc-metrics__summary-dot--err  { background: var(--wc-status-err); }
 .wc-metrics__summary-dot--na   { background: var(--wc-status-na); }
+/* Outranks the `.wc-card p` typography defaults (0,1,1) — this used to be
+   an inline style, which the CSP (style-src 'self') blocks. */
+.wc-card .wc-metrics__note {
+  margin-top: 1.25rem;
+  font-size: 0.85rem;
+}
 
 /* ========== Editable text-field summary (shared by Location, MLAT name,
    Gain, 978 UAT — read-only display with an Edit button reveals inputs). */

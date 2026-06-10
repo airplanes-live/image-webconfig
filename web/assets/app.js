@@ -3221,8 +3221,9 @@
             // whether submit fires. Wi-Fi validators are intentionally
             // no-trim (SSIDs and PSKs may carry whitespace), so error
             // predicates use `v !== ""` rather than `v.trim()`.
-            const ssid = el("input", { type: "text", value: existing ? (existing.ssid || "") : "" });
+            const ssid = el("input", { id: "wifi-ssid", name: "ssid", type: "text", value: existing ? (existing.ssid || "") : "" });
             const psk = el("input", {
+                id: "wifi-psk", name: "psk",
                 type: "password", autocomplete: "new-password", class: "wifi-pw-input",
                 placeholder: isEdit && existing.has_psk ? "(unchanged — leave blank to keep)" : "8-63 chars or 64-hex",
             });
@@ -3241,13 +3242,14 @@
                 pwToggle.setAttribute("aria-label", reveal ? "Hide password" : "Show password");
             };
             const pwField = el("div", { class: "wifi-pw-field" }, psk, pwToggle);
-            const hidden = el("input", { type: "checkbox" });
+            const hidden = el("input", { id: "wifi-hidden", name: "hidden", type: "checkbox" });
             if (existing && existing.hidden) hidden.checked = true;
             const priority = el("input", {
+                id: "wifi-priority", name: "priority",
                 type: "number", min: "0", max: "999",
                 value: String(existing ? (existing.priority || 0) : 0),
             });
-            const testBox = el("input", { type: "checkbox", checked: "" });
+            const testBox = el("input", { id: "wifi-test-connection", name: "test_connection", type: "checkbox", checked: "" });
             const submit = el("button", { type: "submit", class: "wc-btn-primary" }, isEdit ? "Save changes" : "Add network");
             const cancel = el("button", { type: "button", class: "wc-btn-ghost" }, "Cancel");
             cancel.onclick = () => { formHost.replaceChildren(); };
@@ -3365,8 +3367,8 @@
                 },
             },
                 el("h3", {}, isEdit ? "Edit " + (existing.ssid || existing.id) : "Add network"),
-                el("div", { class: "field" }, el("label", {}, "SSID"), ssid, ssidError),
-                el("div", { class: "field" }, el("label", {}, "Password"), pwField, pskError),
+                el("div", { class: "field" }, el("label", { for: "wifi-ssid" }, "SSID"), ssid, ssidError),
+                el("div", { class: "field" }, el("label", { for: "wifi-psk" }, "Password"), pwField, pskError),
                 el("div", { class: "field-row" },
                     el("label", {}, hidden, " Hidden network"),
                     el("label", {}, "Priority ", priority),
@@ -3526,8 +3528,7 @@
             el("h2", {}, "System metrics"),
             summaryBanner,
             el("dl", { class: "wc-metrics" }, ...cells),
-            el("p", { class: "muted",
-                style: "margin-top: 1.25rem; font-size: 0.85rem;" },
+            el("p", { class: "muted wc-metrics__note" },
                 "These are the same readings the feeder reports to airplanes.live when diagnostics are enabled."),
         ));
     }
@@ -3924,15 +3925,15 @@
 
         // Not set up: collect sign-in details + location; the actions row lives
         // inside the form so "Set up" and "View logs" stay on one line.
-        const email = el("input", { type: "email", autocomplete: "email", placeholder: "you@example.com" });
-        const key = el("input", { type: "text", autocomplete: "off", spellcheck: "false",
+        const email = el("input", { id: "agg-fr24-email", name: "email", type: "email", autocomplete: "email", placeholder: "you@example.com" });
+        const key = el("input", { id: "agg-fr24-key", name: "sharing_key", type: "text", autocomplete: "off", spellcheck: "false",
             placeholder: "optional — paste an existing sharing key" });
         const emailErr = el("p", { class: "field-help wc-field-error", hidden: true, role: "alert" }, "Enter a valid email address.");
         const keyErr = el("p", { class: "field-help wc-field-error", hidden: true, role: "alert" }, "Sharing keys are 6–40 letters and digits.");
 
-        const lat = el("input", { type: "text", inputmode: "decimal", autocomplete: "off", spellcheck: "false", value: cfg.LATITUDE || "" });
-        const lon = el("input", { type: "text", inputmode: "decimal", autocomplete: "off", spellcheck: "false", value: cfg.LONGITUDE || "" });
-        const alt = el("input", { type: "text", inputmode: "decimal", autocomplete: "off", spellcheck: "false", value: cfg.ALTITUDE || "" });
+        const lat = el("input", { id: "agg-fr24-lat", name: "lat", type: "text", inputmode: "decimal", autocomplete: "off", spellcheck: "false", value: cfg.LATITUDE || "" });
+        const lon = el("input", { id: "agg-fr24-lon", name: "lon", type: "text", inputmode: "decimal", autocomplete: "off", spellcheck: "false", value: cfg.LONGITUDE || "" });
+        const alt = el("input", { id: "agg-fr24-alt", name: "alt", type: "text", inputmode: "decimal", autocomplete: "off", spellcheck: "false", value: cfg.ALTITUDE || "" });
 
         const submitLabel = "Set up Flightradar24";
         const submit = el("button", { type: "submit", class: "wc-btn-primary" }, submitLabel);
@@ -3989,12 +3990,12 @@
             },
         },
             el("h3", {}, "Sign-in details"),
-            el("div", { class: "field" }, el("label", {}, "Email address"), email, emailErr),
-            el("div", { class: "field" }, el("label", {}, "Sharing key (optional)"), key, keyErr,
+            el("div", { class: "field" }, el("label", { for: "agg-fr24-email" }, "Email address"), email, emailErr),
+            el("div", { class: "field" }, el("label", { for: "agg-fr24-key" }, "Sharing key (optional)"), key, keyErr,
                 el("p", { class: "field-help" }, "Leave blank to create a new Flightradar24 sharing key from your email. Paste an existing key to reuse a Flightradar24 account.")),
-            el("div", { class: "field" }, el("label", {}, "Latitude"), lat),
-            el("div", { class: "field" }, el("label", {}, "Longitude"), lon),
-            el("div", { class: "field" }, el("label", {}, "Altitude (m)"), alt,
+            el("div", { class: "field" }, el("label", { for: "agg-fr24-lat" }, "Latitude"), lat),
+            el("div", { class: "field" }, el("label", { for: "agg-fr24-lon" }, "Longitude"), lon),
+            el("div", { class: "field" }, el("label", { for: "agg-fr24-alt" }, "Altitude (m)"), alt,
                 el("p", { class: "field-help" }, "Sent to Flightradar24 at sign-up. Prefilled from your feeder location; edit to send a different location.")),
             inlineErr,
             el("div", { class: "wc-agg-row__actions" }, submit, viewLogs),
@@ -4096,12 +4097,12 @@
         }
 
         // Not set up: Feeder ID (optional) + MLAT toggle; actions in the form.
-        const feederId = el("input", { type: "text", autocomplete: "off", spellcheck: "false",
+        const feederId = el("input", { id: "agg-piaware-feeder-id", name: "feeder_id", type: "text", autocomplete: "off", spellcheck: "false",
             placeholder: "optional — paste a Feeder ID to reclaim an existing feeder" });
         const feederErr = el("p", { class: "field-help wc-field-error", hidden: true, role: "alert" },
             "A Feeder ID looks like 00000000-0000-0000-0000-000000000000.");
 
-        const mlat = el("input", { type: "checkbox" });
+        const mlat = el("input", { id: "agg-piaware-mlat", name: "mlat_enabled", type: "checkbox" });
         mlat.checked = mlatOn;
 
         const submitLabel = "Set up FlightAware";
@@ -4133,7 +4134,7 @@
             },
         },
             el("h3", {}, "FlightAware settings"),
-            el("div", { class: "field" }, el("label", {}, "Feeder ID (optional)"), feederId, feederErr,
+            el("div", { class: "field" }, el("label", { for: "agg-piaware-feeder-id" }, "Feeder ID (optional)"), feederId, feederErr,
                 el("p", { class: "field-help" }, "Leave blank to register a new FlightAware feeder. Paste an existing Feeder ID to reclaim a feeder you already own.")),
             el("div", { class: "field" },
                 el("label", { class: "wc-checkbox" }, mlat, el("span", {}, "Participate in MLAT (multilateration)")),
