@@ -17,7 +17,7 @@ func newTestPaths(t *testing.T) (Paths, string) {
 		FeederIDFile:     filepath.Join(dir, "feeder-id"),
 		ClaimSecretFile:  filepath.Join(dir, "feeder-claim-secret"),
 		ClaimVersionFile: filepath.Join(dir, "feeder-claim-secret.version"),
-		ClaimPageURL:     "https://airplanes.live/feeder/claim",
+		ClaimPageURL:     "https://airplanes.live/feeder/claim/",
 	}, dir
 }
 
@@ -192,7 +192,7 @@ func TestRead_StatErrorPropagates(t *testing.T) {
 		FeederIDFile:     filepath.Join(tmp, "feeder-id"),
 		ClaimSecretFile:  filepath.Join(parent, "feeder-claim-secret"),
 		ClaimVersionFile: filepath.Join(parent, "feeder-claim-secret.version"),
-		ClaimPageURL:     "https://airplanes.live/feeder/claim",
+		ClaimPageURL:     "https://airplanes.live/feeder/claim/",
 	}
 	_ = os.WriteFile(p.FeederIDFile, []byte("abc-123\n"), 0o644)
 	r := NewReader(p)
@@ -301,7 +301,7 @@ func TestReveal_HappyPath_CanonicalOnDisk(t *testing.T) {
 	if got.ClaimSecret != "ABCD-EFGH-IJKL-MNOP" {
 		t.Errorf("ClaimSecret = %q, want ABCD-EFGH-IJKL-MNOP", got.ClaimSecret)
 	}
-	if got.ClaimPage != "https://airplanes.live/feeder/claim" {
+	if got.ClaimPage != "https://airplanes.live/feeder/claim/" {
 		t.Errorf("ClaimPage = %q", got.ClaimPage)
 	}
 }
@@ -441,7 +441,7 @@ func TestNewReader_DefaultsClaimPageURLWhenEmpty(t *testing.T) {
 		ClaimSecretFile: "/tmp/_unused",
 		// ClaimPageURL omitted on purpose.
 	})
-	if r.paths.ClaimPageURL != "https://airplanes.live/feeder/claim" {
+	if r.paths.ClaimPageURL != "https://airplanes.live/feeder/claim/" {
 		t.Errorf("ClaimPageURL = %q, want default", r.paths.ClaimPageURL)
 	}
 }

@@ -465,6 +465,20 @@
         } catch (_) { return null; }
     }
 
+    // claimHrefWithFeederId builds the "Claim this feeder" href: the
+    // safeClaimHref-validated claim page plus a feeder_id query parameter
+    // the website uses to prefill its claim form. A feeder id that fails
+    // isValidFeederId is left off — a bad prefill link would land the user
+    // on an inexplicably empty form, while the bare claim page still works.
+    function claimHrefWithFeederId(claimPage, feederId) {
+        const safe = safeClaimHref(claimPage);
+        if (!safe) return null;
+        if (!isValidFeederId(feederId)) return safe;
+        const u = new URL(safe);
+        u.searchParams.set("feeder_id", String(feederId).trim());
+        return u.toString();
+    }
+
     // ===== Status / tile classification =====
 
     // Msg-rate baseline advances on every poll. computeMsgRate has the same
@@ -1402,7 +1416,7 @@
                         "reveal returned incomplete data"));
                     return;
                 }
-                const safe = safeClaimHref(r.payload.claim_page);
+                const safe = claimHrefWithFeederId(r.payload.claim_page, r.payload.feeder_id);
                 const linkOrText = safe
                     ? el("a", { href: safe, target: "_blank", rel: "noopener noreferrer" }, "Claim this feeder")
                     : el("span", { class: "muted" }, r.payload.claim_page || "");

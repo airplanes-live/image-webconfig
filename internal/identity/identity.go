@@ -28,11 +28,11 @@ type Paths struct {
 	FeederIDFile     string // /etc/airplanes/feeder-id
 	ClaimSecretFile  string // /etc/airplanes/feeder-claim-secret
 	ClaimVersionFile string // /etc/airplanes/feeder-claim-secret.version
-	ClaimPageURL     string // https://airplanes.live/feeder/claim
+	ClaimPageURL     string // https://airplanes.live/feeder/claim/
 }
 
 const (
-	defaultClaimPageURL     = "https://airplanes.live/feeder/claim"
+	defaultClaimPageURL     = "https://airplanes.live/feeder/claim/"
 	defaultClaimVersionFile = "/etc/airplanes/feeder-claim-secret.version"
 )
 
