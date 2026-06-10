@@ -274,8 +274,15 @@ func (s *Server) handleChangePassword(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Rotate ALL sessions (codex: don't preserve the current one — captured
-	// cookies survive a password change otherwise on LAN-HTTP).
-	s.sessions.RevokeAll()
+	// cookies survive a password change otherwise on LAN-HTTP). A failure
+	// here means the persisted session mirror could resurrect pre-change
+	// sessions at the next restart — fail loudly rather than pretend the
+	// rotation happened. The in-memory table is cleared regardless.
+	if err := s.sessions.RevokeAll(); err != nil {
+		log.Printf("change-password: revoke sessions: %v", err)
+		writeJSONError(w, http.StatusInternalServerError, "session rotation failed")
+		return
+	}
 	token, expires, err := s.sessions.Issue()
 	if err != nil {
 		log.Printf("change-password: issue: %v", err)

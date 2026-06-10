@@ -17,7 +17,15 @@ Group=airplanes-webconfig
 # directive makes the dependency explicit instead of relying on /etc/group to
 # be authoritative at unit load time.
 SupplementaryGroups=airplanes-feed video
-ExecStart=/usr/local/bin/airplanes-webconfig --listen 127.0.0.1:8080
+# Session-token hashes are mirrored under /run so logins survive the
+# service restart the runtime-overlay self-update performs (its rollback
+# path stops the unit before restarting it, hence Preserve=yes rather
+# than =restart). /run is tmpfs: a reboot clears all sessions. Mode 0700 —
+# only the service account may read the mirror.
+RuntimeDirectory=airplanes-webconfig
+RuntimeDirectoryMode=0700
+RuntimeDirectoryPreserve=yes
+ExecStart=/usr/local/bin/airplanes-webconfig --listen 127.0.0.1:8080 --sessions-path /run/airplanes-webconfig/sessions.json
 Restart=on-failure
 RestartSec=5s
 

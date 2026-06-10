@@ -2770,6 +2770,15 @@
     // but treat it as a terminal stop so the poller doesn't spin).
     const ORCHESTRATOR_TERMINAL_STEPS = new Set(["done", "failed", "idle", "unavailable"]);
 
+    // ORCHESTRATOR_GATEWAY_ERROR_MAX_POLLS bounds how many consecutive
+    // 502/503/504 polls are absorbed silently. The orchestrator restarts
+    // webconfig itself mid-run, so lighttpd answers for the backend for a
+    // stretch; sessions persist across that restart, so the right move is
+    // to keep the last rendered state and retry. 90 polls * 2 s = 3 min —
+    // far past any normal restart — after which a warning surfaces (the
+    // poll keeps going; a recovering backend clears it).
+    const ORCHESTRATOR_GATEWAY_ERROR_MAX_POLLS = 90;
+
     // orchestratorProgress renders the polling progress view after the
     // user clicks "Update System". It polls /api/orchestrator/state at
     // ORCHESTRATOR_POLL_INTERVAL_MS and stops once a terminal step is
@@ -2806,6 +2815,7 @@
         // ORCHESTRATOR_STALE_GRACE_POLLS rationale above).
         let sawNonTerminal = false;
         let staleTerminalPolls = 0;
+        let gatewayErrorPolls = 0;
         let cancelled = false;
         let pollTimer = null;
         // Local AbortController so a poller-issued fetch can be cancelled
@@ -2850,6 +2860,22 @@
                 return;
             }
             if (cancelled) return;
+            // lighttpd answers 502/503/504 for the backend while the
+            // update restarts webconfig itself. Sessions survive that
+            // restart, so treat the gateway-error stretch like a network
+            // blip: keep the last rendered state and retry. Bounded so a
+            // backend that never comes back surfaces a warning instead
+            // of polling silently forever.
+            if (r.status === 502 || r.status === 503 || r.status === 504) {
+                gatewayErrorPolls += 1;
+                if (gatewayErrorPolls > ORCHESTRATOR_GATEWAY_ERROR_MAX_POLLS) {
+                    errorEl.textContent = "Cannot reach the feeder — the update may still be running. This page keeps retrying.";
+                    errorEl.hidden = false;
+                }
+                pollTimer = setTimeout(pollOnce, ORCHESTRATOR_POLL_INTERVAL_MS);
+                return;
+            }
+            gatewayErrorPolls = 0;
             if (handleAuthFailure(r)) return;
             const p = r && r.payload;
             const step = (p && p.step) || "unknown";
