@@ -70,6 +70,8 @@ func main() {
 		"path to argon2id PHC password hash")
 	sessionTTL := flag.Duration("session-ttl", 24*time.Hour,
 		"sliding session TTL")
+	sessionsPath := flag.String("sessions-path", "",
+		"file to mirror session-token hashes to so logins survive a service restart (empty = in-memory only; the shipped unit passes a path under /run so a reboot still logs everyone out)")
 	argonTime := flag.Uint("argon2-time", uint(auth.DefaultParams.TimeCost),
 		"argon2id time cost")
 	argonMem := flag.Uint("argon2-memory-kb", uint(auth.DefaultParams.MemoryKB),
@@ -152,7 +154,7 @@ func main() {
 		Handler: server.New(server.Deps{
 			Version:      effectiveVersion,
 			Store:        auth.NewPasswordStore(*hashPath),
-			Sessions:     auth.NewSessions(*sessionTTL),
+			Sessions:     auth.NewPersistentSessions(*sessionTTL, *sessionsPath),
 			Lockout:      auth.NewLockout(*lockoutThreshold, *lockoutWindow, *lockoutDuration),
 			Guard:        guard,
 			Argon2Params: params,
@@ -181,9 +183,9 @@ func main() {
 
 	// SIGHUP refreshes the schema cache. The update orchestrator's
 	// transient unit fires this after its feed leg so a new
-	// feed-env-keys.sh can take effect without bouncing the webconfig
-	// session table (sessions are in-memory; a restart logs every
-	// operator out).
+	// feed-env-keys.sh can take effect without bouncing the whole
+	// process (sessions survive a restart when --sessions-path is set,
+	// but a reload is still cheaper than a restart).
 	hup := make(chan os.Signal, 1)
 	signal.Notify(hup, syscall.SIGHUP)
 	go func() {

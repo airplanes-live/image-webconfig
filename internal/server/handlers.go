@@ -120,6 +120,15 @@ func (s *Server) handleSetup(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// First-time setup must not inherit sessions from a previous life of
+	// this device (e.g. a hand-deleted password hash with the persisted
+	// session mirror left behind).
+	if err := s.sessions.RevokeAll(); err != nil {
+		log.Printf("setup: revoke sessions: %v", err)
+		writeJSONError(w, http.StatusInternalServerError, "session rotation failed")
+		return
+	}
+
 	// Auto-login — only the linkat winner reaches here.
 	token, expires, err := s.sessions.Issue()
 	if err != nil {
@@ -267,15 +276,22 @@ func (s *Server) handleChangePassword(w http.ResponseWriter, r *http.Request) {
 		writeJSONError(w, http.StatusInternalServerError, "hash failed")
 		return
 	}
+	// Rotate ALL sessions (codex: don't preserve the current one — captured
+	// cookies survive a password change otherwise on LAN-HTTP). Rotation
+	// runs BEFORE the password commit: if the process dies between the
+	// two, the safe wreckage is "everyone logged out, password unchanged"
+	// — never "password changed, pre-change sessions still mirrored on
+	// disk for the next restart to resurrect".
+	if err := s.sessions.RevokeAll(); err != nil {
+		log.Printf("change-password: revoke sessions: %v", err)
+		writeJSONError(w, http.StatusInternalServerError, "session rotation failed")
+		return
+	}
 	if err := s.store.Replace(newPHC); err != nil {
 		log.Printf("change-password: store: %v", err)
 		writeJSONError(w, http.StatusInternalServerError, "store write failed")
 		return
 	}
-
-	// Rotate ALL sessions (codex: don't preserve the current one — captured
-	// cookies survive a password change otherwise on LAN-HTTP).
-	s.sessions.RevokeAll()
 	token, expires, err := s.sessions.Issue()
 	if err != nil {
 		log.Printf("change-password: issue: %v", err)
