@@ -52,7 +52,7 @@ func newTestServer(t *testing.T) (*httptest.Server, *Server) {
 		FeederIDFile:     filepath.Join(dir, "feeder-id"),
 		ClaimSecretFile:  filepath.Join(dir, "feeder-claim-secret"),
 		ClaimVersionFile: filepath.Join(dir, "feeder-claim-secret.version"),
-		ClaimPageURL:     "https://airplanes.live/feeder/claim",
+		ClaimPageURL:     "https://airplanes.live/feeder/claim/",
 	}
 	_ = os.WriteFile(idPaths.FeederIDFile, []byte("test-feeder-id"), 0o644)
 	_ = os.WriteFile(idPaths.ClaimSecretFile, []byte("ABCDEFGHIJKLMNOP"), 0o640)

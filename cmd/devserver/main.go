@@ -103,7 +103,7 @@ func main() {
 	idPaths := identity.Paths{
 		FeederIDFile:    state.Paths.FeederID,
 		ClaimSecretFile: state.Paths.ClaimSecret,
-		ClaimPageURL:    "https://airplanes.live/feeder/claim",
+		ClaimPageURL:    "https://airplanes.live/feeder/claim/",
 	}
 
 	statusReader := status.NewReader("dev", statusPaths, devfakes.Runner(state, priv),
