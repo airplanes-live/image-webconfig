@@ -1176,7 +1176,9 @@
         let dot = "ok";
         if (pct < 40) dot = "err";
         else if (pct < 60) dot = "warn";
-        return { dot, meta: displaySSID + " · " + pct + "%" };
+        // Signal first: the meta line truncates on the right, and a long
+        // SSID would otherwise push the percentage out of view.
+        return { dot, meta: pct + "% · " + displaySSID };
     }
 
     function buildWifiTile() {
