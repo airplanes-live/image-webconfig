@@ -123,10 +123,14 @@ func List(root string) []Device {
 	return out
 }
 
+// readAttr strips only the sysfs attribute's trailing newline — NOT all
+// whitespace. A serial with embedded or edge whitespace must surface
+// verbatim so the UI can flag it as unsupported, rather than offering a
+// trimmed variant that no longer matches the device's actual EEPROM value.
 func readAttr(dir, name string) string {
 	b, err := os.ReadFile(filepath.Join(dir, name))
 	if err != nil {
 		return ""
 	}
-	return strings.TrimSpace(string(b))
+	return strings.TrimRight(string(b), "\r\n")
 }

@@ -2560,7 +2560,11 @@
         // are listed disabled — offering them would build an unsaveable form.
         function rebuildSdr1090Options() {
             const saved = (configState.savedValues.READSB_SDR_SERIAL || "").trim();
-            const keep = sdr1090Value();
+            // Preserve the user's in-progress choice across a rebuild (the
+            // /api/sdr fetch can resolve mid-edit): keep the OPTION value —
+            // custom mode survives as custom mode, the typed text stays in
+            // the untouched custom input.
+            const keep = sdr1090Select.value;
             sdr1090Select.textContent = "";
             sdr1090Select.appendChild(el("option", { value: "" }, "Automatic (single SDR)"));
             const seen = new Set();
@@ -2571,7 +2575,11 @@
                 if (d.product) label += " — " + d.product;
                 if (d.duplicate) label += " (duplicate serial)";
                 const opts = { value: d.serial };
-                if (!isValidReadsbSdrSerial(d.serial)) {
+                // Raw charset test, not the (trimming) validator: a
+                // whitespace-padded EEPROM serial must be offered disabled
+                // verbatim, never silently trimmed into a value that no
+                // longer matches the device.
+                if (!sdrSerialRE.test(d.serial)) {
                     opts.disabled = true;
                     label += " — unsupported serial, reflash with rtl_eeprom";
                 }
@@ -2810,6 +2818,10 @@
                 uatEdit.refreshSummary();
                 uatEdit.setEditing(false);
                 uatGroup.recheck();
+                // The 1090 group's same-stick warning compares against the
+                // 978 serial just saved — recompute it so an open 1090
+                // editor doesn't show a stale verdict.
+                refreshSdr1090Editor();
             },
         });
 
@@ -2833,6 +2845,9 @@
             for (const d of sdrDevices) {
                 if (seen.has(d.serial)) continue;
                 seen.add(d.serial);
+                // Don't suggest serials the validator would reject — a
+                // selectable suggestion must never make the field unsaveable.
+                if (!sdrSerialRE.test(d.serial)) continue;
                 sdr978Datalist.appendChild(el("option", { value: d.serial }));
             }
         });

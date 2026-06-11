@@ -107,6 +107,18 @@ func TestList_MarksDuplicatesAndSortsByBusPath(t *testing.T) {
 	}
 }
 
+func TestList_PreservesWhitespacePaddedSerialVerbatim(t *testing.T) {
+	t.Parallel()
+	root := t.TempDir()
+	writeDevice(t, root, "1-1.2", map[string]string{
+		"idVendor": "0bda", "idProduct": "2838", "serial": " 1090 ",
+	})
+	got := List(root)
+	if len(got) != 1 || got[0].Serial != " 1090 " {
+		t.Fatalf("List = %+v, want serial preserved verbatim (\" 1090 \")", got)
+	}
+}
+
 func TestList_NormalizesVidPidCase(t *testing.T) {
 	t.Parallel()
 	root := t.TempDir()
