@@ -2804,8 +2804,8 @@
     // click (left over from a prior run — the state file lives on
     // /run/ which survives the orchestrator's process exit). The card
     // shows step + status + (when present) the error string the
-    // orchestrator wrote, plus an apt_irreversible notice the
-    // orchestrator surfaces once the apt phase has run.
+    // orchestrator wrote, plus an apt_irreversible notice when a failed
+    // run left the apt phase's package changes in place.
     function orchestratorProgress() {
         const stepEl = el("p", { class: "muted" }, "Starting…");
         const statusEl = el("p", { class: "muted" }, "");
@@ -2934,9 +2934,19 @@
             } else {
                 errorEl.hidden = true;
             }
-            if (aptIrr) {
+            // The apt phase has no rollback, but that only matters when
+            // the run actually failed: the user may assume "failed" means
+            // the device reverted entirely, and the note corrects that.
+            // On a successful run nothing rolled back, so the warning
+            // would be noise. Failure is encoded as status === "failed";
+            // the step field keeps the step name, so it covers both a
+            // failure inside the apt step and a later step failing after
+            // apt already mutated the system.
+            if (aptIrr && status === "failed") {
                 aptNoteEl.textContent = "Note: the apt package upgrade has run and is not rolled back automatically; webconfig and runtime steps can still roll back independently.";
                 aptNoteEl.hidden = false;
+            } else {
+                aptNoteEl.hidden = true;
             }
             if (isTerminal) {
                 // Terminal step reached for the live run. Stop polling
