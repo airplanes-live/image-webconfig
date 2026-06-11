@@ -24,9 +24,11 @@ import (
 // surfaces as "client thinks input is fine but real Pi 400s" in the
 // field — keep them aligned.
 var (
-	mlatUserRE      = regexp.MustCompile(`^[A-Za-z0-9_-]{1,64}$`)
-	gainNumericRE   = regexp.MustCompile(`^-?[0-9]+(?:\.[0-9]+)?$`)
-	dump978SerialRE = regexp.MustCompile(`^[0-9A-Za-z_-]{1,32}$`)
+	mlatUserRE    = regexp.MustCompile(`^[A-Za-z0-9_-]{1,64}$`)
+	gainNumericRE = regexp.MustCompile(`^-?[0-9]+(?:\.[0-9]+)?$`)
+	// sdrSerialRE covers READSB_SDR_SERIAL and DUMP978_SDR_SERIAL — same
+	// rule (valid_readsb_sdr_serial / valid_dump978_serial in feed).
+	sdrSerialRE = regexp.MustCompile(`^[0-9A-Za-z_-]{1,32}$`)
 )
 
 // validateGainValue mirrors valid_gain: auto/min/max OR numeric in [0, 60].
@@ -309,8 +311,13 @@ func applyFeed(state *State, body []byte) (wexec.Result, error) {
 			rejectErrors["GAIN"] = msg
 		}
 	}
+	if s, present := updates["READSB_SDR_SERIAL"]; present && s != "" {
+		if !sdrSerialRE.MatchString(s) {
+			rejectErrors["READSB_SDR_SERIAL"] = "must match [0-9A-Za-z_-]{1,32} or be empty"
+		}
+	}
 	if s, present := updates["DUMP978_SDR_SERIAL"]; present && s != "" {
-		if !dump978SerialRE.MatchString(s) {
+		if !sdrSerialRE.MatchString(s) {
 			rejectErrors["DUMP978_SDR_SERIAL"] = "must match [0-9A-Za-z_-]{1,32} or be empty"
 		}
 	}

@@ -29,6 +29,7 @@ var AllReadKeys = []string{
 	"INPUT",
 	"INPUT_TYPE",
 	"GAIN",
+	"READSB_SDR_SERIAL",
 	"UAT_INPUT",
 	"DUMP978_SDR_SERIAL",
 	"DUMP978_GAIN",

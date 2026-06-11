@@ -64,6 +64,16 @@ func newTestServer(t *testing.T) (*httptest.Server, *Server) {
 		0o644,
 	)
 
+	// Hermetic sysfs fixture for GET /api/sdr — keeps tests off the
+	// runner's real /sys and gives the handler one deterministic device.
+	sdrRoot := filepath.Join(dir, "sysfs-usb")
+	sdrDev := filepath.Join(sdrRoot, "1-1.2")
+	_ = os.MkdirAll(sdrDev, 0o755)
+	_ = os.WriteFile(filepath.Join(sdrDev, "idVendor"), []byte("0bda\n"), 0o644)
+	_ = os.WriteFile(filepath.Join(sdrDev, "idProduct"), []byte("2838\n"), 0o644)
+	_ = os.WriteFile(filepath.Join(sdrDev, "serial"), []byte("1090\n"), 0o644)
+	_ = os.WriteFile(filepath.Join(sdrDev, "product"), []byte("RTL2838UHIDIR\n"), 0o644)
+
 	statusPaths := status.Paths{
 		ManifestFile:     filepath.Join(dir, "build-manifest.json"),
 		AircraftJSONFile: filepath.Join(dir, "aircraft.json"),
@@ -139,12 +149,13 @@ func newTestServer(t *testing.T) (*httptest.Server, *Server) {
 		Status:       status.NewReader("test-sha", statusPaths, statusRunner),
 		Logs:         logs.NewStreamer(logsRunner),
 		Schema: schemacache.NewPrepopulated(
-			[]string{"LATITUDE", "LONGITUDE", "ALTITUDE", "GEO_CONFIGURED", "MLAT_USER", "MLAT_ENABLED", "MLAT_PRIVATE", "REPORT_STATUS", "REMOTE_CONFIG_ENABLED", "GAIN", "UAT_INPUT", "DUMP978_SDR_SERIAL", "DUMP978_GAIN"},
-			[]string{"LATITUDE", "LONGITUDE", "ALTITUDE", "GEO_CONFIGURED", "MLAT_USER", "MLAT_ENABLED", "MLAT_PRIVATE", "REPORT_STATUS", "REMOTE_CONFIG_ENABLED", "INPUT", "INPUT_TYPE", "GAIN", "UAT_INPUT", "DUMP978_SDR_SERIAL", "DUMP978_GAIN"},
+			[]string{"LATITUDE", "LONGITUDE", "ALTITUDE", "GEO_CONFIGURED", "MLAT_USER", "MLAT_ENABLED", "MLAT_PRIVATE", "REPORT_STATUS", "REMOTE_CONFIG_ENABLED", "GAIN", "READSB_SDR_SERIAL", "UAT_INPUT", "DUMP978_SDR_SERIAL", "DUMP978_GAIN"},
+			[]string{"LATITUDE", "LONGITUDE", "ALTITUDE", "GEO_CONFIGURED", "MLAT_USER", "MLAT_ENABLED", "MLAT_PRIVATE", "REPORT_STATUS", "REMOTE_CONFIG_ENABLED", "INPUT", "INPUT_TYPE", "GAIN", "READSB_SDR_SERIAL", "UAT_INPUT", "DUMP978_SDR_SERIAL", "DUMP978_GAIN"},
 		),
-		Runner:      captureRunner,
-		StdinRunner: captureStdinRunner,
-		Privileged:  priv,
+		Runner:       captureRunner,
+		StdinRunner:  captureStdinRunner,
+		Privileged:   priv,
+		SDRSysfsRoot: sdrRoot,
 	}
 	handler := New(deps)
 	ts := httptest.NewServer(handler)

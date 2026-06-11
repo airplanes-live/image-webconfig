@@ -1331,6 +1331,14 @@ input[aria-invalid="true"] {
   border-color: var(--wc-danger);
 }
 
+/* Inline field-level warning — advisory, does not block saving. */
+.wc-field-warn {
+  color: var(--wc-status-warn);
+  font-size: 0.8rem;
+  margin: 0.25rem 0 0;
+}
+.wc-field-warn[hidden] { display: none; }
+
 /* ========== Third-party aggregators ========== */
 
 .wc-agg-intro {
