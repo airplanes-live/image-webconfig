@@ -169,6 +169,10 @@ func TestWebsiteURL(t *testing.T) {
 		{"quoted", "APL_FEED_WEBSITE_URL=\"http://airplanes.test/\"\n", "http://airplanes.test/"},
 		{"empty value", "APL_FEED_WEBSITE_URL=\n", ""},
 		{"last wins", "APL_FEED_WEBSITE_URL=https://one.example\nAPL_FEED_WEBSITE_URL=https://two.example\n", "https://two.example"},
+		// apl-feed's awk matcher is line-start anchored; an indented line
+		// it ignores must be ignored here too, or the claim link would
+		// point at a backend the secret never registered with.
+		{"leading whitespace ignored", "  APL_FEED_WEBSITE_URL=https://dev.airplanes.live\n", ""},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

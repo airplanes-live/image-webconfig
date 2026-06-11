@@ -70,13 +70,41 @@ func (r *Reader) ReadAll() (map[string]string, error) {
 // caller falls back to the production default, matching apl-feed's
 // _resolve_website_url posture. Deliberately NOT part of ReadKeys: this
 // is an internal backend pointer, not a /api/config surface.
+//
+// Parsed line-start anchored (no leading whitespace), unlike read()'s
+// keyLine: apl-feed's awk matcher is /^APL_FEED_WEBSITE_URL=/, and an
+// indented line that webconfig honored but apl-feed ignored would link
+// the claim page to a backend the secret never registered with.
 func (r *Reader) WebsiteURL() string {
 	const key = "APL_FEED_WEBSITE_URL"
-	m, err := r.read([]string{key})
+	file, err := os.Open(r.Path)
 	if err != nil {
 		return ""
 	}
-	return m[key]
+	defer file.Close()
+
+	var out string
+	scanner := bufio.NewScanner(file)
+	scanner.Buffer(make([]byte, 4096), 64*1024)
+	for scanner.Scan() {
+		line := scanner.Text()
+		if !strings.HasPrefix(line, key+"=") {
+			continue
+		}
+		m := keyLine.FindStringSubmatch(line)
+		if m == nil {
+			continue
+		}
+		value := m[2]
+		if value == "" {
+			value = m[3] // unquoted
+		}
+		out = value // last occurrence wins, like read()
+	}
+	if err := scanner.Err(); err != nil {
+		return ""
+	}
+	return out
 }
 
 func (r *Reader) read(keys []string) (map[string]string, error) {
