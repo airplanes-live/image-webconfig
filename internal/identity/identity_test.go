@@ -17,7 +17,7 @@ func newTestPaths(t *testing.T) (Paths, string) {
 		FeederIDFile:     filepath.Join(dir, "feeder-id"),
 		ClaimSecretFile:  filepath.Join(dir, "feeder-claim-secret"),
 		ClaimVersionFile: filepath.Join(dir, "feeder-claim-secret.version"),
-		ClaimPageURL:     "https://airplanes.live/feeder/claim/",
+		FeedEnvFile:      filepath.Join(dir, "feed.env"), // absent unless a test writes it
 	}, dir
 }
 
@@ -192,7 +192,7 @@ func TestRead_StatErrorPropagates(t *testing.T) {
 		FeederIDFile:     filepath.Join(tmp, "feeder-id"),
 		ClaimSecretFile:  filepath.Join(parent, "feeder-claim-secret"),
 		ClaimVersionFile: filepath.Join(parent, "feeder-claim-secret.version"),
-		ClaimPageURL:     "https://airplanes.live/feeder/claim/",
+		FeedEnvFile:      filepath.Join(tmp, "feed.env"),
 	}
 	_ = os.WriteFile(p.FeederIDFile, []byte("abc-123\n"), 0o644)
 	r := NewReader(p)
@@ -434,15 +434,54 @@ func TestReveal_SecretMalformedRejected(t *testing.T) {
 	}
 }
 
-func TestNewReader_DefaultsClaimPageURLWhenEmpty(t *testing.T) {
+func TestNewReader_DefaultsFeedEnvFileWhenEmpty(t *testing.T) {
 	t.Parallel()
 	r := NewReader(Paths{
 		FeederIDFile:    "/tmp/_unused",
 		ClaimSecretFile: "/tmp/_unused",
-		// ClaimPageURL omitted on purpose.
+		// FeedEnvFile omitted on purpose.
 	})
-	if r.paths.ClaimPageURL != "https://airplanes.live/feeder/claim/" {
-		t.Errorf("ClaimPageURL = %q, want default", r.paths.ClaimPageURL)
+	if r.paths.FeedEnvFile != "/etc/airplanes/feed.env" {
+		t.Errorf("FeedEnvFile = %q, want default", r.paths.FeedEnvFile)
+	}
+}
+
+// The claim page must follow feed.env's APL_FEED_WEBSITE_URL — the backend
+// apl-feed registers the secret against — so an overridden feeder doesn't
+// link to a site that has never heard of it. Mirrors feed's claim.sh
+// claim_page_url derivation.
+func TestReveal_ClaimPageFollowsWebsiteURL(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name    string
+		feedEnv string // "" → no feed.env file written
+		want    string
+	}{
+		{"no feed.env", "", "https://airplanes.live/feeder/claim/"},
+		{"no key", "LATITUDE=1.0\n", "https://airplanes.live/feeder/claim/"},
+		{"override", "APL_FEED_WEBSITE_URL=https://dev.airplanes.live\n", "https://dev.airplanes.live/feeder/claim/"},
+		{"trailing slash", "APL_FEED_WEBSITE_URL=http://airplanes.test/\n", "http://airplanes.test/feeder/claim/"},
+		{"quoted", "APL_FEED_WEBSITE_URL=\"https://dev.airplanes.live\"\n", "https://dev.airplanes.live/feeder/claim/"},
+		{"empty value", "APL_FEED_WEBSITE_URL=\n", "https://airplanes.live/feeder/claim/"},
+		{"last wins", "APL_FEED_WEBSITE_URL=https://one.example\nAPL_FEED_WEBSITE_URL=https://two.example\n", "https://two.example/feeder/claim/"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			p, _ := newTestPaths(t)
+			_ = os.WriteFile(p.FeederIDFile, []byte("abc-123\n"), 0o644)
+			_ = os.WriteFile(p.ClaimSecretFile, []byte("ABCDEFGHIJKLMNOP\n"), 0o640)
+			if tc.feedEnv != "" {
+				_ = os.WriteFile(p.FeedEnvFile, []byte(tc.feedEnv), 0o644)
+			}
+			got, err := NewReader(p).Reveal()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got.ClaimPage != tc.want {
+				t.Errorf("ClaimPage = %q, want %q", got.ClaimPage, tc.want)
+			}
+		})
 	}
 }
 

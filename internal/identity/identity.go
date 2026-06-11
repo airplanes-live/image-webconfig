@@ -21,6 +21,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/airplanes-live/image-webconfig/internal/feedenv"
 )
 
 // Paths webconfig reads. Override per-test.
@@ -28,11 +30,11 @@ type Paths struct {
 	FeederIDFile     string // /etc/airplanes/feeder-id
 	ClaimSecretFile  string // /etc/airplanes/feeder-claim-secret
 	ClaimVersionFile string // /etc/airplanes/feeder-claim-secret.version
-	ClaimPageURL     string // https://airplanes.live/feeder/claim/
+	FeedEnvFile      string // /etc/airplanes/feed.env — APL_FEED_WEBSITE_URL drives the claim page link
 }
 
 const (
-	defaultClaimPageURL     = "https://airplanes.live/feeder/claim/"
+	defaultWebsiteURL       = "https://airplanes.live"
 	defaultClaimVersionFile = "/etc/airplanes/feeder-claim-secret.version"
 )
 
@@ -42,7 +44,7 @@ func DefaultPaths() Paths {
 		FeederIDFile:     "/etc/airplanes/feeder-id",
 		ClaimSecretFile:  "/etc/airplanes/feeder-claim-secret",
 		ClaimVersionFile: defaultClaimVersionFile,
-		ClaimPageURL:     defaultClaimPageURL,
+		FeedEnvFile:      feedenv.DefaultPath,
 	}
 }
 
@@ -52,17 +54,31 @@ type Reader struct {
 	paths Paths
 }
 
-// NewReader builds a Reader. Empty ClaimPageURL / ClaimVersionFile fall
+// NewReader builds a Reader. Empty FeedEnvFile / ClaimVersionFile fall
 // back to the production defaults so callers don't have to specify them
 // (and so test fixtures that don't care about those fields still work).
 func NewReader(p Paths) *Reader {
-	if p.ClaimPageURL == "" {
-		p.ClaimPageURL = defaultClaimPageURL
+	if p.FeedEnvFile == "" {
+		p.FeedEnvFile = feedenv.DefaultPath
 	}
 	if p.ClaimVersionFile == "" {
 		p.ClaimVersionFile = defaultClaimVersionFile
 	}
 	return &Reader{paths: p}
+}
+
+// claimPage builds the claim page URL from feed.env's APL_FEED_WEBSITE_URL —
+// the same backend pointer apl-feed registers the secret against — falling
+// back to production when unset. Mirrors feed's claim.sh claim_page_url so
+// the UI link and the CLI instructions point at the same site. Resolved per
+// call, not at construction: feed.env can change under a running webconfig.
+func (r *Reader) claimPage() string {
+	base := (&feedenv.Reader{Path: r.paths.FeedEnvFile}).WebsiteURL()
+	base = strings.TrimRight(base, "/")
+	if base == "" {
+		base = defaultWebsiteURL
+	}
+	return base + "/feeder/claim/"
 }
 
 // Identity is the GET /api/identity payload. All fields are always
@@ -218,7 +234,7 @@ func (r *Reader) Reveal() (IdentityWithSecret, error) {
 	return IdentityWithSecret{
 		FeederID:    feederID,
 		ClaimSecret: format4x4(canonical),
-		ClaimPage:   r.paths.ClaimPageURL,
+		ClaimPage:   r.claimPage(),
 	}, nil
 }
 

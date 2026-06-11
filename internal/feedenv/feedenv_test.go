@@ -156,3 +156,39 @@ func mapsEqual(a, b map[string]string) bool {
 	}
 	return true
 }
+
+func TestWebsiteURL(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name    string
+		content string
+		want    string
+	}{
+		{"absent key", "LATITUDE=1.0\n", ""},
+		{"plain", "APL_FEED_WEBSITE_URL=https://dev.airplanes.live\n", "https://dev.airplanes.live"},
+		{"quoted", "APL_FEED_WEBSITE_URL=\"http://airplanes.test/\"\n", "http://airplanes.test/"},
+		{"empty value", "APL_FEED_WEBSITE_URL=\n", ""},
+		{"last wins", "APL_FEED_WEBSITE_URL=https://one.example\nAPL_FEED_WEBSITE_URL=https://two.example\n", "https://two.example"},
+		// apl-feed's awk matcher is line-start anchored; an indented line
+		// it ignores must be ignored here too, or the claim link would
+		// point at a backend the secret never registered with.
+		{"leading whitespace ignored", "  APL_FEED_WEBSITE_URL=https://dev.airplanes.live\n", ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			r := &Reader{Path: writeEnv(t, tc.content)}
+			if got := r.WebsiteURL(); got != tc.want {
+				t.Errorf("WebsiteURL() = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestWebsiteURL_MissingFileIsEmpty(t *testing.T) {
+	t.Parallel()
+	r := &Reader{Path: filepath.Join(t.TempDir(), "nope.env")}
+	if got := r.WebsiteURL(); got != "" {
+		t.Errorf("WebsiteURL() = %q, want empty", got)
+	}
+}
