@@ -48,7 +48,7 @@ func claimStatusServer(t *testing.T, dir string, probe claimstatus.ProbeFunc) *h
 		FeederIDFile:     filepath.Join(dir, "feeder-id"),
 		ClaimSecretFile:  filepath.Join(dir, "feeder-claim-secret"),
 		ClaimVersionFile: filepath.Join(dir, "feeder-claim-secret.version"),
-		ClaimPageURL:     "https://airplanes.live/feeder/claim/",
+		FeedEnvFile:      filepath.Join(dir, "feed.env"),
 	}
 	_ = os.WriteFile(idp.FeederIDFile, []byte("test-feeder-id\n"), 0o644)
 	_ = os.WriteFile(idp.ClaimSecretFile, []byte("ABCDEFGHIJKLMNOP\n"), 0o640)

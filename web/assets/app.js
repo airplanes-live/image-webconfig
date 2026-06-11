@@ -456,11 +456,15 @@
 
     // ===== Safe claim URL =====
 
+    // safeClaimHref gates what may be rendered as a clickable href. The
+    // claim page follows feed.env's APL_FEED_WEBSITE_URL, so the value is
+    // config-derived data: require a plain web scheme so a javascript: or
+    // data: URL in feed.env can never become a live link. Anything else
+    // degrades to non-clickable text.
     function safeClaimHref(url) {
         try {
             const u = new URL(url);
-            if (u.protocol !== "https:") return null;
-            if (u.hostname !== "airplanes.live" && !u.hostname.endsWith(".airplanes.live")) return null;
+            if (u.protocol !== "https:" && u.protocol !== "http:") return null;
             return u.toString();
         } catch (_) { return null; }
     }

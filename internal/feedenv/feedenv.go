@@ -62,6 +62,24 @@ var ErrNotFound = errors.New("feedenv: feed.env not found")
 // ReadAll returns whitelisted keys mapped to their value. Keys absent from
 // feed.env are simply omitted from the returned map.
 func (r *Reader) ReadAll() (map[string]string, error) {
+	return r.read(ReadKeys)
+}
+
+// WebsiteURL returns APL_FEED_WEBSITE_URL from feed.env, or "" when the
+// file or the key is absent. Any read error also collapses to "" — the
+// caller falls back to the production default, matching apl-feed's
+// _resolve_website_url posture. Deliberately NOT part of ReadKeys: this
+// is an internal backend pointer, not a /api/config surface.
+func (r *Reader) WebsiteURL() string {
+	const key = "APL_FEED_WEBSITE_URL"
+	m, err := r.read([]string{key})
+	if err != nil {
+		return ""
+	}
+	return m[key]
+}
+
+func (r *Reader) read(keys []string) (map[string]string, error) {
 	file, err := os.Open(r.Path)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
@@ -71,12 +89,12 @@ func (r *Reader) ReadAll() (map[string]string, error) {
 	}
 	defer file.Close()
 
-	whitelist := make(map[string]struct{}, len(ReadKeys))
-	for _, k := range ReadKeys {
+	whitelist := make(map[string]struct{}, len(keys))
+	for _, k := range keys {
 		whitelist[k] = struct{}{}
 	}
 
-	out := make(map[string]string, len(ReadKeys))
+	out := make(map[string]string, len(keys))
 	scanner := bufio.NewScanner(file)
 	scanner.Buffer(make([]byte, 4096), 64*1024)
 	for scanner.Scan() {
