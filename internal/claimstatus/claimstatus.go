@@ -66,29 +66,36 @@ func isDefinitive(result string) bool { return definitiveResults[result] }
 // fields distinguish "absent" from a zero value so the API response can
 // omit them rather than assert false/0.
 type Output struct {
-	SchemaVersion      int     `json:"schema_version"`
-	Result             string  `json:"result"`
-	Registered         *bool   `json:"registered"`
-	OwnerPresent       *bool   `json:"owner_present"`
-	Version            *int    `json:"version"`
-	ResetUntil         *string `json:"reset_until"`
-	LastSeenAt         *string `json:"last_seen_at"`
-	LastSeenAgeSeconds *int    `json:"last_seen_age_seconds"`
-	RetryAfterSeconds  *int    `json:"retry_after_seconds"`
-	Detail             *string `json:"detail"`
+	SchemaVersion int    `json:"schema_version"`
+	Result        string `json:"result"`
+	Registered    *bool  `json:"registered"`
+	OwnerPresent  *bool  `json:"owner_present"`
+	Version       *int   `json:"version"`
+	// Claimable / ClaimUnavailableReason arrive with newer feed CLIs
+	// (and servers); nil means the field is unknown and the UI renders
+	// as before the pair existed.
+	Claimable              *bool   `json:"claimable"`
+	ClaimUnavailableReason *string `json:"claim_unavailable_reason"`
+	ResetUntil             *string `json:"reset_until"`
+	LastSeenAt             *string `json:"last_seen_at"`
+	LastSeenAgeSeconds     *int    `json:"last_seen_age_seconds"`
+	RetryAfterSeconds      *int    `json:"retry_after_seconds"`
+	Detail                 *string `json:"detail"`
 }
 
 // Response is the GET /api/claim/status body. It is the probe Output plus
 // freshness metadata the SPA renders ("checked N ago", stale banner).
 type Response struct {
-	Result             string  `json:"result"`
-	Registered         *bool   `json:"registered,omitempty"`
-	OwnerPresent       *bool   `json:"owner_present,omitempty"`
-	Version            *int    `json:"version,omitempty"`
-	ResetUntil         *string `json:"reset_until,omitempty"`
-	LastSeenAt         *string `json:"last_seen_at,omitempty"`
-	LastSeenAgeSeconds *int    `json:"last_seen_age_seconds,omitempty"`
-	RetryAfterSeconds  *int    `json:"retry_after_seconds,omitempty"`
+	Result                 string  `json:"result"`
+	Registered             *bool   `json:"registered,omitempty"`
+	OwnerPresent           *bool   `json:"owner_present,omitempty"`
+	Version                *int    `json:"version,omitempty"`
+	Claimable              *bool   `json:"claimable,omitempty"`
+	ClaimUnavailableReason *string `json:"claim_unavailable_reason,omitempty"`
+	ResetUntil             *string `json:"reset_until,omitempty"`
+	LastSeenAt             *string `json:"last_seen_at,omitempty"`
+	LastSeenAgeSeconds     *int    `json:"last_seen_age_seconds,omitempty"`
+	RetryAfterSeconds      *int    `json:"retry_after_seconds,omitempty"`
 	// CheckedAt is the RFC3339 UTC time of the probe that produced this
 	// verdict. For a stale fallback it is the time of the last good probe,
 	// not the failed refresh, so "checked N ago" stays truthful.
@@ -102,15 +109,17 @@ type Response struct {
 
 func responseFrom(o Output, at time.Time) Response {
 	return Response{
-		Result:             o.Result,
-		Registered:         o.Registered,
-		OwnerPresent:       o.OwnerPresent,
-		Version:            o.Version,
-		ResetUntil:         o.ResetUntil,
-		LastSeenAt:         o.LastSeenAt,
-		LastSeenAgeSeconds: o.LastSeenAgeSeconds,
-		RetryAfterSeconds:  o.RetryAfterSeconds,
-		CheckedAt:          at.UTC().Format(time.RFC3339),
+		Result:                 o.Result,
+		Registered:             o.Registered,
+		OwnerPresent:           o.OwnerPresent,
+		Version:                o.Version,
+		Claimable:              o.Claimable,
+		ClaimUnavailableReason: o.ClaimUnavailableReason,
+		ResetUntil:             o.ResetUntil,
+		LastSeenAt:             o.LastSeenAt,
+		LastSeenAgeSeconds:     o.LastSeenAgeSeconds,
+		RetryAfterSeconds:      o.RetryAfterSeconds,
+		CheckedAt:              at.UTC().Format(time.RFC3339),
 	}
 }
 

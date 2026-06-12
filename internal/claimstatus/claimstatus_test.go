@@ -42,6 +42,45 @@ func TestParseOutput(t *testing.T) {
 	}
 }
 
+func TestParseOutput_Claimability(t *testing.T) {
+	t.Run("claimable false with reason", func(t *testing.T) {
+		out, ok := parseOutput([]byte(`{"schema_version":1,"result":"unclaimed","claimable":false,"claim_unavailable_reason":"not_seen_feeding"}`))
+		if !ok {
+			t.Fatal("parse failed")
+		}
+		if out.Claimable == nil || *out.Claimable {
+			t.Errorf("claimable = %v, want false", out.Claimable)
+		}
+		if out.ClaimUnavailableReason == nil || *out.ClaimUnavailableReason != "not_seen_feeding" {
+			t.Errorf("reason = %v, want not_seen_feeding", out.ClaimUnavailableReason)
+		}
+	})
+	t.Run("claimable true", func(t *testing.T) {
+		out, ok := parseOutput([]byte(`{"schema_version":1,"result":"unclaimed","claimable":true,"claim_unavailable_reason":null}`))
+		if !ok {
+			t.Fatal("parse failed")
+		}
+		if out.Claimable == nil || !*out.Claimable {
+			t.Errorf("claimable = %v, want true", out.Claimable)
+		}
+		if out.ClaimUnavailableReason != nil {
+			t.Errorf("reason = %v, want nil", out.ClaimUnavailableReason)
+		}
+	})
+	t.Run("fields absent on older feed CLI", func(t *testing.T) {
+		out, ok := parseOutput([]byte(`{"schema_version":1,"result":"unclaimed"}`))
+		if !ok {
+			t.Fatal("parse failed")
+		}
+		if out.Claimable != nil {
+			t.Errorf("claimable = %v, want nil", out.Claimable)
+		}
+		if out.ClaimUnavailableReason != nil {
+			t.Errorf("reason = %v, want nil", out.ClaimUnavailableReason)
+		}
+	})
+}
+
 // --- Prober --------------------------------------------------------------
 
 func fakeRunner(stdout string, exit int, err error) wexec.CommandRunner {

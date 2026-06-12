@@ -491,6 +491,17 @@ func claimStatusFeed(state *State, argv []string) (wexec.Result, error) {
 		env["registered"] = true
 		env["owner_present"] = false
 		env["version"] = v
+		// Fake the server-side liveness gate: for 90s after a dev
+		// registration the feeder is "waiting for first data", then it
+		// becomes claimable — so both UI states are reachable locally.
+		registeredAt := state.ClaimRegisteredAt()
+		if !registeredAt.IsZero() && time.Since(registeredAt) < 90*time.Second {
+			env["claimable"] = false
+			env["claim_unavailable_reason"] = "not_seen_feeding"
+		} else {
+			env["claimable"] = true
+			env["claim_unavailable_reason"] = nil
+		}
 	}
 	b, _ := json.Marshal(env)
 	return wexec.Result{Stdout: b}, nil
