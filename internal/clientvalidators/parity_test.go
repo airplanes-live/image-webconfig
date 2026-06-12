@@ -185,6 +185,23 @@ func feedSpecs() []validatorSpec {
 			},
 		},
 		{
+			JSName: "isValidReadsbSdrSerial", BashName: "valid_readsb_sdr_serial", Source: sourceFeed,
+			Vectors: []vector{
+				vec("", true), // both accept empty (single-SDR default)
+				vec("1090", true),
+				// All-numeric serials are accepted — readsb's index-vs-serial
+				// ambiguity for small integers is a UI warning, not a
+				// validation rule.
+				vec("0", true),
+				vec("00000001", true),
+				vec("abc-def_123", true),
+				vec("abc!", false),
+				vec("has space", false),
+				vec(bigSerial, true),
+				vec(tooBigSerial, false),
+			},
+		},
+		{
 			JSName: "isValidDump978Serial", BashName: "valid_dump978_serial", Source: sourceFeed,
 			Vectors: []vector{
 				vec("", true), // both accept empty

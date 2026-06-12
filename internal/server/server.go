@@ -14,6 +14,7 @@ import (
 	"github.com/airplanes-live/image-webconfig/internal/identity"
 	"github.com/airplanes-live/image-webconfig/internal/logs"
 	"github.com/airplanes-live/image-webconfig/internal/schemacache"
+	"github.com/airplanes-live/image-webconfig/internal/sdr"
 	"github.com/airplanes-live/image-webconfig/internal/status"
 	webassets "github.com/airplanes-live/image-webconfig/web"
 )
@@ -50,6 +51,10 @@ type Server struct {
 	// the production capability check; tests override via
 	// Deps.OrchestratorCapable.
 	orchestratorCapableFunc func() bool
+	// sdrSysfsRoot is where GET /api/sdr enumerates RTL-SDR devices.
+	// Defaults to sdr.DefaultSysfsRoot; tests and the devserver inject a
+	// fake sysfs tree.
+	sdrSysfsRoot string
 	// assetsFS, when non-nil, overrides the embedded web/assets used for
 	// GET / and GET /static/*. Default (nil) keeps production behavior:
 	// assets are served from the binary's go:embed FS. cmd/devserver sets
@@ -216,6 +221,10 @@ type Deps struct {
 	// Tests inject a closure that flips the gate without touching the
 	// filesystem at well-known paths owned by airplanes-live/image.
 	OrchestratorCapable func() bool
+	// SDRSysfsRoot is the sysfs directory GET /api/sdr enumerates.
+	// Defaults to sdr.DefaultSysfsRoot; tests and cmd/devserver inject a
+	// fake tree.
+	SDRSysfsRoot string
 	// AssetsFS, when non-nil, overrides the embedded web/assets used for
 	// GET / and GET /static/*. Default (nil) keeps production behavior:
 	// assets are served from the binary's go:embed FS. cmd/devserver sets
@@ -249,6 +258,10 @@ func New(d Deps) http.Handler {
 	if orchestratorCapable == nil {
 		orchestratorCapable = defaultOrchestratorCapable
 	}
+	sdrSysfsRoot := d.SDRSysfsRoot
+	if sdrSysfsRoot == "" {
+		sdrSysfsRoot = sdr.DefaultSysfsRoot
+	}
 	s := &Server{
 		version:                 d.Version,
 		store:                   d.Store,
@@ -269,6 +282,7 @@ func New(d Deps) http.Handler {
 		upgradeStatePath:        upgradeStatePath,
 		orchestratorStatePath:   orchestratorStatePath,
 		orchestratorCapableFunc: orchestratorCapable,
+		sdrSysfsRoot:            sdrSysfsRoot,
 		assetsFS:                d.AssetsFS,
 	}
 
@@ -289,6 +303,7 @@ func New(d Deps) http.Handler {
 	mux.HandleFunc("POST /api/identity/export", s.requireSession(s.handleIdentityExport))
 	mux.HandleFunc("POST /api/identity/import", s.requireSession(s.handleIdentityImport))
 	mux.HandleFunc("GET /api/config", s.requireSession(s.handleConfigGet))
+	mux.HandleFunc("GET /api/sdr", s.requireSession(s.handleSDRList))
 	mux.HandleFunc("GET /api/status", s.requireSession(s.handleStatus))
 	mux.HandleFunc("GET /api/status/upgrade", s.requireSession(s.handleUpgradeStatus))
 	mux.HandleFunc("GET /api/log/{unit}", s.requireSession(s.handleLog))

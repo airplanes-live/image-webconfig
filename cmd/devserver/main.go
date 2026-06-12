@@ -84,7 +84,7 @@ func main() {
 		"LATITUDE", "LONGITUDE", "ALTITUDE", "GEO_CONFIGURED",
 		"MLAT_USER", "MLAT_ENABLED", "MLAT_PRIVATE",
 		"REPORT_STATUS", "REMOTE_CONFIG_ENABLED",
-		"GAIN", "UAT_INPUT", "DUMP978_SDR_SERIAL", "DUMP978_GAIN",
+		"GAIN", "READSB_SDR_SERIAL", "UAT_INPUT", "DUMP978_SDR_SERIAL", "DUMP978_GAIN",
 	}
 	readable := append(append([]string{}, writable...), "INPUT", "INPUT_TYPE")
 	schema := schemacache.NewPrepopulated(writable, readable)
@@ -138,6 +138,7 @@ func main() {
 		StdinRunner:      devfakes.StdinRunner(state, priv),
 		Privileged:       priv,
 		UpgradeStatePath: state.Paths.UpgradeState,
+		SDRSysfsRoot:     devfakes.SeedSDRSysfs(resolvedState),
 		AssetsFS:         assetsFS,
 	})
 

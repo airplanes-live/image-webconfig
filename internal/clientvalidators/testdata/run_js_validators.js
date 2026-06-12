@@ -60,6 +60,7 @@ const exportedNames = [
     "altitudeToBareMetres",
     "isValidMlatUser",
     "isValidGain",
+    "isValidReadsbSdrSerial",
     "isValidDump978Serial",
     "isValidDump978Gain",
     "isValidWifiSSID",

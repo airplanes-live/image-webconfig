@@ -684,13 +684,21 @@
         return Number.isFinite(n) && n >= 0 && n <= 60;
     }
 
+    // isValidReadsbSdrSerial mirrors valid_readsb_sdr_serial. Empty is
+    // valid (single-SDR default: readsb opens the first stick, no --device).
+    const sdrSerialRE = /^[0-9A-Za-z_-]{1,32}$/;
+    function isValidReadsbSdrSerial(v) {
+        const s = (v == null ? "" : String(v)).trim();
+        if (s === "") return true;
+        return sdrSerialRE.test(s);
+    }
+
     // isValidDump978Serial mirrors valid_dump978_serial. Empty is valid
     // (treated as "no SDR serial selected").
-    const dump978SerialRE = /^[0-9A-Za-z_-]{1,32}$/;
     function isValidDump978Serial(v) {
         const s = (v == null ? "" : String(v)).trim();
         if (s === "") return true;
-        return dump978SerialRE.test(s);
+        return sdrSerialRE.test(s);
     }
 
     // isValidDump978Gain mirrors valid_dump978_gain. dump978-fa rejects
@@ -2513,6 +2521,162 @@
             },
         });
 
+        // ===== 1090 SDR serial =====
+        // Pins readsb to a specific RTL-SDR by EEPROM serial so dual-SDR
+        // feeders survive USB re-enumeration. Detected devices come from
+        // GET /api/sdr (best-effort: enumeration failure degrades to the
+        // custom free-text path, never blocks saving).
+        const sdrG = buildGroup("1090 SDR");
+        const SDR_CUSTOM = "__custom__";
+        const sdr1090Id = fieldId("READSB_SDR_SERIAL");
+        const sdr1090Select = el("select", { id: sdr1090Id, name: "READSB_SDR_SERIAL" });
+        const sdr1090Custom = el("input", {
+            type: "text", placeholder: "serial",
+            "aria-label": "Custom 1090 SDR serial",
+        });
+        const sdr1090CustomField = el("div", { class: "field" }, sdr1090Custom);
+        // sdrDevices is shared with the 978 serial datalist below.
+        let sdrDevices = [];
+
+        sdrG.body.appendChild(el("p", { class: "help" },
+            "With two SDRs (1090 + 978), USB enumeration order can change ",
+            "across reboots and readsb may open the wrong stick. Pinning by ",
+            "serial makes the assignment deterministic. Leave on automatic ",
+            "for a single SDR.",
+        ));
+
+        const sdr1090Error = el("p", {
+            class: "field-help wc-field-error", hidden: true, role: "alert",
+        }, "Letters, digits, underscore, hyphen — up to 32 characters.");
+        const sdr1090Warn = el("p", {
+            class: "field-help wc-field-warn", hidden: true,
+        });
+
+        // The currently-effective serial: the select's value, or the
+        // custom text input when "Custom serial…" is chosen.
+        const sdr1090Value = () =>
+            sdr1090Select.value === SDR_CUSTOM ? sdr1090Custom.value : sdr1090Select.value;
+
+        // rebuildSdr1090Options repopulates the select from the saved value
+        // plus the detected-device list: Automatic (empty), each detected
+        // serial, the saved value as "(not detected)" when absent, and the
+        // custom escape hatch. Detected serials that fail the charset rule
+        // are listed disabled — offering them would build an unsaveable form.
+        function rebuildSdr1090Options() {
+            const saved = (configState.savedValues.READSB_SDR_SERIAL || "").trim();
+            // Preserve the user's in-progress choice across a rebuild (the
+            // /api/sdr fetch can resolve mid-edit): keep the OPTION value —
+            // custom mode survives as custom mode, the typed text stays in
+            // the untouched custom input.
+            const keep = sdr1090Select.value;
+            sdr1090Select.textContent = "";
+            sdr1090Select.appendChild(el("option", { value: "" }, "Automatic (single SDR)"));
+            const seen = new Set();
+            for (const d of sdrDevices) {
+                if (seen.has(d.serial)) continue;
+                seen.add(d.serial);
+                let label = d.serial;
+                if (d.product) label += " — " + d.product;
+                if (d.duplicate) label += " (duplicate serial)";
+                const opts = { value: d.serial };
+                // Raw charset test, not the (trimming) validator: a
+                // whitespace-padded EEPROM serial must be offered disabled
+                // verbatim, never silently trimmed into a value that no
+                // longer matches the device.
+                if (!sdrSerialRE.test(d.serial)) {
+                    opts.disabled = true;
+                    label += " — unsupported serial, reflash with rtl_eeprom";
+                }
+                sdr1090Select.appendChild(el("option", opts, label));
+            }
+            if (saved !== "" && !seen.has(saved)) {
+                sdr1090Select.appendChild(el("option", { value: saved }, saved + " (not detected)"));
+            }
+            sdr1090Select.appendChild(el("option", { value: SDR_CUSTOM }, "Custom serial…"));
+            // Restore the previous selection if it still exists; fall back
+            // to the saved value (always present via the branches above).
+            const values = Array.from(sdr1090Select.options).map((o) => o.value);
+            sdr1090Select.value = values.includes(keep) ? keep : saved;
+            refreshSdr1090Editor();
+        }
+
+        // refreshSdr1090Editor recomputes custom-input visibility, the
+        // error line, and the advisory warning line.
+        function refreshSdr1090Editor() {
+            sdr1090CustomField.hidden = sdr1090Select.value !== SDR_CUSTOM;
+            const v = (sdr1090Value() || "").trim();
+            const invalid = v !== "" && !isValidReadsbSdrSerial(v);
+            sdr1090Error.hidden = !invalid;
+            sdr1090Warn.hidden = true;
+            if (invalid) return;
+            const warnings = [];
+            if (sdrDevices.some((d) => d.duplicate)) {
+                warnings.push("Two or more sticks share a serial — pinning by a duplicated serial is unreliable. Assign unique serials with rtl_eeprom.");
+            }
+            if (v === "" && sdrDevices.length >= 2) {
+                warnings.push("Multiple SDRs detected but 1090 is not pinned — after a reboot readsb may grab the wrong stick.");
+            }
+            const uat978 = (configState.savedValues.UAT_INPUT || "") !== ""
+                ? (configState.savedValues.DUMP978_SDR_SERIAL || "978").trim() : "";
+            if (v !== "" && uat978 !== "" && v === uat978) {
+                warnings.push("This is also the 978 SDR serial — both decoders would fight over one stick.");
+            }
+            // readsb's device search treats a fully-numeric string below the
+            // device count as an index, not a serial (strtol base 0, so
+            // "00000001" parses as 1). Warn — pinning by such a serial does
+            // not do what it looks like.
+            const n = Number(v);
+            if (v !== "" && Number.isInteger(n) && n >= 0 && n < sdrDevices.length) {
+                warnings.push("readsb interprets \"" + v + "\" as a device index, not a serial. Use a longer serial (rtl_eeprom) for a reliable pin.");
+            }
+            if (warnings.length > 0) {
+                sdr1090Warn.textContent = warnings.join(" ");
+                sdr1090Warn.hidden = false;
+            }
+        }
+        sdr1090Select.addEventListener("change", refreshSdr1090Editor);
+        sdr1090Custom.addEventListener("input", refreshSdr1090Editor);
+
+        const sdr1090Editor = el("div", {},
+            sdr1090Select,
+            sdr1090CustomField,
+            sdr1090Error,
+            sdr1090Warn,
+        );
+        const sdr1090Edit = buildEditableField({
+            summarise: () => (configState.savedValues.READSB_SDR_SERIAL || "").trim() || "automatic",
+            inputsWrapper: sdr1090Editor,
+            resetInputs: () => {
+                sdr1090Custom.value = "";
+                rebuildSdr1090Options();
+            },
+            focusInput: sdr1090Select,
+            footerEl: sdrG.footer,
+            afterCancel: () => { sdrGroup.recheck(); },
+        });
+        sdrG.body.appendChild(el("div", { class: "field" },
+            el("label", { for: sdr1090Id }, "1090 SDR serial"),
+            sdr1090Edit.summaryEl,
+            sdr1090Editor,
+        ));
+        const sdrGroup = mountGroup({
+            name: "sdr1090",
+            formEl: sdrG.form,
+            footerEl: sdrG.footer,
+            keys: ["READSB_SDR_SERIAL"],
+            readInputs: () => ({ READSB_SDR_SERIAL: sdr1090Value() }),
+            isValid: () => isValidReadsbSdrSerial(sdr1090Value()),
+            payload: () => ({ READSB_SDR_SERIAL: sdr1090Value().trim() }),
+            onSavedHook: () => {
+                sdr1090Custom.value = "";
+                rebuildSdr1090Options();
+                sdr1090Edit.refreshSummary();
+                sdr1090Edit.setEditing(false);
+                sdrGroup.recheck();
+            },
+        });
+        rebuildSdr1090Options();
+
         // ===== 978 UAT =====
         const uatG = buildGroup("978 UAT");
         const uatId = fieldId("UAT_INPUT");
@@ -2533,6 +2697,12 @@
             value: configState.savedValues.DUMP978_GAIN || "42.1",
             placeholder: "42.1", inputmode: "decimal",
         });
+
+        // Detected-serial suggestions for the 978 field — same /api/sdr
+        // data as the 1090 picker; the field stays free-text.
+        const sdr978ListId = fieldId("DUMP978_SDR_SERIAL_LIST");
+        const sdr978Datalist = el("datalist", { id: sdr978ListId });
+        sdrSerialInput.setAttribute("list", sdr978ListId);
 
         const sdrSerialError = el("p", {
             class: "field-help wc-field-error", hidden: true, role: "alert",
@@ -2560,6 +2730,7 @@
             el("div", { class: "field" },
                 el("label", { for: sdrSerialId }, "978 SDR serial"),
                 sdrSerialInput,
+                sdr978Datalist,
                 sdrSerialError,
             ),
             el("div", { class: "field" },
@@ -2651,13 +2822,39 @@
                 uatEdit.refreshSummary();
                 uatEdit.setEditing(false);
                 uatGroup.recheck();
+                // The 1090 group's same-stick warning compares against the
+                // 978 serial just saved — recompute it so an open 1090
+                // editor doesn't show a stale verdict.
+                refreshSdr1090Editor();
             },
         });
 
         // Assemble
         parent.appendChild(mlatG.fieldset);
         parent.appendChild(gainG.fieldset);
+        parent.appendChild(sdrG.fieldset);
         parent.appendChild(uatG.fieldset);
+
+        // Best-effort SDR enumeration: populate the 1090 picker and the
+        // 978 datalist once the device list arrives. Any failure leaves
+        // the base options (automatic / saved / custom) in place — the
+        // form never depends on this endpoint.
+        getJSON("/api/sdr").then((r) => {
+            if (!r.ok || !Array.isArray(r.payload.devices)) return;
+            sdrDevices = r.payload.devices.filter(
+                (d) => d && typeof d.serial === "string" && d.serial !== "");
+            rebuildSdr1090Options();
+            sdr978Datalist.textContent = "";
+            const seen = new Set();
+            for (const d of sdrDevices) {
+                if (seen.has(d.serial)) continue;
+                seen.add(d.serial);
+                // Don't suggest serials the validator would reject — a
+                // selectable suggestion must never make the field unsaveable.
+                if (!sdrSerialRE.test(d.serial)) continue;
+                sdr978Datalist.appendChild(el("option", { value: d.serial }));
+            }
+        });
     }
 
     // ===== Privacy & remote management tile =====
