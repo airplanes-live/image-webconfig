@@ -219,7 +219,7 @@ func (s *Server) aggregatorMutate(w http.ResponseWriter, r *http.Request, argv [
 		return
 	}
 	if injectGeo {
-		body, err = s.injectFeedEnvGeo(body)
+		body, err = s.injectFeedEnvGeo(r.Context(), body)
 		if err != nil {
 			writeJSONError(w, http.StatusBadRequest, err.Error())
 			return
@@ -242,14 +242,14 @@ func (s *Server) aggregatorMutate(w http.ResponseWriter, r *http.Request, argv [
 // anything malformed is dropped — the helper's geo validation then rejects with
 // guidance rather than acting on a bad coordinate. The helper range-validates
 // whatever it receives. ALTITUDE in feed.env is already bare metres.
-func (s *Server) injectFeedEnvGeo(body []byte) ([]byte, error) {
+func (s *Server) injectFeedEnvGeo(ctx context.Context, body []byte) ([]byte, error) {
 	m := map[string]json.RawMessage{}
 	if err := json.Unmarshal(body, &m); err != nil || m == nil {
 		return nil, errors.New("request body must be a JSON object")
 	}
 	var values map[string]string
 	if s.feedEnv != nil {
-		values, _ = s.feedEnv.ReadAll() // absent/unreadable → inject nothing, helper rejects on missing geo
+		values, _ = s.feedEnv.ReadAll(ctx) // absent/unreadable → inject nothing, helper rejects on missing geo
 	}
 	for envKey, field := range map[string]string{"LATITUDE": "lat", "LONGITUDE": "lon", "ALTITUDE": "alt"} {
 		// A client-supplied finite numeric coordinate wins, so the user can send

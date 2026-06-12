@@ -11,10 +11,11 @@
 // production sudoers / argv contract is enforced by separate parity
 // tests that don't run against these fakes.
 //
-// State ownership: every fake reads from the same *State and writes
-// through to backing temp files via atomic temp+rename so the real
-// production readers (feedenv.Reader, status.Reader, identity.Reader,
-// runtimestate.Read) see a coherent on-disk view. The fakes are only
+// State ownership: every fake reads from the same *State. File-backed
+// production readers (status.Reader, identity.Reader, runtimestate.Read)
+// see a coherent on-disk view via atomic temp+rename writes; exec-backed
+// readers (feedenv.Reader through the fake `apl-feed config show`) read
+// the same in-memory map the fake apply mutates. The fakes are only
 // the *subprocess* layer; the rest of the server stays on the
 // production code path.
 package devfakes
@@ -40,7 +41,6 @@ import (
 // `rm -rf <state-dir>`.
 type Paths struct {
 	StateDir       string
-	FeedEnv        string
 	FeederID       string
 	ClaimSecret    string
 	PasswordHash   string
@@ -64,7 +64,6 @@ type Paths struct {
 func DefaultPaths(dir string) Paths {
 	return Paths{
 		StateDir:          dir,
-		FeedEnv:           filepath.Join(dir, "feed.env"),
 		FeederID:          filepath.Join(dir, "feeder-id"),
 		ClaimSecret:       filepath.Join(dir, "feeder-claim-secret"),
 		PasswordHash:      filepath.Join(dir, "password.hash"),
@@ -402,9 +401,6 @@ func aggregatorUnit(id string) string { return "airplanes-aggregator@" + id + ".
 func (s *State) SyncAll() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if err := s.syncFeedEnvLocked(); err != nil {
-		return err
-	}
 	if err := s.syncIdentityLocked(); err != nil {
 		return err
 	}
@@ -479,9 +475,6 @@ func (s *State) ApplyFeedEnv(updates map[string]string) ([]string, error) {
 		}
 	}
 	sort.Strings(changed)
-	if err := s.syncFeedEnvLocked(); err != nil {
-		return nil, err
-	}
 	// MLAT/UAT decisions depend on lat/lon and on UAT_INPUT — keep the
 	// runtime state files in sync so the dashboard tile flips as the
 	// operator edits config.
@@ -798,34 +791,6 @@ func writeAtomic(path string, data []byte, mode os.FileMode) error {
 		return fmt.Errorf("devfakes: rename: %w", err)
 	}
 	return nil
-}
-
-func (s *State) syncFeedEnvLocked() error {
-	keys := make([]string, 0, len(s.feedEnv))
-	for k := range s.feedEnv {
-		keys = append(keys, k)
-	}
-	sort.Strings(keys)
-	var b strings.Builder
-	for _, k := range keys {
-		// feed.env is bash-sourced in production; values without
-		// shell-meaningful chars don't need quoting. The dev seed
-		// values are all simple — wrapped in double quotes for
-		// the few that contain spaces (none today, but cheap).
-		v := s.feedEnv[k]
-		if strings.ContainsAny(v, " \t\"'$`\\") {
-			b.WriteString(k)
-			b.WriteString("=\"")
-			b.WriteString(strings.ReplaceAll(v, "\"", "\\\""))
-			b.WriteString("\"\n")
-			continue
-		}
-		b.WriteString(k)
-		b.WriteByte('=')
-		b.WriteString(v)
-		b.WriteByte('\n')
-	}
-	return writeAtomic(s.Paths.FeedEnv, []byte(b.String()), 0o644)
 }
 
 func (s *State) syncIdentityLocked() error {

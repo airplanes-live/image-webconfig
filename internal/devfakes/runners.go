@@ -71,6 +71,7 @@ func StubPrivilegedArgv() server.PrivilegedArgv {
 	return server.PrivilegedArgv{
 		ApplyFeed:         []string{"dev-stub", "apl-feed", "apply"},
 		SchemaFeed:        []string{"dev-stub", "apl-feed", "schema"},
+		ConfigShowFeed:    []string{"dev-stub", "apl-feed", "config", "show"},
 		Reboot:            []string{"dev-stub", "systemctl", "reboot"},
 		Poweroff:          []string{"dev-stub", "systemctl", "poweroff"},
 		StartOrchestrator: []string{"dev-stub", "systemd-run", "airplanes-update-orchestrator"},
@@ -204,6 +205,10 @@ func dispatchStub(state *State, priv server.PrivilegedArgv, argv []string, body 
 			return applyFeed(state, body)
 		case "schema":
 			return schemaFeed(state)
+		case "config":
+			if len(argv) >= 4 && argv[3] == "show" {
+				return configShowFeed(state)
+			}
 		case "claim":
 			return claimStatusFeed(state, argv)
 		}
@@ -442,22 +447,53 @@ func identityImport(state *State, body []byte) (wexec.Result, error) {
 	return wexec.Result{Stdout: []byte("Restored feeder config for Feeder ID " + env.FeederUUID + "\n")}, nil
 }
 
-func schemaFeed(state *State) (wexec.Result, error) {
+// SchemaWritableKeys / SchemaReadableKeys mirror feed's
+// scripts/lib/feed-env-keys.sh registry. One definition shared by the
+// fake schema endpoint, the fake config-show endpoint, and the
+// devserver's prepopulated schema cache, so the simulated key universe
+// cannot drift between them.
+var SchemaWritableKeys = []string{
+	"LATITUDE", "LONGITUDE", "ALTITUDE", "GEO_CONFIGURED",
+	"MLAT_USER", "MLAT_ENABLED", "MLAT_PRIVATE",
+	"REPORT_STATUS", "REMOTE_CONFIG_ENABLED",
+	"GAIN", "READSB_SDR_SERIAL", "UAT_INPUT", "DUMP978_SDR_SERIAL", "DUMP978_GAIN",
+}
+
+// SchemaReadableKeys is the writable set plus the read-only daemon
+// inputs (INPUT, INPUT_TYPE).
+var SchemaReadableKeys = append(append([]string{}, SchemaWritableKeys...), "INPUT", "INPUT_TYPE")
+
+func schemaFeed(_ *State) (wexec.Result, error) {
 	// Not called by the running server (schemacache.NewPrepopulated
-	// skips this), but emit a valid envelope for symmetry. Mirrors
-	// internal/configspec/configspec.go AllReadKeys + the writable set
-	// the schemacache tests use.
-	writable := []string{
-		"LATITUDE", "LONGITUDE", "ALTITUDE", "GEO_CONFIGURED",
-		"MLAT_USER", "MLAT_ENABLED", "MLAT_PRIVATE",
-		"REPORT_STATUS", "REMOTE_CONFIG_ENABLED",
-		"GAIN", "UAT_INPUT", "DUMP978_SDR_SERIAL", "DUMP978_GAIN",
-	}
-	readable := append(append([]string{}, writable...), "INPUT", "INPUT_TYPE")
+	// skips this), but emit a valid envelope for symmetry.
 	env := map[string]any{
 		"version":       1,
-		"writable_keys": writable,
-		"readable_keys": readable,
+		"writable_keys": SchemaWritableKeys,
+		"readable_keys": SchemaReadableKeys,
+	}
+	b, _ := json.Marshal(env)
+	return wexec.Result{Stdout: b}, nil
+}
+
+// configShowFeed fakes `apl-feed config show --json`: one entry per
+// readable key, plus the readable-only APL_FEED_WEBSITE_URL — string
+// when the key is present in the simulated feed.env (including the
+// explicitly-empty ""), null when absent. Built from the same
+// state.feedEnv map the fake apply mutates, so a config read after a
+// save can never observe stale values.
+func configShowFeed(state *State) (wexec.Result, error) {
+	snapshot := state.FeedEnvSnapshot()
+	values := make(map[string]any, len(SchemaReadableKeys)+1)
+	for _, k := range append(append([]string{}, SchemaReadableKeys...), "APL_FEED_WEBSITE_URL") {
+		if v, ok := snapshot[k]; ok {
+			values[k] = v
+		} else {
+			values[k] = nil
+		}
+	}
+	env := map[string]any{
+		"schema_version": 1,
+		"values":         values,
 	}
 	b, _ := json.Marshal(env)
 	return wexec.Result{Stdout: b}, nil

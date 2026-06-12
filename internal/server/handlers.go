@@ -325,8 +325,8 @@ func (s *Server) handleIdentity(w http.ResponseWriter, _ *http.Request) {
 // /api/identity/secret (POST): full claim secret reveal. POST so it can't
 // be cached or logged in browser history; Cache-Control: no-store via
 // writeJSON.
-func (s *Server) handleIdentitySecret(w http.ResponseWriter, _ *http.Request) {
-	got, err := s.identity.Reveal()
+func (s *Server) handleIdentitySecret(w http.ResponseWriter, r *http.Request) {
+	got, err := s.identity.Reveal(r.Context())
 	if err != nil {
 		if errors.Is(err, identity.ErrNoClaimSecret) {
 			writeJSONError(w, http.StatusNotFound, "no claim secret yet — register first")
@@ -483,19 +483,19 @@ func isCanonicalClaimSecret(s string) bool {
 	return count == 16
 }
 
-// /api/config (GET): feed.env values filtered against the schema-cached
-// readable_keys set. Returns 503 when the schema cache is unavailable
-// (boot-time apl-feed schema --json fetch failed and no SIGHUP has
-// since refreshed it).
-func (s *Server) handleConfigGet(w http.ResponseWriter, _ *http.Request) {
+// /api/config (GET): config values read via `apl-feed config show`,
+// filtered against the schema-cached readable_keys set. Returns 503
+// when the schema cache is unavailable (boot-time apl-feed schema
+// --json fetch failed and no SIGHUP has since refreshed it).
+func (s *Server) handleConfigGet(w http.ResponseWriter, r *http.Request) {
 	if s.schema == nil || s.schema.Degraded() {
 		writeJSONError(w, http.StatusServiceUnavailable, "schema unavailable; retry after the next feed update")
 		return
 	}
-	values, err := s.feedEnv.ReadAll()
+	values, err := s.feedEnv.ReadAll(r.Context())
 	if err != nil {
 		log.Printf("feedenv read: %v", err)
-		writeJSONError(w, http.StatusInternalServerError, "feed.env read failed")
+		writeJSONError(w, http.StatusInternalServerError, "config read failed")
 		return
 	}
 	filtered := make(map[string]string, len(values))
@@ -650,11 +650,13 @@ func (s *Server) applyConfigLocked(ctx context.Context, updates map[string]strin
 	// pre-DEV-383 behavior. We must NOT treat the read failure as bootstrap;
 	// that would attach metadata to every tracked key the form posts,
 	// including unchanged ones, and stamp fresh edited_at tuples across the
-	// sidecar on every save.
-	current, readErr := s.feedEnv.ReadAll()
+	// sidecar on every save. An absent feed.env is NOT an error: config
+	// show reports every key null, ReadAll returns an empty map, and the
+	// first save correctly stamps bootstrap metadata.
+	current, readErr := s.feedEnv.ReadAll(ctx)
 	var payload map[string]any
 	if readErr != nil {
-		log.Printf("config-post: feed.env pre-read for metadata gating failed; falling back to bare-string payload: %v", readErr)
+		log.Printf("config-post: config pre-read for metadata gating failed; falling back to bare-string payload: %v", readErr)
 		payload = feedmeta.BareStringPayload(updates)
 	} else {
 		payload = feedmeta.BuildApplyPayload(current, updates, s.now())
