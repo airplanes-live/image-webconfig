@@ -509,6 +509,14 @@ func TestOrchestratorRunning_StatusAware(t *testing.T) {
 		{"unknown-step-failed", `{"step":"flash-capacitor","status":"failed"}`, false},
 		{"unknown-step-ok", `{"step":"flash-capacitor","status":"ok"}`, true},
 		{"done-ok", `{"step":"done","status":"ok"}`, false},
+		// The entry write. Deliberately terminal even though status says
+		// running: idle/running is a millisecond-lived marker (the
+		// orchestrator flocks before any write, then moves straight to
+		// apt), so a persisted one means a crash before the first real
+		// step. Treating it as running would 409 the retry until reboot;
+		// the redundant-start window it leaves open is closed by the
+		// maintenance-unit guard and systemd-run's unit-name collision.
+		{"idle-running-entry-write", `{"step":"idle","status":"running"}`, false},
 	}
 	for _, tc := range cases {
 		tc := tc
