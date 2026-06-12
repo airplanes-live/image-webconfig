@@ -247,6 +247,12 @@ func dispatchStub(state *State, priv server.PrivilegedArgv, argv []string, body 
 		time.AfterFunc(5*time.Second, func() {
 			state.SetServiceState(unit, "inactive")
 		})
+		// The orchestrator transient also gets a simulated state-file
+		// progression so the SPA's progress view has something real to
+		// poll (GET /api/orchestrator/state reads the backing file).
+		if unit == "airplanes-update-orchestrator.service" {
+			state.StartOrchestratorRun(0)
+		}
 		return wexec.Result{}, nil
 	}
 	log.Printf("devfakes: unhandled stub argv %v", argv)

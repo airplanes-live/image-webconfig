@@ -212,14 +212,26 @@ func TestOrchestratorStart_AlreadyRunningReturns409(t *testing.T) {
 // until something else clobbers it; the next start has to be allowed.
 func TestOrchestratorStart_TerminalStateAllowsRestart(t *testing.T) {
 	t.Parallel()
-	for _, step := range []string{"done", "failed", "idle"} {
-		step := step
-		t.Run(step, func(t *testing.T) {
+	cases := []struct {
+		name    string
+		payload string
+	}{
+		{"done", `{"step":"done","status":"ok"}`},
+		{"failed", `{"step":"failed","status":"ok"}`},
+		{"idle", `{"step":"idle","status":"ok"}`},
+		// Real failed-run terminal writes: status carries the failure,
+		// step keeps the failing step's name. A failed update must be
+		// retryable without a reboot.
+		{"apt-failed", `{"step":"apt","status":"failed","error":"step exited with code 100"}`},
+		{"runtime-failed", `{"step":"runtime","status":"failed","error":"runtime self-update exited non-zero"}`},
+	}
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 			dir := t.TempDir()
 			path := filepath.Join(dir, "orchestrator.state")
-			payload := `{"step":"` + step + `","status":"ok"}`
-			if err := os.WriteFile(path, []byte(payload), 0o644); err != nil {
+			if err := os.WriteFile(path, []byte(tc.payload), 0o644); err != nil {
 				t.Fatal(err)
 			}
 			h := newWriteHarness(t,
@@ -471,6 +483,48 @@ func TestOrchestratorRunning_NonTerminalSteps(t *testing.T) {
 			}
 			if got != tc.running {
 				t.Fatalf("orchestratorRunning(%q) = %v, want %v", tc.step, got, tc.running)
+			}
+		})
+	}
+}
+
+// TestOrchestratorRunning_StatusAware pins down the terminal model
+// against the orchestrator's real envelope: failure is status "failed"
+// with `step` keeping the failing step's name — only that status is
+// terminal. Intermediate statuses ("ok" after a step finishes,
+// "skipped") must stay running, or a slow runtime step after apt/ok
+// would let a second orchestrator start mid-run.
+func TestOrchestratorRunning_StatusAware(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name    string
+		payload string
+		running bool
+	}{
+		{"apt-running", `{"step":"apt","status":"running"}`, true},
+		{"apt-ok-intermediate", `{"step":"apt","status":"ok"}`, true},
+		{"runtime-skipped-intermediate", `{"step":"runtime","status":"skipped"}`, true},
+		{"apt-failed", `{"step":"apt","status":"failed","error":"step exited with code 100"}`, false},
+		{"runtime-failed", `{"step":"runtime","status":"failed","error":"runtime self-update exited non-zero"}`, false},
+		{"unknown-step-failed", `{"step":"flash-capacitor","status":"failed"}`, false},
+		{"unknown-step-ok", `{"step":"flash-capacitor","status":"ok"}`, true},
+		{"done-ok", `{"step":"done","status":"ok"}`, false},
+	}
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			dir := t.TempDir()
+			path := filepath.Join(dir, "orchestrator.state")
+			if err := os.WriteFile(path, []byte(tc.payload), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			got, err := orchestratorRunning(path)
+			if err != nil {
+				t.Fatalf("unexpected err: %v", err)
+			}
+			if got != tc.running {
+				t.Fatalf("orchestratorRunning(%s) = %v, want %v", tc.payload, got, tc.running)
 			}
 		})
 	}
