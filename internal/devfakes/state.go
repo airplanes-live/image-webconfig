@@ -550,6 +550,20 @@ func (s *State) ClaimRegisteredAt() time.Time {
 	return s.claimRegisteredAt
 }
 
+// IdentitySnapshot returns uuid, secret, version, and the registration
+// moment under one lock so claimStatusFeed never mixes fields from two
+// different identities during a concurrent register/import.
+func (s *State) IdentitySnapshot() (uuid, secret string, version *int, registeredAt time.Time) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var v *int
+	if s.version != nil {
+		copyV := *s.version
+		v = &copyV
+	}
+	return s.uuid, s.claim, v, s.claimRegisteredAt
+}
+
 // ClaimSecret returns the materialised secret (empty until
 // RegisterClaim is called). Tests use this; the running server
 // reads the file via identity.Reader, not via this method.
@@ -581,6 +595,9 @@ func (s *State) ImportIdentity(uuid, secret string, version *int) error {
 	defer s.mu.Unlock()
 	s.uuid = uuid
 	s.claim = secret
+	// Imported identities have no registration moment; a stale window
+	// from an earlier RegisterClaim must not leak onto them.
+	s.claimRegisteredAt = time.Time{}
 	if version != nil {
 		v := *version
 		s.version = &v

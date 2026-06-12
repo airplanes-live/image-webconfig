@@ -475,7 +475,7 @@ func claimStatusFeed(state *State, argv []string) (wexec.Result, error) {
 		log.Printf("devfakes: unhandled apl-feed claim %v", argv)
 		return wexec.Result{}, nil
 	}
-	uuid, secret, version := state.Identity()
+	uuid, secret, version, registeredAt := state.IdentitySnapshot()
 	env := map[string]any{"schema_version": 1}
 	switch {
 	case uuid == "":
@@ -494,7 +494,6 @@ func claimStatusFeed(state *State, argv []string) (wexec.Result, error) {
 		// Fake the server-side liveness gate: for 90s after a dev
 		// registration the feeder is "waiting for first data", then it
 		// becomes claimable — so both UI states are reachable locally.
-		registeredAt := state.ClaimRegisteredAt()
 		if !registeredAt.IsZero() && time.Since(registeredAt) < 90*time.Second {
 			env["claimable"] = false
 			env["claim_unavailable_reason"] = "not_seen_feeding"

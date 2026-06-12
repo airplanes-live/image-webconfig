@@ -4732,6 +4732,8 @@
             view = r.payload.last_seen_at
                 ? ["warn", "Registered", "Registered, but not seen feeding recently — claimable again once it reconnects"]
                 : ["warn", "Registered", "Registered — waiting for first data before it can be claimed"];
+        } else if (r.payload.result === "unclaimed" && r.payload.claimable === false) {
+            view = ["warn", "Registered", "Registered, but not currently claimable"];
         }
         applyClaimDot(ctx, view[0], view[1], view[2]);
     }
