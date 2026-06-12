@@ -82,14 +82,42 @@ func defaultOrchestratorCapable() bool {
 // started_at, finished_at, error, apt_irreversible}. The handler does
 // NOT round-trip the parsed struct — it returns the file bytes as-is
 // so future fields the orchestrator adds reach the SPA without a
-// webconfig release. Only `step` is read here, by orchestratorRunning,
-// to decide whether a prior run is still in flight.
+// webconfig release. Only `step` and `status` are read here, by
+// orchestratorRunning, to decide whether a prior run is still in
+// flight.
+
+// orchestratorStateTerminal reports whether a {step, status} pair
+// describes a run that has ended. The orchestrator encodes failure as
+// status "failed" with `step` keeping the name of the step that failed
+// ("apt" / "runtime") — there is no terminal `step` value for failures.
+// Success terminates with step "done". Only status "failed" is
+// terminal-by-status: intermediate writes carry status "ok" (step
+// finished, run continues) and "skipped", so treating any non-running
+// status as terminal would open a window for an overlapping start.
+//
+// "failed" and "idle" remain in the step set: "idle" is what the state
+// handler synthesizes for a missing file, and the orchestrator's entry
+// write (step idle, status running) lasts only until the first step
+// starts — that window is covered by the maintenanceUnitActive guard
+// and systemd-run's "already exists" backstop in
+// handleOrchestratorStart.
+func orchestratorStateTerminal(step, status string) bool {
+	if status == "failed" {
+		return true
+	}
+	switch step {
+	case orchestratorStepDone, orchestratorStepFailed, orchestratorStepIdle, "":
+		return true
+	default:
+		return false
+	}
+}
 
 // orchestratorRunning reports whether the on-disk state file describes
-// an in-flight run. A terminal `step` (`done` or `failed`) counts as
-// not-running; everything else (including a parse error or an unknown
-// step name) is treated as running so a click can't kick a second
-// orchestrator while one is still flushing its state file.
+// an in-flight run. A terminal state (see orchestratorStateTerminal)
+// counts as not-running; everything else (including a parse error or an
+// unknown step name) is treated as running so a click can't kick a
+// second orchestrator while one is still flushing its state file.
 //
 // Returns (running, parseErr). A parseErr is reported by readState so
 // the start path can be told apart from the state-read path (the latter
@@ -111,17 +139,13 @@ func orchestratorRunning(path string) (bool, error) {
 		return true, errors.New("orchestrator state file is empty")
 	}
 	var s struct {
-		Step string `json:"step"`
+		Step   string `json:"step"`
+		Status string `json:"status"`
 	}
 	if err := json.Unmarshal(body, &s); err != nil {
 		return true, err
 	}
-	switch s.Step {
-	case orchestratorStepDone, orchestratorStepFailed, orchestratorStepIdle, "":
-		return false, nil
-	default:
-		return true, nil
-	}
+	return !orchestratorStateTerminal(s.Step, s.Status), nil
 }
 
 // handleOrchestratorStart is POST /api/orchestrator/start.

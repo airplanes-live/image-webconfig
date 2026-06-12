@@ -51,6 +51,10 @@ type Paths struct {
 	UAT978State    string
 	Dump978FAState string
 	UpgradeState   string
+	// OrchestratorState backs GET /api/orchestrator/state — the file the
+	// simulated update-orchestrator run (StartOrchestratorRun) writes its
+	// progression to, standing in for /run/airplanes/orchestrator.state.
+	OrchestratorState string
 }
 
 // DefaultPaths returns a Paths bundle rooted at dir. The filenames are
@@ -59,18 +63,19 @@ type Paths struct {
 // and /var/lib.
 func DefaultPaths(dir string) Paths {
 	return Paths{
-		StateDir:       dir,
-		FeedEnv:        filepath.Join(dir, "feed.env"),
-		FeederID:       filepath.Join(dir, "feeder-id"),
-		ClaimSecret:    filepath.Join(dir, "feeder-claim-secret"),
-		PasswordHash:   filepath.Join(dir, "password.hash"),
-		Manifest:       filepath.Join(dir, "build-manifest.json"),
-		AircraftJSON:   filepath.Join(dir, "aircraft.json"),
-		MlatState:      filepath.Join(dir, "mlat.state"),
-		FeedState:      filepath.Join(dir, "feed.state"),
-		UAT978State:    filepath.Join(dir, "uat978.state"),
-		Dump978FAState: filepath.Join(dir, "dump978fa.state"),
-		UpgradeState:   filepath.Join(dir, "upgrade-state"),
+		StateDir:          dir,
+		FeedEnv:           filepath.Join(dir, "feed.env"),
+		FeederID:          filepath.Join(dir, "feeder-id"),
+		ClaimSecret:       filepath.Join(dir, "feeder-claim-secret"),
+		PasswordHash:      filepath.Join(dir, "password.hash"),
+		Manifest:          filepath.Join(dir, "build-manifest.json"),
+		AircraftJSON:      filepath.Join(dir, "aircraft.json"),
+		MlatState:         filepath.Join(dir, "mlat.state"),
+		FeedState:         filepath.Join(dir, "feed.state"),
+		UAT978State:       filepath.Join(dir, "uat978.state"),
+		Dump978FAState:    filepath.Join(dir, "dump978fa.state"),
+		UpgradeState:      filepath.Join(dir, "upgrade-state"),
+		OrchestratorState: filepath.Join(dir, "orchestrator.state"),
 	}
 }
 
@@ -117,6 +122,15 @@ type State struct {
 	// just lets the SPA exercise enable / disable / config / backup flows
 	// without a Pi.
 	aggregators map[string]*aggRecord
+	// orchestratorOutcome selects how a simulated update-orchestrator
+	// run ends (OrchestratorOutcome* constants). Empty means ok.
+	orchestratorOutcome string
+	// orchestratorAbort/orchestratorAborted/orchestratorWG let
+	// AbortOrchestratorRuns stop in-flight simulated runs and wait out
+	// their goroutines, so test cleanup never races a state-file write.
+	orchestratorAbort   chan struct{}
+	orchestratorAborted bool
+	orchestratorWG      sync.WaitGroup
 }
 
 // aggRecord is the dev-fake per-adapter aggregator state the verbs mutate.

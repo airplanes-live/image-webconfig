@@ -48,6 +48,8 @@ func main() {
 		"directory containing index.html + app.js + style.css to serve at GET / and /static/* (default: autodetect ./web/assets, else use the embedded copy)")
 	stateDir := flag.String("state-dir", "",
 		"directory used to back the in-memory simulator's on-disk projection (default: a fresh /tmp dir, removed on shutdown). When set explicitly, the directory must be empty and is NOT removed on shutdown.")
+	orchestratorOutcome := flag.String("orchestrator-outcome", devfakes.OrchestratorOutcomeOK,
+		"how a simulated Update System run ends: ok | fail-apt | fail-runtime")
 	flag.Parse()
 
 	resolvedState, ownState, err := resolveStateDir(*stateDir)
@@ -63,6 +65,9 @@ func main() {
 	state := devfakes.NewState(devfakes.DefaultPaths(resolvedState))
 	if err := state.SyncAll(); err != nil {
 		log.Fatalf("seed state: %v", err)
+	}
+	if err := state.SetOrchestratorOutcome(*orchestratorOutcome); err != nil {
+		log.Fatalf("orchestrator-outcome: %v", err)
 	}
 
 	assetsFS, assetsLabel, err := resolveAssetsFS(*assetsDir)
@@ -122,24 +127,26 @@ func main() {
 	claimStatusCache := claimstatus.NewCache(claimStatusProber.Probe, nil)
 
 	handler := server.New(server.Deps{
-		Version:          "dev",
-		Store:            auth.NewPasswordStore(state.Paths.PasswordHash),
-		Sessions:         auth.NewSessions(24 * time.Hour),
-		Lockout:          auth.NewLockout(5, time.Minute, 15*time.Minute),
-		Guard:            guard,
-		Argon2Params:     fastArgon2,
-		Identity:         identity.NewReader(idPaths),
-		FeedEnv:          &feedenv.Reader{Path: state.Paths.FeedEnv},
-		Status:           statusReader,
-		ClaimStatus:      claimStatusCache,
-		Logs:             logs.NewStreamer(devfakes.StreamRunner(state)),
-		Schema:           schema,
-		Runner:           devfakes.Runner(state, priv),
-		StdinRunner:      devfakes.StdinRunner(state, priv),
-		Privileged:       priv,
-		UpgradeStatePath: state.Paths.UpgradeState,
-		SDRSysfsRoot:     devfakes.SeedSDRSysfs(resolvedState),
-		AssetsFS:         assetsFS,
+		Version:               "dev",
+		Store:                 auth.NewPasswordStore(state.Paths.PasswordHash),
+		Sessions:              auth.NewSessions(24 * time.Hour),
+		Lockout:               auth.NewLockout(5, time.Minute, 15*time.Minute),
+		Guard:                 guard,
+		Argon2Params:          fastArgon2,
+		Identity:              identity.NewReader(idPaths),
+		FeedEnv:               &feedenv.Reader{Path: state.Paths.FeedEnv},
+		Status:                statusReader,
+		ClaimStatus:           claimStatusCache,
+		Logs:                  logs.NewStreamer(devfakes.StreamRunner(state)),
+		Schema:                schema,
+		Runner:                devfakes.Runner(state, priv),
+		StdinRunner:           devfakes.StdinRunner(state, priv),
+		Privileged:            priv,
+		UpgradeStatePath:      state.Paths.UpgradeState,
+		OrchestratorStatePath: state.Paths.OrchestratorState,
+		OrchestratorCapable:   func() bool { return true },
+		SDRSysfsRoot:          devfakes.SeedSDRSysfs(resolvedState),
+		AssetsFS:              assetsFS,
 	})
 
 	srv := &http.Server{
