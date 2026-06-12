@@ -4725,7 +4725,16 @@
             applyClaimDot(ctx, "na", "Status unknown", "Couldn’t load claim status");
             return;
         }
-        const view = CLAIM_DOT[r.payload.result] || ["na", "Status unknown", "Couldn’t determine claim status right now"];
+        let view = CLAIM_DOT[r.payload.result] || ["na", "Status unknown", "Couldn’t determine claim status right now"];
+        // Refine "Registered" when the server says the feeder can't be
+        // claimed until it is seen feeding (newer feed CLI + server).
+        if (r.payload.result === "unclaimed" && r.payload.claim_unavailable_reason === "not_seen_feeding") {
+            view = r.payload.last_seen_at
+                ? ["warn", "Registered", "Registered, but not seen feeding recently — claimable again once it reconnects"]
+                : ["warn", "Registered", "Registered — waiting for first data before it can be claimed"];
+        } else if (r.payload.result === "unclaimed" && r.payload.claimable === false) {
+            view = ["warn", "Registered", "Registered, but not currently claimable"];
+        }
         applyClaimDot(ctx, view[0], view[1], view[2]);
     }
 
@@ -5042,6 +5051,18 @@
                 case "claimed":
                     return { h: "Claimed ✓", muted: r.version ? "Linked to an airplanes.live account · v" + r.version : "Linked to an airplanes.live account." };
                 case "unclaimed":
+                    // The claimability pair (newer feed CLI + server)
+                    // refines the unclaimed copy; absent fields fall
+                    // through to the original wording.
+                    if (r.claim_unavailable_reason === "not_seen_feeding") {
+                        if (r.last_seen_at) {
+                            return { h: "Registered — not seen feeding recently", muted: "Claiming unlocks a few minutes after the feeder reconnects and data flows. This page re-checks automatically." };
+                        }
+                        return { h: "Registered — waiting for first data", muted: "Claiming unlocks once the feeder is seen by the server, usually a few minutes after data starts flowing. This page re-checks automatically." };
+                    }
+                    if (r.claimable === false) {
+                        return { h: "Registered — not currently claimable", muted: "Claiming is temporarily unavailable for this feeder." };
+                    }
                     return { h: "Registered — not yet claimed", muted: "Use “Show claim secret” on the dashboard to claim this feeder to your account." };
                 case "unregistered":
                 case "no_identity":

@@ -106,16 +106,20 @@ type WifiNetwork struct {
 // wifi signal sidecar) is synced inside the same critical section
 // so the production reader can never observe a partial write.
 type State struct {
-	Paths     Paths
-	mu        sync.Mutex
-	feedEnv   map[string]string
-	networks  []WifiNetwork
-	services  map[string]string // unit name → "active"|"inactive"|"failed"
-	uuid      string            // feeder UUID; seeded with a dev value, replaceable via ImportIdentity
-	claim     string            // 16-char A-Z0-9 secret; empty until RegisterClaim or ImportIdentity
-	version   *int              // claim.version (nil unless ImportIdentity supplied one)
-	feedStart time.Time
-	tickStart time.Time
+	Paths    Paths
+	mu       sync.Mutex
+	feedEnv  map[string]string
+	networks []WifiNetwork
+	services map[string]string // unit name → "active"|"inactive"|"failed"
+	uuid     string            // feeder UUID; seeded with a dev value, replaceable via ImportIdentity
+	claim    string            // 16-char A-Z0-9 secret; empty until RegisterClaim or ImportIdentity
+	version  *int              // claim.version (nil unless ImportIdentity supplied one)
+	// claimRegisteredAt is when RegisterClaim minted the secret; zero for
+	// imported/pre-seeded identities. Drives the fake "waiting for first
+	// data" window in claimStatusFeed.
+	claimRegisteredAt time.Time
+	feedStart         time.Time
+	tickStart         time.Time
 	// aggregators holds dev-only third-party aggregator records keyed by
 	// adapter id (e.g. "fr24"). Purely in-memory — the production
 	// apl-aggregator helper persists to /etc/airplanes/aggregators; the fake
@@ -533,7 +537,31 @@ func (s *State) RegisterClaim() error {
 		return nil
 	}
 	s.claim = randomClaimSecret()
+	s.claimRegisteredAt = time.Now()
 	return s.syncClaimSecretLocked()
+}
+
+// ClaimRegisteredAt returns when RegisterClaim minted the secret (zero
+// for imported/pre-seeded identities). claimStatusFeed uses it to fake
+// the server-side "waiting for first data" window after registration.
+func (s *State) ClaimRegisteredAt() time.Time {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.claimRegisteredAt
+}
+
+// IdentitySnapshot returns uuid, secret, version, and the registration
+// moment under one lock so claimStatusFeed never mixes fields from two
+// different identities during a concurrent register/import.
+func (s *State) IdentitySnapshot() (uuid, secret string, version *int, registeredAt time.Time) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var v *int
+	if s.version != nil {
+		copyV := *s.version
+		v = &copyV
+	}
+	return s.uuid, s.claim, v, s.claimRegisteredAt
 }
 
 // ClaimSecret returns the materialised secret (empty until
@@ -567,6 +595,9 @@ func (s *State) ImportIdentity(uuid, secret string, version *int) error {
 	defer s.mu.Unlock()
 	s.uuid = uuid
 	s.claim = secret
+	// Imported identities have no registration moment; a stale window
+	// from an earlier RegisterClaim must not leak onto them.
+	s.claimRegisteredAt = time.Time{}
 	if version != nil {
 		v := *version
 		s.version = &v

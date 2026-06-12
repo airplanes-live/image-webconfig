@@ -3,10 +3,12 @@ package server
 import (
 	"context"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -105,6 +107,53 @@ func TestClaimStatus_AuthedReturnsVerdict(t *testing.T) {
 	}
 	if got.CheckedAt == "" {
 		t.Errorf("checked_at empty")
+	}
+}
+
+func TestClaimStatus_ClaimabilityRoundTrips(t *testing.T) {
+	t.Parallel()
+	owner := false
+	claimable := false
+	reason := "not_seen_feeding"
+	ts := claimStatusServer(t, t.TempDir(), func(context.Context) (claimstatus.Output, error) {
+		return claimstatus.Output{
+			SchemaVersion:          1,
+			Result:                 claimstatus.ResultUnclaimed,
+			OwnerPresent:           &owner,
+			Claimable:              &claimable,
+			ClaimUnavailableReason: &reason,
+		}, nil
+	})
+	c := authedClient(t, ts)
+	resp := mustGet(t, c, ts.URL+"/api/claim/status")
+	defer resp.Body.Close()
+	var got claimstatus.Response
+	if err := json.NewDecoder(resp.Body).Decode(&got); err != nil {
+		t.Fatal(err)
+	}
+	if got.Claimable == nil || *got.Claimable {
+		t.Errorf("claimable = %v, want false", got.Claimable)
+	}
+	if got.ClaimUnavailableReason == nil || *got.ClaimUnavailableReason != "not_seen_feeding" {
+		t.Errorf("claim_unavailable_reason = %v, want not_seen_feeding", got.ClaimUnavailableReason)
+	}
+}
+
+func TestClaimStatus_ClaimabilityOmittedWhenAbsent(t *testing.T) {
+	t.Parallel()
+	owner := false
+	ts := claimStatusServer(t, t.TempDir(), func(context.Context) (claimstatus.Output, error) {
+		return claimstatus.Output{SchemaVersion: 1, Result: claimstatus.ResultUnclaimed, OwnerPresent: &owner}, nil
+	})
+	c := authedClient(t, ts)
+	resp := mustGet(t, c, ts.URL+"/api/claim/status")
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(body), "claimable") {
+		t.Errorf("claimable key present in body despite absent probe field: %s", body)
 	}
 }
 

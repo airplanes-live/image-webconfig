@@ -42,6 +42,45 @@ func TestParseOutput(t *testing.T) {
 	}
 }
 
+func TestParseOutput_Claimability(t *testing.T) {
+	t.Run("claimable false with reason", func(t *testing.T) {
+		out, ok := parseOutput([]byte(`{"schema_version":1,"result":"unclaimed","claimable":false,"claim_unavailable_reason":"not_seen_feeding"}`))
+		if !ok {
+			t.Fatal("parse failed")
+		}
+		if out.Claimable == nil || *out.Claimable {
+			t.Errorf("claimable = %v, want false", out.Claimable)
+		}
+		if out.ClaimUnavailableReason == nil || *out.ClaimUnavailableReason != "not_seen_feeding" {
+			t.Errorf("reason = %v, want not_seen_feeding", out.ClaimUnavailableReason)
+		}
+	})
+	t.Run("claimable true", func(t *testing.T) {
+		out, ok := parseOutput([]byte(`{"schema_version":1,"result":"unclaimed","claimable":true,"claim_unavailable_reason":null}`))
+		if !ok {
+			t.Fatal("parse failed")
+		}
+		if out.Claimable == nil || !*out.Claimable {
+			t.Errorf("claimable = %v, want true", out.Claimable)
+		}
+		if out.ClaimUnavailableReason != nil {
+			t.Errorf("reason = %v, want nil", out.ClaimUnavailableReason)
+		}
+	})
+	t.Run("fields absent on older feed CLI", func(t *testing.T) {
+		out, ok := parseOutput([]byte(`{"schema_version":1,"result":"unclaimed"}`))
+		if !ok {
+			t.Fatal("parse failed")
+		}
+		if out.Claimable != nil {
+			t.Errorf("claimable = %v, want nil", out.Claimable)
+		}
+		if out.ClaimUnavailableReason != nil {
+			t.Errorf("reason = %v, want nil", out.ClaimUnavailableReason)
+		}
+	})
+}
+
 // --- Prober --------------------------------------------------------------
 
 func fakeRunner(stdout string, exit int, err error) wexec.CommandRunner {
@@ -197,6 +236,40 @@ func TestCache_StaleFallbackOnTransientAfterGood(t *testing.T) {
 	// CheckedAt must reflect the last GOOD probe, not the failed refresh.
 	if second.CheckedAt != first.CheckedAt {
 		t.Fatalf("stale CheckedAt = %q, want last-good %q", second.CheckedAt, first.CheckedAt)
+	}
+}
+
+func TestCache_StaleFallbackCarriesClaimability(t *testing.T) {
+	clk := newClock()
+	var calls int32
+	claimable := false
+	reason := "not_seen_feeding"
+	probe := func(context.Context) (Output, error) {
+		if atomic.AddInt32(&calls, 1) == 1 {
+			owner := false
+			return Output{
+				SchemaVersion:          1,
+				Result:                 ResultUnclaimed,
+				OwnerPresent:           &owner,
+				Claimable:              &claimable,
+				ClaimUnavailableReason: &reason,
+			}, nil
+		}
+		return Output{SchemaVersion: 1, Result: ResultUnreachable}, nil
+	}
+	c := NewCache(probe, clk.now)
+
+	c.Get(context.Background(), "k", time.Minute)
+	clk.advance(2 * time.Minute)
+	stale := c.Get(context.Background(), "k", time.Minute)
+	if !stale.Stale {
+		t.Fatalf("want stale fallback, got %+v", stale)
+	}
+	if stale.Claimable == nil || *stale.Claimable {
+		t.Errorf("stale claimable = %v, want false", stale.Claimable)
+	}
+	if stale.ClaimUnavailableReason == nil || *stale.ClaimUnavailableReason != "not_seen_feeding" {
+		t.Errorf("stale reason = %v, want not_seen_feeding", stale.ClaimUnavailableReason)
 	}
 }
 
