@@ -84,15 +84,9 @@ func main() {
 
 	// Schema is prepopulated — the fake apl-feed schema endpoint is
 	// implemented but the server never reaches for it after the cache
-	// is loaded, so we skip the indirection.
-	writable := []string{
-		"LATITUDE", "LONGITUDE", "ALTITUDE", "GEO_CONFIGURED",
-		"MLAT_USER", "MLAT_ENABLED", "MLAT_PRIVATE",
-		"REPORT_STATUS", "REMOTE_CONFIG_ENABLED",
-		"GAIN", "READSB_SDR_SERIAL", "UAT_INPUT", "DUMP978_SDR_SERIAL", "DUMP978_GAIN",
-	}
-	readable := append(append([]string{}, writable...), "INPUT", "INPUT_TYPE")
-	schema := schemacache.NewPrepopulated(writable, readable)
+	// is loaded, so we skip the indirection. Key lists are shared with
+	// the fake schema/config-show endpoints in devfakes.
+	schema := schemacache.NewPrepopulated(devfakes.SchemaWritableKeys, devfakes.SchemaReadableKeys)
 
 	statusPaths := status.Paths{
 		ManifestFile:       state.Paths.Manifest,
@@ -108,7 +102,13 @@ func main() {
 	idPaths := identity.Paths{
 		FeederIDFile:    state.Paths.FeederID,
 		ClaimSecretFile: state.Paths.ClaimSecret,
-		FeedEnvFile:     state.Paths.FeedEnv,
+	}
+
+	// Config reads go through the fake `apl-feed config show` runner so
+	// the SPA sees the same map the fake apply mutates.
+	feedEnvReader := &feedenv.Reader{
+		Exec: devfakes.Runner(state, priv),
+		Argv: priv.ConfigShowFeed,
 	}
 
 	statusReader := status.NewReader("dev", statusPaths, devfakes.Runner(state, priv),
@@ -133,8 +133,8 @@ func main() {
 		Lockout:               auth.NewLockout(5, time.Minute, 15*time.Minute),
 		Guard:                 guard,
 		Argon2Params:          fastArgon2,
-		Identity:              identity.NewReader(idPaths),
-		FeedEnv:               &feedenv.Reader{Path: state.Paths.FeedEnv},
+		Identity:              identity.NewReader(idPaths, feedEnvReader),
+		FeedEnv:               feedEnvReader,
 		Status:                statusReader,
 		ClaimStatus:           claimStatusCache,
 		Logs:                  logs.NewStreamer(devfakes.StreamRunner(state)),

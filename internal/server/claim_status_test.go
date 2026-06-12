@@ -15,6 +15,7 @@ import (
 
 	"github.com/airplanes-live/image-webconfig/internal/auth"
 	"github.com/airplanes-live/image-webconfig/internal/claimstatus"
+	"github.com/airplanes-live/image-webconfig/internal/feedenv/feedenvtest"
 	"github.com/airplanes-live/image-webconfig/internal/identity"
 )
 
@@ -50,7 +51,6 @@ func claimStatusServer(t *testing.T, dir string, probe claimstatus.ProbeFunc) *h
 		FeederIDFile:     filepath.Join(dir, "feeder-id"),
 		ClaimSecretFile:  filepath.Join(dir, "feeder-claim-secret"),
 		ClaimVersionFile: filepath.Join(dir, "feeder-claim-secret.version"),
-		FeedEnvFile:      filepath.Join(dir, "feed.env"),
 	}
 	_ = os.WriteFile(idp.FeederIDFile, []byte("test-feeder-id\n"), 0o644)
 	_ = os.WriteFile(idp.ClaimSecretFile, []byte("ABCDEFGHIJKLMNOP\n"), 0o640)
@@ -63,7 +63,7 @@ func claimStatusServer(t *testing.T, dir string, probe claimstatus.ProbeFunc) *h
 		Lockout:      auth.NewLockout(5, time.Minute, 15*time.Minute),
 		Guard:        guard,
 		Argon2Params: fastTestParams,
-		Identity:     identity.NewReader(idp),
+		Identity:     identity.NewReader(idp, feedenvtest.Reader(nil)),
 		ClaimStatus:  claimstatus.NewCache(probe, nil),
 	})
 	ts := httptest.NewServer(h)

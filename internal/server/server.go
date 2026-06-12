@@ -68,14 +68,17 @@ type Server struct {
 // the value used for sidecar `edited_at` stamps.
 func (s *Server) now() time.Time { return s.nowFunc() }
 
-// PrivilegedArgv carries the exact sudoers-allowed argv shapes for every
-// command webconfig elevates. Each slice is invoked verbatim — no
-// concatenation, no shell.
+// PrivilegedArgv carries the binary's argv shapes — every external
+// command webconfig invokes. Each slice is invoked verbatim — no
+// concatenation, no shell. Only the sudo-prefixed shapes must appear in
+// the sudoers file; the parity test covers exactly those. Read-only
+// shapes (SchemaFeed, ConfigShowFeed) run unprivileged.
 //
-// ApplyFeed and SchemaFeed both target the apl-feed binary installed by
-// the feed scripts (canonical writer + schema endpoint). The feed CLI
-// owns feed.env validation, restart fan-out, and the on-disk schema —
-// webconfig is a thin HTTP shell around its JSON interface.
+// ApplyFeed, SchemaFeed, and ConfigShowFeed all target the apl-feed
+// binary installed by the feed scripts (canonical writer + schema +
+// config-read endpoints). The feed CLI owns feed.env validation,
+// restart fan-out, and the on-disk schema — webconfig is a thin HTTP
+// shell around its JSON interface.
 //
 // Wifi* target the apl-wifi binary installed by stage-airplanes/05. One
 // entry per subcommand keeps the sudoers grant pinned to a single verb;
@@ -85,6 +88,7 @@ func (s *Server) now() time.Time { return s.nowFunc() }
 type PrivilegedArgv struct {
 	ApplyFeed         []string // sudo -n /usr/local/bin/apl-feed apply --json --lock-timeout 5
 	SchemaFeed        []string // /usr/local/bin/apl-feed schema --json (no sudo: read-only)
+	ConfigShowFeed    []string // /usr/local/bin/apl-feed config show --json (no sudo: read-only)
 	Reboot            []string // sudo -n /usr/bin/systemctl reboot
 	Poweroff          []string // sudo -n /usr/bin/systemctl poweroff
 	StartOrchestrator []string // sudo systemd-run --unit=airplanes-update-orchestrator ...
@@ -129,10 +133,11 @@ func DefaultPrivilegedArgv() PrivilegedArgv {
 		return append([]string{"/usr/bin/sudo", "-n"}, args...)
 	}
 	return PrivilegedArgv{
-		ApplyFeed:  sudo("/usr/local/bin/apl-feed", "apply", "--json", "--lock-timeout", "5"),
-		SchemaFeed: []string{"/usr/local/bin/apl-feed", "schema", "--json"},
-		Reboot:     sudo("/usr/bin/systemctl", "reboot"),
-		Poweroff:   sudo("/usr/bin/systemctl", "poweroff"),
+		ApplyFeed:      sudo("/usr/local/bin/apl-feed", "apply", "--json", "--lock-timeout", "5"),
+		SchemaFeed:     []string{"/usr/local/bin/apl-feed", "schema", "--json"},
+		ConfigShowFeed: []string{"/usr/local/bin/apl-feed", "config", "show", "--json"},
+		Reboot:         sudo("/usr/bin/systemctl", "reboot"),
+		Poweroff:       sudo("/usr/bin/systemctl", "poweroff"),
 		// StartOrchestrator launches the unified update orchestrator —
 		// apt → runtime overlay — as a transient systemd unit. --collect
 		// drops the unit record on exit so a repeat invocation doesn't 409

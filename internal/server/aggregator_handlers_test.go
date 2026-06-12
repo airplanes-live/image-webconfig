@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"encoding/json"
 	"net/http"
-	"os"
 	"reflect"
 	"strings"
 	"testing"
@@ -428,9 +427,7 @@ func TestAggregatorEnable_ClientGeoWinsOverFeedEnv(t *testing.T) {
 	// feed.env has a location, but a client that supplies its own coordinates
 	// wins — the user can send an explicit (e.g. different) location to
 	// Flightradar24. The helper still range-validates what it receives.
-	if err := os.WriteFile(h.feedEnvPath, []byte("LATITUDE=\"51.5\"\nLONGITUDE=\"-0.12\"\nALTITUDE=\"30\"\n"), 0o644); err != nil {
-		t.Fatal(err)
-	}
+	h.setFeedEnv(map[string]string{"LATITUDE": "51.5", "LONGITUDE": "-0.12", "ALTITUDE": "30"})
 	h.stdinResult = wexec.Result{Stdout: []byte(`{"protocol_version":1,"result":"accepted","step":"starting","id":"fr24","request_id":"r1"}`)}
 	r := postJSON(t, h.client, h.ts.URL+"/api/aggregators/fr24/enable",
 		map[string]any{"lat": 1.0, "lon": 2.0, "alt": 9999, "fields": map[string]string{"email": "a@b.c"}})
@@ -459,9 +456,7 @@ func TestAggregatorEnable_FillsGeoFromFeedEnvWhenClientOmits(t *testing.T) {
 	h := newWriteHarness(t)
 	// A client that omits geo (e.g. piaware, or any caller without coordinates)
 	// gets the feeder location filled in from feed.env.
-	if err := os.WriteFile(h.feedEnvPath, []byte("LATITUDE=\"51.5\"\nLONGITUDE=\"-0.12\"\nALTITUDE=\"30\"\n"), 0o644); err != nil {
-		t.Fatal(err)
-	}
+	h.setFeedEnv(map[string]string{"LATITUDE": "51.5", "LONGITUDE": "-0.12", "ALTITUDE": "30"})
 	h.stdinResult = wexec.Result{Stdout: []byte(`{"protocol_version":1,"result":"accepted","step":"starting","id":"fr24","request_id":"r1"}`)}
 	r := postJSON(t, h.client, h.ts.URL+"/api/aggregators/fr24/enable",
 		map[string]any{"fields": map[string]string{"email": "a@b.c"}})
@@ -483,9 +478,7 @@ func TestAggregatorEnable_KeepsClientGeoWhenLocationUnset(t *testing.T) {
 	// feed.env has no location yet, but the client supplies coordinates — they're
 	// forwarded so a user can set up Flightradar24 before configuring the feeder
 	// location.
-	if err := os.WriteFile(h.feedEnvPath, []byte("UAT_INPUT=\"\"\n"), 0o644); err != nil {
-		t.Fatal(err)
-	}
+	h.setFeedEnv(map[string]string{"UAT_INPUT": ""})
 	h.stdinResult = wexec.Result{Stdout: []byte(`{"protocol_version":1,"result":"accepted","id":"fr24","request_id":"r1"}`)}
 	r := postJSON(t, h.client, h.ts.URL+"/api/aggregators/fr24/enable",
 		map[string]any{"lat": 1.0, "lon": 2.0, "alt": 9999, "fields": map[string]string{"email": "a@b.c"}})

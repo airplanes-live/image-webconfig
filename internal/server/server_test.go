@@ -14,7 +14,6 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
-	"sort"
 	"strings"
 	"sync"
 	"testing"
@@ -24,6 +23,7 @@ import (
 	"github.com/airplanes-live/image-webconfig/internal/auth"
 	wexec "github.com/airplanes-live/image-webconfig/internal/exec"
 	"github.com/airplanes-live/image-webconfig/internal/feedenv"
+	"github.com/airplanes-live/image-webconfig/internal/feedenv/feedenvtest"
 	"github.com/airplanes-live/image-webconfig/internal/feedmeta"
 	"github.com/airplanes-live/image-webconfig/internal/identity"
 	"github.com/airplanes-live/image-webconfig/internal/logs"
@@ -52,17 +52,21 @@ func newTestServer(t *testing.T) (*httptest.Server, *Server) {
 		FeederIDFile:     filepath.Join(dir, "feeder-id"),
 		ClaimSecretFile:  filepath.Join(dir, "feeder-claim-secret"),
 		ClaimVersionFile: filepath.Join(dir, "feeder-claim-secret.version"),
-		FeedEnvFile:      filepath.Join(dir, "feed.env"),
 	}
 	_ = os.WriteFile(idPaths.FeederIDFile, []byte("test-feeder-id"), 0o644)
 	_ = os.WriteFile(idPaths.ClaimSecretFile, []byte("ABCDEFGHIJKLMNOP"), 0o640)
 	_ = os.WriteFile(idPaths.ClaimVersionFile, []byte("1\n"), 0o640)
 
-	feedEnvPath := filepath.Join(dir, "feed.env")
-	_ = os.WriteFile(feedEnvPath,
-		[]byte(`LATITUDE=51.5`+"\n"+`LONGITUDE=-0.1`+"\n"+`MLAT_USER=tester`+"\n"+`MLAT_ENABLED=true`+"\n"),
-		0o644,
-	)
+	// APL_FEED_WEBSITE_URL mirrors the post-feed-registry reality: the
+	// CLI reports it as readable, but webconfig's APIReadKeys filter must
+	// keep it off GET /api/config (asserted below).
+	feedEnv := feedenvtest.Reader(map[string]string{
+		"LATITUDE":             "51.5",
+		"LONGITUDE":            "-0.1",
+		"MLAT_USER":            "tester",
+		"MLAT_ENABLED":         "true",
+		"APL_FEED_WEBSITE_URL": "https://dev.airplanes.live",
+	})
 
 	// Hermetic sysfs fixture for GET /api/sdr — keeps tests off the
 	// runner's real /sys and gives the handler one deterministic device.
@@ -144,13 +148,17 @@ func newTestServer(t *testing.T) (*httptest.Server, *Server) {
 		Lockout:      auth.NewLockout(5, time.Minute, 15*time.Minute),
 		Guard:        guard,
 		Argon2Params: fastTestParams,
-		Identity:     identity.NewReader(idPaths),
-		FeedEnv:      &feedenv.Reader{Path: feedEnvPath},
+		Identity:     identity.NewReader(idPaths, feedEnv),
+		FeedEnv:      feedEnv,
 		Status:       status.NewReader("test-sha", statusPaths, statusRunner),
 		Logs:         logs.NewStreamer(logsRunner),
+		// readable includes APL_FEED_WEBSITE_URL — like the real
+		// post-registry schema — so the website-URL exclusion test below
+		// proves the APIReadKeys filter is what keeps it off the API, not
+		// the schema gate.
 		Schema: schemacache.NewPrepopulated(
 			[]string{"LATITUDE", "LONGITUDE", "ALTITUDE", "GEO_CONFIGURED", "MLAT_USER", "MLAT_ENABLED", "MLAT_PRIVATE", "REPORT_STATUS", "REMOTE_CONFIG_ENABLED", "GAIN", "READSB_SDR_SERIAL", "UAT_INPUT", "DUMP978_SDR_SERIAL", "DUMP978_GAIN"},
-			[]string{"LATITUDE", "LONGITUDE", "ALTITUDE", "GEO_CONFIGURED", "MLAT_USER", "MLAT_ENABLED", "MLAT_PRIVATE", "REPORT_STATUS", "REMOTE_CONFIG_ENABLED", "INPUT", "INPUT_TYPE", "GAIN", "READSB_SDR_SERIAL", "UAT_INPUT", "DUMP978_SDR_SERIAL", "DUMP978_GAIN"},
+			[]string{"LATITUDE", "LONGITUDE", "ALTITUDE", "GEO_CONFIGURED", "MLAT_USER", "MLAT_ENABLED", "MLAT_PRIVATE", "REPORT_STATUS", "REMOTE_CONFIG_ENABLED", "INPUT", "INPUT_TYPE", "GAIN", "READSB_SDR_SERIAL", "UAT_INPUT", "DUMP978_SDR_SERIAL", "DUMP978_GAIN", "APL_FEED_WEBSITE_URL"},
 		),
 		Runner:       captureRunner,
 		StdinRunner:  captureStdinRunner,
@@ -185,10 +193,16 @@ type stdinCall struct {
 // /api/orchestrator/start / /api/reboot — it wires deterministic captures
 // for both runners and pre-authenticates the returned client.
 type writeHarness struct {
-	ts              *httptest.Server
-	client          *http.Client
-	feedEnvPath     string
-	mu              sync.Mutex
+	ts     *httptest.Server
+	client *http.Client
+	mu     sync.Mutex
+	// feedEnv backs the fake `apl-feed config show`: present keys come
+	// back as strings (including ""), everything else is absent. Tests
+	// swap it via setFeedEnv between requests.
+	feedEnv map[string]string
+	// feedEnvErr, when non-nil, makes every config-show exec fail —
+	// the transient-read-failure case the metadata gating degrades on.
+	feedEnvErr      error
 	calls           [][]string
 	stdinCalls      []stdinCall
 	runnerErr       error                            // returned by captureRunner; tests override
@@ -239,22 +253,26 @@ func newWriteHarness(t *testing.T, opts ...harnessOption) *writeHarness {
 	if err != nil {
 		t.Fatal(err)
 	}
-	feedEnvPath := filepath.Join(dir, "feed.env")
-	if err := os.WriteFile(feedEnvPath,
-		[]byte(`LATITUDE="0"`+"\n"+`UAT_INPUT=""`+"\n"),
-		0o644,
-	); err != nil {
-		t.Fatal(err)
-	}
-
 	h := &writeHarness{
-		feedEnvPath: feedEnvPath,
+		feedEnv: map[string]string{"LATITUDE": "0", "UAT_INPUT": ""},
 		// Default response from apl-feed apply --json: every write
 		// succeeds and lands an `applied` envelope. Individual tests
 		// override h.stdinResult / h.stdinErr to exercise rejected,
 		// lock_timeout, filesystem_error, etc.
 		stdinResult: wexec.Result{Stdout: []byte(`{"status":"applied","changed":[],"pending_restart":[]}`)},
 	}
+	feedEnv := feedenvtest.ReaderFunc(func() (map[string]string, error) {
+		h.mu.Lock()
+		defer h.mu.Unlock()
+		if h.feedEnvErr != nil {
+			return nil, h.feedEnvErr
+		}
+		out := make(map[string]string, len(h.feedEnv))
+		for k, v := range h.feedEnv {
+			out[k] = v
+		}
+		return out, nil
+	})
 	for _, o := range opts {
 		o(h)
 	}
@@ -319,8 +337,8 @@ func newWriteHarness(t *testing.T, opts ...harnessOption) *writeHarness {
 		Lockout:      auth.NewLockout(5, time.Minute, 15*time.Minute),
 		Guard:        guard,
 		Argon2Params: fastTestParams,
-		Identity:     identity.NewReader(identity.Paths{FeederIDFile: filepath.Join(dir, "feeder-id")}),
-		FeedEnv:      &feedenv.Reader{Path: feedEnvPath},
+		Identity:     identity.NewReader(identity.Paths{FeederIDFile: filepath.Join(dir, "feeder-id")}, feedEnv),
+		FeedEnv:      feedEnv,
 		Status: status.NewReader("test-sha", status.Paths{
 			SystemctlBinary: "/bin/true", IsActiveTimeout: time.Second,
 		}, captureRunner),
@@ -345,6 +363,23 @@ func newWriteHarness(t *testing.T, opts ...harnessOption) *writeHarness {
 		t.Fatalf("setup status = %d", r.StatusCode)
 	}
 	return h
+}
+
+// setFeedEnv replaces the value set the fake `apl-feed config show`
+// serves. Present keys (including explicitly-empty "") come back as
+// strings; everything else reads as absent.
+func (h *writeHarness) setFeedEnv(values map[string]string) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.feedEnv = values
+	h.feedEnvErr = nil
+}
+
+// setFeedEnvErr makes every subsequent config-show exec fail.
+func (h *writeHarness) setFeedEnvErr(err error) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.feedEnvErr = err
 }
 
 func (h *writeHarness) callsCopy() [][]string {
@@ -1376,6 +1411,34 @@ func TestConfigGet_AuthedReturnsValues(t *testing.T) {
 	}
 }
 
+// TestConfigGet_NeverExposesWebsiteURL pins the privacy boundary at the
+// HTTP level: the test server's fake config show returns
+// APL_FEED_WEBSITE_URL AND the schema cache lists it as readable (the
+// post-registry reality), so the only thing keeping it off the API is
+// feedenv's APIReadKeys filter. It must never appear in GET /api/config.
+func TestConfigGet_NeverExposesWebsiteURL(t *testing.T) {
+	t.Parallel()
+	ts, _ := newTestServer(t)
+	c := authedClient(t, ts)
+	resp := mustGet(t, c, ts.URL+"/api/config")
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d", resp.StatusCode)
+	}
+	var got struct {
+		Values map[string]string `json:"values"`
+	}
+	_ = json.NewDecoder(resp.Body).Decode(&got)
+	if v, ok := got.Values["APL_FEED_WEBSITE_URL"]; ok {
+		t.Errorf("APL_FEED_WEBSITE_URL = %q leaked into GET /api/config", v)
+	}
+	// Sanity: the response is otherwise populated, so the absence above
+	// is the filter at work and not an empty value set.
+	if got.Values["LATITUDE"] != "51.5" {
+		t.Errorf("LATITUDE = %q, want 51.5", got.Values["LATITUDE"])
+	}
+}
+
 func TestStatus_RequiresAuth(t *testing.T) {
 	t.Parallel()
 	ts, _ := newTestServer(t)
@@ -1518,9 +1581,10 @@ func TestAssetsFS_OverrideServesIndexAndStatic(t *testing.T) {
 // altitude bare-metres contract. The operator posts "400ft", the
 // fake apl-feed canonicalises it on apply (mirroring feed's
 // _apl_feed_apply_canonicalize_altitude → altitude_to_bare_metres),
-// the GET that follows reads the canonicalised value back from
-// feed.env. Without this end-to-end test, the JS / Go / fake-apply
-// layers could each pass their own unit test while still drifting.
+// the GET that follows reads the canonicalised value back through the
+// fake config show. Without this end-to-end test, the JS / Go /
+// fake-apply layers could each pass their own unit test while still
+// drifting.
 func TestConfigPost_AltitudeFtRoundTripsAsBareMetres(t *testing.T) {
 	dir := t.TempDir()
 	hashPath := filepath.Join(dir, "password.hash")
@@ -1528,19 +1592,16 @@ func TestConfigPost_AltitudeFtRoundTripsAsBareMetres(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	feedEnvPath := filepath.Join(dir, "feed.env")
-	// Seed with an existing ALTITUDE so the GET path has something
-	// to compare against before the POST mutates it.
-	if err := os.WriteFile(feedEnvPath,
-		[]byte(`ALTITUDE="12"`+"\n"+`LATITUDE="51.5"`+"\n"+`LONGITUDE="-0.1"`+"\n"),
-		0o644,
-	); err != nil {
-		t.Fatal(err)
-	}
+	// Simulated config state, shared between the canonicalising apply
+	// fake and the config-show fake the FeedEnv reader execs. Seed with
+	// an existing ALTITUDE so the GET path has something to compare
+	// against before the POST mutates it.
+	var currentMu sync.Mutex
+	current := map[string]string{"ALTITUDE": "12", "LATITUDE": "51.5", "LONGITUDE": "-0.1"}
 
 	// Canonicalising stdin runner: parses the JSON payload feed
 	// expects, mirrors feedmeta.AltitudeToBareMetres on every
-	// ALTITUDE value, and rewrites feed.env with the merged result.
+	// ALTITUDE value, and merges the result into the shared state.
 	// This is the minimum production-shaped behaviour the parity
 	// contract relies on; we deliberately do NOT call into devfakes
 	// here because that package imports server (circular).
@@ -1552,13 +1613,7 @@ func TestConfigPost_AltitudeFtRoundTripsAsBareMetres(t *testing.T) {
 		if err := json.Unmarshal(raw, &payload); err != nil {
 			return wexec.Result{Stdout: []byte(`{"status":"parse_error"}`)}, nil
 		}
-		// Reuse the existing feed.env so unchanged keys survive.
-		rd := &feedenv.Reader{Path: feedEnvPath}
-		current, _ := rd.ReadAll()
-		merged := make(map[string]string, len(current)+len(payload.Updates))
-		for k, v := range current {
-			merged[k] = v
-		}
+		currentMu.Lock()
 		for k, rawVal := range payload.Updates {
 			value, ok := extractValueFromApplyPayload(rawVal)
 			if !ok {
@@ -1568,24 +1623,21 @@ func TestConfigPost_AltitudeFtRoundTripsAsBareMetres(t *testing.T) {
 				canon, _ := feedmeta.AltitudeToBareMetres(value)
 				value = canon
 			}
-			merged[k] = value
+			current[k] = value
 		}
-		// Atomic write of the merged env.
-		var buf bytes.Buffer
-		keys := make([]string, 0, len(merged))
-		for k := range merged {
-			keys = append(keys, k)
-		}
-		// Stable order keeps the file diffable in failure messages.
-		sort.Strings(keys)
-		for _, k := range keys {
-			fmt.Fprintf(&buf, "%s=%q\n", k, merged[k])
-		}
-		if err := os.WriteFile(feedEnvPath, buf.Bytes(), 0o644); err != nil {
-			return wexec.Result{}, err
-		}
+		currentMu.Unlock()
 		return wexec.Result{Stdout: []byte(`{"status":"applied","changed":["ALTITUDE"],"pending_restart":[]}`)}, nil
 	}
+
+	feedEnv := feedenvtest.ReaderFunc(func() (map[string]string, error) {
+		currentMu.Lock()
+		defer currentMu.Unlock()
+		out := make(map[string]string, len(current))
+		for k, v := range current {
+			out[k] = v
+		}
+		return out, nil
+	})
 
 	deps := Deps{
 		Version:      "test-sha",
@@ -1594,8 +1646,8 @@ func TestConfigPost_AltitudeFtRoundTripsAsBareMetres(t *testing.T) {
 		Lockout:      auth.NewLockout(5, time.Minute, 15*time.Minute),
 		Guard:        guard,
 		Argon2Params: fastTestParams,
-		Identity:     identity.NewReader(identity.Paths{FeederIDFile: filepath.Join(dir, "feeder-id")}),
-		FeedEnv:      &feedenv.Reader{Path: feedEnvPath},
+		Identity:     identity.NewReader(identity.Paths{FeederIDFile: filepath.Join(dir, "feeder-id")}, feedEnv),
+		FeedEnv:      feedEnv,
 		Status: status.NewReader("test-sha", status.Paths{
 			SystemctlBinary: "/bin/true", IsActiveTimeout: time.Second,
 		}, func(_ context.Context, _ []string) (wexec.Result, error) { return wexec.Result{}, nil }),
@@ -1692,10 +1744,7 @@ func TestConfigPost_NudgesConfigSyncOnApplied(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			feedEnvPath := filepath.Join(dir, "feed.env")
-			if err := os.WriteFile(feedEnvPath, []byte(`REMOTE_CONFIG_ENABLED="false"`+"\n"), 0o644); err != nil {
-				t.Fatal(err)
-			}
+			feedEnv := feedenvtest.Reader(map[string]string{"REMOTE_CONFIG_ENABLED": "false"})
 
 			// Apply runner returns the table-driven status without touching disk.
 			stdinRunner := func(_ context.Context, _ []string, stdin io.Reader) (wexec.Result, error) {
@@ -1722,8 +1771,8 @@ func TestConfigPost_NudgesConfigSyncOnApplied(t *testing.T) {
 				Lockout:      auth.NewLockout(5, time.Minute, 15*time.Minute),
 				Guard:        guard,
 				Argon2Params: fastTestParams,
-				Identity:     identity.NewReader(identity.Paths{FeederIDFile: filepath.Join(dir, "feeder-id")}),
-				FeedEnv:      &feedenv.Reader{Path: feedEnvPath},
+				Identity:     identity.NewReader(identity.Paths{FeederIDFile: filepath.Join(dir, "feeder-id")}, feedEnv),
+				FeedEnv:      feedEnv,
 				Status: status.NewReader("test-sha", status.Paths{
 					SystemctlBinary: "/bin/true", IsActiveTimeout: time.Second,
 				}, func(_ context.Context, _ []string) (wexec.Result, error) { return wexec.Result{}, nil }),
@@ -1768,6 +1817,19 @@ func TestConfigPost_NudgesConfigSyncOnApplied(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// TestDefaultPrivilegedArgv_ConfigShowFeedMatchesFeedenvDefault pins the
+// argv-struct entry to the argv feedenv.New() actually execs in
+// production — the two are wired independently (cmd/webconfig uses
+// feedenv.New(); cmd/devserver uses priv.ConfigShowFeed) and must not
+// drift.
+func TestDefaultPrivilegedArgv_ConfigShowFeedMatchesFeedenvDefault(t *testing.T) {
+	t.Parallel()
+	got := DefaultPrivilegedArgv().ConfigShowFeed
+	if !reflect.DeepEqual(got, feedenv.DefaultArgv) {
+		t.Fatalf("ConfigShowFeed argv = %v, want feedenv.DefaultArgv %v", got, feedenv.DefaultArgv)
 	}
 }
 

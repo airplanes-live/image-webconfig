@@ -54,8 +54,8 @@ type privilegedArgvCase struct {
 }
 
 // privilegedArgvCases enumerates every sudo'd shape the binary uses. The
-// non-sudo SchemaFeed is intentionally excluded — read-only paths don't need
-// a sudoers grant.
+// non-sudo SchemaFeed and ConfigShowFeed are intentionally excluded —
+// read-only paths don't need a sudoers grant.
 func privilegedArgvCases(priv PrivilegedArgv) []privilegedArgvCase {
 	return []privilegedArgvCase{
 		{"ApplyFeed", priv.ApplyFeed},

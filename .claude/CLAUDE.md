@@ -41,7 +41,7 @@ Release workflow (`.github/workflows/release.yml`): tag push or push-to-dev trig
 cmd/webconfig/                  binary entrypoint (--listen, --password-hash, --pi-health)
 internal/
   server/                       HTTP mux, route registration, PrivilegedArgv contract
-  feedenv/                      feed.env reader, key allowlist
+  feedenv/                      CLI-backed config reader — execs apl-feed config show; API key allowlist
   configspec/                   the writable-keys whitelist
   auth/                         argon2id PHC password store, session mgmt
   identity/                     feeder claim secret reveal
@@ -79,7 +79,7 @@ Build-mode reads `AIRPLANES_WEBCONFIG_BRANCH` from the pi-gen config (a concrete
 ## Cross-repo coupling
 
 - **`airplanes-live/image`** — pi-gen consumer. `stage-airplanes/05-install-webconfig/00-run.sh` clones this repo and invokes `install.sh --build-mode`. The image bakes a frozen release; on-device updates replace it.
-- **`airplanes-live/feed`** — the webconfig writes feed.env via `sudo -n /usr/local/bin/apl-feed apply --json --lock-timeout 5`. That argv is pinned in `files/etc/sudoers.d/010_airplanes-webconfig` and must stay in sync with feed's `apl-feed` CLI. Validator parity between `web/assets/app.js` (JS validators, inside the `@validator-parity` block) and feed's `scripts/lib/configure-validators.sh` (bash) is enforced by `internal/clientvalidators/parity_test.go`, which executes the actual shipped JS in a Node subprocess and the actual shipped bash functions in a subprocess against a shared input-vector table. Wi-Fi validator parity against `files/usr/local/lib/airplanes/wifi-validators.sh` is enforced by the same test.
+- **`airplanes-live/feed`** — the webconfig writes feed.env via `sudo -n /usr/local/bin/apl-feed apply --json --lock-timeout 5`. That argv is pinned in `files/etc/sudoers.d/010_airplanes-webconfig` and must stay in sync with feed's `apl-feed` CLI. The read path also goes through the CLI: `internal/feedenv` execs the unprivileged `apl-feed config show --json` (no sudoers entry) instead of parsing feed.env itself. Validator parity between `web/assets/app.js` (JS validators, inside the `@validator-parity` block) and feed's `scripts/lib/configure-validators.sh` (bash) is enforced by `internal/clientvalidators/parity_test.go`, which executes the actual shipped JS in a Node subprocess and the actual shipped bash functions in a subprocess against a shared input-vector table. Wi-Fi validator parity against `files/usr/local/lib/airplanes/wifi-validators.sh` is enforced by the same test.
 - **`/etc/airplanes/release-channel`** — same file feed reads. One device-wide channel knob.
 
 ## Rules
@@ -107,4 +107,4 @@ go run ./cmd/devserver
 # → http://127.0.0.1:8080 — first visit triggers password setup (≥12 chars)
 ```
 
-Defaults serve `web/assets/` from disk when run from the repo root, so edits to `index.html` / `app.js` / `style.css` show up on the next browser refresh without rebuilding. `--orchestrator-outcome=ok|fail-apt|fail-runtime` selects how a simulated Update System run ends. Mutations (config save, Wi-Fi add/delete/activate, claim register) round-trip against backing temp files so the production `feedenv.Reader` / `status.Reader` / `identity.Reader` see a coherent view. State resets on every binary restart. The production binary `cmd/webconfig` is untouched — `internal/devfakes` is only imported by `cmd/devserver`.
+Defaults serve `web/assets/` from disk when run from the repo root, so edits to `index.html` / `app.js` / `style.css` show up on the next browser refresh without rebuilding. `--orchestrator-outcome=ok|fail-apt|fail-runtime` selects how a simulated Update System run ends. Mutations (config save, Wi-Fi add/delete/activate, claim register) round-trip through one shared fake state — file-backed readers (`status.Reader`, `identity.Reader`) see it via backing temp files, the CLI-backed `feedenv.Reader` via the fake `apl-feed config show` runner — so every reader sees a coherent view. State resets on every binary restart. The production binary `cmd/webconfig` is untouched — `internal/devfakes` is only imported by `cmd/devserver`.

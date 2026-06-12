@@ -8,11 +8,11 @@
 // is fetched at boot via `apl-feed schema --json` into
 // internal/schemacache. This package now only carries the static
 // read-key list that internal/feedenv pins via a drift test — kept here
-// to avoid pulling the feedenv package's file I/O surface into callers
+// to avoid pulling the feedenv package's exec surface into callers
 // that just want the list shape.
 package configspec
 
-// AllReadKeys mirrors feedenv.ReadKeys; duplicated here so the drift
+// AllReadKeys mirrors feedenv.APIReadKeys; duplicated here so the drift
 // test in internal/feedenv/feedenv_test.go has something to compare
 // against without an import cycle. Will be retired once the schema
 // endpoint's readable_keys is consumed end-to-end.

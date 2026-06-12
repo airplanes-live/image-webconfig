@@ -148,6 +148,10 @@ func main() {
 	claimStatusProber := claimstatus.Prober{Runner: wexec.RealRunner, Argv: claimstatus.DefaultArgv}
 	claimStatusCache := claimstatus.NewCache(claimStatusProber.Probe, nil)
 
+	// One config reader shared by the /api/config handlers and the
+	// identity claim-page link — both read through `apl-feed config show`.
+	feedEnv := feedenv.New()
+
 	effectiveVersion := resolveVersion()
 	srv := &http.Server{
 		Addr: *listen,
@@ -158,8 +162,8 @@ func main() {
 			Lockout:      auth.NewLockout(*lockoutThreshold, *lockoutWindow, *lockoutDuration),
 			Guard:        guard,
 			Argon2Params: params,
-			Identity:     identity.NewReader(identity.DefaultPaths()),
-			FeedEnv:      feedenv.New(),
+			Identity:     identity.NewReader(identity.DefaultPaths(), feedEnv),
+			FeedEnv:      feedEnv,
 			Status: status.NewReader(effectiveVersion, status.DefaultPaths(), nil,
 				status.WithHardware(hardware.NewReader(
 					hardware.DefaultPaths(),

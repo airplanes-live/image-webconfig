@@ -1,6 +1,7 @@
 package identity
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"os"
@@ -8,6 +9,9 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/airplanes-live/image-webconfig/internal/feedenv"
+	"github.com/airplanes-live/image-webconfig/internal/feedenv/feedenvtest"
 )
 
 func newTestPaths(t *testing.T) (Paths, string) {
@@ -17,14 +21,17 @@ func newTestPaths(t *testing.T) (Paths, string) {
 		FeederIDFile:     filepath.Join(dir, "feeder-id"),
 		ClaimSecretFile:  filepath.Join(dir, "feeder-claim-secret"),
 		ClaimVersionFile: filepath.Join(dir, "feeder-claim-secret.version"),
-		FeedEnvFile:      filepath.Join(dir, "feed.env"), // absent unless a test writes it
 	}, dir
 }
+
+// noEnv returns a feedenv reader serving an empty configuration —
+// claim-page derivation falls back to the production default.
+func noEnv() *feedenv.Reader { return feedenvtest.Reader(nil) }
 
 func TestRead_Missing(t *testing.T) {
 	t.Parallel()
 	p, _ := newTestPaths(t)
-	r := NewReader(p)
+	r := NewReader(p, noEnv())
 	_, err := r.Read()
 	if !errors.Is(err, ErrNoFeederID) {
 		t.Fatalf("err = %v, want ErrNoFeederID", err)
@@ -37,7 +44,7 @@ func TestRead_FeederIDPresent_NoSecret(t *testing.T) {
 	if err := os.WriteFile(p.FeederIDFile, []byte("abc-123\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	r := NewReader(p)
+	r := NewReader(p, noEnv())
 	got, err := r.Read()
 	if err != nil {
 		t.Fatal(err)
@@ -57,7 +64,7 @@ func TestRead_FeederIDAndSecretPresent(t *testing.T) {
 	_ = os.WriteFile(p.ClaimSecretFile, []byte("ABCDEFGHIJKLMNOP\n"), 0o640)
 	_ = os.WriteFile(p.ClaimVersionFile, []byte("3\n"), 0o640)
 	beforeWrite := time.Now().Add(-2 * time.Second).UTC()
-	r := NewReader(p)
+	r := NewReader(p, noEnv())
 	got, err := r.Read()
 	if err != nil {
 		t.Fatal(err)
@@ -89,7 +96,7 @@ func TestRead_SecretPresentNoVersionFile(t *testing.T) {
 	p, _ := newTestPaths(t)
 	_ = os.WriteFile(p.FeederIDFile, []byte("abc-123\n"), 0o644)
 	_ = os.WriteFile(p.ClaimSecretFile, []byte("ABCDEFGHIJKLMNOP\n"), 0o640)
-	r := NewReader(p)
+	r := NewReader(p, noEnv())
 	got, err := r.Read()
 	if err != nil {
 		t.Fatal(err)
@@ -114,7 +121,7 @@ func TestRead_SecretFileEmptyNotPresent(t *testing.T) {
 	p, _ := newTestPaths(t)
 	_ = os.WriteFile(p.FeederIDFile, []byte("abc-123\n"), 0o644)
 	_ = os.WriteFile(p.ClaimSecretFile, []byte(""), 0o640)
-	r := NewReader(p)
+	r := NewReader(p, noEnv())
 	got, err := r.Read()
 	if err != nil {
 		t.Fatal(err)
@@ -159,7 +166,7 @@ func TestRead_VersionFileVariants(t *testing.T) {
 			_ = os.WriteFile(p.FeederIDFile, []byte("abc-123\n"), 0o644)
 			_ = os.WriteFile(p.ClaimSecretFile, []byte("ABCDEFGHIJKLMNOP\n"), 0o640)
 			_ = os.WriteFile(p.ClaimVersionFile, []byte(tc.content), 0o640)
-			r := NewReader(p)
+			r := NewReader(p, noEnv())
 			got, err := r.Read()
 			if err != nil {
 				t.Fatal(err)
@@ -192,10 +199,9 @@ func TestRead_StatErrorPropagates(t *testing.T) {
 		FeederIDFile:     filepath.Join(tmp, "feeder-id"),
 		ClaimSecretFile:  filepath.Join(parent, "feeder-claim-secret"),
 		ClaimVersionFile: filepath.Join(parent, "feeder-claim-secret.version"),
-		FeedEnvFile:      filepath.Join(tmp, "feed.env"),
 	}
 	_ = os.WriteFile(p.FeederIDFile, []byte("abc-123\n"), 0o644)
-	r := NewReader(p)
+	r := NewReader(p, noEnv())
 	_, err := r.Read()
 	if err == nil {
 		t.Fatal("expected stat error to propagate, got nil")
@@ -268,7 +274,7 @@ func TestNewReader_DefaultsClaimVersionFileWhenEmpty(t *testing.T) {
 		FeederIDFile:    "/tmp/_unused",
 		ClaimSecretFile: "/tmp/_unused",
 		// ClaimVersionFile omitted on purpose.
-	})
+	}, noEnv())
 	if r.paths.ClaimVersionFile != defaultClaimVersionFile {
 		t.Errorf("ClaimVersionFile = %q, want %q",
 			r.paths.ClaimVersionFile, defaultClaimVersionFile)
@@ -279,7 +285,7 @@ func TestRead_FeederIDEmptyTreatedAsMissing(t *testing.T) {
 	t.Parallel()
 	p, _ := newTestPaths(t)
 	_ = os.WriteFile(p.FeederIDFile, []byte("\n"), 0o644)
-	r := NewReader(p)
+	r := NewReader(p, noEnv())
 	if _, err := r.Read(); !errors.Is(err, ErrNoFeederID) {
 		t.Fatalf("err = %v, want ErrNoFeederID", err)
 	}
@@ -290,8 +296,8 @@ func TestReveal_HappyPath_CanonicalOnDisk(t *testing.T) {
 	p, _ := newTestPaths(t)
 	_ = os.WriteFile(p.FeederIDFile, []byte("abc-123\n"), 0o644)
 	_ = os.WriteFile(p.ClaimSecretFile, []byte("ABCDEFGHIJKLMNOP\n"), 0o640)
-	r := NewReader(p)
-	got, err := r.Reveal()
+	r := NewReader(p, noEnv())
+	got, err := r.Reveal(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -315,8 +321,8 @@ func TestReveal_CanonicalizesLowercaseHyphenatedOnDisk(t *testing.T) {
 	p, _ := newTestPaths(t)
 	_ = os.WriteFile(p.FeederIDFile, []byte("abc-123\n"), 0o644)
 	_ = os.WriteFile(p.ClaimSecretFile, []byte("abcd-efgh-ijkl-mnop\n"), 0o640)
-	r := NewReader(p)
-	got, err := r.Reveal()
+	r := NewReader(p, noEnv())
+	got, err := r.Reveal(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -329,8 +335,8 @@ func TestReveal_NoFeederID(t *testing.T) {
 	t.Parallel()
 	p, _ := newTestPaths(t)
 	_ = os.WriteFile(p.ClaimSecretFile, []byte("ABCDEFGHIJKLMNOP\n"), 0o640)
-	r := NewReader(p)
-	if _, err := r.Reveal(); !errors.Is(err, ErrNoFeederID) {
+	r := NewReader(p, noEnv())
+	if _, err := r.Reveal(context.Background()); !errors.Is(err, ErrNoFeederID) {
 		t.Fatalf("err = %v, want ErrNoFeederID", err)
 	}
 }
@@ -339,8 +345,8 @@ func TestReveal_SecretMissing(t *testing.T) {
 	t.Parallel()
 	p, _ := newTestPaths(t)
 	_ = os.WriteFile(p.FeederIDFile, []byte("abc-123\n"), 0o644)
-	r := NewReader(p)
-	if _, err := r.Reveal(); !errors.Is(err, ErrNoClaimSecret) {
+	r := NewReader(p, noEnv())
+	if _, err := r.Reveal(context.Background()); !errors.Is(err, ErrNoClaimSecret) {
 		t.Fatalf("err = %v, want ErrNoClaimSecret", err)
 	}
 }
@@ -355,8 +361,8 @@ func TestReveal_SecretEmptyFileTreatedAsMalformed(t *testing.T) {
 	p, _ := newTestPaths(t)
 	_ = os.WriteFile(p.FeederIDFile, []byte("abc-123\n"), 0o644)
 	_ = os.WriteFile(p.ClaimSecretFile, []byte(""), 0o640)
-	r := NewReader(p)
-	_, err := r.Reveal()
+	r := NewReader(p, noEnv())
+	_, err := r.Reveal(context.Background())
 	if err == nil {
 		t.Fatal("expected non-nil error for empty secret file")
 	}
@@ -370,8 +376,8 @@ func TestReveal_SecretWhitespaceOnlyTreatedAsMalformed(t *testing.T) {
 	p, _ := newTestPaths(t)
 	_ = os.WriteFile(p.FeederIDFile, []byte("abc-123\n"), 0o644)
 	_ = os.WriteFile(p.ClaimSecretFile, []byte("   \n"), 0o640)
-	r := NewReader(p)
-	_, err := r.Reveal()
+	r := NewReader(p, noEnv())
+	_, err := r.Reveal(context.Background())
 	if err == nil {
 		t.Fatal("expected non-nil error for whitespace-only secret file")
 	}
@@ -387,8 +393,8 @@ func TestReveal_SecretCRLFAccepted(t *testing.T) {
 	p, _ := newTestPaths(t)
 	_ = os.WriteFile(p.FeederIDFile, []byte("abc-123\n"), 0o644)
 	_ = os.WriteFile(p.ClaimSecretFile, []byte("ABCDEFGHIJKLMNOP\r\n"), 0o640)
-	r := NewReader(p)
-	got, err := r.Reveal()
+	r := NewReader(p, noEnv())
+	got, err := r.Reveal(context.Background())
 	if err != nil {
 		t.Fatalf("CRLF-terminated secret rejected: %v", err)
 	}
@@ -407,8 +413,8 @@ func TestReveal_SecretFileIsDirectoryReturnsReadError(t *testing.T) {
 	if err := os.Mkdir(p.ClaimSecretFile, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	r := NewReader(p)
-	_, err := r.Reveal()
+	r := NewReader(p, noEnv())
+	_, err := r.Reveal(context.Background())
 	if err == nil {
 		t.Fatal("expected non-nil error when secret path is a directory")
 	}
@@ -423,8 +429,8 @@ func TestReveal_SecretMalformedRejected(t *testing.T) {
 	_ = os.WriteFile(p.FeederIDFile, []byte("abc-123\n"), 0o644)
 	// Garbage that doesn't canonicalize to 16 chars A-Z 0-9.
 	_ = os.WriteFile(p.ClaimSecretFile, []byte("not-a-secret\n"), 0o640)
-	r := NewReader(p)
-	_, err := r.Reveal()
+	r := NewReader(p, noEnv())
+	_, err := r.Reveal(context.Background())
 	if err == nil {
 		t.Fatal("expected non-nil error for malformed secret")
 	}
@@ -434,36 +440,27 @@ func TestReveal_SecretMalformedRejected(t *testing.T) {
 	}
 }
 
-func TestNewReader_DefaultsFeedEnvFileWhenEmpty(t *testing.T) {
-	t.Parallel()
-	r := NewReader(Paths{
-		FeederIDFile:    "/tmp/_unused",
-		ClaimSecretFile: "/tmp/_unused",
-		// FeedEnvFile omitted on purpose.
-	})
-	if r.paths.FeedEnvFile != "/etc/airplanes/feed.env" {
-		t.Errorf("FeedEnvFile = %q, want default", r.paths.FeedEnvFile)
-	}
-}
-
-// The claim page must follow feed.env's APL_FEED_WEBSITE_URL — the backend
-// apl-feed registers the secret against — so an overridden feeder doesn't
-// link to a site that has never heard of it. Mirrors feed's claim.sh
-// claim_page_url derivation.
+// The claim page must follow APL_FEED_WEBSITE_URL — the backend apl-feed
+// registers the secret against, read via `apl-feed config show` — so an
+// overridden feeder doesn't link to a site that has never heard of it.
+// Mirrors feed's claim.sh claim_page_url derivation.
 func TestReveal_ClaimPageFollowsWebsiteURL(t *testing.T) {
 	t.Parallel()
 	cases := []struct {
-		name    string
-		feedEnv string // "" → no feed.env file written
-		want    string
+		name string
+		env  *feedenv.Reader
+		want string
 	}{
-		{"no feed.env", "", "https://airplanes.live/feeder/claim/"},
-		{"no key", "LATITUDE=1.0\n", "https://airplanes.live/feeder/claim/"},
-		{"override", "APL_FEED_WEBSITE_URL=https://dev.airplanes.live\n", "https://dev.airplanes.live/feeder/claim/"},
-		{"trailing slash", "APL_FEED_WEBSITE_URL=http://airplanes.test/\n", "http://airplanes.test/feeder/claim/"},
-		{"quoted", "APL_FEED_WEBSITE_URL=\"https://dev.airplanes.live\"\n", "https://dev.airplanes.live/feeder/claim/"},
-		{"empty value", "APL_FEED_WEBSITE_URL=\n", "https://airplanes.live/feeder/claim/"},
-		{"last wins", "APL_FEED_WEBSITE_URL=https://one.example\nAPL_FEED_WEBSITE_URL=https://two.example\n", "https://two.example/feeder/claim/"},
+		{"no config", feedenvtest.Reader(nil), "https://airplanes.live/feeder/claim/"},
+		{"no key", feedenvtest.Reader(map[string]string{"LATITUDE": "1.0"}), "https://airplanes.live/feeder/claim/"},
+		{"override", feedenvtest.Reader(map[string]string{"APL_FEED_WEBSITE_URL": "https://dev.airplanes.live"}), "https://dev.airplanes.live/feeder/claim/"},
+		{"trailing slash", feedenvtest.Reader(map[string]string{"APL_FEED_WEBSITE_URL": "http://airplanes.test/"}), "http://airplanes.test/feeder/claim/"},
+		{"empty value", feedenvtest.Reader(map[string]string{"APL_FEED_WEBSITE_URL": ""}), "https://airplanes.live/feeder/claim/"},
+		// A failed config read collapses to the production default —
+		// never an empty or broken link.
+		{"read failure", feedenvtest.ReaderFunc(func() (map[string]string, error) {
+			return nil, errors.New("config show exploded")
+		}), "https://airplanes.live/feeder/claim/"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -471,10 +468,7 @@ func TestReveal_ClaimPageFollowsWebsiteURL(t *testing.T) {
 			p, _ := newTestPaths(t)
 			_ = os.WriteFile(p.FeederIDFile, []byte("abc-123\n"), 0o644)
 			_ = os.WriteFile(p.ClaimSecretFile, []byte("ABCDEFGHIJKLMNOP\n"), 0o640)
-			if tc.feedEnv != "" {
-				_ = os.WriteFile(p.FeedEnvFile, []byte(tc.feedEnv), 0o644)
-			}
-			got, err := NewReader(p).Reveal()
+			got, err := NewReader(p, tc.env).Reveal(context.Background())
 			if err != nil {
 				t.Fatal(err)
 			}

@@ -361,6 +361,9 @@ func TestApplyFeed_StrictFieldValidation(t *testing.T) {
 
 func TestApplyFeed_WritesAreVisibleToFeedenvReader(t *testing.T) {
 	t.Parallel()
+	// The production feedenv.Reader wired to the fake config-show runner
+	// must observe a fake apply immediately — both fakes share the same
+	// in-memory state.feedEnv map.
 	s := mustNewState(t)
 	priv := StubPrivilegedArgv()
 	runner := StdinRunner(s, priv)
@@ -368,13 +371,50 @@ func TestApplyFeed_WritesAreVisibleToFeedenvReader(t *testing.T) {
 	if _, err := runner(context.Background(), priv.ApplyFeed, strings.NewReader(payload)); err != nil {
 		t.Fatalf("runner: %v", err)
 	}
-	rd := &feedenv.Reader{Path: s.Paths.FeedEnv}
-	got, err := rd.ReadAll()
+	rd := &feedenv.Reader{Exec: Runner(s, priv), Argv: priv.ConfigShowFeed}
+	got, err := rd.ReadAll(context.Background())
 	if err != nil {
 		t.Fatalf("feedenv.ReadAll: %v", err)
 	}
 	if got["MLAT_ENABLED"] != "false" {
 		t.Fatalf("feedenv read after fake apply: MLAT_ENABLED=%q want false", got["MLAT_ENABLED"])
+	}
+}
+
+func TestConfigShowFeed_StringNullAndEmpty(t *testing.T) {
+	t.Parallel()
+	// The fake config-show must distinguish present (string, including
+	// the explicitly-empty "") from absent (null) the way the real
+	// `apl-feed config show --json` does.
+	s := mustNewState(t)
+	priv := StubPrivilegedArgv()
+	runner := Runner(s, priv)
+	res, err := runner(context.Background(), priv.ConfigShowFeed)
+	if err != nil {
+		t.Fatalf("runner: %v", err)
+	}
+	var env struct {
+		SchemaVersion int                `json:"schema_version"`
+		Values        map[string]*string `json:"values"`
+	}
+	if err := json.Unmarshal(res.Stdout, &env); err != nil {
+		t.Fatalf("unmarshal %q: %v", res.Stdout, err)
+	}
+	if env.SchemaVersion != 1 {
+		t.Errorf("schema_version = %d, want 1", env.SchemaVersion)
+	}
+	if v := env.Values["GAIN"]; v == nil || *v != "auto" {
+		t.Errorf("GAIN = %v, want \"auto\"", v)
+	}
+	if v, ok := env.Values["UAT_INPUT"]; !ok || v == nil || *v != "" {
+		t.Errorf("UAT_INPUT = %v (present=%v), want explicit empty string", v, ok)
+	}
+	// Not seeded in NewState → null, but the entry must exist (one entry
+	// per readable key, plus the readable-only website URL).
+	if v, ok := env.Values["APL_FEED_WEBSITE_URL"]; !ok {
+		t.Error("APL_FEED_WEBSITE_URL entry missing from envelope")
+	} else if v != nil {
+		t.Errorf("APL_FEED_WEBSITE_URL = %q, want null", *v)
 	}
 }
 
@@ -540,12 +580,15 @@ func TestClaimRegister_MaterialisesSecret(t *testing.T) {
 	}
 }
 
-func TestConcurrentApply_AtomicWrites(t *testing.T) {
+func TestConcurrentApply_ReadersSeeCoherentState(t *testing.T) {
 	t.Parallel()
+	// Concurrent fake applies racing config-show reads must never
+	// surface a torn or unreadable snapshot — the state mutex is the
+	// serialization point both fakes share.
 	s := mustNewState(t)
 	priv := StubPrivilegedArgv()
 	runner := StdinRunner(s, priv)
-	rd := &feedenv.Reader{Path: s.Paths.FeedEnv}
+	rd := &feedenv.Reader{Exec: Runner(s, priv), Argv: priv.ConfigShowFeed}
 
 	const writers = 16
 	const iters = 25
@@ -561,7 +604,7 @@ func TestConcurrentApply_AtomicWrites(t *testing.T) {
 					t.Errorf("apply: %v", err)
 					return
 				}
-				if _, err := rd.ReadAll(); err != nil {
+				if _, err := rd.ReadAll(context.Background()); err != nil {
 					t.Errorf("read during write: %v", err)
 					return
 				}
