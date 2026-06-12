@@ -12,19 +12,26 @@ import (
 )
 
 // Output marshals the config-show envelope for the given present keys.
-// Absent keys are simply omitted — the reader treats an omitted entry
-// and an explicit null identically (key not in feed.env). An empty
-// string value stays an empty string on the wire (explicitly-empty).
+// To match the real CLI's wire shape (one entry per readable key), every
+// known readable key absent from values is emitted as an explicit null —
+// not omitted — so tests exercise the same envelope production sees. An
+// empty string value stays an empty string on the wire (explicitly-empty).
+// Present keys outside the known readable set are still emitted, letting
+// tests simulate a newer feed CLI with extra readable keys.
 func Output(values map[string]string) []byte {
-	if values == nil {
-		values = map[string]string{} // nil would marshal to a null values object
+	wire := make(map[string]any, len(feedenv.APIReadKeys)+1+len(values))
+	for _, k := range append(append([]string{}, feedenv.APIReadKeys...), "APL_FEED_WEBSITE_URL") {
+		wire[k] = nil
+	}
+	for k, v := range values {
+		wire[k] = v
 	}
 	b, err := json.Marshal(map[string]any{
 		"schema_version": 1,
-		"values":         values,
+		"values":         wire,
 	})
 	if err != nil {
-		panic(err) // map[string]string cannot fail to marshal
+		panic(err) // string/nil map values cannot fail to marshal
 	}
 	return b
 }
