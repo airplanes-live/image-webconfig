@@ -52,6 +52,10 @@ func mustNewState(t *testing.T) *State {
 	if err := s.SyncAll(); err != nil {
 		t.Fatalf("SyncAll: %v", err)
 	}
+	// Registered after t.TempDir's own cleanup, so it runs first: any
+	// simulated orchestrator run a test kicked off is stopped before the
+	// directory removal it would otherwise race.
+	t.Cleanup(s.AbortOrchestratorRuns)
 	return s
 }
 

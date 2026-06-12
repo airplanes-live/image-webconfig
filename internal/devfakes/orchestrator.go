@@ -50,6 +50,21 @@ func (s *State) SetOrchestratorOutcome(outcome string) error {
 	return nil
 }
 
+// AbortOrchestratorRuns stops every in-flight simulated run and waits
+// for their goroutines to exit, guaranteeing no state-file write lands
+// after it returns. Tests register it as a cleanup so the async
+// progression can't race t.TempDir removal; the devserver never calls
+// it (runs there end on their own).
+func (s *State) AbortOrchestratorRuns() {
+	s.mu.Lock()
+	if s.orchestratorAbort != nil && !s.orchestratorAborted {
+		close(s.orchestratorAbort)
+		s.orchestratorAborted = true
+	}
+	s.mu.Unlock()
+	s.orchestratorWG.Wait()
+}
+
 // StartOrchestratorRun simulates the update orchestrator's state-file
 // progression in the background, paced by stepDelay (0 → the devserver
 // default). The sequence mirrors the real orchestrator: an entry write
@@ -62,12 +77,29 @@ func (s *State) StartOrchestratorRun(stepDelay time.Duration) {
 	}
 	s.mu.Lock()
 	outcome := s.orchestratorOutcome
+	if s.orchestratorAbort == nil {
+		s.orchestratorAbort = make(chan struct{})
+	}
+	abort := s.orchestratorAbort
 	s.mu.Unlock()
 	if outcome == "" {
 		outcome = OrchestratorOutcomeOK
 	}
 
+	s.orchestratorWG.Add(1)
 	go func() {
+		defer s.orchestratorWG.Done()
+		// pause returns false when the run is aborted; the caller must
+		// bail without further writes so AbortOrchestratorRuns can
+		// guarantee a quiet state dir on return.
+		pause := func() bool {
+			select {
+			case <-time.After(stepDelay):
+				return true
+			case <-abort:
+				return false
+			}
+		}
 		now := func() *string {
 			v := time.Now().UTC().Format(time.RFC3339)
 			return &v
@@ -85,11 +117,15 @@ func (s *State) StartOrchestratorRun(stepDelay time.Duration) {
 		errStr := func(msg string) *string { return &msg }
 
 		write(orchestratorState{Step: "idle", Status: "running"})
-		time.Sleep(stepDelay)
+		if !pause() {
+			return
+		}
 
 		started := now()
 		write(orchestratorState{Step: "apt", Status: "running", StartedAt: started, AptIrreversible: true})
-		time.Sleep(stepDelay)
+		if !pause() {
+			return
+		}
 		if outcome == OrchestratorOutcomeFailApt {
 			write(orchestratorState{
 				Step: "apt", Status: "failed", StartedAt: started, FinishedAt: now(),
@@ -101,7 +137,9 @@ func (s *State) StartOrchestratorRun(stepDelay time.Duration) {
 
 		started = now()
 		write(orchestratorState{Step: "runtime", Status: "running", StartedAt: started, AptIrreversible: true})
-		time.Sleep(stepDelay)
+		if !pause() {
+			return
+		}
 		if outcome == OrchestratorOutcomeFailRuntime {
 			write(orchestratorState{
 				Step: "runtime", Status: "failed", StartedAt: started, FinishedAt: now(),

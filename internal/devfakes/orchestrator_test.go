@@ -38,6 +38,7 @@ func TestStartOrchestratorRun_OKEndsDone(t *testing.T) {
 	t.Parallel()
 	dir := t.TempDir()
 	s := NewState(Paths{StateDir: dir, OrchestratorState: filepath.Join(dir, "orchestrator.state")})
+	t.Cleanup(s.AbortOrchestratorRuns)
 	if err := s.SetOrchestratorOutcome(OrchestratorOutcomeOK); err != nil {
 		t.Fatal(err)
 	}
@@ -55,6 +56,7 @@ func TestStartOrchestratorRun_FailAptEndsAptFailed(t *testing.T) {
 	t.Parallel()
 	dir := t.TempDir()
 	s := NewState(Paths{StateDir: dir, OrchestratorState: filepath.Join(dir, "orchestrator.state")})
+	t.Cleanup(s.AbortOrchestratorRuns)
 	if err := s.SetOrchestratorOutcome(OrchestratorOutcomeFailApt); err != nil {
 		t.Fatal(err)
 	}

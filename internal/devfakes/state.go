@@ -125,6 +125,12 @@ type State struct {
 	// orchestratorOutcome selects how a simulated update-orchestrator
 	// run ends (OrchestratorOutcome* constants). Empty means ok.
 	orchestratorOutcome string
+	// orchestratorAbort/orchestratorAborted/orchestratorWG let
+	// AbortOrchestratorRuns stop in-flight simulated runs and wait out
+	// their goroutines, so test cleanup never races a state-file write.
+	orchestratorAbort   chan struct{}
+	orchestratorAborted bool
+	orchestratorWG      sync.WaitGroup
 }
 
 // aggRecord is the dev-fake per-adapter aggregator state the verbs mutate.
