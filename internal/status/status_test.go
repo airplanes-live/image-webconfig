@@ -341,6 +341,7 @@ func newDecisionTestPaths(t *testing.T) Paths {
 		MlatStateFile:     filepath.Join(dir, "run", "airplanes-mlat", "state"),
 		FeedStateFile:     filepath.Join(dir, "run", "airplanes-feed", "state"),
 		UAT978StateFile:   filepath.Join(dir, "run", "airplanes-978", "state"),
+		ReadsbStateFile:   filepath.Join(dir, "run", "readsb", "state"),
 		SystemctlBinary:   "systemctl",
 		IsActiveTimeout:   2 * time.Second,
 	}
@@ -811,5 +812,100 @@ func TestRead_WifiOption_ProbeReturnsNil_OmitsField(t *testing.T) {
 	blob, _ := json.Marshal(got)
 	if strings.Contains(string(blob), `"wifi"`) {
 		t.Errorf("marshaled JSON should omit wifi when probe returned nil: %s", blob)
+	}
+}
+
+func TestRead_ReadsbDecisionNoHardwareWhenActive(t *testing.T) {
+	t.Parallel()
+	p := newDecisionTestPaths(t)
+	writeStateFile(t, p.ReadsbStateFile, "schema_version=1\nservice=readsb\nstate=disabled\nreason=no_hardware\n")
+	r := NewReader("v", p, perArgvRunner(map[string]func(unit string) (string, error){
+		"is-active:default": func(_ string) (string, error) { return "active", nil },
+	}))
+	got, err := r.Read(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.ReadsbDecision == nil {
+		t.Fatalf("ReadsbDecision = nil, want non-nil")
+	}
+	if got.ReadsbDecision.State != "disabled" || got.ReadsbDecision.Reason != "no_hardware" {
+		t.Errorf("ReadsbDecision = %+v, want disabled/no_hardware", *got.ReadsbDecision)
+	}
+}
+
+func TestRead_ReadsbDecisionNilWhenStateFileAbsent(t *testing.T) {
+	t.Parallel()
+	p := newDecisionTestPaths(t)
+	r := NewReader("v", p, perArgvRunner(map[string]func(unit string) (string, error){
+		"is-active:default": func(_ string) (string, error) { return "active", nil },
+	}))
+	got, _ := r.Read(context.Background())
+	if got.ReadsbDecision != nil {
+		t.Errorf("ReadsbDecision = %+v, want nil (no state file → systemd fallback)", got.ReadsbDecision)
+	}
+}
+
+func TestRead_ReadsbDecisionNilWhenInactive(t *testing.T) {
+	t.Parallel()
+	p := newDecisionTestPaths(t)
+	// readsb has no exit-64 path, so a non-active unit must never consult the
+	// (possibly stale) state file.
+	writeStateFile(t, p.ReadsbStateFile, "schema_version=1\nstate=disabled\nreason=no_hardware\n")
+	r := NewReader("v", p, perArgvRunner(map[string]func(unit string) (string, error){
+		"is-active:readsb.service": func(_ string) (string, error) { return "failed", errors.New("exit 3") },
+		"is-active:default":        func(_ string) (string, error) { return "active", nil },
+	}))
+	got, _ := r.Read(context.Background())
+	if got.ReadsbDecision != nil {
+		t.Errorf("ReadsbDecision = %+v, want nil for non-active readsb", got.ReadsbDecision)
+	}
+}
+
+func TestRead_ReadsbDecisionNilOnDisallowedReason(t *testing.T) {
+	t.Parallel()
+	p := newDecisionTestPaths(t)
+	// A reason outside AllowedReasonsReadsb (e.g. a 978-only token) is dropped,
+	// not passed through.
+	writeStateFile(t, p.ReadsbStateFile, "schema_version=1\nstate=disabled\nreason=uat_disabled\n")
+	r := NewReader("v", p, perArgvRunner(map[string]func(unit string) (string, error){
+		"is-active:default": func(_ string) (string, error) { return "active", nil },
+	}))
+	got, _ := r.Read(context.Background())
+	if got.ReadsbDecision != nil {
+		t.Errorf("ReadsbDecision = %+v, want nil for disallowed reason", got.ReadsbDecision)
+	}
+}
+
+func TestRead_FeedSuppressedWhenReadsbDisabled(t *testing.T) {
+	t.Parallel()
+	p := newDecisionTestPaths(t)
+	// A preserved (stale) aircraft.json must not be reported as live when the
+	// decoder self-disabled for a missing pinned SDR.
+	writeStateFile(t, p.AircraftJSONFile, `{"now":1717000000,"messages":1234,"aircraft":[{},{},{}]}`)
+	writeStateFile(t, p.ReadsbStateFile, "schema_version=1\nstate=disabled\nreason=no_hardware\n")
+	r := NewReader("v", p, perArgvRunner(map[string]func(unit string) (string, error){
+		"is-active:default": func(_ string) (string, error) { return "active", nil },
+	}))
+	got, _ := r.Read(context.Background())
+	if got.Feed != nil {
+		t.Errorf("Feed = %+v, want nil (suppressed while readsb disabled)", *got.Feed)
+	}
+}
+
+func TestRead_FeedPresentWhenReadsbEnabled(t *testing.T) {
+	t.Parallel()
+	p := newDecisionTestPaths(t)
+	writeStateFile(t, p.AircraftJSONFile, `{"now":1717000000,"messages":1234,"aircraft":[{},{},{}]}`)
+	writeStateFile(t, p.ReadsbStateFile, "schema_version=1\nstate=enabled\nreason=ok\n")
+	r := NewReader("v", p, perArgvRunner(map[string]func(unit string) (string, error){
+		"is-active:default": func(_ string) (string, error) { return "active", nil },
+	}))
+	got, _ := r.Read(context.Background())
+	if got.Feed == nil {
+		t.Fatal("Feed = nil, want populated when readsb enabled")
+	}
+	if got.Feed.AircraftCount != 3 {
+		t.Errorf("AircraftCount = %d, want 3", got.Feed.AircraftCount)
 	}
 }
