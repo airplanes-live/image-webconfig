@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -22,10 +23,10 @@ func (s stubHardwareProbe) Probe(context.Context) *hardware.Snapshot { return s.
 func statusReaderWithHardware(t *testing.T, snap *hardware.Snapshot) *status.Reader {
 	t.Helper()
 	paths := status.Paths{
-		ManifestFile:     filepath.Join(t.TempDir(), "no-manifest.json"),
-		AircraftJSONFile: filepath.Join(t.TempDir(), "no-aircraft.json"),
-		SystemctlBinary:  "/usr/bin/systemctl",
-		IsActiveTimeout:  time.Second,
+		ImageManifestFile: filepath.Join(t.TempDir(), "no-manifest.json"),
+		AircraftJSONFile:  filepath.Join(t.TempDir(), "no-aircraft.json"),
+		SystemctlBinary:   "/usr/bin/systemctl",
+		IsActiveTimeout:   time.Second,
 	}
 	runner := func(context.Context, []string) (wexec.Result, error) {
 		return wexec.Result{Stdout: []byte("active\n")}, nil
@@ -115,5 +116,40 @@ func TestHandleStatus_NoHardwareHealthDoesNotPanic(t *testing.T) {
 	}
 	if _, present := body["hardware_health"]; present {
 		t.Errorf("hardware_health should be omitted when no probe is wired")
+	}
+}
+
+func TestHandleStatus_EmitsBothManifestsNotLegacyKey(t *testing.T) {
+	dir := t.TempDir()
+	img := filepath.Join(dir, "build-manifest.json")
+	rt := filepath.Join(dir, "runtime-manifest.json")
+	if err := os.WriteFile(img, []byte(`{"pi_gen":"abc"}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(rt, []byte(`{"components":{"webconfig":{"version":"dev"}}}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	paths := status.Paths{
+		ImageManifestFile:   img,
+		RuntimeManifestFile: rt,
+		AircraftJSONFile:    filepath.Join(dir, "no-aircraft.json"),
+		SystemctlBinary:     "/usr/bin/systemctl",
+		IsActiveTimeout:     time.Second,
+	}
+	runner := func(context.Context, []string) (wexec.Result, error) {
+		return wexec.Result{Stdout: []byte("active\n")}, nil
+	}
+	reader := status.NewReader("test-sha", paths, runner)
+	body, _ := getStatus(t, reader, "")
+
+	if _, ok := body["image_manifest"].(map[string]any); !ok {
+		t.Errorf("image_manifest missing or not an object: %v", body["image_manifest"])
+	}
+	if _, ok := body["runtime_manifest"].(map[string]any); !ok {
+		t.Errorf("runtime_manifest missing or not an object: %v", body["runtime_manifest"])
+	}
+	// The legacy `manifest` key must be gone (renamed to image_manifest).
+	if _, present := body["manifest"]; present {
+		t.Errorf("legacy `manifest` key still present: %v", body["manifest"])
 	}
 }

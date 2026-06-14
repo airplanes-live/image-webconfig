@@ -1,8 +1,11 @@
 // Package status assembles the GET /api/status payload: per-service
 // active/inactive state, the last-seen aircraft snapshot from
-// /run/readsb/aircraft.json, and the build manifest at
-// /etc/airplanes/build-manifest.json. Only local sources — no network
-// calls — so /api/status stays cheap to poll.
+// /run/readsb/aircraft.json, and two build manifests — the immutable
+// image manifest at /etc/airplanes/build-manifest.json (flash-time
+// provenance) and the runtime-overlay manifest at
+// /etc/airplanes/runtime-manifest.json (the live component versions,
+// which advance on every overlay update). Only local sources — no
+// network calls — so /api/status stays cheap to poll.
 package status
 
 import (
@@ -68,29 +71,31 @@ var MonitoredServices = []string{
 // Paths configures file lookups; defaults match the rootfs layout. Override
 // in tests.
 type Paths struct {
-	ManifestFile       string   // /etc/airplanes/build-manifest.json
-	AircraftJSONFile   string   // /run/readsb/aircraft.json
-	MlatStateFile      string   // /run/airplanes-mlat/state
-	FeedStateFile      string   // /run/airplanes-feed/state
-	UAT978StateFile    string   // /run/airplanes-978/state
-	Dump978FAStateFile string   // /run/dump978-fa/state
-	RebootRequiredFile string   // /var/run/reboot-required (written by needrestart after kernel/libc upgrades)
-	SystemctlSudoArgv0 []string // [sudo, -n, ...] OR [systemctl] (no sudo: is-active is read-only)
-	SystemctlBinary    string   // /usr/bin/systemctl
-	IsActiveTimeout    time.Duration
+	ImageManifestFile   string   // /etc/airplanes/build-manifest.json (flash-time, immutable)
+	RuntimeManifestFile string   // /etc/airplanes/runtime-manifest.json (live overlay, advances on update)
+	AircraftJSONFile    string   // /run/readsb/aircraft.json
+	MlatStateFile       string   // /run/airplanes-mlat/state
+	FeedStateFile       string   // /run/airplanes-feed/state
+	UAT978StateFile     string   // /run/airplanes-978/state
+	Dump978FAStateFile  string   // /run/dump978-fa/state
+	RebootRequiredFile  string   // /var/run/reboot-required (written by needrestart after kernel/libc upgrades)
+	SystemctlSudoArgv0  []string // [sudo, -n, ...] OR [systemctl] (no sudo: is-active is read-only)
+	SystemctlBinary     string   // /usr/bin/systemctl
+	IsActiveTimeout     time.Duration
 }
 
 func DefaultPaths() Paths {
 	return Paths{
-		ManifestFile:       "/etc/airplanes/build-manifest.json",
-		AircraftJSONFile:   "/run/readsb/aircraft.json",
-		MlatStateFile:      "/run/airplanes-mlat/state",
-		FeedStateFile:      "/run/airplanes-feed/state",
-		UAT978StateFile:    "/run/airplanes-978/state",
-		Dump978FAStateFile: "/run/dump978-fa/state",
-		RebootRequiredFile: "/var/run/reboot-required",
-		SystemctlBinary:    "/usr/bin/systemctl",
-		IsActiveTimeout:    2 * time.Second,
+		ImageManifestFile:   "/etc/airplanes/build-manifest.json",
+		RuntimeManifestFile: "/etc/airplanes/runtime-manifest.json",
+		AircraftJSONFile:    "/run/readsb/aircraft.json",
+		MlatStateFile:       "/run/airplanes-mlat/state",
+		FeedStateFile:       "/run/airplanes-feed/state",
+		UAT978StateFile:     "/run/airplanes-978/state",
+		Dump978FAStateFile:  "/run/dump978-fa/state",
+		RebootRequiredFile:  "/var/run/reboot-required",
+		SystemctlBinary:     "/usr/bin/systemctl",
+		IsActiveTimeout:     2 * time.Second,
 	}
 }
 
@@ -120,8 +125,14 @@ func NewReader(version string, p Paths, r wexec.CommandRunner, opts ...Option) *
 type Status struct {
 	Version  string            `json:"webconfig_version"`
 	Services map[string]string `json:"services"` // unit → "active" / "inactive" / "unknown"
-	Manifest json.RawMessage   `json:"manifest,omitempty"`
-	Feed     *FeedStats        `json:"feed,omitempty"`
+	// ImageManifest is the immutable flash-time manifest (pi_gen,
+	// build_timestamp, baked component SHAs). RuntimeManifest is the live
+	// overlay manifest whose component versions advance on every overlay
+	// update — the field a "what am I running" check should read. Both are
+	// passed through raw; either is omitted on a read/parse error.
+	ImageManifest   json.RawMessage `json:"image_manifest,omitempty"`
+	RuntimeManifest json.RawMessage `json:"runtime_manifest,omitempty"`
+	Feed            *FeedStats      `json:"feed,omitempty"`
 	// Decisions are the daemons' published config-classifications, read
 	// from /run/<service>/state. omitempty so an old daemon (pre PR 1
 	// in feed, pre PR 4 in image for UAT) without a state file doesn't
@@ -250,13 +261,8 @@ func (r *Reader) Read(ctx context.Context) (Status, error) {
 	wifiWG.Wait()
 	out.Wifi = wifiResult
 
-	if m, err := os.ReadFile(r.paths.ManifestFile); err == nil {
-		// Validate JSON shape so we never embed garbage in the response.
-		var dummy json.RawMessage
-		if json.Unmarshal(m, &dummy) == nil {
-			out.Manifest = m
-		}
-	}
+	out.ImageManifest = readRawManifest(r.paths.ImageManifestFile)
+	out.RuntimeManifest = readRawManifest(r.paths.RuntimeManifestFile)
 
 	if fs, err := readAircraftJSON(r.paths.AircraftJSONFile); err == nil {
 		out.Feed = fs
@@ -414,6 +420,27 @@ type readsbAircraftJSON struct {
 	Now      float64    `json:"now"`
 	Messages int64      `json:"messages"`
 	Aircraft []struct{} `json:"aircraft"`
+}
+
+// readRawManifest returns a manifest file's bytes only if they parse as a
+// JSON object, so /api/status never embeds garbage or a bare null/array/
+// scalar (which would surface as e.g. `"runtime_manifest": null`). Returns
+// nil on a missing or non-object file (the corresponding field is then
+// omitted). The runtime manifest path is a symlink into the active overlay;
+// os.ReadFile follows it to the current target.
+func readRawManifest(path string) json.RawMessage {
+	m, err := os.ReadFile(path)
+	if err != nil {
+		return nil
+	}
+	// Unmarshalling into a map rejects arrays and scalars; the explicit nil
+	// check rejects a literal `null` (which decodes into a nil map without
+	// error). Only a JSON object survives.
+	var obj map[string]json.RawMessage
+	if json.Unmarshal(m, &obj) != nil || obj == nil {
+		return nil
+	}
+	return m
 }
 
 func readAircraftJSON(path string) (*FeedStats, error) {

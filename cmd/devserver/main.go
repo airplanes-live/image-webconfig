@@ -89,15 +89,16 @@ func main() {
 	schema := schemacache.NewPrepopulated(devfakes.SchemaWritableKeys, devfakes.SchemaReadableKeys)
 
 	statusPaths := status.Paths{
-		ManifestFile:       state.Paths.Manifest,
-		AircraftJSONFile:   state.Paths.AircraftJSON,
-		MlatStateFile:      state.Paths.MlatState,
-		FeedStateFile:      state.Paths.FeedState,
-		UAT978StateFile:    state.Paths.UAT978State,
-		Dump978FAStateFile: state.Paths.Dump978FAState,
-		RebootRequiredFile: filepath.Join(resolvedState, "reboot-required"),
-		SystemctlBinary:    "/usr/bin/systemctl",
-		IsActiveTimeout:    2 * time.Second,
+		ImageManifestFile:   state.Paths.Manifest,
+		RuntimeManifestFile: state.Paths.RuntimeManifest,
+		AircraftJSONFile:    state.Paths.AircraftJSON,
+		MlatStateFile:       state.Paths.MlatState,
+		FeedStateFile:       state.Paths.FeedState,
+		UAT978StateFile:     state.Paths.UAT978State,
+		Dump978FAStateFile:  state.Paths.Dump978FAState,
+		RebootRequiredFile:  filepath.Join(resolvedState, "reboot-required"),
+		SystemctlBinary:     "/usr/bin/systemctl",
+		IsActiveTimeout:     2 * time.Second,
 	}
 	idPaths := identity.Paths{
 		FeederIDFile:    state.Paths.FeederID,

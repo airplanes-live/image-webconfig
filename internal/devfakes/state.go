@@ -40,17 +40,18 @@ import (
 // field becomes a per-file child of that directory so cleanup is
 // `rm -rf <state-dir>`.
 type Paths struct {
-	StateDir       string
-	FeederID       string
-	ClaimSecret    string
-	PasswordHash   string
-	Manifest       string
-	AircraftJSON   string
-	MlatState      string
-	FeedState      string
-	UAT978State    string
-	Dump978FAState string
-	UpgradeState   string
+	StateDir        string
+	FeederID        string
+	ClaimSecret     string
+	PasswordHash    string
+	Manifest        string
+	RuntimeManifest string
+	AircraftJSON    string
+	MlatState       string
+	FeedState       string
+	UAT978State     string
+	Dump978FAState  string
+	UpgradeState    string
 	// OrchestratorState backs GET /api/orchestrator/state — the file the
 	// simulated update-orchestrator run (StartOrchestratorRun) writes its
 	// progression to, standing in for /run/airplanes/orchestrator.state.
@@ -68,6 +69,7 @@ func DefaultPaths(dir string) Paths {
 		ClaimSecret:       filepath.Join(dir, "feeder-claim-secret"),
 		PasswordHash:      filepath.Join(dir, "password.hash"),
 		Manifest:          filepath.Join(dir, "build-manifest.json"),
+		RuntimeManifest:   filepath.Join(dir, "runtime-manifest.json"),
 		AircraftJSON:      filepath.Join(dir, "aircraft.json"),
 		MlatState:         filepath.Join(dir, "mlat.state"),
 		FeedState:         filepath.Join(dir, "feed.state"),
@@ -819,7 +821,27 @@ func (s *State) syncManifestLocked() error {
 	if err != nil {
 		return err
 	}
-	return writeAtomic(s.Paths.Manifest, b, 0o644)
+	if err := writeAtomic(s.Paths.Manifest, b, 0o644); err != nil {
+		return err
+	}
+	// Runtime-overlay manifest — distinct shape from the image manifest,
+	// carrying the component versions that advance on update, so dev
+	// /api/status mirrors the prod payload (image_manifest + runtime_manifest).
+	runtime := map[string]any{
+		"channel":    "dev",
+		"commit_sha": "0000000000000000000000000000000000000000",
+		"build_date": s.feedStart.UTC().Format(time.RFC3339),
+		"arches":     []string{"dev"},
+		"components": map[string]any{
+			"feed_scripts": map[string]any{"commit_sha": "0000000000000000000000000000000000000000", "version": "dev"},
+			"webconfig":    map[string]any{"commit_sha": "0000000000000000000000000000000000000000", "version": "dev"},
+		},
+	}
+	rb, err := json.Marshal(runtime)
+	if err != nil {
+		return err
+	}
+	return writeAtomic(s.Paths.RuntimeManifest, rb, 0o644)
 }
 
 func (s *State) syncUpgradeStateLocked() error {

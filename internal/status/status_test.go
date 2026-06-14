@@ -20,10 +20,11 @@ func newTestPaths(t *testing.T) (Paths, string) {
 	t.Helper()
 	dir := t.TempDir()
 	return Paths{
-		ManifestFile:     filepath.Join(dir, "build-manifest.json"),
-		AircraftJSONFile: filepath.Join(dir, "aircraft.json"),
-		SystemctlBinary:  "/usr/bin/systemctl",
-		IsActiveTimeout:  2 * time.Second,
+		ImageManifestFile:   filepath.Join(dir, "build-manifest.json"),
+		RuntimeManifestFile: filepath.Join(dir, "runtime-manifest.json"),
+		AircraftJSONFile:    filepath.Join(dir, "aircraft.json"),
+		SystemctlBinary:     "/usr/bin/systemctl",
+		IsActiveTimeout:     2 * time.Second,
 	}, dir
 }
 
@@ -81,42 +82,142 @@ func TestRead_TimeoutReportsUnknown(t *testing.T) {
 	}
 }
 
-func TestRead_ManifestPassthrough(t *testing.T) {
+func TestRead_ImageManifestPassthrough(t *testing.T) {
 	t.Parallel()
 	p, _ := newTestPaths(t)
 	manifest := []byte(`{"schema_version":1,"channel":"dev","arch":"arm64"}`)
-	if err := os.WriteFile(p.ManifestFile, manifest, 0o644); err != nil {
+	if err := os.WriteFile(p.ImageManifestFile, manifest, 0o644); err != nil {
 		t.Fatal(err)
 	}
 	r := NewReader("v", p, fixedRunner("active", nil))
 	got, _ := r.Read(context.Background())
 	var roundtrip map[string]any
-	if err := json.Unmarshal(got.Manifest, &roundtrip); err != nil {
+	if err := json.Unmarshal(got.ImageManifest, &roundtrip); err != nil {
 		t.Fatal(err)
 	}
 	if roundtrip["channel"] != "dev" {
-		t.Errorf("manifest channel = %v, want dev", roundtrip["channel"])
+		t.Errorf("image manifest channel = %v, want dev", roundtrip["channel"])
 	}
 }
 
-func TestRead_ManifestMissingOmitted(t *testing.T) {
+func TestRead_ImageManifestMissingOmitted(t *testing.T) {
 	t.Parallel()
 	p, _ := newTestPaths(t)
 	r := NewReader("v", p, fixedRunner("active", nil))
 	got, _ := r.Read(context.Background())
-	if got.Manifest != nil {
-		t.Errorf("Manifest = %s, want nil (file missing)", got.Manifest)
+	if got.ImageManifest != nil {
+		t.Errorf("ImageManifest = %s, want nil (file missing)", got.ImageManifest)
 	}
 }
 
-func TestRead_ManifestCorruptOmitted(t *testing.T) {
+func TestRead_ImageManifestCorruptOmitted(t *testing.T) {
 	t.Parallel()
 	p, _ := newTestPaths(t)
-	_ = os.WriteFile(p.ManifestFile, []byte("not json"), 0o644)
+	_ = os.WriteFile(p.ImageManifestFile, []byte("not json"), 0o644)
 	r := NewReader("v", p, fixedRunner("active", nil))
 	got, _ := r.Read(context.Background())
-	if got.Manifest != nil {
-		t.Errorf("Manifest passed through corrupt JSON: %s", got.Manifest)
+	if got.ImageManifest != nil {
+		t.Errorf("ImageManifest passed through corrupt JSON: %s", got.ImageManifest)
+	}
+}
+
+func TestRead_RuntimeManifestPassthrough(t *testing.T) {
+	t.Parallel()
+	p, _ := newTestPaths(t)
+	manifest := []byte(`{"channel":"dev","components":{"feed_scripts":{"version":"dev"}}}`)
+	if err := os.WriteFile(p.RuntimeManifestFile, manifest, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	r := NewReader("v", p, fixedRunner("active", nil))
+	got, _ := r.Read(context.Background())
+	var roundtrip map[string]any
+	if err := json.Unmarshal(got.RuntimeManifest, &roundtrip); err != nil {
+		t.Fatal(err)
+	}
+	if roundtrip["channel"] != "dev" {
+		t.Errorf("runtime manifest channel = %v, want dev", roundtrip["channel"])
+	}
+}
+
+func TestRead_RuntimeManifestMissingOmitted(t *testing.T) {
+	t.Parallel()
+	p, _ := newTestPaths(t)
+	r := NewReader("v", p, fixedRunner("active", nil))
+	got, _ := r.Read(context.Background())
+	if got.RuntimeManifest != nil {
+		t.Errorf("RuntimeManifest = %s, want nil (file missing)", got.RuntimeManifest)
+	}
+}
+
+func TestRead_RuntimeManifestCorruptOmitted(t *testing.T) {
+	t.Parallel()
+	p, _ := newTestPaths(t)
+	_ = os.WriteFile(p.RuntimeManifestFile, []byte("not json"), 0o644)
+	r := NewReader("v", p, fixedRunner("active", nil))
+	got, _ := r.Read(context.Background())
+	if got.RuntimeManifest != nil {
+		t.Errorf("RuntimeManifest passed through corrupt JSON: %s", got.RuntimeManifest)
+	}
+}
+
+// The two manifests are read independently: a present image manifest must
+// not be suppressed by a missing runtime manifest, and vice versa.
+func TestRead_ManifestsIndependent(t *testing.T) {
+	t.Parallel()
+	p, _ := newTestPaths(t)
+	if err := os.WriteFile(p.ImageManifestFile, []byte(`{"pi_gen":"abc"}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// RuntimeManifestFile deliberately absent.
+	r := NewReader("v", p, fixedRunner("active", nil))
+	got, _ := r.Read(context.Background())
+	if got.ImageManifest == nil {
+		t.Error("ImageManifest nil, want present")
+	}
+	if got.RuntimeManifest != nil {
+		t.Errorf("RuntimeManifest = %s, want nil", got.RuntimeManifest)
+	}
+}
+
+// A syntactically-valid but non-object manifest (null / array / scalar) must
+// be omitted, never surfaced as e.g. `"runtime_manifest": null`.
+func TestRead_RuntimeManifestNonObjectOmitted(t *testing.T) {
+	t.Parallel()
+	for _, body := range []string{"null", "[1,2]", `"x"`, "42"} {
+		p, _ := newTestPaths(t)
+		if err := os.WriteFile(p.RuntimeManifestFile, []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		r := NewReader("v", p, fixedRunner("active", nil))
+		got, _ := r.Read(context.Background())
+		if got.RuntimeManifest != nil {
+			t.Errorf("body %q: RuntimeManifest = %s, want nil", body, got.RuntimeManifest)
+		}
+	}
+}
+
+// On a real feeder /etc/airplanes/runtime-manifest.json is a symlink into the
+// active overlay; the reader must follow it to the target.
+func TestRead_RuntimeManifestSymlinkFollowed(t *testing.T) {
+	t.Parallel()
+	p, dir := newTestPaths(t)
+	target := filepath.Join(dir, "overlay-manifest.json")
+	if err := os.WriteFile(target, []byte(`{"channel":"dev"}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(dir, "runtime-link.json")
+	if err := os.Symlink(target, link); err != nil {
+		t.Fatal(err)
+	}
+	p.RuntimeManifestFile = link
+	r := NewReader("v", p, fixedRunner("active", nil))
+	got, _ := r.Read(context.Background())
+	var roundtrip map[string]any
+	if err := json.Unmarshal(got.RuntimeManifest, &roundtrip); err != nil {
+		t.Fatalf("symlinked manifest not read: %v", err)
+	}
+	if roundtrip["channel"] != "dev" {
+		t.Errorf("channel = %v, want dev", roundtrip["channel"])
 	}
 }
 
@@ -235,13 +336,13 @@ func newDecisionTestPaths(t *testing.T) Paths {
 	t.Helper()
 	dir := t.TempDir()
 	return Paths{
-		ManifestFile:     filepath.Join(dir, "build-manifest.json"),
-		AircraftJSONFile: filepath.Join(dir, "aircraft.json"),
-		MlatStateFile:    filepath.Join(dir, "run", "airplanes-mlat", "state"),
-		FeedStateFile:    filepath.Join(dir, "run", "airplanes-feed", "state"),
-		UAT978StateFile:  filepath.Join(dir, "run", "airplanes-978", "state"),
-		SystemctlBinary:  "systemctl",
-		IsActiveTimeout:  2 * time.Second,
+		ImageManifestFile: filepath.Join(dir, "build-manifest.json"),
+		AircraftJSONFile:  filepath.Join(dir, "aircraft.json"),
+		MlatStateFile:     filepath.Join(dir, "run", "airplanes-mlat", "state"),
+		FeedStateFile:     filepath.Join(dir, "run", "airplanes-feed", "state"),
+		UAT978StateFile:   filepath.Join(dir, "run", "airplanes-978", "state"),
+		SystemctlBinary:   "systemctl",
+		IsActiveTimeout:   2 * time.Second,
 	}
 }
 
