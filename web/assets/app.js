@@ -684,6 +684,30 @@
         return Number.isFinite(n) && n >= 0 && n <= 60;
     }
 
+    // gainIsAdaptive reports whether the (saved) configured gain leaves the
+    // value up to readsb — auto/min/max, or empty (the default is auto). For a
+    // pinned numeric gain the configured value IS the effective value, so we
+    // don't surface a redundant "currently X dB". Explicit allowlist, not
+    // "not a number", so a hand-edited junk value hides rather than shows.
+    function gainIsAdaptive(v) {
+        const s = (v == null ? "" : String(v)).trim();
+        return s === "" || s === "auto" || s === "min" || s === "max";
+    }
+
+    // GAIN_STALE_S: hide the effective gain once readsb's stats.json is older
+    // than this. readsb rewrites it every ~10s, so a larger gap means a wedged
+    // or stopped decoder and a frozen reading we shouldn't trust.
+    const GAIN_STALE_S = 90;
+
+    // effectiveGainDb pulls readsb's live effective gain from /api/status's
+    // readsb_stats, or null when absent, non-numeric, or too stale to trust.
+    function effectiveGainDb(payload) {
+        const rs = payload && payload.readsb_stats;
+        if (!rs || typeof rs.gain_db !== "number") return null;
+        if (typeof rs.age_sec === "number" && rs.age_sec >= GAIN_STALE_S) return null;
+        return rs.gain_db;
+    }
+
     // isValidReadsbSdrSerial mirrors valid_readsb_sdr_serial. Empty is
     // valid (single-SDR default: readsb opens the first stick, no --device).
     const sdrSerialRE = /^[0-9A-Za-z_-]{1,32}$/;
@@ -965,6 +989,13 @@
                     if (n !== null) parts.push(n + " aircraft");
                     if (lastMsgRate !== null) parts.push(lastMsgRate.toFixed(0) + " msg/s");
                     else if (n !== null) parts.push("rate pending");
+                    // Effective gain, shown only under adaptive config
+                    // (auto/min/max) — a pinned numeric gain is already the
+                    // configured value, so it would be redundant here.
+                    const gainDb = effectiveGainDb(payload);
+                    if (gainDb !== null && gainIsAdaptive(configValues.GAIN)) {
+                        parts.push(gainDb.toFixed(1) + " dB");
+                    }
                     return { dot: "ok", meta: parts.join(" · ") || "active" };
                 }
                 if (state === "failed") return { dot: "err", meta: "failed" };
@@ -1373,6 +1404,28 @@
         for (const unit of MONITORED_SERVICES) {
             const tile = grid.tiles[unit];
             if (tile) updateTile(tile, unit, payload);
+        }
+    }
+
+    // updateEffectiveGain refreshes the "Currently X dB" line under the Gain
+    // config field. The config card is rendered once and persists across status
+    // polls, so this is driven from the poll rather than a config re-render.
+    // Scoped to ctx.configBody (not a global query). Shown only when readsb is
+    // active, the saved gain is adaptive, and a fresh reading exists.
+    function updateEffectiveGain(ctx, status) {
+        const host = ctx && ctx.configBody;
+        if (!host) return;
+        const line = host.querySelector('[data-role="gain-effective"]');
+        if (!line) return;
+        const payload = (status && status.payload) || {};
+        const readsbActive = (payload.services || {})["readsb.service"] === "active";
+        const gainDb = effectiveGainDb(payload);
+        if (readsbActive && gainIsAdaptive(configState.savedValues.GAIN) && gainDb !== null) {
+            line.textContent = "Currently " + gainDb.toFixed(1) + " dB.";
+            line.hidden = false;
+        } else {
+            line.textContent = "";
+            line.hidden = true;
         }
     }
 
@@ -2510,6 +2563,15 @@
             }, "wiedehopf's gain guide"),
             ".",
         ));
+        // Live "Currently X dB" line — the effective gain readsb settled on.
+        // Refreshed by updateEffectiveGain() from the status poll (the config
+        // card persists across polls); shown only under adaptive gain.
+        const gainEffective = el("p", {
+            class: "field-help wc-gain-effective",
+            "data-role": "gain-effective",
+            hidden: true,
+        });
+        gainG.body.appendChild(gainEffective);
         const gainError = el("p", {
             class: "field-help wc-field-error", hidden: true, role: "alert",
         }, "auto, min, max, or a number between 0 and 60.");
@@ -2548,6 +2610,10 @@
                 gainEdit.refreshSummary();
                 gainEdit.setEditing(false);
                 gainGroup.recheck();
+                // Reflect the new gain mode immediately (e.g. switching to a
+                // pinned number must hide "Currently X dB" without waiting for
+                // the next poll, which is paused while the card has focus).
+                if (dashboardCtx) updateEffectiveGain(dashboardCtx, dashboardCtx.lastStatus);
             },
         });
 
@@ -4651,6 +4717,8 @@
         updateMsgRateFromStatus(status);
         updateHero(heroEl, status, ctx.configValues);
         updateTiles(tileGrid, status, ctx.configValues);
+        ctx.lastStatus = status;
+        updateEffectiveGain(ctx, status);
         updateAppTiles(tileGrid);
         updateRebootBanner(rebootBanner, !!(status && status.payload && status.payload.reboot_required));
 
@@ -4698,6 +4766,8 @@
             updateMsgRateFromStatus(status);
             updateHero(ctx.heroEl, status, ctx.configValues);
             updateTiles(ctx.tileGrid, status, ctx.configValues);
+            ctx.lastStatus = status;
+            updateEffectiveGain(ctx, status);
             renderAggregatorTiles(ctx.tileGrid.aggTiles, aggregators);
             updateAppTiles(ctx.tileGrid);
             updateRebootBanner(ctx.rebootBanner, !!(status && status.payload && status.payload.reboot_required));

@@ -23,6 +23,7 @@ func newTestPaths(t *testing.T) (Paths, string) {
 		ImageManifestFile:   filepath.Join(dir, "build-manifest.json"),
 		RuntimeManifestFile: filepath.Join(dir, "runtime-manifest.json"),
 		AircraftJSONFile:    filepath.Join(dir, "aircraft.json"),
+		ReadsbStatsFile:     filepath.Join(dir, "stats.json"),
 		SystemctlBinary:     "/usr/bin/systemctl",
 		IsActiveTimeout:     2 * time.Second,
 	}, dir
@@ -909,3 +910,123 @@ func TestRead_FeedPresentWhenReadsbEnabled(t *testing.T) {
 		t.Errorf("AircraftCount = %d, want 3", got.Feed.AircraftCount)
 	}
 }
+
+// writeStatsFile writes a stats.json into a fresh temp dir and returns its path.
+func writeStatsFile(t *testing.T, body string) string {
+	t.Helper()
+	p := filepath.Join(t.TempDir(), "stats.json")
+	if err := os.WriteFile(p, []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	return p
+}
+
+func TestReadReadsbStats_Parsed(t *testing.T) {
+	t.Parallel()
+	got := readReadsbStats(writeStatsFile(t, `{"gain_db":49.6,"messages":1}`))
+	if got == nil {
+		t.Fatal("readReadsbStats = nil, want non-nil")
+	}
+	if got.GainDB != 49.6 {
+		t.Errorf("GainDB = %v, want 49.6", got.GainDB)
+	}
+	if got.AgeSec < 0 || got.AgeSec > 5 {
+		t.Errorf("AgeSec = %d, want ~0 for a freshly written file", got.AgeSec)
+	}
+}
+
+func TestReadReadsbStats_MissingFile(t *testing.T) {
+	t.Parallel()
+	if got := readReadsbStats(filepath.Join(t.TempDir(), "nope.json")); got != nil {
+		t.Errorf("readReadsbStats(missing) = %+v, want nil", got)
+	}
+}
+
+// A JSON string for gain_db must be rejected so the Go reader and the
+// render-status `jq '.gain_db | numbers'` type-gate agree on what counts.
+func TestReadReadsbStats_NonNumericOrAbsent(t *testing.T) {
+	t.Parallel()
+	for _, body := range []string{
+		`{"gain_db":null}`,   // explicit null
+		`{"gain_db":"49.6"}`, // string, not number
+		`{"messages":1}`,     // key absent
+		`{"gain_db":49.6`,    // truncated / corrupt
+		`not json at all`,    // garbage
+		``,                   // empty file
+	} {
+		if got := readReadsbStats(writeStatsFile(t, body)); got != nil {
+			t.Errorf("readReadsbStats(%q) = %+v, want nil", body, got)
+		}
+	}
+}
+
+func TestReadReadsbStats_RangeGate(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		gain string
+		want *float64
+	}{
+		{"0", f64(0)}, // valid low boundary, distinct from absent
+		{"49.6", f64(49.6)},
+		{"99", f64(99)}, // upper boundary kept
+		{"100", nil},    // just over → dropped
+		{"-10", nil},    // negative → RTL AGC sentinel / garbage
+	}
+	for _, c := range cases {
+		got := readReadsbStats(writeStatsFile(t, `{"gain_db":`+c.gain+`}`))
+		switch {
+		case c.want == nil && got != nil:
+			t.Errorf("gain_db=%s: got %+v, want nil", c.gain, got)
+		case c.want != nil && got == nil:
+			t.Errorf("gain_db=%s: got nil, want %v", c.gain, *c.want)
+		case c.want != nil && got != nil && got.GainDB != *c.want:
+			t.Errorf("gain_db=%s: GainDB = %v, want %v", c.gain, got.GainDB, *c.want)
+		}
+	}
+}
+
+func TestReadReadsbStats_AgeFromMtime(t *testing.T) {
+	t.Parallel()
+	p := writeStatsFile(t, `{"gain_db":40.2}`)
+	old := time.Now().Add(-120 * time.Second)
+	if err := os.Chtimes(p, old, old); err != nil {
+		t.Fatal(err)
+	}
+	got := readReadsbStats(p)
+	if got == nil {
+		t.Fatal("readReadsbStats = nil, want non-nil")
+	}
+	if got.AgeSec < 115 || got.AgeSec > 125 {
+		t.Errorf("AgeSec = %d, want ~120 (from backdated mtime)", got.AgeSec)
+	}
+}
+
+// Read() wires stats.json through to the payload, and omits the field entirely
+// when the file is absent (so a pre-first-write decoder doesn't break the shape).
+func TestRead_ReadsbStatsWiredAndOmitted(t *testing.T) {
+	t.Parallel()
+
+	p, dir := newTestPaths(t)
+	if err := os.WriteFile(filepath.Join(dir, "stats.json"), []byte(`{"gain_db":33.3}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	got, _ := NewReader("v", p, fixedRunner("active", nil)).Read(context.Background())
+	if got.ReadsbStats == nil || got.ReadsbStats.GainDB != 33.3 {
+		t.Fatalf("ReadsbStats = %+v, want GainDB 33.3", got.ReadsbStats)
+	}
+	if blob, _ := json.Marshal(got); !strings.Contains(string(blob), `"readsb_stats"`) {
+		t.Errorf("marshaled JSON should contain readsb_stats: %s", blob)
+	}
+
+	// No stats file → field omitted.
+	p2, _ := newTestPaths(t) // ReadsbStatsFile points at a non-existent path
+	got2, _ := NewReader("v", p2, fixedRunner("active", nil)).Read(context.Background())
+	if got2.ReadsbStats != nil {
+		t.Errorf("ReadsbStats = %+v, want nil with no stats file", got2.ReadsbStats)
+	}
+	if blob, _ := json.Marshal(got2); strings.Contains(string(blob), `"readsb_stats"`) {
+		t.Errorf("marshaled JSON should omit readsb_stats when absent: %s", blob)
+	}
+}
+
+func f64(v float64) *float64 { return &v }

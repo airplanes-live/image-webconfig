@@ -92,6 +92,7 @@ func main() {
 		ImageManifestFile:   state.Paths.Manifest,
 		RuntimeManifestFile: state.Paths.RuntimeManifest,
 		AircraftJSONFile:    state.Paths.AircraftJSON,
+		ReadsbStatsFile:     state.Paths.ReadsbStats,
 		MlatStateFile:       state.Paths.MlatState,
 		FeedStateFile:       state.Paths.FeedState,
 		UAT978StateFile:     state.Paths.UAT978State,
