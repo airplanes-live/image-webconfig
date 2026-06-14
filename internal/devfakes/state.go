@@ -51,6 +51,7 @@ type Paths struct {
 	FeedState       string
 	UAT978State     string
 	Dump978FAState  string
+	ReadsbState     string
 	UpgradeState    string
 	// OrchestratorState backs GET /api/orchestrator/state — the file the
 	// simulated update-orchestrator run (StartOrchestratorRun) writes its
@@ -75,6 +76,7 @@ func DefaultPaths(dir string) Paths {
 		FeedState:         filepath.Join(dir, "feed.state"),
 		UAT978State:       filepath.Join(dir, "uat978.state"),
 		Dump978FAState:    filepath.Join(dir, "dump978fa.state"),
+		ReadsbState:       filepath.Join(dir, "readsb.state"),
 		UpgradeState:      filepath.Join(dir, "upgrade-state"),
 		OrchestratorState: filepath.Join(dir, "orchestrator.state"),
 	}
@@ -888,6 +890,16 @@ func (s *State) syncRuntimeStatesLocked() error {
 		dump978State, dump978Reason = "enabled", "ok"
 	}
 
+	// readsb self-disables when a pinned 1090 serial isn't among the fake SDRs
+	// (SeedSDRSysfs lays down 1090 + 00000001). Set READSB_SDR_SERIAL to a
+	// value outside that set in the dev config to exercise the no_hardware
+	// dashboard (readsb tile, feed-idle tile, hero title, overall "down").
+	readsbState, readsbReason := "enabled", "ok"
+	if serial := strings.TrimSpace(feed["READSB_SDR_SERIAL"]); serial != "" &&
+		serial != "1090" && serial != "00000001" {
+		readsbState, readsbReason = "disabled", "no_hardware"
+	}
+
 	writeState := func(path, decision, reason string) error {
 		body := "schema_version=1\nstate=" + decision + "\nreason=" + reason + "\n"
 		return writeAtomic(path, []byte(body), 0o644)
@@ -901,7 +913,10 @@ func (s *State) syncRuntimeStatesLocked() error {
 	if err := writeState(s.Paths.UAT978State, uatState, uatReason); err != nil {
 		return err
 	}
-	return writeState(s.Paths.Dump978FAState, dump978State, dump978Reason)
+	if err := writeState(s.Paths.Dump978FAState, dump978State, dump978Reason); err != nil {
+		return err
+	}
+	return writeState(s.Paths.ReadsbState, readsbState, readsbReason)
 }
 
 // --- helpers --------------------------------------------------------------

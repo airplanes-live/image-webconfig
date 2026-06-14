@@ -78,6 +78,7 @@ type Paths struct {
 	FeedStateFile       string   // /run/airplanes-feed/state
 	UAT978StateFile     string   // /run/airplanes-978/state
 	Dump978FAStateFile  string   // /run/dump978-fa/state
+	ReadsbStateFile     string   // /run/readsb/state
 	RebootRequiredFile  string   // /var/run/reboot-required (written by needrestart after kernel/libc upgrades)
 	SystemctlSudoArgv0  []string // [sudo, -n, ...] OR [systemctl] (no sudo: is-active is read-only)
 	SystemctlBinary     string   // /usr/bin/systemctl
@@ -93,6 +94,7 @@ func DefaultPaths() Paths {
 		FeedStateFile:       "/run/airplanes-feed/state",
 		UAT978StateFile:     "/run/airplanes-978/state",
 		Dump978FAStateFile:  "/run/dump978-fa/state",
+		ReadsbStateFile:     "/run/readsb/state",
 		RebootRequiredFile:  "/var/run/reboot-required",
 		SystemctlBinary:     "/usr/bin/systemctl",
 		IsActiveTimeout:     2 * time.Second,
@@ -146,10 +148,16 @@ type Status struct {
 	// no_hardware decision propagates into UATDecision.Reason as
 	// peer_no_hardware so the airplanes-978 tile can render an "idle relay"
 	// state without polling two endpoints.
+	//
+	// ReadsbDecision is readsb.sh's publication. Its only non-ok reason is
+	// no_hardware (a pinned 1090 SDR serial that isn't present); the frontend
+	// renders that as a "1090 SDR not detected" tile rather than the green
+	// decoder-ok state that systemd-active alone would imply.
 	MlatDecision      *Decision `json:"mlat_decision,omitempty"`
 	FeedDecision      *Decision `json:"feed_decision,omitempty"`
 	UATDecision       *Decision `json:"uat_decision,omitempty"`
 	Dump978FADecision *Decision `json:"dump978fa_decision,omitempty"`
+	ReadsbDecision    *Decision `json:"readsb_decision,omitempty"`
 
 	// Hardware-health surface. Three top-level keys mirror the
 	// airplanes-live/website feeder-diagnostics split:
@@ -272,6 +280,15 @@ func (r *Reader) Read(ctx context.Context) (Status, error) {
 	out.FeedDecision = r.readFeedDecision(out.Services["airplanes-feed.service"])
 	out.UATDecision = r.readUATDecision(ctx, out.Services["airplanes-978.service"])
 	out.Dump978FADecision = r.readDump978FADecision(ctx, out.Services["dump978-fa.service"])
+	out.ReadsbDecision = r.readReadsbDecision(out.Services["readsb.service"])
+
+	// A self-disabled decoder (pinned 1090 SDR absent) is not producing, but
+	// RuntimeDirectoryPreserve keeps its last aircraft.json around. Drop the
+	// snapshot so no consumer (readsb tile, feed tile, hero line) reports a
+	// frozen count as live; the readsb_decision carries the real reason.
+	if out.ReadsbDecision != nil && out.ReadsbDecision.State == "disabled" {
+		out.Feed = nil
+	}
 
 	if r.paths.RebootRequiredFile != "" {
 		if _, err := os.Stat(r.paths.RebootRequiredFile); err == nil {
@@ -358,6 +375,20 @@ func (r *Reader) readDump978FADecision(ctx context.Context, svcState string) *De
 		return nil
 	}
 	return decisionFromFile(r.paths.Dump978FAStateFile, runtimestate.AllowedReasonsDump978FA)
+}
+
+// readReadsbDecision reads readsb.sh's published decision. Unlike the 978/mlat
+// wrappers readsb has no exit-64 strict-misconfig path, so it's only consulted
+// for active/transitioning states (the no_hardware self-disable sleeps with the
+// unit still active). Returns nil otherwise so consumers fall back to the
+// systemd active-state + aircraft.json classification — which also covers an
+// older overlay whose readsb.sh predates the state file.
+func (r *Reader) readReadsbDecision(svcState string) *Decision {
+	switch svcState {
+	case "active", "activating", "reloading":
+		return decisionFromFile(r.paths.ReadsbStateFile, runtimestate.AllowedReasonsReadsb)
+	}
+	return nil
 }
 
 // decisionFromFile reads, validates, and returns the Decision encoded in a

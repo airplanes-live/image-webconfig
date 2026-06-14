@@ -83,6 +83,14 @@ var AllowedReasonsDump978FA = map[string]bool{
 	"no_hardware":       true,
 }
 
+// AllowedReasonsReadsb mirrors readsb.sh's _readsb_classify. readsb has no
+// config-level disable/misconfig path of its own; the only non-ok reason is
+// the hardware-probe self-disable when a pinned 1090 SDR serial isn't present.
+var AllowedReasonsReadsb = map[string]bool{
+	"ok":          true,
+	"no_hardware": true,
+}
+
 // Read parses a runtime state file. Returns ErrUnknownSchema if the
 // schema_version line is missing or not "1". Returns os.ErrNotExist
 // (wrapped) for a missing file. Other errors propagate as-is.

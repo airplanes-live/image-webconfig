@@ -911,6 +911,13 @@
 
         switch (unit) {
             case "airplanes-feed.service": {
+                // The forwarder has no live 1090 input when the decoder
+                // self-disabled for an absent pinned SDR — render idle rather
+                // than the green "feeding" the active forwarder alone implies.
+                const readsbDecision = payload.readsb_decision || null;
+                if (readsbDecision && readsbDecision.state === "disabled") {
+                    return { dot: "warn", meta: "idle — no 1090 SDR" };
+                }
                 if (state === "active") {
                     const n = feed && typeof feed.aircraft_count === "number" ? feed.aircraft_count : null;
                     if (n === null) return { dot: "ok", meta: "feeding" };
@@ -937,6 +944,18 @@
                 return { dot: "err", meta: "mlat down" };
             }
             case "readsb.service": {
+                // Decision-first: an "active" readsb may be sleeping in the
+                // pinned-SDR-absent self-disable (state file says
+                // disabled/no_hardware). Consult the published decision before
+                // the active-state count shortcut, mirroring the mlat/978 tiles.
+                const readsbDecision = payload.readsb_decision || null;
+                if (readsbDecision && readsbDecision.state === "disabled") {
+                    // Any disabled decision is non-green; no_hardware (a pinned
+                    // 1090 SDR that isn't present) gets the specific message.
+                    return readsbDecision.reason === "no_hardware"
+                        ? { dot: "warn", meta: "1090 SDR not detected" }
+                        : { dot: "warn", meta: "decoder disabled" };
+                }
                 if (state === "active") {
                     const n = feed && typeof feed.aircraft_count === "number" ? feed.aircraft_count : null;
                     // lastMsgRate is computed once per poll by the dashboard
@@ -1012,7 +1031,12 @@
         // device is not feeding. Pessimistic on `unknown` because the
         // tile-level classifier already shows the user a red dot in
         // that case — saying "partial" in the hero would contradict it.
-        if (feedState !== "active" || readsbState !== "active") {
+        // A self-disabled readsb (pinned 1090 SDR absent) is "active" but not
+        // decoding, so it does not count as feeding either.
+        const readsbDecision = payload.readsb_decision || null;
+        const readsbDecoding = readsbState === "active"
+            && !(readsbDecision && readsbDecision.state === "disabled");
+        if (feedState !== "active" || !readsbDecoding) {
             return { dot: "err", label: "down" };
         }
 
@@ -1083,7 +1107,13 @@
 
         // Title summarises the feed line.
         const aircraft = feed && typeof feed.aircraft_count === "number" ? feed.aircraft_count : null;
-        if (services["airplanes-feed.service"] === "active" && aircraft !== null) {
+        const heroReadsbDecision = payload.readsb_decision || null;
+        const heroReadsbDisabled = heroReadsbDecision && heroReadsbDecision.state === "disabled";
+        if (heroReadsbDisabled) {
+            // The decoder self-disabled (pinned 1090 SDR absent): not feeding,
+            // regardless of the forwarder still being active.
+            heroEl.titleEl.textContent = "Not feeding · 1090 SDR not detected";
+        } else if (services["airplanes-feed.service"] === "active" && aircraft !== null) {
             heroEl.titleEl.textContent = aircraft === 0
                 ? "Feeding · no aircraft visible right now"
                 : "Feeding " + aircraft + " aircraft";

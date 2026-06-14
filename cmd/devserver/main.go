@@ -96,6 +96,7 @@ func main() {
 		FeedStateFile:       state.Paths.FeedState,
 		UAT978StateFile:     state.Paths.UAT978State,
 		Dump978FAStateFile:  state.Paths.Dump978FAState,
+		ReadsbStateFile:     state.Paths.ReadsbState,
 		RebootRequiredFile:  filepath.Join(resolvedState, "reboot-required"),
 		SystemctlBinary:     "/usr/bin/systemctl",
 		IsActiveTimeout:     2 * time.Second,
