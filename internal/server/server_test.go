@@ -79,10 +79,10 @@ func newTestServer(t *testing.T) (*httptest.Server, *Server) {
 	_ = os.WriteFile(filepath.Join(sdrDev, "product"), []byte("RTL2838UHIDIR\n"), 0o644)
 
 	statusPaths := status.Paths{
-		ManifestFile:     filepath.Join(dir, "build-manifest.json"),
-		AircraftJSONFile: filepath.Join(dir, "aircraft.json"),
-		SystemctlBinary:  "/usr/bin/systemctl",
-		IsActiveTimeout:  time.Second,
+		ImageManifestFile: filepath.Join(dir, "build-manifest.json"),
+		AircraftJSONFile:  filepath.Join(dir, "aircraft.json"),
+		SystemctlBinary:   "/usr/bin/systemctl",
+		IsActiveTimeout:   time.Second,
 	}
 	statusRunner := func(_ context.Context, _ []string) (wexec.Result, error) {
 		return wexec.Result{Stdout: []byte("active\n")}, nil
