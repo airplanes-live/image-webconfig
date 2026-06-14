@@ -12,6 +12,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"io/fs"
 	"os"
 	"strings"
@@ -74,6 +75,7 @@ type Paths struct {
 	ImageManifestFile   string   // /etc/airplanes/build-manifest.json (flash-time, immutable)
 	RuntimeManifestFile string   // /etc/airplanes/runtime-manifest.json (live overlay, advances on update)
 	AircraftJSONFile    string   // /run/readsb/aircraft.json
+	ReadsbStatsFile     string   // /run/readsb/stats.json (effective gain_db)
 	MlatStateFile       string   // /run/airplanes-mlat/state
 	FeedStateFile       string   // /run/airplanes-feed/state
 	UAT978StateFile     string   // /run/airplanes-978/state
@@ -90,6 +92,7 @@ func DefaultPaths() Paths {
 		ImageManifestFile:   "/etc/airplanes/build-manifest.json",
 		RuntimeManifestFile: "/etc/airplanes/runtime-manifest.json",
 		AircraftJSONFile:    "/run/readsb/aircraft.json",
+		ReadsbStatsFile:     "/run/readsb/stats.json",
 		MlatStateFile:       "/run/airplanes-mlat/state",
 		FeedStateFile:       "/run/airplanes-feed/state",
 		UAT978StateFile:     "/run/airplanes-978/state",
@@ -135,6 +138,14 @@ type Status struct {
 	ImageManifest   json.RawMessage `json:"image_manifest,omitempty"`
 	RuntimeManifest json.RawMessage `json:"runtime_manifest,omitempty"`
 	Feed            *FeedStats      `json:"feed,omitempty"`
+	// ReadsbStats carries the decoder's effective SDR gain (gain_db) and the
+	// age of that reading. Distinct from Feed (aircraft.json) — sourced from
+	// /run/readsb/stats.json, which readsb rewrites on its ~10s stats cadence
+	// after every autogain adjustment. Omitted until the first stats write
+	// (~10s post-boot) or when no in-range numeric gain_db is present. The
+	// frontend hides the value when AgeSec grows stale (wedged decoder) and
+	// only shows it at all when the configured gain is adaptive.
+	ReadsbStats *ReadsbStats `json:"readsb_stats,omitempty"`
 	// Decisions are the daemons' published config-classifications, read
 	// from /run/<service>/state. omitempty so an old daemon (pre PR 1
 	// in feed, pre PR 4 in image for UAT) without a state file doesn't
@@ -200,6 +211,15 @@ type FeedStats struct {
 	NowSeconds      float64 `json:"now"`              // readsb's `now` field
 	MessagesCounter int64   `json:"messages_counter"` // readsb's `messages` field
 	AircraftCount   int     `json:"aircraft_count"`
+}
+
+// ReadsbStats is the effective-gain slice of readsb's stats.json. AgeSec is
+// whole seconds since the file was last written; the frontend hides GainDB
+// once it grows stale (readsb wedged or stopped). Only emitted when a numeric
+// gain_db in a sane dB range is present.
+type ReadsbStats struct {
+	GainDB float64 `json:"gain_db"`
+	AgeSec int64   `json:"age_sec"`
 }
 
 // Read assembles the status payload. Failures in one source don't fail the
@@ -275,6 +295,8 @@ func (r *Reader) Read(ctx context.Context) (Status, error) {
 	if fs, err := readAircraftJSON(r.paths.AircraftJSONFile); err == nil {
 		out.Feed = fs
 	}
+
+	out.ReadsbStats = readReadsbStats(r.paths.ReadsbStatsFile)
 
 	out.MlatDecision = r.readMlatDecision(ctx, out.Services["airplanes-mlat.service"])
 	out.FeedDecision = r.readFeedDecision(out.Services["airplanes-feed.service"])
@@ -491,4 +513,51 @@ func readAircraftJSON(path string) (*FeedStats, error) {
 		MessagesCounter: raw.Messages,
 		AircraftCount:   len(raw.Aircraft),
 	}, nil
+}
+
+// readsbStatsJSON is the relevant subset of readsb's stats.json. GainDB is a
+// pointer so a JSON string ("49.6") fails to decode into the float (yielding
+// nil, matching the render-status `jq '.gain_db | numbers'` type-gate) and a
+// literal 0 stays distinguishable from an absent key.
+type readsbStatsJSON struct {
+	GainDB *float64 `json:"gain_db"`
+}
+
+// readReadsbStats reads readsb's effective SDR gain from stats.json. readsb
+// rewrites gain_db after every autogain adjustment (~10s cadence), so the file
+// mtime is a good liveness proxy: AgeSec lets the client suppress a value left
+// behind by a wedged or stopped decoder. Returns nil when the file is
+// missing/unparseable, gain_db is absent or non-numeric, or the value is
+// outside a sane dB range (drops the RTL hardware-AGC sentinel — we run
+// software auto, so a real reading is always a small positive dB).
+func readReadsbStats(path string) *ReadsbStats {
+	// Open once and Stat the same fd so the mtime can't be paired with
+	// different file content by a concurrent rewrite (readsb writes atomically
+	// via rename, but the read+stat would otherwise straddle that swap).
+	f, err := os.Open(path)
+	if err != nil {
+		return nil
+	}
+	defer f.Close()
+	info, err := f.Stat()
+	if err != nil {
+		return nil
+	}
+	b, err := io.ReadAll(f)
+	if err != nil {
+		return nil
+	}
+	var raw readsbStatsJSON
+	if json.Unmarshal(b, &raw) != nil || raw.GainDB == nil {
+		return nil
+	}
+	g := *raw.GainDB
+	if g < 0 || g > 99 {
+		return nil
+	}
+	age := time.Since(info.ModTime())
+	if age < 0 {
+		age = 0
+	}
+	return &ReadsbStats{GainDB: g, AgeSec: int64(age.Seconds())}
 }

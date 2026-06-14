@@ -47,6 +47,7 @@ type Paths struct {
 	Manifest        string
 	RuntimeManifest string
 	AircraftJSON    string
+	ReadsbStats     string
 	MlatState       string
 	FeedState       string
 	UAT978State     string
@@ -72,6 +73,7 @@ func DefaultPaths(dir string) Paths {
 		Manifest:          filepath.Join(dir, "build-manifest.json"),
 		RuntimeManifest:   filepath.Join(dir, "runtime-manifest.json"),
 		AircraftJSON:      filepath.Join(dir, "aircraft.json"),
+		ReadsbStats:       filepath.Join(dir, "stats.json"),
 		MlatState:         filepath.Join(dir, "mlat.state"),
 		FeedState:         filepath.Join(dir, "feed.state"),
 		UAT978State:       filepath.Join(dir, "uat978.state"),
@@ -409,6 +411,9 @@ func (s *State) SyncAll() error {
 		return err
 	}
 	if err := s.syncAircraftJSONLocked(); err != nil {
+		return err
+	}
+	if err := s.syncReadsbStatsLocked(); err != nil {
 		return err
 	}
 	if err := s.syncRuntimeStatesLocked(); err != nil {
@@ -765,7 +770,10 @@ func (s *State) activeConnLocked() *ActiveConn {
 func (s *State) RefreshAircraftJSON() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.syncAircraftJSONLocked()
+	if err := s.syncAircraftJSONLocked(); err != nil {
+		return err
+	}
+	return s.syncReadsbStatsLocked()
 }
 
 // --- atomic on-disk projection --------------------------------------------
@@ -862,6 +870,23 @@ func (s *State) syncAircraftJSONLocked() error {
 		return err
 	}
 	return writeAtomic(s.Paths.AircraftJSON, b, 0o644)
+}
+
+// syncReadsbStatsLocked projects a synthetic readsb stats.json so the dev UI
+// renders the effective-gain surfaces. The gain steps a little over time
+// (44.5–49.5 dB) to look like a live autogain settling, and the file is
+// rewritten on every refresh so its mtime stays fresh (age_sec small).
+func (s *State) syncReadsbStatsLocked() error {
+	elapsed := time.Since(s.feedStart).Seconds()
+	doc := map[string]any{
+		"gain_db":  44.5 + float64(int(elapsed)%6),
+		"messages": int64(elapsed * 4200),
+	}
+	b, err := json.Marshal(doc)
+	if err != nil {
+		return err
+	}
+	return writeAtomic(s.Paths.ReadsbStats, b, 0o644)
 }
 
 func (s *State) syncRuntimeStatesLocked() error {
