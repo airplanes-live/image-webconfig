@@ -14,6 +14,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -25,20 +26,48 @@ import (
 // Keep slugs in sync with LOG_SLUG_TO_UNIT in web/assets/app.js — a slug
 // missing here returns 404, while a slug missing there just hides the link.
 var Whitelist = map[string]string{
-	"feed":           "airplanes-feed.service",
-	"mlat":           "airplanes-mlat.service",
-	"readsb":         "readsb.service",
-	"dump978":        "dump978-fa.service",
-	"uat":            "airplanes-978.service",
-	"claim":          "airplanes-claim.service",
-	"webconfig":      "airplanes-webconfig.service",
-	"update":           "airplanes-update.service",
-	"system-upgrade":   "airplanes-system-upgrade.service",
-	"webconfig-update": "airplanes-webconfig-update.service",
+	"feed":                "airplanes-feed.service",
+	"mlat":                "airplanes-mlat.service",
+	"readsb":              "readsb.service",
+	"dump978":             "dump978-fa.service",
+	"uat":                 "airplanes-978.service",
+	"claim":               "airplanes-claim.service",
+	"webconfig":           "airplanes-webconfig.service",
+	"update-orchestrator": "airplanes-update-orchestrator.service",
+	// Optional third-party aggregator services. FR24 runs under our templated
+	// unit (airplanes-aggregator@<id>.service); piaware is delivered as its own
+	// apt-installed unit, so its logs come from piaware.service directly.
+	"fr24":    "airplanes-aggregator@fr24.service",
+	"piaware": "piaware.service",
 }
 
 // JournalctlBinary is overridable for tests.
 var JournalctlBinary = "/usr/bin/journalctl"
+
+// shortFormatLine matches journalctl's --output=short layout:
+//
+//	MMM DD HH:MM:SS hostname syslog-id[pid]: message
+//
+// Day is space-padded for single digits (e.g. "May  9 14:23:45"). The
+// hostname is a single non-space token; the syslog identifier ends in
+// ":" (with or without "[pid]"). Lines that don't match (boot
+// separators like "-- Boot abc --", continuation lines starting with
+// whitespace, anything unexpected) are passed through unchanged.
+var shortFormatLine = regexp.MustCompile(`^([A-Z][a-z]{2} [ 0-9][0-9] [0-9]{2}:[0-9]{2}:[0-9]{2}) \S+ (\S+:) (.*)$`)
+
+// stripHostname removes the hostname token between the timestamp and
+// the syslog identifier in a journalctl --output=short line. The
+// hostname is redundant — every line came from this feeder — and the
+// repetition crowds the message column. Lines that don't match the
+// short format are returned unchanged so boot separators and any
+// future format quirks survive intact.
+func stripHostname(line string) string {
+	m := shortFormatLine.FindStringSubmatch(line)
+	if m == nil {
+		return line
+	}
+	return m[1] + " " + m[2] + " " + m[3]
+}
 
 // streamMaxLifetime caps how long any single SSE stream stays open. The
 // global http.Server.WriteTimeout is disabled for this handler via
@@ -126,7 +155,7 @@ func (s *Streamer) ServeSSE(ctx context.Context, w http.ResponseWriter, slug str
 		"--follow",
 		"--no-pager",
 		"--lines=100",
-		"--output=cat",
+		"--output=short",
 	}
 	go func() {
 		err := s.streamer(ctx, pw, argv)
@@ -184,7 +213,7 @@ func (s *Streamer) ServeSSE(ctx context.Context, w http.ResponseWriter, slug str
 				}
 				return nil
 			}
-			if err := write("data: %s\n\n", strings.ReplaceAll(line, "\n", "\\n")); err != nil {
+			if err := write("data: %s\n\n", strings.ReplaceAll(stripHostname(line), "\n", "\\n")); err != nil {
 				closeOnce(err)
 				return err
 			}

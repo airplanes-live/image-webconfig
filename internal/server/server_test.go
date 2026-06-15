@@ -17,11 +17,14 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"testing/fstest"
 	"time"
 
 	"github.com/airplanes-live/image-webconfig/internal/auth"
 	wexec "github.com/airplanes-live/image-webconfig/internal/exec"
 	"github.com/airplanes-live/image-webconfig/internal/feedenv"
+	"github.com/airplanes-live/image-webconfig/internal/feedenv/feedenvtest"
+	"github.com/airplanes-live/image-webconfig/internal/feedmeta"
 	"github.com/airplanes-live/image-webconfig/internal/identity"
 	"github.com/airplanes-live/image-webconfig/internal/logs"
 	"github.com/airplanes-live/image-webconfig/internal/schemacache"
@@ -46,24 +49,40 @@ func newTestServer(t *testing.T) (*httptest.Server, *Server) {
 	}
 
 	idPaths := identity.Paths{
-		FeederIDFile:    filepath.Join(dir, "feeder-id"),
-		ClaimSecretFile: filepath.Join(dir, "feeder-claim-secret"),
-		ClaimPageURL:    "https://airplanes.live/feeder/claim",
+		FeederIDFile:     filepath.Join(dir, "feeder-id"),
+		ClaimSecretFile:  filepath.Join(dir, "feeder-claim-secret"),
+		ClaimVersionFile: filepath.Join(dir, "feeder-claim-secret.version"),
 	}
 	_ = os.WriteFile(idPaths.FeederIDFile, []byte("test-feeder-id"), 0o644)
 	_ = os.WriteFile(idPaths.ClaimSecretFile, []byte("ABCDEFGHIJKLMNOP"), 0o640)
+	_ = os.WriteFile(idPaths.ClaimVersionFile, []byte("1\n"), 0o640)
 
-	feedEnvPath := filepath.Join(dir, "feed.env")
-	_ = os.WriteFile(feedEnvPath,
-		[]byte(`LATITUDE=51.5`+"\n"+`LONGITUDE=-0.1`+"\n"+`MLAT_USER=tester`+"\n"+`MLAT_ENABLED=true`+"\n"),
-		0o644,
-	)
+	// APL_FEED_WEBSITE_URL mirrors the post-feed-registry reality: the
+	// CLI reports it as readable, but webconfig's APIReadKeys filter must
+	// keep it off GET /api/config (asserted below).
+	feedEnv := feedenvtest.Reader(map[string]string{
+		"LATITUDE":             "51.5",
+		"LONGITUDE":            "-0.1",
+		"MLAT_USER":            "tester",
+		"MLAT_ENABLED":         "true",
+		"APL_FEED_WEBSITE_URL": "https://dev.airplanes.live",
+	})
+
+	// Hermetic sysfs fixture for GET /api/sdr — keeps tests off the
+	// runner's real /sys and gives the handler one deterministic device.
+	sdrRoot := filepath.Join(dir, "sysfs-usb")
+	sdrDev := filepath.Join(sdrRoot, "1-1.2")
+	_ = os.MkdirAll(sdrDev, 0o755)
+	_ = os.WriteFile(filepath.Join(sdrDev, "idVendor"), []byte("0bda\n"), 0o644)
+	_ = os.WriteFile(filepath.Join(sdrDev, "idProduct"), []byte("2838\n"), 0o644)
+	_ = os.WriteFile(filepath.Join(sdrDev, "serial"), []byte("1090\n"), 0o644)
+	_ = os.WriteFile(filepath.Join(sdrDev, "product"), []byte("RTL2838UHIDIR\n"), 0o644)
 
 	statusPaths := status.Paths{
-		ManifestFile:     filepath.Join(dir, "build-manifest.json"),
-		AircraftJSONFile: filepath.Join(dir, "aircraft.json"),
-		SystemctlBinary:  "/usr/bin/systemctl",
-		IsActiveTimeout:  time.Second,
+		ImageManifestFile: filepath.Join(dir, "build-manifest.json"),
+		AircraftJSONFile:  filepath.Join(dir, "aircraft.json"),
+		SystemctlBinary:   "/usr/bin/systemctl",
+		IsActiveTimeout:   time.Second,
 	}
 	statusRunner := func(_ context.Context, _ []string) (wexec.Result, error) {
 		return wexec.Result{Stdout: []byte("active\n")}, nil
@@ -95,21 +114,31 @@ func newTestServer(t *testing.T) (*httptest.Server, *Server) {
 	}
 
 	priv := PrivilegedArgv{
-		ApplyFeed:            []string{"sudo-stub", "apl-feed", "apply", "--json", "--lock-timeout", "5"},
-		SchemaFeed:           []string{"apl-feed", "schema", "--json"},
-		Reboot:               []string{"sudo-stub", "reboot"},
-		Poweroff:             []string{"sudo-stub", "poweroff"},
-		StartUpdate:          []string{"sudo-stub", "update"},
-		StartSystemUpgrade:   []string{"sudo-stub", "system-upgrade"},
-		StartWebconfigUpdate: []string{"sudo-stub", "webconfig-update"},
-		RegisterClaim:        []string{"sudo-stub", "systemctl", "start", "--no-block", "airplanes-claim.service"},
-		WifiList:             []string{"sudo-stub", "apl-wifi", "list", "--json"},
-		WifiAdd:              []string{"sudo-stub", "apl-wifi", "add", "--json"},
-		WifiUpdate:           []string{"sudo-stub", "apl-wifi", "update", "--json"},
-		WifiDelete:           []string{"sudo-stub", "apl-wifi", "delete", "--json"},
-		WifiTest:             []string{"sudo-stub", "apl-wifi", "test", "--json"},
-		WifiActivate:         []string{"sudo-stub", "apl-wifi", "activate", "--json"},
-		WifiStatus:           []string{"sudo-stub", "apl-wifi", "status", "--json"},
+		ApplyFeed:         []string{"sudo-stub", "apl-feed", "apply", "--json", "--lock-timeout", "5"},
+		SchemaFeed:        []string{"apl-feed", "schema", "--json"},
+		Reboot:            []string{"sudo-stub", "reboot"},
+		Poweroff:          []string{"sudo-stub", "poweroff"},
+		StartOrchestrator: []string{"sudo-stub", "orchestrator"},
+		RegisterClaim:     []string{"sudo-stub", "systemctl", "start", "--no-block", "airplanes-claim.service"},
+		SyncConfig:        []string{"sudo-stub", "systemctl", "start", "--no-block", "airplanes-config-sync.service"},
+		WifiList:          []string{"sudo-stub", "apl-wifi", "list", "--json"},
+		WifiAdd:           []string{"sudo-stub", "apl-wifi", "add", "--json"},
+		WifiUpdate:        []string{"sudo-stub", "apl-wifi", "update", "--json"},
+		WifiDelete:        []string{"sudo-stub", "apl-wifi", "delete", "--json"},
+		WifiTest:          []string{"sudo-stub", "apl-wifi", "test", "--json"},
+		WifiActivate:      []string{"sudo-stub", "apl-wifi", "activate", "--json"},
+		WifiAdopt:         []string{"sudo-stub", "apl-wifi", "adopt", "--json"},
+		WifiStatus:        []string{"sudo-stub", "apl-wifi", "status", "--json"},
+		ExportIdentity:    []string{"sudo-stub", "identity-export"},
+		ImportIdentity:    []string{"sudo-stub", "identity-import"},
+		AggregatorStatus:  []string{"sudo-stub", "apl-aggregator", "status", "--json"},
+		AggregatorDetail:  []string{"sudo-stub", "apl-aggregator", "detail", "--json"},
+		AggregatorEnable:  []string{"sudo-stub", "apl-aggregator", "enable", "--json"},
+		AggregatorDisable: []string{"sudo-stub", "apl-aggregator", "disable", "--json"},
+		AggregatorSet:     []string{"sudo-stub", "apl-aggregator", "set", "--json"},
+		AggregatorReset:   []string{"sudo-stub", "apl-aggregator", "reset", "--json"},
+		AggregatorExport:  []string{"sudo-stub", "apl-aggregator", "export", "--json"},
+		AggregatorImport:  []string{"sudo-stub", "apl-aggregator", "import", "--json"},
 	}
 
 	deps := Deps{
@@ -119,17 +148,22 @@ func newTestServer(t *testing.T) (*httptest.Server, *Server) {
 		Lockout:      auth.NewLockout(5, time.Minute, 15*time.Minute),
 		Guard:        guard,
 		Argon2Params: fastTestParams,
-		Identity:     identity.NewReader(idPaths),
-		FeedEnv:      &feedenv.Reader{Path: feedEnvPath},
+		Identity:     identity.NewReader(idPaths, feedEnv),
+		FeedEnv:      feedEnv,
 		Status:       status.NewReader("test-sha", statusPaths, statusRunner),
 		Logs:         logs.NewStreamer(logsRunner),
+		// readable includes APL_FEED_WEBSITE_URL — like the real
+		// post-registry schema — so the website-URL exclusion test below
+		// proves the APIReadKeys filter is what keeps it off the API, not
+		// the schema gate.
 		Schema: schemacache.NewPrepopulated(
-			[]string{"LATITUDE", "LONGITUDE", "ALTITUDE", "GEO_CONFIGURED", "MLAT_USER", "MLAT_ENABLED", "MLAT_PRIVATE", "GAIN", "UAT_INPUT", "DUMP978_SDR_SERIAL", "DUMP978_GAIN"},
-			[]string{"LATITUDE", "LONGITUDE", "ALTITUDE", "GEO_CONFIGURED", "MLAT_USER", "MLAT_ENABLED", "MLAT_PRIVATE", "INPUT", "INPUT_TYPE", "GAIN", "UAT_INPUT", "DUMP978_SDR_SERIAL", "DUMP978_GAIN"},
+			[]string{"LATITUDE", "LONGITUDE", "ALTITUDE", "GEO_CONFIGURED", "MLAT_USER", "MLAT_ENABLED", "MLAT_PRIVATE", "REPORT_STATUS", "REMOTE_CONFIG_ENABLED", "GAIN", "READSB_SDR_SERIAL", "UAT_INPUT", "DUMP978_SDR_SERIAL", "DUMP978_GAIN"},
+			[]string{"LATITUDE", "LONGITUDE", "ALTITUDE", "GEO_CONFIGURED", "MLAT_USER", "MLAT_ENABLED", "MLAT_PRIVATE", "REPORT_STATUS", "REMOTE_CONFIG_ENABLED", "INPUT", "INPUT_TYPE", "GAIN", "READSB_SDR_SERIAL", "UAT_INPUT", "DUMP978_SDR_SERIAL", "DUMP978_GAIN", "APL_FEED_WEBSITE_URL"},
 		),
-		Runner:      captureRunner,
-		StdinRunner: captureStdinRunner,
-		Privileged:  priv,
+		Runner:       captureRunner,
+		StdinRunner:  captureStdinRunner,
+		Privileged:   priv,
+		SDRSysfsRoot: sdrRoot,
 	}
 	handler := New(deps)
 	ts := httptest.NewServer(handler)
@@ -155,14 +189,20 @@ type stdinCall struct {
 	stdin []byte
 }
 
-// writeHarness is the test harness for POST /api/config / /api/update /
-// /api/reboot — it wires deterministic captures for both runners and
-// pre-authenticates the returned client.
+// writeHarness is the test harness for POST /api/config /
+// /api/orchestrator/start / /api/reboot — it wires deterministic captures
+// for both runners and pre-authenticates the returned client.
 type writeHarness struct {
-	ts              *httptest.Server
-	client          *http.Client
-	feedEnvPath     string
-	mu              sync.Mutex
+	ts     *httptest.Server
+	client *http.Client
+	mu     sync.Mutex
+	// feedEnv backs the fake `apl-feed config show`: present keys come
+	// back as strings (including ""), everything else is absent. Tests
+	// swap it via setFeedEnv between requests.
+	feedEnv map[string]string
+	// feedEnvErr, when non-nil, makes every config-show exec fail —
+	// the transient-read-failure case the metadata gating degrades on.
+	feedEnvErr      error
 	calls           [][]string
 	stdinCalls      []stdinCall
 	runnerErr       error                            // returned by captureRunner; tests override
@@ -170,9 +210,42 @@ type writeHarness struct {
 	runnerResultFor func(argv []string) wexec.Result // optional: per-argv canned Result (stdout+stderr); falls back to zero value
 	stdinErr        error
 	stdinResult     wexec.Result
+	// upgradeStatePath is wired into Deps.UpgradeStatePath. Set via
+	// withUpgradeStatePath() before harness construction; defaults to
+	// the production path (which doesn't exist in tests, surfacing
+	// "unknown" — matches what an un-upgraded feeder would report).
+	upgradeStatePath string
+	// orchestratorStatePath is wired into Deps.OrchestratorStatePath.
+	// Set via withOrchestratorStatePath() before harness construction;
+	// defaults to the production path, which doesn't exist in tests.
+	orchestratorStatePath string
+	// orchestratorCapable is wired into Deps.OrchestratorCapable. nil
+	// means "use the production capability check" — that returns false
+	// in tests because the well-known image-owned paths don't exist,
+	// matching what an un-imaged feeder would report. Tests that need
+	// the capable path use withOrchestratorCapable(true) to flip it.
+	orchestratorCapable func() bool
 }
 
-func newWriteHarness(t *testing.T) *writeHarness {
+// harnessOption mutates a writeHarness BEFORE Deps is constructed, so
+// option-set fields are visible to the deps wiring.
+type harnessOption func(*writeHarness)
+
+func withUpgradeStatePath(p string) harnessOption {
+	return func(h *writeHarness) { h.upgradeStatePath = p }
+}
+
+func withOrchestratorStatePath(p string) harnessOption {
+	return func(h *writeHarness) { h.orchestratorStatePath = p }
+}
+
+func withOrchestratorCapable(capable bool) harnessOption {
+	return func(h *writeHarness) {
+		h.orchestratorCapable = func() bool { return capable }
+	}
+}
+
+func newWriteHarness(t *testing.T, opts ...harnessOption) *writeHarness {
 	t.Helper()
 	dir := t.TempDir()
 	hashPath := filepath.Join(dir, "password.hash")
@@ -180,21 +253,28 @@ func newWriteHarness(t *testing.T) *writeHarness {
 	if err != nil {
 		t.Fatal(err)
 	}
-	feedEnvPath := filepath.Join(dir, "feed.env")
-	if err := os.WriteFile(feedEnvPath,
-		[]byte(`LATITUDE="0"`+"\n"+`UAT_INPUT=""`+"\n"),
-		0o644,
-	); err != nil {
-		t.Fatal(err)
-	}
-
 	h := &writeHarness{
-		feedEnvPath: feedEnvPath,
+		feedEnv: map[string]string{"LATITUDE": "0", "UAT_INPUT": ""},
 		// Default response from apl-feed apply --json: every write
 		// succeeds and lands an `applied` envelope. Individual tests
 		// override h.stdinResult / h.stdinErr to exercise rejected,
 		// lock_timeout, filesystem_error, etc.
 		stdinResult: wexec.Result{Stdout: []byte(`{"status":"applied","changed":[],"pending_restart":[]}`)},
+	}
+	feedEnv := feedenvtest.ReaderFunc(func() (map[string]string, error) {
+		h.mu.Lock()
+		defer h.mu.Unlock()
+		if h.feedEnvErr != nil {
+			return nil, h.feedEnvErr
+		}
+		out := make(map[string]string, len(h.feedEnv))
+		for k, v := range h.feedEnv {
+			out[k] = v
+		}
+		return out, nil
+	})
+	for _, o := range opts {
+		o(h)
 	}
 	captureRunner := func(_ context.Context, argv []string) (wexec.Result, error) {
 		h.mu.Lock()
@@ -223,21 +303,31 @@ func newWriteHarness(t *testing.T) *writeHarness {
 	}
 
 	priv := PrivilegedArgv{
-		ApplyFeed:            []string{"sudo-stub", "apl-feed", "apply", "--json", "--lock-timeout", "5"},
-		SchemaFeed:           []string{"apl-feed", "schema", "--json"},
-		Reboot:               []string{"sudo-stub", "reboot"},
-		Poweroff:             []string{"sudo-stub", "poweroff"},
-		StartUpdate:          []string{"sudo-stub", "update"},
-		StartSystemUpgrade:   []string{"sudo-stub", "system-upgrade"},
-		StartWebconfigUpdate: []string{"sudo-stub", "webconfig-update"},
-		RegisterClaim:        []string{"sudo-stub", "systemctl", "start", "--no-block", "airplanes-claim.service"},
-		WifiList:             []string{"sudo-stub", "apl-wifi", "list", "--json"},
-		WifiAdd:              []string{"sudo-stub", "apl-wifi", "add", "--json"},
-		WifiUpdate:           []string{"sudo-stub", "apl-wifi", "update", "--json"},
-		WifiDelete:           []string{"sudo-stub", "apl-wifi", "delete", "--json"},
-		WifiTest:             []string{"sudo-stub", "apl-wifi", "test", "--json"},
-		WifiActivate:         []string{"sudo-stub", "apl-wifi", "activate", "--json"},
-		WifiStatus:           []string{"sudo-stub", "apl-wifi", "status", "--json"},
+		ApplyFeed:         []string{"sudo-stub", "apl-feed", "apply", "--json", "--lock-timeout", "5"},
+		SchemaFeed:        []string{"apl-feed", "schema", "--json"},
+		Reboot:            []string{"sudo-stub", "reboot"},
+		Poweroff:          []string{"sudo-stub", "poweroff"},
+		StartOrchestrator: []string{"sudo-stub", "orchestrator"},
+		RegisterClaim:     []string{"sudo-stub", "systemctl", "start", "--no-block", "airplanes-claim.service"},
+		SyncConfig:        []string{"sudo-stub", "systemctl", "start", "--no-block", "airplanes-config-sync.service"},
+		WifiList:          []string{"sudo-stub", "apl-wifi", "list", "--json"},
+		WifiAdd:           []string{"sudo-stub", "apl-wifi", "add", "--json"},
+		WifiUpdate:        []string{"sudo-stub", "apl-wifi", "update", "--json"},
+		WifiDelete:        []string{"sudo-stub", "apl-wifi", "delete", "--json"},
+		WifiTest:          []string{"sudo-stub", "apl-wifi", "test", "--json"},
+		WifiActivate:      []string{"sudo-stub", "apl-wifi", "activate", "--json"},
+		WifiAdopt:         []string{"sudo-stub", "apl-wifi", "adopt", "--json"},
+		WifiStatus:        []string{"sudo-stub", "apl-wifi", "status", "--json"},
+		ExportIdentity:    []string{"sudo-stub", "identity-export"},
+		ImportIdentity:    []string{"sudo-stub", "identity-import"},
+		AggregatorStatus:  []string{"sudo-stub", "apl-aggregator", "status", "--json"},
+		AggregatorDetail:  []string{"sudo-stub", "apl-aggregator", "detail", "--json"},
+		AggregatorEnable:  []string{"sudo-stub", "apl-aggregator", "enable", "--json"},
+		AggregatorDisable: []string{"sudo-stub", "apl-aggregator", "disable", "--json"},
+		AggregatorSet:     []string{"sudo-stub", "apl-aggregator", "set", "--json"},
+		AggregatorReset:   []string{"sudo-stub", "apl-aggregator", "reset", "--json"},
+		AggregatorExport:  []string{"sudo-stub", "apl-aggregator", "export", "--json"},
+		AggregatorImport:  []string{"sudo-stub", "apl-aggregator", "import", "--json"},
 	}
 
 	deps := Deps{
@@ -247,19 +337,22 @@ func newWriteHarness(t *testing.T) *writeHarness {
 		Lockout:      auth.NewLockout(5, time.Minute, 15*time.Minute),
 		Guard:        guard,
 		Argon2Params: fastTestParams,
-		Identity:     identity.NewReader(identity.Paths{FeederIDFile: filepath.Join(dir, "feeder-id")}),
-		FeedEnv:      &feedenv.Reader{Path: feedEnvPath},
+		Identity:     identity.NewReader(identity.Paths{FeederIDFile: filepath.Join(dir, "feeder-id")}, feedEnv),
+		FeedEnv:      feedEnv,
 		Status: status.NewReader("test-sha", status.Paths{
 			SystemctlBinary: "/bin/true", IsActiveTimeout: time.Second,
 		}, captureRunner),
 		Logs: logs.NewStreamer(nil),
 		Schema: schemacache.NewPrepopulated(
-			[]string{"LATITUDE", "LONGITUDE", "ALTITUDE", "GEO_CONFIGURED", "MLAT_USER", "MLAT_ENABLED", "MLAT_PRIVATE", "GAIN", "UAT_INPUT", "DUMP978_SDR_SERIAL", "DUMP978_GAIN"},
-			[]string{"LATITUDE", "LONGITUDE", "ALTITUDE", "GEO_CONFIGURED", "MLAT_USER", "MLAT_ENABLED", "MLAT_PRIVATE", "INPUT", "INPUT_TYPE", "GAIN", "UAT_INPUT", "DUMP978_SDR_SERIAL", "DUMP978_GAIN"},
+			[]string{"LATITUDE", "LONGITUDE", "ALTITUDE", "GEO_CONFIGURED", "MLAT_USER", "MLAT_ENABLED", "MLAT_PRIVATE", "REPORT_STATUS", "REMOTE_CONFIG_ENABLED", "GAIN", "UAT_INPUT", "DUMP978_SDR_SERIAL", "DUMP978_GAIN"},
+			[]string{"LATITUDE", "LONGITUDE", "ALTITUDE", "GEO_CONFIGURED", "MLAT_USER", "MLAT_ENABLED", "MLAT_PRIVATE", "REPORT_STATUS", "REMOTE_CONFIG_ENABLED", "INPUT", "INPUT_TYPE", "GAIN", "UAT_INPUT", "DUMP978_SDR_SERIAL", "DUMP978_GAIN"},
 		),
-		Runner:      captureRunner,
-		StdinRunner: captureStdinRunner,
-		Privileged:  priv,
+		Runner:                captureRunner,
+		StdinRunner:           captureStdinRunner,
+		Privileged:            priv,
+		UpgradeStatePath:      h.upgradeStatePath,
+		OrchestratorStatePath: h.orchestratorStatePath,
+		OrchestratorCapable:   h.orchestratorCapable,
 	}
 	h.ts = httptest.NewServer(New(deps))
 	t.Cleanup(h.ts.Close)
@@ -270,6 +363,23 @@ func newWriteHarness(t *testing.T) *writeHarness {
 		t.Fatalf("setup status = %d", r.StatusCode)
 	}
 	return h
+}
+
+// setFeedEnv replaces the value set the fake `apl-feed config show`
+// serves. Present keys (including explicitly-empty "") come back as
+// strings; everything else reads as absent.
+func (h *writeHarness) setFeedEnv(values map[string]string) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.feedEnv = values
+	h.feedEnvErr = nil
+}
+
+// setFeedEnvErr makes every subsequent config-show exec fail.
+func (h *writeHarness) setFeedEnvErr(err error) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.feedEnvErr = err
 }
 
 func (h *writeHarness) callsCopy() [][]string {
@@ -478,176 +588,31 @@ func TestConfigPost_UnknownKeyRejectedPreShellout(t *testing.T) {
 // pending_restart surfaces 978 unit failures alongside feed/mlat. Confirms
 // that both 978 entries land in the response when their restart fails.
 
-func TestUpdate_RequiresAuth(t *testing.T) {
-	t.Parallel()
-	ts, _ := newTestServer(t)
-	c := httpClient(t)
-	r := postJSON(t, c, ts.URL+"/api/update", map[string]any{})
-	defer r.Body.Close()
-	if r.StatusCode != http.StatusUnauthorized {
-		t.Fatalf("status = %d", r.StatusCode)
-	}
-}
-
-func TestUpdate_HappyPathReturns202(t *testing.T) {
-	t.Parallel()
-	h := newWriteHarness(t)
-	r := postJSON(t, h.client, h.ts.URL+"/api/update", map[string]any{})
-	defer r.Body.Close()
-	if r.StatusCode != http.StatusAccepted {
-		t.Fatalf("status = %d", r.StatusCode)
-	}
-	var got map[string]string
-	_ = json.NewDecoder(r.Body).Decode(&got)
-	if got["unit"] != "airplanes-update.service" {
-		t.Errorf("unit = %q", got["unit"])
-	}
-}
-
-func TestUpdate_AlreadyRunning409(t *testing.T) {
-	t.Parallel()
-	h := newWriteHarness(t)
-	h.mu.Lock()
-	// The handler runs `systemctl is-active` first (empty stdout → no unit
-	// active, proceed), then `sudo systemd-run ...`. Tag the systemd-run
-	// path with the "already exists" stderr so the handler's contains-check
-	// fires and maps to 409.
-	h.runnerErrFor = func(argv []string) error {
-		if len(argv) >= 2 && argv[1] == "update" {
-			return errors.New("systemd-run failed")
-		}
-		return nil
-	}
-	h.runnerResultFor = func(argv []string) wexec.Result {
-		if len(argv) >= 2 && argv[1] == "update" {
-			return wexec.Result{Stderr: []byte("Unit airplanes-update.service already exists")}
-		}
-		return wexec.Result{}
-	}
-	h.mu.Unlock()
-	r := postJSON(t, h.client, h.ts.URL+"/api/update", map[string]any{})
-	defer r.Body.Close()
-	if r.StatusCode != http.StatusConflict {
-		t.Fatalf("status = %d, want 409", r.StatusCode)
-	}
-}
-
-func TestWebconfigUpdate_RequiresAuth(t *testing.T) {
-	t.Parallel()
-	ts, _ := newTestServer(t)
-	c := httpClient(t)
-	r := postJSON(t, c, ts.URL+"/api/webconfig-update", map[string]any{})
-	defer r.Body.Close()
-	if r.StatusCode != http.StatusUnauthorized {
-		t.Fatalf("status = %d", r.StatusCode)
-	}
-}
-
-func TestWebconfigUpdate_HappyPathReturns202(t *testing.T) {
-	t.Parallel()
-	h := newWriteHarness(t)
-	r := postJSON(t, h.client, h.ts.URL+"/api/webconfig-update", map[string]any{})
-	defer r.Body.Close()
-	if r.StatusCode != http.StatusAccepted {
-		t.Fatalf("status = %d", r.StatusCode)
-	}
-	var got map[string]string
-	_ = json.NewDecoder(r.Body).Decode(&got)
-	if got["unit"] != "airplanes-webconfig-update.service" {
-		t.Errorf("unit = %q", got["unit"])
-	}
-}
-
-func TestWebconfigUpdate_AlreadyRunning409(t *testing.T) {
-	t.Parallel()
-	h := newWriteHarness(t)
-	h.mu.Lock()
-	h.runnerErrFor = func(argv []string) error {
-		if len(argv) >= 2 && argv[1] == "webconfig-update" {
-			return errors.New("systemd-run failed")
-		}
-		return nil
-	}
-	h.runnerResultFor = func(argv []string) wexec.Result {
-		if len(argv) >= 2 && argv[1] == "webconfig-update" {
-			return wexec.Result{Stderr: []byte("Unit airplanes-webconfig-update.service already exists")}
-		}
-		return wexec.Result{}
-	}
-	h.mu.Unlock()
-	r := postJSON(t, h.client, h.ts.URL+"/api/webconfig-update", map[string]any{})
-	defer r.Body.Close()
-	if r.StatusCode != http.StatusConflict {
-		t.Fatalf("status = %d, want 409", r.StatusCode)
-	}
-}
-
-func TestSystemUpgrade_RequiresAuth(t *testing.T) {
-	t.Parallel()
-	ts, _ := newTestServer(t)
-	c := httpClient(t)
-	r := postJSON(t, c, ts.URL+"/api/system-upgrade", map[string]any{})
-	defer r.Body.Close()
-	if r.StatusCode != http.StatusUnauthorized {
-		t.Fatalf("status = %d", r.StatusCode)
-	}
-}
-
-func TestSystemUpgrade_HappyPathReturns202(t *testing.T) {
+// Negative test: the removed /api/system-upgrade route must not be
+// reachable.  The default mux returns 405 for a known path with the
+// wrong method and 404 for an entirely unknown path; since we removed
+// the route, POST lands on the fallback and we accept either.
+func TestSystemUpgrade_RouteRemoved(t *testing.T) {
 	t.Parallel()
 	h := newWriteHarness(t)
 	r := postJSON(t, h.client, h.ts.URL+"/api/system-upgrade", map[string]any{})
 	defer r.Body.Close()
-	if r.StatusCode != http.StatusAccepted {
-		t.Fatalf("status = %d", r.StatusCode)
-	}
-	var got map[string]string
-	_ = json.NewDecoder(r.Body).Decode(&got)
-	if got["unit"] != "airplanes-system-upgrade.service" {
-		t.Errorf("unit = %q", got["unit"])
+	if r.StatusCode != http.StatusNotFound && r.StatusCode != http.StatusMethodNotAllowed {
+		t.Fatalf("status = %d, want 404 or 405 (route removed)", r.StatusCode)
 	}
 }
 
-func TestSystemUpgrade_AlreadyRunning409(t *testing.T) {
+// Negative test: the removed system-upgrade log slug must not resolve.
+func TestSystemUpgradeLog_SlugRemoved(t *testing.T) {
 	t.Parallel()
 	h := newWriteHarness(t)
-	h.mu.Lock()
-	h.runnerErrFor = func(argv []string) error {
-		if len(argv) >= 2 && argv[1] == "system-upgrade" {
-			return errors.New("systemd-run failed")
-		}
-		return nil
+	r, err := h.client.Get(h.ts.URL + "/api/log/system-upgrade")
+	if err != nil {
+		t.Fatalf("get: %v", err)
 	}
-	h.runnerResultFor = func(argv []string) wexec.Result {
-		if len(argv) >= 2 && argv[1] == "system-upgrade" {
-			return wexec.Result{Stderr: []byte("Unit airplanes-system-upgrade.service already exists")}
-		}
-		return wexec.Result{}
-	}
-	h.mu.Unlock()
-	r := postJSON(t, h.client, h.ts.URL+"/api/system-upgrade", map[string]any{})
 	defer r.Body.Close()
-	if r.StatusCode != http.StatusConflict {
-		t.Fatalf("status = %d, want 409", r.StatusCode)
-	}
-}
-
-func TestSystemUpgrade_ArgvShape(t *testing.T) {
-	t.Parallel()
-	h := newWriteHarness(t)
-	r := postJSON(t, h.client, h.ts.URL+"/api/system-upgrade", map[string]any{})
-	defer r.Body.Close()
-	if r.StatusCode != http.StatusAccepted {
-		t.Fatalf("status = %d", r.StatusCode)
-	}
-	saw := false
-	for _, c := range h.callsCopy() {
-		if len(c) >= 2 && c[0] == "sudo-stub" && c[1] == "system-upgrade" {
-			saw = true
-		}
-	}
-	if !saw {
-		t.Errorf("system-upgrade argv not invoked; calls=%v", h.callsCopy())
+	if r.StatusCode != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404 (slug delisted)", r.StatusCode)
 	}
 }
 
@@ -672,48 +637,10 @@ func activeFor(unit string) func([]string) wexec.Result {
 	}
 }
 
-func TestUpdate_RefusedDuringSystemUpgrade(t *testing.T) {
-	t.Parallel()
-	h := newWriteHarness(t)
-	h.mu.Lock()
-	h.runnerResultFor = activeFor("airplanes-system-upgrade.service")
-	h.mu.Unlock()
-	r := postJSON(t, h.client, h.ts.URL+"/api/update", map[string]any{})
-	defer r.Body.Close()
-	if r.StatusCode != http.StatusConflict {
-		t.Fatalf("status = %d, want 409", r.StatusCode)
-	}
-	// systemd-run argv must not have been invoked.
-	for _, c := range h.callsCopy() {
-		if len(c) >= 2 && c[1] == "update" {
-			t.Fatalf("StartUpdate argv invoked despite 409: %v", c)
-		}
-	}
-}
-
-func TestSystemUpgrade_RefusedDuringFeedUpdate(t *testing.T) {
-	t.Parallel()
-	h := newWriteHarness(t)
-	h.mu.Lock()
-	h.runnerResultFor = activeFor("airplanes-update.service")
-	h.mu.Unlock()
-	r := postJSON(t, h.client, h.ts.URL+"/api/system-upgrade", map[string]any{})
-	defer r.Body.Close()
-	if r.StatusCode != http.StatusConflict {
-		t.Fatalf("status = %d, want 409", r.StatusCode)
-	}
-	for _, c := range h.callsCopy() {
-		if len(c) >= 2 && c[1] == "system-upgrade" {
-			t.Fatalf("StartSystemUpgrade argv invoked despite 409: %v", c)
-		}
-	}
-}
-
 func TestReboot_RefusedDuringMaintenance(t *testing.T) {
 	t.Parallel()
 	for _, unit := range []string{
-		"airplanes-system-upgrade.service",
-		"airplanes-update.service",
+		"airplanes-update-orchestrator.service",
 	} {
 		unit := unit
 		t.Run(unit, func(t *testing.T) {
@@ -822,8 +749,7 @@ func TestPoweroff_AuthedReturns202(t *testing.T) {
 func TestPoweroff_RefusedDuringMaintenance(t *testing.T) {
 	t.Parallel()
 	for _, unit := range []string{
-		"airplanes-system-upgrade.service",
-		"airplanes-update.service",
+		"airplanes-update-orchestrator.service",
 	} {
 		unit := unit
 		t.Run(unit, func(t *testing.T) {
@@ -1405,6 +1331,23 @@ func TestIdentity_AuthedReturnsFeederID(t *testing.T) {
 	if got["claim_secret_present"] != true {
 		t.Errorf("claim_secret_present = %v, want true", got["claim_secret_present"])
 	}
+	// JSON numbers decode to float64 when target is map[string]any.
+	if v, ok := got["claim_secret_version"].(float64); !ok || v != 1 {
+		t.Errorf("claim_secret_version = %v, want 1", got["claim_secret_version"])
+	}
+	updatedAt, ok := got["claim_secret_updated_at"].(string)
+	if !ok || updatedAt == "" {
+		t.Fatalf("claim_secret_updated_at = %v, want non-empty RFC3339 string", got["claim_secret_updated_at"])
+	}
+	// RFC3339 UTC: must end in Z (NOT +00:00); time.Time.UTC().Format(RFC3339)
+	// emits Z. Pin the format so a refactor that drops .UTC() doesn't drift
+	// to a +HH:MM offset that downstream JS / API consumers may not parse.
+	if !strings.HasSuffix(updatedAt, "Z") {
+		t.Errorf("claim_secret_updated_at = %q, want trailing Z (UTC RFC3339)", updatedAt)
+	}
+	if _, err := time.Parse(time.RFC3339, updatedAt); err != nil {
+		t.Errorf("claim_secret_updated_at = %q, not RFC3339-parseable: %v", updatedAt, err)
+	}
 }
 
 func TestIdentitySecret_RequiresAuth(t *testing.T) {
@@ -1465,6 +1408,34 @@ func TestConfigGet_AuthedReturnsValues(t *testing.T) {
 	}
 	if got.Values["MLAT_USER"] != "tester" {
 		t.Errorf("MLAT_USER = %q, want tester", got.Values["MLAT_USER"])
+	}
+}
+
+// TestConfigGet_NeverExposesWebsiteURL pins the privacy boundary at the
+// HTTP level: the test server's fake config show returns
+// APL_FEED_WEBSITE_URL AND the schema cache lists it as readable (the
+// post-registry reality), so the only thing keeping it off the API is
+// feedenv's APIReadKeys filter. It must never appear in GET /api/config.
+func TestConfigGet_NeverExposesWebsiteURL(t *testing.T) {
+	t.Parallel()
+	ts, _ := newTestServer(t)
+	c := authedClient(t, ts)
+	resp := mustGet(t, c, ts.URL+"/api/config")
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d", resp.StatusCode)
+	}
+	var got struct {
+		Values map[string]string `json:"values"`
+	}
+	_ = json.NewDecoder(resp.Body).Decode(&got)
+	if v, ok := got.Values["APL_FEED_WEBSITE_URL"]; ok {
+		t.Errorf("APL_FEED_WEBSITE_URL = %q leaked into GET /api/config", v)
+	}
+	// Sanity: the response is otherwise populated, so the absence above
+	// is the filter at work and not an empty value set.
+	if got.Values["LATITUDE"] != "51.5" {
+		t.Errorf("LATITUDE = %q, want 51.5", got.Values["LATITUDE"])
 	}
 }
 
@@ -1542,8 +1513,8 @@ func TestLog_KnownUnitStreamsSSE(t *testing.T) {
 // TestDefaultPrivilegedArgv_SudoersParity guards against drift between the
 // production argv shapes and the sudoers entries that authorize them. Each
 // argv tail (after the `/usr/bin/sudo -n` prefix) must EXACTLY equal a
-// NOPASSWD command-spec from 010 or 011 — a substring match would not
-// catch a sudoers entry of `apl-feed apply --json` failing to authorize
+// NOPASSWD command-spec from 010 — a substring match would not catch a
+// sudoers entry of `apl-feed apply --json` failing to authorize
 // `apl-feed apply --json --extra` (Contains would pass, sudo would reject
 // at runtime). Implementation lives in ValidatePrivilegedArgvParity so the
 // runtime --validate-sudoers subcommand exercises the same logic against
@@ -1552,11 +1523,324 @@ func TestDefaultPrivilegedArgv_SudoersParity(t *testing.T) {
 	t.Parallel()
 	err := ValidatePrivilegedArgvParity(DefaultPrivilegedArgv(),
 		filepath.Join("..", "..", "files", "etc", "sudoers.d", "010_airplanes-webconfig"),
-		filepath.Join("..", "..", "files", "etc", "sudoers.d", "011_airplanes-webconfig-update"),
 	)
 	if err != nil {
 		t.Fatal(err)
 	}
 }
 
+// TestAssetsFS_OverrideServesIndexAndStatic asserts the Deps.AssetsFS hook
+// used by cmd/devserver routes both `GET /` (index.html) and `GET /static/*`
+// through the override FS rather than the embedded web/assets tree. Without
+// this check, future refactors of server.New could silently leave one of the
+// two callsites pointing at the embedded FS, which would still pass every
+// other test (they all see the embedded copy).
+func TestAssetsFS_OverrideServesIndexAndStatic(t *testing.T) {
+	t.Parallel()
+	override := fstest.MapFS{
+		"index.html": &fstest.MapFile{Data: []byte("DEV-INDEX")},
+		"app.js":     &fstest.MapFile{Data: []byte("DEV-APP")},
+	}
+	handler := New(Deps{
+		Version:    "assets-test",
+		Privileged: DefaultPrivilegedArgv(),
+		AssetsFS:   override,
+	})
+	ts := httptest.NewServer(handler)
+	t.Cleanup(ts.Close)
+
+	for _, tc := range []struct {
+		path string
+		want string
+	}{
+		{"/", "DEV-INDEX"},
+		{"/static/app.js", "DEV-APP"},
+	} {
+		resp, err := http.Get(ts.URL + tc.path)
+		if err != nil {
+			t.Fatalf("GET %s: %v", tc.path, err)
+		}
+		body, _ := io.ReadAll(resp.Body)
+		_ = resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("GET %s: status=%d body=%q", tc.path, resp.StatusCode, body)
+		}
+		if string(body) != tc.want {
+			t.Fatalf("GET %s: body=%q want %q (override not threaded through)", tc.path, body, tc.want)
+		}
+		if got := resp.Header.Get("Cache-Control"); got != "no-store" {
+			t.Errorf("GET %s: Cache-Control=%q want no-store", tc.path, got)
+		}
+	}
+}
+
 // --- pending_restart surfacing (PR 3) ---
+
+// TestConfigPost_AltitudeFtRoundTripsAsBareMetres exercises the full
+// SPA → server → fake apl-feed → feedenv.Reader chain for the
+// altitude bare-metres contract. The operator posts "400ft", the
+// fake apl-feed canonicalises it on apply (mirroring feed's
+// _apl_feed_apply_canonicalize_altitude → altitude_to_bare_metres),
+// the GET that follows reads the canonicalised value back through the
+// fake config show. Without this end-to-end test, the JS / Go /
+// fake-apply layers could each pass their own unit test while still
+// drifting.
+func TestConfigPost_AltitudeFtRoundTripsAsBareMetres(t *testing.T) {
+	dir := t.TempDir()
+	hashPath := filepath.Join(dir, "password.hash")
+	guard, err := auth.NewHashGuard(2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Simulated config state, shared between the canonicalising apply
+	// fake and the config-show fake the FeedEnv reader execs. Seed with
+	// an existing ALTITUDE so the GET path has something to compare
+	// against before the POST mutates it.
+	var currentMu sync.Mutex
+	current := map[string]string{"ALTITUDE": "12", "LATITUDE": "51.5", "LONGITUDE": "-0.1"}
+
+	// Canonicalising stdin runner: parses the JSON payload feed
+	// expects, mirrors feedmeta.AltitudeToBareMetres on every
+	// ALTITUDE value, and merges the result into the shared state.
+	// This is the minimum production-shaped behaviour the parity
+	// contract relies on; we deliberately do NOT call into devfakes
+	// here because that package imports server (circular).
+	stdinRunner := func(_ context.Context, _ []string, stdin io.Reader) (wexec.Result, error) {
+		raw, _ := io.ReadAll(stdin)
+		var payload struct {
+			Updates map[string]json.RawMessage `json:"updates"`
+		}
+		if err := json.Unmarshal(raw, &payload); err != nil {
+			return wexec.Result{Stdout: []byte(`{"status":"parse_error"}`)}, nil
+		}
+		currentMu.Lock()
+		for k, rawVal := range payload.Updates {
+			value, ok := extractValueFromApplyPayload(rawVal)
+			if !ok {
+				continue
+			}
+			if k == "ALTITUDE" {
+				canon, _ := feedmeta.AltitudeToBareMetres(value)
+				value = canon
+			}
+			current[k] = value
+		}
+		currentMu.Unlock()
+		return wexec.Result{Stdout: []byte(`{"status":"applied","changed":["ALTITUDE"],"pending_restart":[]}`)}, nil
+	}
+
+	feedEnv := feedenvtest.ReaderFunc(func() (map[string]string, error) {
+		currentMu.Lock()
+		defer currentMu.Unlock()
+		out := make(map[string]string, len(current))
+		for k, v := range current {
+			out[k] = v
+		}
+		return out, nil
+	})
+
+	deps := Deps{
+		Version:      "test-sha",
+		Store:        auth.NewPasswordStore(hashPath),
+		Sessions:     auth.NewSessions(time.Hour),
+		Lockout:      auth.NewLockout(5, time.Minute, 15*time.Minute),
+		Guard:        guard,
+		Argon2Params: fastTestParams,
+		Identity:     identity.NewReader(identity.Paths{FeederIDFile: filepath.Join(dir, "feeder-id")}, feedEnv),
+		FeedEnv:      feedEnv,
+		Status: status.NewReader("test-sha", status.Paths{
+			SystemctlBinary: "/bin/true", IsActiveTimeout: time.Second,
+		}, func(_ context.Context, _ []string) (wexec.Result, error) { return wexec.Result{}, nil }),
+		Logs: logs.NewStreamer(nil),
+		Schema: schemacache.NewPrepopulated(
+			[]string{"LATITUDE", "LONGITUDE", "ALTITUDE", "GEO_CONFIGURED", "MLAT_USER", "MLAT_ENABLED", "MLAT_PRIVATE", "REPORT_STATUS", "REMOTE_CONFIG_ENABLED", "GAIN", "UAT_INPUT", "DUMP978_SDR_SERIAL", "DUMP978_GAIN"},
+			[]string{"LATITUDE", "LONGITUDE", "ALTITUDE", "GEO_CONFIGURED", "MLAT_USER", "MLAT_ENABLED", "MLAT_PRIVATE", "REPORT_STATUS", "REMOTE_CONFIG_ENABLED", "INPUT", "INPUT_TYPE", "GAIN", "UAT_INPUT", "DUMP978_SDR_SERIAL", "DUMP978_GAIN"},
+		),
+		Runner: func(_ context.Context, _ []string) (wexec.Result, error) {
+			return wexec.Result{}, nil
+		},
+		StdinRunner: stdinRunner,
+		Privileged: PrivilegedArgv{
+			ApplyFeed:  []string{"sudo-stub", "apl-feed", "apply", "--json", "--lock-timeout", "5"},
+			SchemaFeed: []string{"apl-feed", "schema", "--json"},
+			SyncConfig: []string{"sudo-stub", "systemctl", "start", "--no-block", "airplanes-config-sync.service"},
+		},
+	}
+	ts := httptest.NewServer(New(deps))
+	defer ts.Close()
+
+	c := httpClient(t)
+	r := postJSON(t, c, ts.URL+"/api/setup", map[string]string{"password": testPassword})
+	r.Body.Close()
+	if r.StatusCode != http.StatusOK {
+		t.Fatalf("setup status = %d", r.StatusCode)
+	}
+
+	// POST raw operator input — the SPA forwards 400ft verbatim.
+	r = postJSON(t, c, ts.URL+"/api/config",
+		map[string]any{"updates": map[string]string{"ALTITUDE": "400ft"}})
+	defer r.Body.Close()
+	if r.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(r.Body)
+		t.Fatalf("POST /api/config status=%d body=%q", r.StatusCode, body)
+	}
+
+	// GET must now return the canonicalised bare-metres value.
+	resp := mustGet(t, c, ts.URL+"/api/config")
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("GET /api/config status=%d", resp.StatusCode)
+	}
+	var got struct {
+		Values map[string]string `json:"values"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&got); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if got.Values["ALTITUDE"] != "121.92" {
+		t.Errorf("ALTITUDE round-trip: got %q, want 121.92 (400ft canonicalised to bare metres)", got.Values["ALTITUDE"])
+	}
+}
+
+// extractValueFromApplyPayload mirrors what apl-feed's --json handler
+// does to the heterogeneous payload value: a bare JSON string is the
+// value; an object form `{"value": "...", "edited_at": ..., "edited_by": ...}`
+// has its .value field as the value.
+func extractValueFromApplyPayload(raw json.RawMessage) (string, bool) {
+	var s string
+	if err := json.Unmarshal(raw, &s); err == nil {
+		return s, true
+	}
+	var obj struct {
+		Value string `json:"value"`
+	}
+	if err := json.Unmarshal(raw, &obj); err == nil {
+		return obj.Value, true
+	}
+	return "", false
+}
+
+// TestConfigPost_NudgesConfigSyncOnApplied asserts the post-save config-sync
+// nudge fires exactly when apl-feed reports a real write ("applied") and stays
+// silent on "no_change". The nudge is async, so the positive case waits on a
+// channel and the negative case asserts silence over a short window.
+func TestConfigPost_NudgesConfigSyncOnApplied(t *testing.T) {
+	wantSync := []string{"sudo-stub", "systemctl", "start", "--no-block", "airplanes-config-sync.service"}
+
+	cases := []struct {
+		name        string
+		applyStatus string
+		expectNudge bool
+	}{
+		{"applied fires the nudge", "applied", true},
+		{"no_change stays silent", "no_change", false},
+	}
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			hashPath := filepath.Join(dir, "password.hash")
+			guard, err := auth.NewHashGuard(2)
+			if err != nil {
+				t.Fatal(err)
+			}
+			feedEnv := feedenvtest.Reader(map[string]string{"REMOTE_CONFIG_ENABLED": "false"})
+
+			// Apply runner returns the table-driven status without touching disk.
+			stdinRunner := func(_ context.Context, _ []string, stdin io.Reader) (wexec.Result, error) {
+				io.Copy(io.Discard, stdin)
+				return wexec.Result{Stdout: []byte(`{"status":"` + tc.applyStatus + `"}`)}, nil
+			}
+
+			// Capturing runner signals when the nudge argv fires.
+			syncCh := make(chan struct{}, 1)
+			runner := func(_ context.Context, argv []string) (wexec.Result, error) {
+				if reflect.DeepEqual(argv, wantSync) {
+					select {
+					case syncCh <- struct{}{}:
+					default:
+					}
+				}
+				return wexec.Result{}, nil
+			}
+
+			deps := Deps{
+				Version:      "test-sha",
+				Store:        auth.NewPasswordStore(hashPath),
+				Sessions:     auth.NewSessions(time.Hour),
+				Lockout:      auth.NewLockout(5, time.Minute, 15*time.Minute),
+				Guard:        guard,
+				Argon2Params: fastTestParams,
+				Identity:     identity.NewReader(identity.Paths{FeederIDFile: filepath.Join(dir, "feeder-id")}, feedEnv),
+				FeedEnv:      feedEnv,
+				Status: status.NewReader("test-sha", status.Paths{
+					SystemctlBinary: "/bin/true", IsActiveTimeout: time.Second,
+				}, func(_ context.Context, _ []string) (wexec.Result, error) { return wexec.Result{}, nil }),
+				Logs:        logs.NewStreamer(nil),
+				Schema:      schemacache.NewPrepopulated([]string{"REMOTE_CONFIG_ENABLED"}, []string{"REMOTE_CONFIG_ENABLED"}),
+				Runner:      runner,
+				StdinRunner: stdinRunner,
+				Privileged: PrivilegedArgv{
+					ApplyFeed:  []string{"sudo-stub", "apl-feed", "apply", "--json", "--lock-timeout", "5"},
+					SchemaFeed: []string{"apl-feed", "schema", "--json"},
+					SyncConfig: wantSync,
+				},
+			}
+			ts := httptest.NewServer(New(deps))
+			defer ts.Close()
+
+			c := httpClient(t)
+			r := postJSON(t, c, ts.URL+"/api/setup", map[string]string{"password": testPassword})
+			r.Body.Close()
+			if r.StatusCode != http.StatusOK {
+				t.Fatalf("setup status = %d", r.StatusCode)
+			}
+
+			r = postJSON(t, c, ts.URL+"/api/config",
+				map[string]any{"updates": map[string]string{"REMOTE_CONFIG_ENABLED": "true"}})
+			r.Body.Close()
+			if r.StatusCode != http.StatusOK {
+				t.Fatalf("POST /api/config status=%d", r.StatusCode)
+			}
+
+			if tc.expectNudge {
+				select {
+				case <-syncCh:
+				case <-time.After(2 * time.Second):
+					t.Fatal("expected config-sync nudge after applied save, got none")
+				}
+			} else {
+				select {
+				case <-syncCh:
+					t.Fatal("config-sync nudge fired on no_change save")
+				case <-time.After(500 * time.Millisecond):
+				}
+			}
+		})
+	}
+}
+
+// TestDefaultPrivilegedArgv_ConfigShowFeedMatchesFeedenvDefault pins the
+// argv-struct entry to the argv feedenv.New() actually execs in
+// production — the two are wired independently (cmd/webconfig uses
+// feedenv.New(); cmd/devserver uses priv.ConfigShowFeed) and must not
+// drift.
+func TestDefaultPrivilegedArgv_ConfigShowFeedMatchesFeedenvDefault(t *testing.T) {
+	t.Parallel()
+	got := DefaultPrivilegedArgv().ConfigShowFeed
+	if !reflect.DeepEqual(got, feedenv.DefaultArgv) {
+		t.Fatalf("ConfigShowFeed argv = %v, want feedenv.DefaultArgv %v", got, feedenv.DefaultArgv)
+	}
+}
+
+// TestDefaultPrivilegedArgv_SyncConfigPinned pins the exact argv so renaming the
+// unit on either the Go or sudoers side trips a test rather than silently
+// shipping a no-op nudge. Sudoers parity only proves the two sides agree with
+// each other; this proves they agree with the intended unit name.
+func TestDefaultPrivilegedArgv_SyncConfigPinned(t *testing.T) {
+	got := DefaultPrivilegedArgv().SyncConfig
+	want := []string{"/usr/bin/sudo", "-n", "/usr/bin/systemctl", "start", "--no-block", "airplanes-config-sync.service"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("SyncConfig argv = %v, want %v", got, want)
+	}
+}

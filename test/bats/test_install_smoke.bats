@@ -1,15 +1,14 @@
 #!/usr/bin/env bats
 #
-# End-to-end smoke for install.sh --build-mode and --runtime against a
-# synthesized release payload served from a local file:// URL.
+# End-to-end smoke for install.sh --build-mode against a synthesized
+# release payload served from a local file:// URL.
 #
 # What's covered:
 #   - install.sh resolves channel, downloads all four assets, verifies
 #     SHA256SUMS, extracts rootfs.tar.gz, installs the binary, writes
-#     the manifest, copies the installer into the rootfs.
+#     the manifest.
 #   - build-mode rejects a manifest whose commit_sha does not match the
 #     cloned source's HEAD.
-#   - runtime mode preserves the previous binary as .prev for rollback.
 
 setup() {
     REPO_ROOT="$(cd "$BATS_TEST_DIRNAME/../.." && pwd)"
@@ -27,17 +26,11 @@ setup() {
     printf 'fake-arm64-binary\n'  > "$PAYLOAD/airplanes-webconfig-arm64"
     printf 'fake-armhf-binary\n' > "$PAYLOAD/airplanes-webconfig-armhf"
 
-    # Fake rootfs.tar.gz that ships a sentinel file under /usr/local/bin
-    # AND a copy of the installer at /usr/local/share/airplanes-webconfig/
-    # (mirrors the release packaging step). The on-device self-update path
-    # invokes the installed installer, not the original clone.
+    # Fake rootfs.tar.gz that ships a sentinel file under /usr/local/bin so
+    # the build-mode test can assert the rootfs payload was extracted.
     FAKEFS="$WORK/fake-rootfs"
     install -d -m 755 "$FAKEFS/usr/local/bin"
-    install -d -m 755 "$FAKEFS/usr/local/share/airplanes-webconfig/scripts/lib"
     printf 'sentinel\n' > "$FAKEFS/usr/local/bin/sentinel.txt"
-    install -m 0755 "$REPO_ROOT/install.sh" "$FAKEFS/usr/local/share/airplanes-webconfig/install.sh"
-    install -m 0755 "$REPO_ROOT/update.sh" "$FAKEFS/usr/local/share/airplanes-webconfig/update.sh"
-    install -m 0644 "$REPO_ROOT/scripts/lib/install-common.sh" "$FAKEFS/usr/local/share/airplanes-webconfig/scripts/lib/install-common.sh"
     tar -C "$FAKEFS" --owner=0 --group=0 --numeric-owner \
         -czf "$PAYLOAD/rootfs.tar.gz" .
 
@@ -94,7 +87,7 @@ teardown() {
     rm -rf "$WORK"
 }
 
-@test "install.sh --build-mode lays binary, rootfs, manifest, installer" {
+@test "install.sh --build-mode lays binary, rootfs, manifest" {
     export AIRPLANES_WEBCONFIG_BRANCH=v9.9.9
     ARCH=arm64 run bash "$REPO_ROOT/install.sh" --build-mode
     [ "$status" -eq 0 ] || { echo "$output"; false; }
@@ -105,10 +98,6 @@ teardown() {
     [ -f "$ROOTFS_DIR/usr/local/bin/sentinel.txt" ]
     [ -f "$ROOTFS_DIR/etc/airplanes/webconfig-release.json" ]
     grep -q "v9.9.9" "$ROOTFS_DIR/etc/airplanes/webconfig-release.json"
-
-    [ -x "$ROOTFS_DIR/usr/local/share/airplanes-webconfig/install.sh" ]
-    [ -x "$ROOTFS_DIR/usr/local/share/airplanes-webconfig/update.sh" ]
-    [ -f "$ROOTFS_DIR/usr/local/share/airplanes-webconfig/scripts/lib/install-common.sh" ]
 }
 
 @test "install.sh --build-mode honors ARCH=armhf" {
@@ -175,144 +164,4 @@ JSON
     ARCH=arm64 run bash "$REPO_ROOT/install.sh" --build-mode
     [ "$status" -ne 0 ]
     echo "$output" | grep -qE "SHA256SUMS missing"
-}
-
-@test "install.sh --runtime preserves previous binary as .prev" {
-    # Seed a pretend-running install at AIRPLANES_ROOT.
-    AIRPLANES_ROOT="$WORK/sysroot"
-    install -d -m 755 "$AIRPLANES_ROOT/usr/local/bin" "$AIRPLANES_ROOT/etc/airplanes"
-    printf 'previous-binary\n' > "$AIRPLANES_ROOT/usr/local/bin/airplanes-webconfig"
-    chmod 0755 "$AIRPLANES_ROOT/usr/local/bin/airplanes-webconfig"
-    echo stable > "$AIRPLANES_ROOT/etc/airplanes/release-channel"
-
-    # Stub `uname -m` so detect_arch returns aarch64 (→ arm64) on this
-    # x86 dev box. We prepend the stub to PATH so the install.sh subshell
-    # picks it up before /usr/bin/uname.
-    STUB_DIR="$WORK/stubs"
-    install -d "$STUB_DIR"
-    cat > "$STUB_DIR/uname" <<'STUB'
-#!/bin/bash
-if [[ "$1" == "-m" ]]; then echo aarch64; exit 0; fi
-exec /usr/bin/uname "$@"
-STUB
-    chmod +x "$STUB_DIR/uname"
-
-    unset AIRPLANES_WEBCONFIG_BRANCH
-    unset ROOTFS_DIR
-    export AIRPLANES_ROOT
-    PATH="$STUB_DIR:$PATH" run bash "$REPO_ROOT/install.sh" --runtime
-    if [ "$status" -ne 0 ]; then
-        printf '%s\n' "$output"
-        return 1
-    fi
-
-    [ -f "$AIRPLANES_ROOT/usr/local/bin/airplanes-webconfig.prev" ]
-    grep -q "previous-binary" "$AIRPLANES_ROOT/usr/local/bin/airplanes-webconfig.prev"
-    grep -q "fake-arm64-binary" "$AIRPLANES_ROOT/usr/local/bin/airplanes-webconfig"
-}
-
-@test "install.sh --runtime A→B chain leaves correct .prev and updated manifest" {
-    # Seed a pretend-running install at AIRPLANES_ROOT representing v0.1.0.
-    AIRPLANES_ROOT="$WORK/sysroot-chain"
-    install -d -m 755 "$AIRPLANES_ROOT/usr/local/bin" "$AIRPLANES_ROOT/etc/airplanes"
-    printf 'baseline-binary\n' > "$AIRPLANES_ROOT/usr/local/bin/airplanes-webconfig"
-    chmod 0755 "$AIRPLANES_ROOT/usr/local/bin/airplanes-webconfig"
-    echo stable > "$AIRPLANES_ROOT/etc/airplanes/release-channel"
-
-    # Push v9.9.10 into the fake remote so the stable resolver can pick it.
-    SEED2="$WORK/seed2"
-    git init -q "$SEED2"
-    (
-        cd "$SEED2"
-        git config user.email t@example.com
-        git config user.name test
-        git commit --allow-empty -q -m c2
-        git tag v9.9.10
-        git remote add origin "$FAKE_REMOTE"
-        git push -q origin --tags
-    )
-
-    # Stage a v9.9.10 payload alongside v9.9.9 (different binary contents so
-    # we can prove install B is the one that landed).
-    PAYLOAD10="$WORK/payload10"
-    install -d -m 755 "$PAYLOAD10"
-    printf 'fake-arm64-binary v9.9.10\n' > "$PAYLOAD10/airplanes-webconfig-arm64"
-    printf 'fake-armhf-binary v9.9.10\n' > "$PAYLOAD10/airplanes-webconfig-armhf"
-    cp "$PAYLOAD/rootfs.tar.gz" "$PAYLOAD10/rootfs.tar.gz"
-    cat > "$PAYLOAD10/manifest.json" <<JSON
-{
-  "version": "v9.9.10",
-  "kind": "stable",
-  "commit_sha": "$EXPECTED_SHA",
-  "build_date": "2026-01-01T00:00:00Z",
-  "arches": ["arm64", "armhf"]
-}
-JSON
-    ( cd "$PAYLOAD10" && sha256sum \
-        airplanes-webconfig-arm64 \
-        airplanes-webconfig-armhf \
-        rootfs.tar.gz \
-        manifest.json \
-        > SHA256SUMS )
-    ln -s "$PAYLOAD10" "$WORK/v9.9.10"
-
-    # uname stub: aarch64 → arm64.
-    STUB_DIR="$WORK/stubs-chain"
-    install -d "$STUB_DIR"
-    cat > "$STUB_DIR/uname" <<'STUB'
-#!/bin/bash
-if [[ "$1" == "-m" ]]; then echo aarch64; exit 0; fi
-exec /usr/bin/uname "$@"
-STUB
-    chmod +x "$STUB_DIR/uname"
-
-    unset AIRPLANES_WEBCONFIG_BRANCH
-    unset ROOTFS_DIR
-    export AIRPLANES_ROOT
-
-    # The stable resolver picks the highest semver tag. Drop v9.9.10 from
-    # the remote before install A so the resolver picks v9.9.9; re-push
-    # v9.9.10 between A and B.
-    git -C "$SEED2" push -q origin :refs/tags/v9.9.10
-
-    PATH="$STUB_DIR:$PATH" run bash "$REPO_ROOT/install.sh" --runtime
-    [ "$status" -eq 0 ] || { echo "INSTALL A:"; printf '%s\n' "$output"; false; }
-
-    grep -q "fake-arm64-binary$" "$AIRPLANES_ROOT/usr/local/bin/airplanes-webconfig"
-    [ -f "$AIRPLANES_ROOT/usr/local/bin/airplanes-webconfig.prev" ]
-    grep -q "baseline-binary" "$AIRPLANES_ROOT/usr/local/bin/airplanes-webconfig.prev"
-    grep -q '"version": "v9.9.9"' "$AIRPLANES_ROOT/etc/airplanes/webconfig-release.json"
-
-    # Push v9.9.10 now; install B should pick it as the new highest semver.
-    git -C "$SEED2" push -q origin refs/tags/v9.9.10
-
-    PATH="$STUB_DIR:$PATH" run bash "$REPO_ROOT/install.sh" --runtime
-    [ "$status" -eq 0 ] || { echo "INSTALL B:"; printf '%s\n' "$output"; false; }
-
-    grep -q "fake-arm64-binary v9.9.10" "$AIRPLANES_ROOT/usr/local/bin/airplanes-webconfig"
-    [ -f "$AIRPLANES_ROOT/usr/local/bin/airplanes-webconfig.prev" ]
-    grep -q "fake-arm64-binary$" "$AIRPLANES_ROOT/usr/local/bin/airplanes-webconfig.prev"
-    grep -q '"version": "v9.9.10"' "$AIRPLANES_ROOT/etc/airplanes/webconfig-release.json"
-}
-
-@test "install.sh refuses armv6l (Pi Zero W1) clearly" {
-    STUB_DIR="$WORK/stubs"
-    install -d "$STUB_DIR"
-    cat > "$STUB_DIR/uname" <<'STUB'
-#!/bin/bash
-if [[ "$1" == "-m" ]]; then echo armv6l; exit 0; fi
-exec /usr/bin/uname "$@"
-STUB
-    chmod +x "$STUB_DIR/uname"
-
-    AIRPLANES_ROOT="$WORK/sysroot2"
-    install -d -m 755 "$AIRPLANES_ROOT/etc/airplanes"
-    echo stable > "$AIRPLANES_ROOT/etc/airplanes/release-channel"
-
-    unset AIRPLANES_WEBCONFIG_BRANCH
-    unset ROOTFS_DIR
-    export AIRPLANES_ROOT
-    PATH="$STUB_DIR:$PATH" run bash "$REPO_ROOT/install.sh" --runtime
-    [ "$status" -ne 0 ]
-    echo "$output" | grep -q "armv6l is not supported"
 }

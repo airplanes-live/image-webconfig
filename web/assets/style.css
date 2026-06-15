@@ -28,11 +28,12 @@
   --wc-line-strong: rgba(20, 32, 51, 0.22);
   --wc-accent: #0c6f9b;
   --wc-accent-strong: #074b70;
-  --wc-warm: #ef8458;
-  --wc-warm-strong: #db6a3a;
-  --wc-danger: #b1442e;
-  --wc-danger-strong: #8e351f;
-  --wc-success: #15803d;
+  --wc-warm: #f0a04b;
+  --wc-warm-strong: #d98a2b;
+  --wc-danger: #d9534a;
+  --wc-danger-strong: #c0392b;
+  --wc-success: #218459;
+  --wc-success-ink: #ffffff;
   --wc-shell-backdrop: rgba(247, 244, 236, 0.92);
 
   --wc-status-ok: var(--wc-success);
@@ -43,27 +44,33 @@
   --wc-radius: 8px;
   --wc-radius-sm: 6px;
   --wc-shadow-soft: 0 1px 2px rgba(20, 32, 51, 0.04);
+
+  /* Single spacing knob for the dashboard tile grid: the gap between
+     tiles, the gap between stacked tile rows, and the hero-to-grid gap
+     all resolve to this so the whole dashboard reads as one even grid. */
+  --wc-tile-gap: 0.75rem;
 }
 
 /* User-chosen dark — overrides OS preference */
 html[data-theme="dark"] {
-  --wc-surface-0: #0d1520;
-  --wc-surface-1: #121f30;
-  --wc-surface-2: #121f30;
-  --wc-surface-3: #172538;
-  --wc-ink-1: #edf3f8;
-  --wc-ink-2: #b8c6d6;
+  --wc-surface-0: #181a1e;
+  --wc-surface-1: #20232a;
+  --wc-surface-2: #20232a;
+  --wc-surface-3: #282b33;
+  --wc-ink-1: #e7eaef;
+  --wc-ink-2: #adb3bd;
   --wc-ink-3: #8d9cae;
-  --wc-line-soft: rgba(237, 243, 248, 0.10);
-  --wc-line-strong: rgba(237, 243, 248, 0.22);
-  --wc-accent: #64b9df;
-  --wc-accent-strong: #91d4f0;
-  --wc-warm: #ff9b70;
-  --wc-warm-strong: #ffb489;
-  --wc-danger: #e87a5f;
-  --wc-danger-strong: #f08e74;
-  --wc-success: #3fb950;
-  --wc-shell-backdrop: rgba(13, 21, 32, 0.92);
+  --wc-line-soft: rgba(231, 234, 239, 0.10);
+  --wc-line-strong: rgba(231, 234, 239, 0.22);
+  --wc-accent: #1786b6;
+  --wc-accent-strong: #3aa0d3;
+  --wc-warm: #ffb547;
+  --wc-warm-strong: #ffc16a;
+  --wc-danger: #e85d5d;
+  --wc-danger-strong: #ef7878;
+  --wc-success: #3ddc97;
+  --wc-success-ink: #051a10;
+  --wc-shell-backdrop: rgba(24, 26, 30, 0.92);
   --wc-shadow-soft: 0 1px 2px rgba(0, 0, 0, 0.35);
 }
 
@@ -75,23 +82,24 @@ html[data-theme="light"] {
 /* OS preference applies only when no explicit override */
 @media (prefers-color-scheme: dark) {
   html:not([data-theme]) {
-    --wc-surface-0: #0d1520;
-    --wc-surface-1: #121f30;
-    --wc-surface-2: #121f30;
-    --wc-surface-3: #172538;
-    --wc-ink-1: #edf3f8;
-    --wc-ink-2: #b8c6d6;
+    --wc-surface-0: #181a1e;
+    --wc-surface-1: #20232a;
+    --wc-surface-2: #20232a;
+    --wc-surface-3: #282b33;
+    --wc-ink-1: #e7eaef;
+    --wc-ink-2: #adb3bd;
     --wc-ink-3: #8d9cae;
-    --wc-line-soft: rgba(237, 243, 248, 0.10);
-    --wc-line-strong: rgba(237, 243, 248, 0.22);
-    --wc-accent: #64b9df;
-    --wc-accent-strong: #91d4f0;
-    --wc-warm: #ff9b70;
-    --wc-warm-strong: #ffb489;
-    --wc-danger: #e87a5f;
-    --wc-danger-strong: #f08e74;
-    --wc-success: #3fb950;
-    --wc-shell-backdrop: rgba(13, 21, 32, 0.92);
+    --wc-line-soft: rgba(231, 234, 239, 0.10);
+    --wc-line-strong: rgba(231, 234, 239, 0.22);
+    --wc-accent: #1786b6;
+    --wc-accent-strong: #3aa0d3;
+    --wc-warm: #ffb547;
+    --wc-warm-strong: #ffc16a;
+    --wc-danger: #e85d5d;
+    --wc-danger-strong: #ef7878;
+    --wc-success: #3ddc97;
+    --wc-success-ink: #051a10;
+    --wc-shell-backdrop: rgba(24, 26, 30, 0.92);
     --wc-shadow-soft: 0 1px 2px rgba(0, 0, 0, 0.35);
   }
 }
@@ -199,6 +207,16 @@ code {
   text-transform: uppercase;
 }
 
+.wc-brand__version {
+  /* Version strings carry `+` and lowercase hex (e.g. `dev-latest+abc1234`).
+     Inherit colour from .wc-brand__meta but drop uppercase + letter-spacing
+     so the suffix stays readable. */
+  margin-left: 0.5em;
+  letter-spacing: 0;
+  text-transform: none;
+}
+.wc-brand__version::before { content: "· "; }
+
 .wc-header__title {
   color: var(--wc-ink-2);
   font-size: 0.95rem;
@@ -252,19 +270,27 @@ main {
    its row's natural y-origin. Vertical spacing comes from the grid gap
    or from explicit margin on the container. */
 
-/* Banner notifications. .wc-flash is the default neutral tone (used by
-   the pending-flash path after navigation); .wc-flash--warn paints a
-   warm-toned strip for actionable warnings like "reboot required". */
+/* Banner notifications. .wc-flash is the neutral baseline; .wc-flash--ok
+   paints a success-accent strip for completed-action confirmations;
+   .wc-flash--warn paints a warm-toned strip for actionable warnings
+   like "reboot required". Symmetric vertical margin so it never touches
+   neighbouring content, whether it's a top banner or a result message
+   shown below a row of buttons. */
 .wc-flash {
   display: flex;
   align-items: center;
   justify-content: space-between;
   gap: 0.75rem;
+  margin: 1rem 0;
   padding: 0.75rem 1rem;
   border-radius: var(--wc-radius);
   border: 1px solid var(--wc-line-soft);
   background: var(--wc-surface-2);
   color: var(--wc-ink-1);
+}
+.wc-flash--ok {
+  background: color-mix(in srgb, var(--wc-success) 18%, var(--wc-surface-1));
+  border-color: var(--wc-success);
 }
 .wc-flash--warn {
   background: color-mix(in srgb, var(--wc-warm) 18%, var(--wc-surface-1));
@@ -276,6 +302,21 @@ main {
   padding: 0.4rem 0.9rem;
   font-size: 0.9rem;
   flex: 0 0 auto;
+}
+.wc-flash__dismiss {
+  background: transparent;
+  border: 0;
+  color: inherit;
+  padding: 0.25rem 0.5rem;
+  min-height: 2rem;
+  font-size: 1.2rem;
+  line-height: 1;
+  cursor: pointer;
+  opacity: 0.7;
+}
+.wc-flash__dismiss:hover,
+.wc-flash__dismiss:focus-visible {
+  opacity: 1;
 }
 
 .wc-card h2,
@@ -307,7 +348,7 @@ main {
   align-items: center;
   gap: 1rem;
   padding: 1.25rem 1.5rem;
-  margin-bottom: 1rem;
+  margin-bottom: var(--wc-tile-gap);
   background: var(--wc-surface-1);
   border: 1px solid var(--wc-line-soft);
   border-radius: var(--wc-radius);
@@ -352,7 +393,9 @@ main {
 
 .wc-grid--tiles {
   display: grid;
-  gap: 0.75rem;
+  /* Column gap, wrap-row gap, and the gap between stacked tile grids
+     (margin-bottom, below) all resolve to the shared --wc-tile-gap. */
+  gap: var(--wc-tile-gap);
   /* minmax(0, 1fr) ignores the items' intrinsic min-content widths so
      each track is exactly (container − gap) / N. Two adjacent tile
      grids (services + apps) with different tile contents otherwise
@@ -360,9 +403,11 @@ main {
      visibly drifts off the columns above it. */
   grid-template-columns: minmax(0, 1fr);
   /* Lock every tile row to the same height so content-driven sub-pixel
-     drift doesn't make adjacent rows look uneven. */
-  grid-auto-rows: 4rem;
-  margin-bottom: 1.25rem;
+     drift doesn't make adjacent rows look uneven. Sized to fit a single-line
+     title plus a two-line meta value (.wc-tile__meta clamps at two lines), so
+     longer status strings wrap instead of truncating mid-word. */
+  grid-auto-rows: 5.25rem;
+  margin-bottom: var(--wc-tile-gap);
 }
 @media (min-width: 576px) {
   .wc-grid--tiles { grid-template-columns: repeat(2, minmax(0, 1fr)); }
@@ -372,6 +417,7 @@ main {
 }
 
 .wc-tile {
+  position: relative;
   display: flex;
   align-items: center;
   gap: 0.75rem;
@@ -385,6 +431,26 @@ main {
   text-decoration: none;
   transition: transform 0.12s ease, border-color 0.12s ease, background 0.12s ease;
 }
+
+/* Left status ribbon — the per-tile health signal, replacing the old
+   right-edge status dot. A pseudo-element (not border-left) so the hover
+   border-color change can't recolour it. Colour is set by the
+   wc-tile--status-* modifier the tile carries; defaults to na (grey). */
+.wc-tile::before {
+  content: "";
+  position: absolute;
+  left: 0;
+  top: 0;
+  bottom: 0;
+  width: 3px;
+  border-radius: var(--wc-radius-sm) 0 0 var(--wc-radius-sm);
+  background: var(--wc-status-na);
+}
+.wc-tile--status-ok::before   { background: var(--wc-status-ok); }
+.wc-tile--status-warn::before { background: var(--wc-status-warn); }
+.wc-tile--status-err::before  { background: var(--wc-status-err); }
+.wc-tile--status-na::before   { background: var(--wc-status-na); }
+
 .wc-tile:hover,
 .wc-tile:focus-visible {
   background: var(--wc-surface-3);
@@ -425,9 +491,13 @@ main {
 .wc-tile__meta {
   font-size: 0.8rem;
   color: var(--wc-ink-3);
-  white-space: nowrap;
+  /* Wrap up to two lines, then clamp with an ellipsis. Replaces the former
+     single-line nowrap clamp that truncated longer status strings. */
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+  line-clamp: 2;
   overflow: hidden;
-  text-overflow: ellipsis;
   font-family: var(--wc-font-mono);
   font-variant-numeric: tabular-nums;
   margin-top: 0.15rem;
@@ -450,6 +520,38 @@ main {
 .wc-tile__dot--err  { background: var(--wc-status-err); }
 .wc-tile__dot--na   { background: var(--wc-status-na); }
 
+/* Identity-card claim-status indicator: a colored dot + label in the card
+   header. green = claimed, blue = registered (not yet claimed), orange =
+   not registered, red = action needed / blocked, grey = unknown. */
+.wc-card-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
+}
+.wc-claim-status {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+  font-size: 0.8rem;
+  font-weight: 500;
+  color: var(--wc-ink-2);
+}
+.wc-claim-dot {
+  display: inline-block;
+  flex-shrink: 0;
+  width: 0.7rem;
+  height: 0.7rem;
+  border-radius: 999px;
+  background: var(--wc-status-na);
+  box-shadow: 0 0 0 2px var(--wc-surface-1);
+}
+.wc-claim-dot--ok   { background: var(--wc-status-ok); }
+.wc-claim-dot--info { background: var(--wc-accent); }
+.wc-claim-dot--warn { background: var(--wc-status-warn); }
+.wc-claim-dot--err  { background: var(--wc-status-err); }
+.wc-claim-dot--na   { background: var(--wc-status-na); }
+
 /* External-link affordance for app tiles. The chevron is muted at rest
    and pops to accent on hover. */
 .wc-tile__chev {
@@ -464,13 +566,10 @@ main {
   color: var(--wc-accent);
 }
 
-/* Infrastructure tiles (hardware health, WiFi) share a visual register
-   that's distinct from service tiles. Same grid cell, but the left-
-   border accent + muted icon tint reads as a different category. */
-.wc-tile--hardware,
-.wc-tile--wifi {
-  border-left: 3px solid var(--wc-accent);
-}
+/* Infrastructure tiles (hardware health, WiFi) keep a muted icon tint so
+   they read as a different category from service tiles. The left status
+   ribbon (.wc-tile::before) is now shared by every tile, so there's no
+   category-specific border here. */
 .wc-tile--hardware .wc-tile__icon,
 .wc-tile--wifi .wc-tile__icon {
   color: var(--wc-ink-2);
@@ -480,6 +579,32 @@ main {
    the existing .wc-grid--tiles bottom margin between them; no extra
    styling needed at the wrapper level. */
 .wc-tiles-stack { display: contents; }
+
+/* When .wc-tile is rendered as a <button> (the navigable Wi-Fi tile),
+   the global button rule would add an accent background, full-width
+   sizing, and centred content. Reset to the anchor-tile appearance. */
+button.wc-tile {
+  width: 100%;
+  min-height: 0;
+  background: var(--wc-surface-1);
+  color: var(--wc-ink-1);
+  border: 1px solid var(--wc-line-soft);
+  font-weight: inherit;
+  text-align: left;
+  justify-content: flex-start;
+  cursor: pointer;
+}
+button.wc-tile:hover {
+  background: var(--wc-surface-3);
+  border-color: var(--wc-line-strong);
+}
+
+/* Nav tiles (app tiles and the Wi-Fi tile) share the chevron pop on
+   hover/focus. */
+.wc-tile--nav:hover .wc-tile__chev,
+.wc-tile--nav:focus-visible .wc-tile__chev {
+  color: var(--wc-accent);
+}
 
 /* ========== Service-state legacy badge (kept for the intermediate
    state where app.js still emits .service-list / .service-state). The
@@ -500,7 +625,7 @@ main {
   color: var(--wc-ink-2);
   font-weight: 600;
 }
-.service-state.state-active   { background: var(--wc-success); color: #fff; }
+.service-state.state-active   { background: var(--wc-success); color: var(--wc-success-ink); }
 .service-state.state-inactive { background: var(--wc-surface-2); color: var(--wc-ink-3); }
 .service-state.state-failed   { background: var(--wc-danger); color: #fff; }
 .service-state.state-unknown  { background: var(--wc-surface-2); color: var(--wc-ink-3); font-style: italic; }
@@ -581,6 +706,9 @@ button.secondary:hover,
 }
 
 .wc-btn-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
   width: 2.75rem;
   min-width: 2.75rem;
   height: 2.75rem;
@@ -595,12 +723,53 @@ button.secondary:hover,
   border-color: var(--wc-line-strong);
   transform: translateY(-1px);
 }
+.wc-btn-icon:focus-visible {
+  outline: 2px solid var(--wc-accent);
+  outline-offset: 2px;
+}
 
 @keyframes wc-spin { to { transform: rotate(360deg); } }
 .wc-btn-icon--spinning svg { animation: wc-spin 0.6s linear infinite; }
 @media (prefers-reduced-motion: reduce) {
   .wc-btn-icon--spinning svg { animation: none; }
 }
+
+/* Copyable value row in the claim box: label + value + a small inline copy
+   button that sits right after the value and is sized to the text, not the
+   2.75rem header icon buttons. The value may wrap (overflow-wrap) so a long
+   feeder UUID can't push the button off a narrow screen. */
+.wc-copy-row {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 0.3rem;
+}
+.wc-copy-val {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+.wc-copy-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: auto;
+  min-width: 0;
+  min-height: 0;
+  /* Transparent padding: the glyph stays text-sized at rest, but the tap
+     target grows to ~24px for touch use. */
+  padding: 0.3rem;
+  line-height: 0;
+  background: transparent;
+  border: none;
+  border-radius: var(--wc-radius-sm);
+  color: var(--wc-ink-3);
+  flex: 0 0 auto;
+}
+.wc-copy-btn:hover { color: var(--wc-ink-1); background: var(--wc-surface-3); }
+.wc-copy-btn--done,
+.wc-copy-btn--done:hover { color: var(--wc-success); background: transparent; }
+.wc-copy-btn--error,
+.wc-copy-btn--error:hover { color: var(--wc-danger); background: transparent; }
 
 /* The header back button visually matches an icon button when collapsed
    on mobile but stretches with text on desktop — keep it as a normal
@@ -628,6 +797,23 @@ button.secondary:hover,
   min-width: max-content;
   white-space: nowrap;
 }
+
+/* Symmetric 2-column action grid used by the Identity, Updates and
+   Power cards. Every cell is the same width (minmax(0, 1fr) ignores
+   intrinsic min-content widths so per-row content can't push column
+   tracks apart); row gap matches column gap, so vertical and horizontal
+   whitespace read as a single rhythm. Buttons stretch to fill their
+   cell, overriding .actions button's flex sizing. */
+.wc-action-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 0.5rem;
+}
+.wc-action-grid > button {
+  width: 100%;
+  min-width: 0;
+}
+.wc-action-grid__spacer { display: block; }
 
 /* Top-level action rows that follow a card need separation; intra-card
    .actions inherit the card's own padding so they don't get this. */
@@ -683,12 +869,81 @@ textarea:focus {
   font-family: var(--wc-font-mono);
   font-size: 0.95rem;
 }
-.config-form button[type="submit"] { width: 100%; margin-top: 0.5rem; }
+
+/* Per-group save footer: confirm button + inline error sit together at
+   the bottom of a fieldset. Hidden when the group has no pending change. */
+.config-fieldset__footer {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 0.5rem;
+  margin-top: 1rem;
+}
+.config-fieldset__footer[hidden] { display: none; }
+/* Collapse the footer (and its top margin) when it holds nothing the user
+   can see — no visible button, no restart notice, no error text. Keeps a
+   clean/disabled group (e.g. MLAT off) from reserving dead space below its
+   content. Reappears the instant a Save/Cancel, pending notice, or error
+   shows. */
+.config-fieldset__footer:not(:has(button:not([hidden]))):not(:has(.config-fieldset__pending:not([hidden]))):not(:has(.error:not(:empty))) {
+  display: none;
+}
+/* Error sits first and grows, pushing the action buttons to the right
+   edge of the box. Empty (no error) it collapses to a flexible spacer
+   that still right-aligns the buttons. */
+.config-fieldset__footer .error { margin: 0; min-height: 0; order: -1; flex: 1 1 auto; }
+.config-fieldset__footer .config-fieldset__pending {
+  margin: 0;
+  flex-basis: 100%;
+  color: var(--wc-warn, var(--wc-ink-2));
+  font-size: 0.85rem;
+}
+.config-fieldset__footer .wc-btn-primary,
+.config-fieldset__footer .wc-btn-ghost { width: auto; margin: 0; }
+
+/* Help text below a field label — smaller and quieter than .help, which
+   sits between fieldsets. .field-help renders inside a .field, between
+   the <label> and the <input>. */
+.field-help {
+  margin: 0.45rem 0 0.1rem;
+  color: var(--wc-ink-3);
+  font-size: 0.76rem;
+  line-height: 1.4;
+}
+
+/* Compact neutral helper link rendered as a small button under an input
+   (e.g. "Find elevation" beneath the altitude field). Shrinks to its
+   content and is pushed to the right edge of the field. */
+.wc-help-link {
+  display: flex;
+  width: fit-content;
+  margin-left: auto;
+  align-items: center;
+  gap: 0.35rem;
+  margin-top: 0.7rem;
+  padding: 0.3rem 0.7rem;
+  font-size: 0.85rem;
+  text-decoration: none;
+  color: var(--wc-ink-1);
+  background: var(--wc-surface-1);
+  border: 1px solid var(--wc-line-strong);
+  border-radius: var(--wc-radius-sm);
+}
+.wc-help-link:hover { background: var(--wc-surface-3); }
+
+/* Live feet→metres echo under the altitude input. Mono + a touch brighter
+   than ordinary help text so it reads as the value that will be saved. */
+.wc-alt-convert {
+  font-family: var(--wc-font-mono);
+  color: var(--wc-ink-2);
+}
+
 
 .config-fieldset {
   border: 1px solid var(--wc-line-soft);
   border-radius: var(--wc-radius-sm);
-  padding: 0.75rem 1rem 0.5rem;
+  padding: 0.75rem 1rem 1rem;
   margin: 0 0 1rem;
 }
 .config-fieldset > legend {
@@ -707,17 +962,16 @@ textarea:focus {
   color: var(--wc-ink-2);
 }
 
-.location-card {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 0.5rem;
-  margin-bottom: 0.25rem;
+/* Position + name inputs revealed by the Enable MLAT checkbox. They sit
+   flush with the other fields — the fieldset border already scopes them
+   to MLAT, so no extra indent is needed (matches the 978 UAT reveal). */
+.mlat-reveal {
+  margin-top: 0.5rem;
 }
-.location-card .location-summary {
-  font-family: var(--wc-font-mono);
-  color: var(--wc-ink-1);
-}
+
+/* Extra separation above the "Hide on the MLAT feeder map" privacy toggle
+   to set it apart from the position/name inputs above it. */
+.mlat-privacy-field { margin-top: 1.25rem; }
 
 /* ========== Logs ========== */
 
@@ -736,6 +990,11 @@ textarea:focus {
   word-break: break-all;
 }
 
+.log-ts {
+  color: var(--wc-ink-3);
+  white-space: nowrap;
+}
+
 /* ========== Two-column responsive split (identity + config) ========== */
 
 .wc-split {
@@ -743,14 +1002,26 @@ textarea:focus {
   gap: 1rem;
   margin-bottom: 1.25rem;
   grid-template-columns: 1fr;
+  /* Don't stretch a short left column to match a tall right column —
+     Identity + Privacy stack only as tall as their content while
+     Configuration may be much taller. */
+  align-items: start;
 }
 @media (min-width: 768px) {
   .wc-split { grid-template-columns: 1fr 1fr; }
 }
 
+/* Vertical stack of cards within one grid cell. Used to put Identity
+   and Privacy in the left column of .wc-split, gap-matched to the
+   grid's own gap. */
+.wc-stack {
+  display: flex;
+  flex-direction: column;
+  gap: 1rem;
+}
+
 /* ========== Wi-Fi panel ========== */
 
-.wifi-status p { margin: 0.25rem 0; }
 .wifi-dot-active,
 .wifi-dot-idle {
   display: inline-block;
@@ -760,7 +1031,7 @@ textarea:focus {
   vertical-align: middle;
   margin-right: 0.35rem;
 }
-.wifi-dot-active { background: #1f8a45; box-shadow: 0 0 0 2px rgba(31, 138, 69, 0.18); }
+.wifi-dot-active { background: var(--wc-success); box-shadow: 0 0 0 2px color-mix(in srgb, var(--wc-success) 18%, transparent); }
 .wifi-dot-idle   { background: var(--wc-line-strong); }
 
 .wifi-badge {
@@ -773,7 +1044,7 @@ textarea:focus {
   margin-left: 0.4rem;
   vertical-align: middle;
 }
-.wifi-badge-warn { background: #fdecc8; color: #5e3a00; }
+.wifi-badge-warn { background: color-mix(in srgb, var(--wc-warm) 18%, var(--wc-surface-1)); color: var(--wc-ink-1); }
 
 .wifi-table {
   width: 100%;
@@ -788,8 +1059,41 @@ textarea:focus {
   vertical-align: middle;
 }
 .wifi-priority { width: 5rem; }
-.wifi-actions  { width: auto; white-space: nowrap; }
-.wifi-actions button + button { margin-left: 0.35rem; }
+.wifi-actions  { width: auto; }
+
+/* Compact action buttons sharing a wrapping row. Overrides the global
+   button { width:100%; min-height:2.75rem } so table + hero actions sit
+   inline and wrap (rather than overflow the card) at narrow widths. */
+.wifi-btn-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.4rem;
+}
+.wifi-btn-row button {
+  width: auto;
+  min-width: max-content;
+  min-height: 2.1rem;
+  padding: 0.3rem 0.75rem;
+  font-size: 0.85rem;
+}
+
+/* Current-network block at the top of the panel. */
+.wifi-current {
+  border: 1px solid var(--wc-line-soft);
+  border-left: 3px solid var(--wc-accent);
+  border-radius: var(--wc-radius-sm);
+  background: var(--wc-surface-1);
+  padding: 0.7rem 0.85rem;
+  margin: 0.25rem 0 0.75rem;
+}
+.wifi-current__head { margin: 0 0 0.15rem; font-size: 1.05rem; }
+.wifi-current__meta { margin: 0 0 0.5rem; font-size: 0.85rem; }
+.wifi-current__note { margin: 0.4rem 0 0; font-size: 0.85rem; }
+
+.wifi-others-title { margin: 0.75rem 0 0.25rem; font-size: 0.95rem; }
+
+.wifi-add-row { margin: 0 0 0.75rem; }
+.wifi-add-btn { width: auto; min-width: max-content; }
 
 .wifi-form .field { margin: 0.5rem 0; }
 .wifi-form .field-row {
@@ -803,7 +1107,29 @@ textarea:focus {
   width: 5rem;
   margin-left: 0.35rem;
 }
-.wifi-help { margin-top: 0.75rem; }
+
+/* Password field with an inline reveal toggle. The input reserves right
+   padding so its text never slides under the button; the button overrides
+   the global full-width sizing and keeps its vertical centering on hover
+   (the global button:hover translateY(-1px) would otherwise undo the
+   translateY(-50%) centering). */
+.wifi-pw-field { position: relative; }
+.wifi-pw-field .wifi-pw-input { padding-right: 4.25rem; }
+.wifi-pw-toggle {
+  position: absolute;
+  top: 50%;
+  right: 0.35rem;
+  transform: translateY(-50%);
+  width: auto;
+  min-width: 0;
+  min-height: 1.9rem;
+  padding: 0.1rem 0.55rem;
+  font-size: 0.8rem;
+  background: var(--wc-surface-2);
+  color: var(--wc-ink-1);
+  border: 1px solid var(--wc-line-soft);
+}
+.wifi-pw-toggle:hover { transform: translateY(-50%); background: var(--wc-surface-3); }
 
 .wifi-flash:empty { display: none; }
 .wifi-flash-ok,
@@ -813,9 +1139,188 @@ textarea:focus {
   border-radius: 0.4rem;
   margin: 0.25rem 0 0.5rem;
 }
-.wifi-flash-ok    { background: #e3f1e6; color: #14441f; }
-.wifi-flash-warn  { background: #fdecc8; color: #5e3a00; }
-.wifi-flash-error { background: #fbdcdc; color: #6a1b1b; }
+.wifi-flash-ok    { background: color-mix(in srgb, var(--wc-success) 18%, var(--wc-surface-1)); color: var(--wc-ink-1); }
+.wifi-flash-warn  { background: color-mix(in srgb, var(--wc-warm) 18%, var(--wc-surface-1)); color: var(--wc-ink-1); }
+.wifi-flash-error { background: color-mix(in srgb, var(--wc-danger) 18%, var(--wc-surface-1)); color: var(--wc-ink-1); }
+
+/* ========== Management card ========== */
+
+/* The Management card renders form rows directly (no inner fieldset),
+   so the muted help paragraph style that .config-fieldset .help used
+   to provide has to live on the card itself. */
+.management-card .help {
+  margin: 0 0 0.75rem;
+  color: var(--wc-ink-3);
+  font-size: 0.85rem;
+}
+.management-card .help a { color: var(--wc-ink-2); }
+.management-card .help code {
+  font-family: var(--wc-font-mono);
+  color: var(--wc-ink-2);
+}
+.management-body .field { margin: 0.5rem 0 0.35rem; }
+
+/* ========== Header user menu ========== */
+
+.wc-user-menu {
+  position: relative;
+  display: inline-flex;
+}
+.wc-user-menu[hidden] { display: none; }
+.wc-user-menu > summary {
+  list-style: none;
+}
+.wc-user-menu > summary::-webkit-details-marker { display: none; }
+.wc-user-menu > summary::marker { content: ""; }
+.wc-user-menu__panel {
+  position: absolute;
+  top: calc(100% + 0.35rem);
+  right: 0;
+  min-width: 12rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.15rem;
+  padding: 0.35rem;
+  background: var(--wc-surface-1);
+  border: 1px solid var(--wc-line-soft);
+  border-radius: var(--wc-radius-sm);
+  box-shadow: 0 6px 18px rgba(0, 0, 0, 0.18);
+  z-index: 50;
+}
+.wc-user-menu__panel button {
+  width: 100%;
+  min-height: 0;
+  padding: 0.5rem 0.75rem;
+  background: transparent;
+  color: var(--wc-ink-1);
+  border: 1px solid transparent;
+  justify-content: flex-start;
+  font-size: 0.9rem;
+  font-weight: 500;
+  text-align: left;
+}
+.wc-user-menu__panel button:hover {
+  background: var(--wc-surface-3);
+  border-color: var(--wc-line-soft);
+  transform: none;
+}
+.wc-user-menu__divider {
+  height: 1px;
+  margin: 0.25rem 0;
+  background: var(--wc-line-soft);
+}
+.wc-user-menu__panel button.wc-user-menu__danger {
+  color: var(--wc-danger);
+}
+.wc-user-menu__panel button.wc-user-menu__danger:hover {
+  background: var(--wc-danger);
+  border-color: var(--wc-danger);
+  color: #fff;
+}
+
+/* ========== System metrics (pi_health subpage) ========== */
+
+.wc-metrics {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(14rem, 1fr));
+  gap: 0.75rem;
+  margin: 0;
+}
+.wc-metrics dt {
+  margin: 0;
+  font-size: 0.75rem;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--wc-ink-3);
+}
+.wc-metrics dd {
+  margin: 0.2rem 0 0;
+  font-family: var(--wc-font-mono);
+  font-size: 1rem;
+  color: var(--wc-ink-1);
+}
+.wc-metrics__cell {
+  padding: 0.65rem 0.85rem;
+  background: var(--wc-surface-2);
+  border: 1px solid var(--wc-line-soft);
+  border-radius: var(--wc-radius-sm);
+}
+.wc-metrics__cell--full { grid-column: 1 / -1; }
+.wc-metrics__flag {
+  display: inline-block;
+  margin: 0.2rem 0.3rem 0 0;
+  padding: 0.15rem 0.5rem;
+  font-size: 0.75rem;
+  font-weight: 600;
+  border-radius: 999px;
+  background: var(--wc-surface-3);
+  color: var(--wc-ink-2);
+}
+.wc-metrics__flag--now {
+  background: var(--wc-danger);
+  color: #fff;
+}
+.wc-metrics__summary {
+  display: flex;
+  align-items: center;
+  gap: 0.55rem;
+  padding: 0.65rem 0.85rem;
+  margin-bottom: 0.75rem;
+  border-radius: var(--wc-radius-sm);
+  background: var(--wc-surface-2);
+  border: 1px solid var(--wc-line-soft);
+}
+.wc-metrics__summary-dot {
+  display: inline-block;
+  width: 0.7rem;
+  height: 0.7rem;
+  flex: 0 0 auto;
+  border-radius: 999px;
+  background: var(--wc-status-na);
+}
+.wc-metrics__summary-dot--ok   { background: var(--wc-status-ok); }
+.wc-metrics__summary-dot--warn { background: var(--wc-status-warn); }
+.wc-metrics__summary-dot--err  { background: var(--wc-status-err); }
+.wc-metrics__summary-dot--na   { background: var(--wc-status-na); }
+/* Outranks the `.wc-card p` typography defaults (0,1,1) — this used to be
+   an inline style, which the CSP (style-src 'self') blocks. */
+.wc-card .wc-metrics__note {
+  margin-top: 1.25rem;
+  font-size: 0.85rem;
+}
+
+/* ========== Editable text-field summary (shared by Location, MLAT name,
+   Gain, 978 UAT — read-only display with an Edit button reveals inputs). */
+
+.wc-editable {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  padding: 0.55rem 0.65rem;
+  background: var(--wc-surface-2);
+  border: 1px solid var(--wc-line-soft);
+  border-radius: var(--wc-radius-sm);
+}
+.wc-editable__value {
+  flex: 1 1 auto;
+  min-width: 0;
+  font-family: var(--wc-font-mono);
+  color: var(--wc-ink-1);
+  word-break: break-word;
+}
+.wc-editable__value--placeholder {
+  color: var(--wc-ink-3);
+  font-style: italic;
+}
+.wc-editable__edit {
+  flex: 0 0 auto;
+  width: auto;
+  min-width: 0;
+  padding: 0.35rem 0.75rem;
+  min-height: 0;
+  font-size: 0.85rem;
+}
 
 /* ========== Reduced motion ========== */
 
@@ -840,3 +1345,134 @@ textarea:focus {
     backdrop-filter: none;
   }
 }
+
+/* ========== Inline field-level error ========== */
+
+.wc-field-error {
+  color: var(--wc-danger);
+  font-size: 0.8rem;
+  margin: 0.25rem 0 0;
+}
+.wc-field-error[hidden] { display: none; }
+input[aria-invalid="true"] {
+  border-color: var(--wc-danger);
+}
+
+/* Inline field-level warning — advisory, does not block saving. */
+.wc-field-warn {
+  color: var(--wc-status-warn);
+  font-size: 0.8rem;
+  margin: 0.25rem 0 0;
+}
+.wc-field-warn[hidden] { display: none; }
+
+/* ========== Third-party aggregators ========== */
+
+.wc-agg-intro {
+  color: var(--wc-ink-2);
+  font-size: 0.9rem;
+  margin: 0 0 0.75rem;
+}
+
+.wc-agg-caveat {
+  color: var(--wc-ink-2);
+  font-size: 0.9rem;
+  margin: 0 0 1rem;
+  padding: 0.6rem 0.8rem;
+  border-left: 3px solid var(--wc-status-warn);
+  background: color-mix(in srgb, var(--wc-status-warn) 8%, var(--wc-surface-1));
+  border-radius: 0 0.4rem 0.4rem 0;
+}
+
+.wc-agg-list { display: flex; flex-direction: column; gap: 0.6rem; }
+
+/* Aggregator rows reuse the .wc-tile--nav visual language: bordered card,
+   icon + body + state dot, with a chevron when the whole row navigates. */
+.wc-agg-row {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+  border: 1px solid var(--wc-line-soft);
+  border-radius: 0.5rem;
+  padding: 0.7rem 0.8rem;
+}
+/* A clickable row is a <button>; reset the global button appearance to the
+   card look and add the tile hover treatment. */
+.wc-agg-row--clickable {
+  width: 100%;
+  background: transparent;
+  color: var(--wc-ink-1);
+  text-align: left;
+  font-weight: inherit;
+  cursor: pointer;
+  transition: border-color 0.12s ease, background 0.12s ease;
+}
+.wc-agg-row--clickable:hover,
+.wc-agg-row--clickable:focus-visible {
+  background: var(--wc-surface-3);
+  border-color: var(--wc-line-strong);
+  outline: none;
+}
+.wc-agg-row__icon {
+  flex: 0 0 auto;
+  width: 1.5rem;
+  height: 1.5rem;
+  color: var(--wc-ink-2);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+.wc-agg-row__body { display: flex; flex-direction: column; min-width: 0; flex: 1; line-height: 1.25; }
+.wc-agg-row__name { font-weight: 600; }
+.wc-agg-row__status {
+  font-size: 0.85rem;
+  color: var(--wc-ink-3);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.wc-agg-row__chev { flex: 0 0 auto; color: var(--wc-ink-3); font-size: 0.95rem; line-height: 1; }
+.wc-agg-row--clickable:hover .wc-agg-row__chev,
+.wc-agg-row--clickable:focus-visible .wc-agg-row__chev { color: var(--wc-accent); }
+.wc-agg-row__actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+  margin-top: 0.6rem;
+}
+.wc-agg-row__actions:empty { margin-top: 0; }
+/* Action buttons size to content here rather than stretching full-width. */
+.wc-agg-row__actions .wc-btn-primary,
+.wc-agg-row__actions .wc-btn-ghost,
+.wc-agg-row__actions .wc-btn-danger { width: auto; flex: 0 0 auto; }
+
+.wc-agg-badge {
+  display: inline-block;
+  font-size: 0.75rem;
+  padding: 0.05rem 0.45rem;
+  border-radius: 0.75rem;
+  background: var(--wc-surface-2);
+  color: var(--wc-ink-2);
+  vertical-align: middle;
+}
+.wc-agg-badge--ok   { background: color-mix(in srgb, var(--wc-status-ok) 18%, var(--wc-surface-1)); color: var(--wc-ink-1); }
+.wc-agg-badge--warn { background: color-mix(in srgb, var(--wc-status-warn) 20%, var(--wc-surface-1)); color: var(--wc-ink-1); }
+.wc-agg-badge--err  { background: color-mix(in srgb, var(--wc-status-err) 20%, var(--wc-surface-1)); color: var(--wc-ink-1); }
+
+.wc-agg-form { margin-top: 0.5rem; }
+.wc-agg-backup { margin-top: 1rem; }
+/* Inline checkbox + label (e.g. the FlightAware MLAT toggle). */
+.wc-checkbox { display: flex; align-items: center; gap: 0.5rem; cursor: pointer; }
+.wc-checkbox input[type="checkbox"] { width: auto; margin: 0; flex: 0 0 auto; }
+
+/* Manage-page title: name + status chip sit together, left-aligned, rather
+   than pushing the chip to the far edge (overrides .wc-card-head). */
+.wc-agg-detail-head { justify-content: flex-start; gap: 0.55rem; }
+.wc-agg-detail-head__name { font-weight: 600; }
+
+/* Status card on a manage page: installed version + per-adapter status lines. */
+.wc-agg-status-card { margin-top: 1rem; }
+.wc-agg-status { display: flex; flex-direction: column; gap: 0.45rem; }
+.wc-agg-status__row { display: flex; align-items: center; gap: 0.55rem; }
+.wc-agg-status__label { color: var(--wc-ink-3); flex: 0 0 9.5rem; }
+.wc-agg-status__value { color: var(--wc-ink-1); font-weight: 500; min-width: 0; }

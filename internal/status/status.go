@@ -1,14 +1,18 @@
 // Package status assembles the GET /api/status payload: per-service
 // active/inactive state, the last-seen aircraft snapshot from
-// /run/readsb/aircraft.json, and the build manifest at
-// /etc/airplanes/build-manifest.json. Only local sources — no network
-// calls — so /api/status stays cheap to poll.
+// /run/readsb/aircraft.json, and two build manifests — the immutable
+// image manifest at /etc/airplanes/build-manifest.json (flash-time
+// provenance) and the runtime-overlay manifest at
+// /etc/airplanes/runtime-manifest.json (the live component versions,
+// which advance on every overlay update). Only local sources — no
+// network calls — so /api/status stays cheap to poll.
 package status
 
 import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"io/fs"
 	"os"
 	"strings"
@@ -16,16 +20,16 @@ import (
 	"time"
 
 	wexec "github.com/airplanes-live/image-webconfig/internal/exec"
-	"github.com/airplanes-live/image-webconfig/internal/pihealth"
+	"github.com/airplanes-live/image-webconfig/internal/hardware"
 	"github.com/airplanes-live/image-webconfig/internal/runtimestate"
 	"github.com/airplanes-live/image-webconfig/internal/wifi"
 )
 
-// PiHealthProbe is the interface status.Reader uses to fetch a hardware
-// snapshot. Concrete production type is *pihealth.Reader; tests inject a
-// stub.
-type PiHealthProbe interface {
-	Probe(ctx context.Context) *pihealth.PiHealth
+// HardwareProbe is the interface status.Reader uses to fetch a hardware
+// snapshot. Concrete production type is *hardware.Reader; tests inject
+// a stub.
+type HardwareProbe interface {
+	Probe(ctx context.Context) *hardware.Snapshot
 }
 
 // WifiProbe is the interface status.Reader uses to fetch WiFi signal
@@ -39,11 +43,11 @@ type WifiProbe interface {
 // signature stable so existing callers compile unchanged.
 type Option func(*Reader)
 
-// WithPiHealth wires a PiHealthProbe into the Reader. When set, Read()
+// WithHardware wires a HardwareProbe into the Reader. When set, Read()
 // runs the probe in parallel with the systemctl fan-out and embeds the
-// result as Status.PiHealth.
-func WithPiHealth(p PiHealthProbe) Option {
-	return func(r *Reader) { r.pihealth = p }
+// result as Status.{PiThrottle, System, HardwareHealth}.
+func WithHardware(p HardwareProbe) Option {
+	return func(r *Reader) { r.hardware = p }
 }
 
 // WithWifi wires a WifiProbe into the Reader. When set, Read() runs the
@@ -68,29 +72,35 @@ var MonitoredServices = []string{
 // Paths configures file lookups; defaults match the rootfs layout. Override
 // in tests.
 type Paths struct {
-	ManifestFile       string   // /etc/airplanes/build-manifest.json
-	AircraftJSONFile   string   // /run/readsb/aircraft.json
-	MlatStateFile      string   // /run/airplanes-mlat/state
-	FeedStateFile      string   // /run/airplanes-feed/state
-	UAT978StateFile    string   // /run/airplanes-978/state
-	Dump978FAStateFile string   // /run/dump978-fa/state
-	RebootRequiredFile string   // /var/run/reboot-required (written by needrestart after kernel/libc upgrades)
-	SystemctlSudoArgv0 []string // [sudo, -n, ...] OR [systemctl] (no sudo: is-active is read-only)
-	SystemctlBinary    string   // /usr/bin/systemctl
-	IsActiveTimeout    time.Duration
+	ImageManifestFile   string   // /etc/airplanes/build-manifest.json (flash-time, immutable)
+	RuntimeManifestFile string   // /etc/airplanes/runtime-manifest.json (live overlay, advances on update)
+	AircraftJSONFile    string   // /run/readsb/aircraft.json
+	ReadsbStatsFile     string   // /run/readsb/stats.json (effective gain_db)
+	MlatStateFile       string   // /run/airplanes-mlat/state
+	FeedStateFile       string   // /run/airplanes-feed/state
+	UAT978StateFile     string   // /run/airplanes-978/state
+	Dump978FAStateFile  string   // /run/dump978-fa/state
+	ReadsbStateFile     string   // /run/readsb/state
+	RebootRequiredFile  string   // /var/run/reboot-required (written by needrestart after kernel/libc upgrades)
+	SystemctlSudoArgv0  []string // [sudo, -n, ...] OR [systemctl] (no sudo: is-active is read-only)
+	SystemctlBinary     string   // /usr/bin/systemctl
+	IsActiveTimeout     time.Duration
 }
 
 func DefaultPaths() Paths {
 	return Paths{
-		ManifestFile:       "/etc/airplanes/build-manifest.json",
-		AircraftJSONFile:   "/run/readsb/aircraft.json",
-		MlatStateFile:      "/run/airplanes-mlat/state",
-		FeedStateFile:      "/run/airplanes-feed/state",
-		UAT978StateFile:    "/run/airplanes-978/state",
-		Dump978FAStateFile: "/run/dump978-fa/state",
-		RebootRequiredFile: "/var/run/reboot-required",
-		SystemctlBinary:    "/usr/bin/systemctl",
-		IsActiveTimeout:    2 * time.Second,
+		ImageManifestFile:   "/etc/airplanes/build-manifest.json",
+		RuntimeManifestFile: "/etc/airplanes/runtime-manifest.json",
+		AircraftJSONFile:    "/run/readsb/aircraft.json",
+		ReadsbStatsFile:     "/run/readsb/stats.json",
+		MlatStateFile:       "/run/airplanes-mlat/state",
+		FeedStateFile:       "/run/airplanes-feed/state",
+		UAT978StateFile:     "/run/airplanes-978/state",
+		Dump978FAStateFile:  "/run/dump978-fa/state",
+		ReadsbStateFile:     "/run/readsb/state",
+		RebootRequiredFile:  "/var/run/reboot-required",
+		SystemctlBinary:     "/usr/bin/systemctl",
+		IsActiveTimeout:     2 * time.Second,
 	}
 }
 
@@ -101,7 +111,7 @@ type Reader struct {
 	paths    Paths
 	runner   wexec.CommandRunner
 	version  string
-	pihealth PiHealthProbe
+	hardware HardwareProbe
 	wifi     WifiProbe
 }
 
@@ -120,8 +130,22 @@ func NewReader(version string, p Paths, r wexec.CommandRunner, opts ...Option) *
 type Status struct {
 	Version  string            `json:"webconfig_version"`
 	Services map[string]string `json:"services"` // unit → "active" / "inactive" / "unknown"
-	Manifest json.RawMessage   `json:"manifest,omitempty"`
-	Feed     *FeedStats        `json:"feed,omitempty"`
+	// ImageManifest is the immutable flash-time manifest (pi_gen,
+	// build_timestamp, baked component SHAs). RuntimeManifest is the live
+	// overlay manifest whose component versions advance on every overlay
+	// update — the field a "what am I running" check should read. Both are
+	// passed through raw; either is omitted on a read/parse error.
+	ImageManifest   json.RawMessage `json:"image_manifest,omitempty"`
+	RuntimeManifest json.RawMessage `json:"runtime_manifest,omitempty"`
+	Feed            *FeedStats      `json:"feed,omitempty"`
+	// ReadsbStats carries the decoder's effective SDR gain (gain_db) and the
+	// age of that reading. Distinct from Feed (aircraft.json) — sourced from
+	// /run/readsb/stats.json, which readsb rewrites on its ~10s stats cadence
+	// after every autogain adjustment. Omitted until the first stats write
+	// (~10s post-boot) or when no in-range numeric gain_db is present. The
+	// frontend hides the value when AgeSec grows stale (wedged decoder) and
+	// only shows it at all when the configured gain is adaptive.
+	ReadsbStats *ReadsbStats `json:"readsb_stats,omitempty"`
 	// Decisions are the daemons' published config-classifications, read
 	// from /run/<service>/state. omitempty so an old daemon (pre PR 1
 	// in feed, pre PR 4 in image for UAT) without a state file doesn't
@@ -135,15 +159,31 @@ type Status struct {
 	// no_hardware decision propagates into UATDecision.Reason as
 	// peer_no_hardware so the airplanes-978 tile can render an "idle relay"
 	// state without polling two endpoints.
+	//
+	// ReadsbDecision is readsb.sh's publication. Its only non-ok reason is
+	// no_hardware (a pinned 1090 SDR serial that isn't present); the frontend
+	// renders that as a "1090 SDR not detected" tile rather than the green
+	// decoder-ok state that systemd-active alone would imply.
 	MlatDecision      *Decision `json:"mlat_decision,omitempty"`
 	FeedDecision      *Decision `json:"feed_decision,omitempty"`
 	UATDecision       *Decision `json:"uat_decision,omitempty"`
 	Dump978FADecision *Decision `json:"dump978fa_decision,omitempty"`
+	ReadsbDecision    *Decision `json:"readsb_decision,omitempty"`
 
-	// PiHealth is the hardware-health snapshot. omitempty so a Reader
-	// configured without WithPiHealth (e.g. server tests that don't care)
-	// keeps the JSON shape compatible.
-	PiHealth *pihealth.PiHealth `json:"pi_health,omitempty"`
+	// Hardware-health surface. Three top-level keys mirror the
+	// airplanes-live/website feeder-diagnostics split:
+	//   - pi_throttle: Pi-only, the 8 vcgencmd get_throttled bits +
+	//     optional PSU enrichment. Omitted on non-Pi or throttle probe
+	//     failure.
+	//   - system: universal, always present (emits at least `{}` even
+	//     when no probe is wired). Per-sub-probe success carried by
+	//     pointer-omitempty on each field.
+	//   - hardware_health: local-only rollup the SPA tile and
+	//     --hardware CLI consume. Omitted when no HardwareProbe is
+	//     wired (test-only path).
+	PiThrottle     *hardware.Throttle `json:"pi_throttle,omitempty"`
+	System         hardware.System    `json:"system"`
+	HardwareHealth *hardware.Health   `json:"hardware_health,omitempty"`
 
 	// Wifi is the live signal snapshot. omitempty when there is no WiFi
 	// hardware (or the probe wasn't configured) so the frontend can hide
@@ -173,6 +213,15 @@ type FeedStats struct {
 	AircraftCount   int     `json:"aircraft_count"`
 }
 
+// ReadsbStats is the effective-gain slice of readsb's stats.json. AgeSec is
+// whole seconds since the file was last written; the frontend hides GainDB
+// once it grows stale (readsb wedged or stopped). Only emitted when a numeric
+// gain_db in a sane dB range is present.
+type ReadsbStats struct {
+	GainDB float64 `json:"gain_db"`
+	AgeSec int64   `json:"age_sec"`
+}
+
 // Read assembles the status payload. Failures in one source don't fail the
 // whole call — services are individually labeled "unknown" on timeout, the
 // manifest is omitted on read error, and the feed snapshot is omitted on
@@ -198,16 +247,16 @@ func (r *Reader) Read(ctx context.Context) (Status, error) {
 		}(unit)
 	}
 
-	// Pi health probe runs in parallel with the systemctl fan-out. The
+	// Hardware probe runs in parallel with the systemctl fan-out. The
 	// probe is bounded by its own per-sub-probe timeouts inside the
-	// pihealth package; we just collect its result.
-	var phWG sync.WaitGroup
-	var phResult *pihealth.PiHealth
-	if r.pihealth != nil {
-		phWG.Add(1)
+	// hardware package; we just collect its result.
+	var hwWG sync.WaitGroup
+	var hwResult *hardware.Snapshot
+	if r.hardware != nil {
+		hwWG.Add(1)
 		go func() {
-			defer phWG.Done()
-			phResult = r.pihealth.Probe(ctx)
+			defer hwWG.Done()
+			hwResult = r.hardware.Probe(ctx)
 		}()
 	}
 
@@ -230,28 +279,38 @@ func (r *Reader) Read(ctx context.Context) (Status, error) {
 		out.Services[s.unit] = s.state
 	}
 
-	phWG.Wait()
-	out.PiHealth = phResult
+	hwWG.Wait()
+	if hwResult != nil {
+		out.PiThrottle = hwResult.PiThrottle
+		out.System = hwResult.System
+		out.HardwareHealth = &hwResult.Health
+	}
 
 	wifiWG.Wait()
 	out.Wifi = wifiResult
 
-	if m, err := os.ReadFile(r.paths.ManifestFile); err == nil {
-		// Validate JSON shape so we never embed garbage in the response.
-		var dummy json.RawMessage
-		if json.Unmarshal(m, &dummy) == nil {
-			out.Manifest = m
-		}
-	}
+	out.ImageManifest = readRawManifest(r.paths.ImageManifestFile)
+	out.RuntimeManifest = readRawManifest(r.paths.RuntimeManifestFile)
 
 	if fs, err := readAircraftJSON(r.paths.AircraftJSONFile); err == nil {
 		out.Feed = fs
 	}
 
+	out.ReadsbStats = readReadsbStats(r.paths.ReadsbStatsFile)
+
 	out.MlatDecision = r.readMlatDecision(ctx, out.Services["airplanes-mlat.service"])
 	out.FeedDecision = r.readFeedDecision(out.Services["airplanes-feed.service"])
 	out.UATDecision = r.readUATDecision(ctx, out.Services["airplanes-978.service"])
 	out.Dump978FADecision = r.readDump978FADecision(ctx, out.Services["dump978-fa.service"])
+	out.ReadsbDecision = r.readReadsbDecision(out.Services["readsb.service"])
+
+	// A self-disabled decoder (pinned 1090 SDR absent) is not producing, but
+	// RuntimeDirectoryPreserve keeps its last aircraft.json around. Drop the
+	// snapshot so no consumer (readsb tile, feed tile, hero line) reports a
+	// frozen count as live; the readsb_decision carries the real reason.
+	if out.ReadsbDecision != nil && out.ReadsbDecision.State == "disabled" {
+		out.Feed = nil
+	}
 
 	if r.paths.RebootRequiredFile != "" {
 		if _, err := os.Stat(r.paths.RebootRequiredFile); err == nil {
@@ -340,6 +399,20 @@ func (r *Reader) readDump978FADecision(ctx context.Context, svcState string) *De
 	return decisionFromFile(r.paths.Dump978FAStateFile, runtimestate.AllowedReasonsDump978FA)
 }
 
+// readReadsbDecision reads readsb.sh's published decision. Unlike the 978/mlat
+// wrappers readsb has no exit-64 strict-misconfig path, so it's only consulted
+// for active/transitioning states (the no_hardware self-disable sleeps with the
+// unit still active). Returns nil otherwise so consumers fall back to the
+// systemd active-state + aircraft.json classification — which also covers an
+// older overlay whose readsb.sh predates the state file.
+func (r *Reader) readReadsbDecision(svcState string) *Decision {
+	switch svcState {
+	case "active", "activating", "reloading":
+		return decisionFromFile(r.paths.ReadsbStateFile, runtimestate.AllowedReasonsReadsb)
+	}
+	return nil
+}
+
 // decisionFromFile reads, validates, and returns the Decision encoded in a
 // runtime state file. allowedReasons gates the reason vocabulary per
 // daemon-owner so a malformed 978 file claiming an MLAT-only reason is
@@ -402,6 +475,27 @@ type readsbAircraftJSON struct {
 	Aircraft []struct{} `json:"aircraft"`
 }
 
+// readRawManifest returns a manifest file's bytes only if they parse as a
+// JSON object, so /api/status never embeds garbage or a bare null/array/
+// scalar (which would surface as e.g. `"runtime_manifest": null`). Returns
+// nil on a missing or non-object file (the corresponding field is then
+// omitted). The runtime manifest path is a symlink into the active overlay;
+// os.ReadFile follows it to the current target.
+func readRawManifest(path string) json.RawMessage {
+	m, err := os.ReadFile(path)
+	if err != nil {
+		return nil
+	}
+	// Unmarshalling into a map rejects arrays and scalars; the explicit nil
+	// check rejects a literal `null` (which decodes into a nil map without
+	// error). Only a JSON object survives.
+	var obj map[string]json.RawMessage
+	if json.Unmarshal(m, &obj) != nil || obj == nil {
+		return nil
+	}
+	return m
+}
+
 func readAircraftJSON(path string) (*FeedStats, error) {
 	b, err := os.ReadFile(path)
 	if err != nil {
@@ -419,4 +513,51 @@ func readAircraftJSON(path string) (*FeedStats, error) {
 		MessagesCounter: raw.Messages,
 		AircraftCount:   len(raw.Aircraft),
 	}, nil
+}
+
+// readsbStatsJSON is the relevant subset of readsb's stats.json. GainDB is a
+// pointer so a JSON string ("49.6") fails to decode into the float (yielding
+// nil, matching the render-status `jq '.gain_db | numbers'` type-gate) and a
+// literal 0 stays distinguishable from an absent key.
+type readsbStatsJSON struct {
+	GainDB *float64 `json:"gain_db"`
+}
+
+// readReadsbStats reads readsb's effective SDR gain from stats.json. readsb
+// rewrites gain_db after every autogain adjustment (~10s cadence), so the file
+// mtime is a good liveness proxy: AgeSec lets the client suppress a value left
+// behind by a wedged or stopped decoder. Returns nil when the file is
+// missing/unparseable, gain_db is absent or non-numeric, or the value is
+// outside a sane dB range (drops the RTL hardware-AGC sentinel — we run
+// software auto, so a real reading is always a small positive dB).
+func readReadsbStats(path string) *ReadsbStats {
+	// Open once and Stat the same fd so the mtime can't be paired with
+	// different file content by a concurrent rewrite (readsb writes atomically
+	// via rename, but the read+stat would otherwise straddle that swap).
+	f, err := os.Open(path)
+	if err != nil {
+		return nil
+	}
+	defer f.Close()
+	info, err := f.Stat()
+	if err != nil {
+		return nil
+	}
+	b, err := io.ReadAll(f)
+	if err != nil {
+		return nil
+	}
+	var raw readsbStatsJSON
+	if json.Unmarshal(b, &raw) != nil || raw.GainDB == nil {
+		return nil
+	}
+	g := *raw.GainDB
+	if g < 0 || g > 99 {
+		return nil
+	}
+	age := time.Since(info.ModTime())
+	if age < 0 {
+		age = 0
+	}
+	return &ReadsbStats{GainDB: g, AgeSec: int64(age.Seconds())}
 }

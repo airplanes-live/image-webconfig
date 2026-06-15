@@ -10,12 +10,22 @@ User=airplanes-webconfig
 Group=airplanes-webconfig
 # airplanes-feed: read access to /etc/airplanes/feeder-claim-secret (mode
 # 0640 group=airplanes-feed) so the /api/identity/secret reveal handler can
-# read the file directly without sudo. systemd loads supplementary groups
-# via initgroups() at process start; this directive makes the dependency
-# explicit instead of relying on /etc/group to be authoritative at unit
-# load time.
-SupplementaryGroups=airplanes-feed
-ExecStart=/usr/local/bin/airplanes-webconfig --listen 127.0.0.1:8080
+# read the file directly without sudo. video: /dev/vcio access for the
+# hardware tile's `vcgencmd get_throttled` / `get_config psu_max_current`
+# probes (mirrors the video-group grant feed makes for its own daemon user).
+# systemd loads supplementary groups via initgroups() at process start; this
+# directive makes the dependency explicit instead of relying on /etc/group to
+# be authoritative at unit load time.
+SupplementaryGroups=airplanes-feed video
+# Session-token hashes are mirrored under /run so logins survive the
+# service restart the runtime-overlay self-update performs (its rollback
+# path stops the unit before restarting it, hence Preserve=yes rather
+# than =restart). /run is tmpfs: a reboot clears all sessions. Mode 0700 —
+# only the service account may read the mirror.
+RuntimeDirectory=airplanes-webconfig
+RuntimeDirectoryMode=0700
+RuntimeDirectoryPreserve=yes
+ExecStart=/usr/local/bin/airplanes-webconfig --listen 127.0.0.1:8080 --sessions-path /run/airplanes-webconfig/sessions.json
 Restart=on-failure
 RestartSec=5s
 

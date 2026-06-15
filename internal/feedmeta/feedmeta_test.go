@@ -2,11 +2,45 @@ package feedmeta
 
 import (
 	"encoding/json"
+	"os"
+	"path/filepath"
 	"reflect"
 	"sort"
 	"testing"
 	"time"
 )
+
+// altitudeFixtureCase mirrors a single entry in
+// testdata/altitude-canonicalization.json (vendored from
+// airplanes-live/feed). The fixture file is the source of truth for
+// the canonicalisation contract across bash / Go / JS callers.
+type altitudeFixtureCase struct {
+	Input          string `json:"input"`
+	ExpectedOutput string `json:"expected_output"`
+	ExpectedOK     bool   `json:"expected_ok"`
+	Note           string `json:"note,omitempty"`
+}
+
+// loadAltitudeFixture returns the table of canonical altitude cases.
+// Failure to read or decode the fixture aborts the test — drift
+// against feed's fixture is a parity bug, not a tolerable skip.
+func loadAltitudeFixture(t *testing.T) []altitudeFixtureCase {
+	t.Helper()
+	raw, err := os.ReadFile(filepath.Join("testdata", "altitude-canonicalization.json"))
+	if err != nil {
+		t.Fatalf("read altitude fixture: %v", err)
+	}
+	var doc struct {
+		Cases []altitudeFixtureCase `json:"cases"`
+	}
+	if err := json.Unmarshal(raw, &doc); err != nil {
+		t.Fatalf("decode altitude fixture: %v", err)
+	}
+	if len(doc.Cases) == 0 {
+		t.Fatal("altitude fixture: zero cases")
+	}
+	return doc.Cases
+}
 
 // fixedNow is the reference timestamp used across these tests. The
 // RFC 3339 UTC literal matches what BuildApplyPayload emits for this time.
@@ -215,21 +249,24 @@ func TestBuildApplyPayload_BooleanFlipsCarryMetadata(t *testing.T) {
 	}
 }
 
-func TestBuildApplyPayload_AltitudeCanonicalEqualIsBareString(t *testing.T) {
-	// Apply library appends `m` to bare-number ALTITUDE before storing
-	// (mirrors _apl_feed_apply_canonicalize_altitude). A user typing
-	// "120" while disk holds "120m" must NOT produce object metadata —
-	// the canonical value is the same and the sidecar must not be bumped.
+func TestBuildApplyPayload_AltitudeCanonicalEqualIsBareMetres(t *testing.T) {
+	// Feed's apply layer canonicalises ALTITUDE to bare metres before
+	// storing (`120m` → `120`, `400ft` → `121.92`). A user typing any
+	// form that canonicalises to the same bare-metres value as disk
+	// must NOT produce object metadata — the sidecar must not bump.
 	for _, tc := range []struct {
-		current, posted string
+		name, current, posted string
 	}{
-		{"120m", "120"},
-		{"120", "120m"},
-		{"120m", "120m"},
-		{"120ft", "120ft"},
-		{"-30.49", "-30.49"},
+		{"bare_equals_metre", "120", "120m"},
+		{"metre_equals_bare", "120m", "120"},
+		{"ft_equals_post_conversion_bare", "121.92", "400ft"},
+		{"bare_equals_bare", "120", "120"},
+		{"metre_equals_metre", "120m", "120m"},
+		{"bare_equals_metre_decimal", "42.5", "42.5m"},
+		{"negative_metre_equals_bare", "-50", "-50m"},
+		{"negative_ft_to_bare", "-15.24", "-50ft"},
 	} {
-		t.Run(tc.current+"_vs_"+tc.posted, func(t *testing.T) {
+		t.Run(tc.name, func(t *testing.T) {
 			got := BuildApplyPayload(
 				map[string]string{"ALTITUDE": tc.current},
 				map[string]string{"ALTITUDE": tc.posted},
@@ -238,21 +275,142 @@ func TestBuildApplyPayload_AltitudeCanonicalEqualIsBareString(t *testing.T) {
 			if _, isUpdate := got["ALTITUDE"].(FieldUpdate); isUpdate {
 				t.Errorf("ALTITUDE canonically equal (%q vs %q): expected bare string, got FieldUpdate", tc.current, tc.posted)
 			}
+			if s, isStr := got["ALTITUDE"].(string); !isStr || s != tc.posted {
+				t.Errorf("ALTITUDE: bare-string passthrough must echo posted value verbatim, got %#v", got["ALTITUDE"])
+			}
 		})
 	}
 }
 
 func TestBuildApplyPayload_AltitudeRealChangeCarriesMetadata(t *testing.T) {
 	// Genuinely different ALTITUDE values (different canonical form)
-	// still get metadata.
+	// still get metadata. 120m → 150m is +30m on disk; 120m → 400ft
+	// canonicalises to 121.92m which is a real change too.
+	for _, tc := range []struct {
+		name, current, posted, wantValue string
+	}{
+		{"bare_changes_value", "120m", "150", "150"},
+		{"ft_to_different_metres", "120m", "400ft", "400ft"},
+		{"decimal_changes", "42.5", "43.0m", "43.0m"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got := BuildApplyPayload(
+				map[string]string{"ALTITUDE": tc.current},
+				map[string]string{"ALTITUDE": tc.posted},
+				fixedNow,
+			)
+			want := FieldUpdate{Value: tc.wantValue, EditedAt: fixedStamp, EditedBy: "feeder"}
+			if got["ALTITUDE"] != want {
+				t.Errorf("%s: want %#v, got %#v", tc.name, want, got["ALTITUDE"])
+			}
+		})
+	}
+}
+
+// TestAltitudeToBareMetres_BoundaryRoundingMatchesBash pins the
+// behaviour at "value whose 11th-decimal slop crosses the boundary":
+// bash's altitude_to_bare_metres formats with %.10f BEFORE the
+// range-check, so an input of e.g. 10000.00000000004 rounds back to
+// 10000 before the gate accepts it. Go must converge with that or
+// the cross-repo metadata sidecar would thrash on certain edges.
+func TestAltitudeToBareMetres_BoundaryRoundingMatchesBash(t *testing.T) {
+	// Just-inside upper bound after %.10f rounding: 11th-decimal
+	// noise rounds away. Accept.
+	for _, in := range []string{"10000.00000000004", "9999.99999999996"} {
+		got, ok := AltitudeToBareMetres(in)
+		if !ok {
+			t.Errorf("input=%q: rejected, want accepted (post-%%.10f rounds inside [-1000,10000])", in)
+		}
+		if got != "10000" {
+			t.Errorf("input=%q: got %q, want 10000 (rounded)", in, got)
+		}
+	}
+	// 10000.0001 has no 11th-decimal slop: %.10f preserves it as
+	// 10000.0001000000 > 10000 → reject. Matches fixture.
+	if _, ok := AltitudeToBareMetres("10000.0001"); ok {
+		t.Errorf("input=10000.0001: accepted, want rejected")
+	}
+}
+
+// TestAltitudeToBareMetres_NegativeZero pins the negative-zero
+// canonical so the JS / Go / bash sides converge. The fixture does
+// not cover -0 because the operator never enters it deliberately,
+// but a fleet-wide migrator that processes every value still has to
+// agree on how to format a `-0` it encounters in the wild.
+//
+// Bash awk emits "-0.0000000000" for `printf "%.10f" -0`; Go's
+// strconv.FormatFloat preserves the negative sign on a -0 input.
+// JS toFixed normalises -0 to "0.0000000000" — the SPA explicitly
+// re-attaches the sign via Object.is so the canonical matches.
+func TestAltitudeToBareMetres_NegativeZero(t *testing.T) {
+	for _, in := range []string{"-0", "-0m", "-0ft"} {
+		got, ok := AltitudeToBareMetres(in)
+		if !ok {
+			t.Errorf("AltitudeToBareMetres(%q): ok=false, want true", in)
+		}
+		if got != "-0" {
+			t.Errorf("AltitudeToBareMetres(%q) = %q, want %q", in, got, "-0")
+		}
+	}
+}
+
+// TestAltitudeToBareMetres_FromFixture exercises the exported helper
+// against the shared canonical fixture vendored from feed. The fixture
+// IS the contract — any divergence between bash/Go/JS surfaces here as
+// a parity failure.
+func TestAltitudeToBareMetres_FromFixture(t *testing.T) {
+	for _, tc := range loadAltitudeFixture(t) {
+		tc := tc
+		t.Run("input="+tc.Input, func(t *testing.T) {
+			got, ok := AltitudeToBareMetres(tc.Input)
+			if ok != tc.ExpectedOK {
+				t.Errorf("AltitudeToBareMetres(%q): ok=%v, want %v", tc.Input, ok, tc.ExpectedOK)
+			}
+			if got != tc.ExpectedOutput {
+				t.Errorf("AltitudeToBareMetres(%q): output=%q, want %q (note=%s)", tc.Input, got, tc.ExpectedOutput, tc.Note)
+			}
+		})
+	}
+}
+
+// TestBuildApplyPayload_AltitudeFixtureDrivenCanonicalEqual iterates
+// every parseable fixture entry and confirms that posting any input
+// against a disk that already holds the canonical bare-metres value
+// is treated as a no-change (bare-string passthrough). The unparseable
+// entries are exercised by the dedicated "unparseable" tests below.
+func TestBuildApplyPayload_AltitudeFixtureDrivenCanonicalEqual(t *testing.T) {
+	for _, tc := range loadAltitudeFixture(t) {
+		if !tc.ExpectedOK {
+			continue
+		}
+		tc := tc
+		t.Run("disk="+tc.ExpectedOutput+"_posted="+tc.Input, func(t *testing.T) {
+			got := BuildApplyPayload(
+				map[string]string{"ALTITUDE": tc.ExpectedOutput},
+				map[string]string{"ALTITUDE": tc.Input},
+				fixedNow,
+			)
+			if _, isUpdate := got["ALTITUDE"].(FieldUpdate); isUpdate {
+				t.Errorf("ALTITUDE %q vs canonical %q: expected bare string, got FieldUpdate", tc.Input, tc.ExpectedOutput)
+			}
+		})
+	}
+}
+
+func TestBuildApplyPayload_AltitudeUnparseableStillEmitsMetadata(t *testing.T) {
+	// Unparseable input must not silently masquerade as "no change" —
+	// the apply layer's validator catches it on the round trip. We
+	// expect a FieldUpdate so the apply CLI sees the bad value and
+	// rejects it; canonicalizeForCompare returns the original value
+	// on parse failure, which a non-equal disk value will then drive
+	// to the changed-tracked branch.
 	got := BuildApplyPayload(
-		map[string]string{"ALTITUDE": "120m"},
-		map[string]string{"ALTITUDE": "150"},
+		map[string]string{"ALTITUDE": "120"},
+		map[string]string{"ALTITUDE": "garbage"},
 		fixedNow,
 	)
-	want := FieldUpdate{Value: "150", EditedAt: fixedStamp, EditedBy: "feeder"}
-	if got["ALTITUDE"] != want {
-		t.Errorf("ALTITUDE real change: want %#v, got %#v", want, got["ALTITUDE"])
+	if _, isUpdate := got["ALTITUDE"].(FieldUpdate); !isUpdate {
+		t.Errorf("unparseable ALTITUDE against different disk value should emit FieldUpdate, got %#v", got["ALTITUDE"])
 	}
 }
 
@@ -260,11 +418,16 @@ func TestCanonicalizeForCompare(t *testing.T) {
 	for _, tc := range []struct {
 		key, in, want string
 	}{
-		{"ALTITUDE", "120", "120m"},
-		{"ALTITUDE", "120m", "120m"},
-		{"ALTITUDE", "120ft", "120ft"},
-		{"ALTITUDE", "-100", "-100m"},
+		{"ALTITUDE", "120", "120"},
+		{"ALTITUDE", "120m", "120"},
+		{"ALTITUDE", "400ft", "121.92"},
+		{"ALTITUDE", "-50ft", "-15.24"},
+		{"ALTITUDE", "-1000", "-1000"},
 		{"ALTITUDE", "", ""},
+		// Out-of-range / unparseable: falls back to original value so
+		// the apply validator catches it on the round trip.
+		{"ALTITUDE", "33000ft", "33000ft"},
+		{"ALTITUDE", "garbage", "garbage"},
 		{"MLAT_USER", "bob", "bob"}, // non-altitude → no-op
 		{"LATITUDE", "47.0", "47.0"},
 	} {
@@ -353,6 +516,44 @@ func TestBuildApplyPayload_JSONShape(t *testing.T) {
 	}
 	if fu != (FieldUpdate{Value: "bob", EditedAt: fixedStamp, EditedBy: "feeder"}) {
 		t.Errorf("MLAT_USER struct: got %#v", fu)
+	}
+}
+
+// TestBuildApplyPayload_PrivacyTogglesAreBareStrings pins the wire shape
+// for the REPORT_STATUS and REMOTE_CONFIG_ENABLED toggles. They are
+// privacy gates rather than user-edited state, so they must not appear
+// in TrackedKeys and must flow through the apply path as bare strings —
+// no FieldUpdate wrapping even when the value differs from current.
+func TestBuildApplyPayload_PrivacyTogglesAreBareStrings(t *testing.T) {
+	for _, key := range []string{"REPORT_STATUS", "REMOTE_CONFIG_ENABLED"} {
+		if IsTracked(key) {
+			t.Errorf("IsTracked(%q) = true, want false (privacy gate, not tracked state)", key)
+		}
+	}
+	// Mix both keys in a single payload alongside an unrelated value
+	// change so the bare-string assertion is exercised against a real
+	// posted-vs-current diff rather than an empty current map.
+	current := map[string]string{
+		"REPORT_STATUS":         "true",
+		"REMOTE_CONFIG_ENABLED": "false",
+	}
+	posted := map[string]string{
+		"REPORT_STATUS":         "false",
+		"REMOTE_CONFIG_ENABLED": "true",
+	}
+	got := BuildApplyPayload(current, posted, fixedNow)
+	for k, wantValue := range posted {
+		v, ok := got[k]
+		if !ok {
+			t.Errorf("%s missing from payload, want bare string %q", k, wantValue)
+			continue
+		}
+		if _, isUpdate := v.(FieldUpdate); isUpdate {
+			t.Errorf("%s carried FieldUpdate metadata; privacy toggles must be bare strings", k)
+		}
+		if s, isStr := v.(string); !isStr || s != wantValue {
+			t.Errorf("%s = %#v, want bare string %q", k, v, wantValue)
+		}
 	}
 }
 

@@ -12,23 +12,56 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
 	"github.com/airplanes-live/image-webconfig/internal/auth"
+	"github.com/airplanes-live/image-webconfig/internal/claimstatus"
 	wexec "github.com/airplanes-live/image-webconfig/internal/exec"
 	"github.com/airplanes-live/image-webconfig/internal/feedenv"
+	"github.com/airplanes-live/image-webconfig/internal/hardware"
 	"github.com/airplanes-live/image-webconfig/internal/identity"
 	"github.com/airplanes-live/image-webconfig/internal/logs"
-	"github.com/airplanes-live/image-webconfig/internal/pihealth"
 	"github.com/airplanes-live/image-webconfig/internal/schemacache"
 	"github.com/airplanes-live/image-webconfig/internal/server"
 	"github.com/airplanes-live/image-webconfig/internal/status"
 	"github.com/airplanes-live/image-webconfig/internal/wifi"
 )
 
-// version is overridden via -ldflags "-X main.version=<sha>".
-var version = "dev"
+// version and commitSha are stamped by the release pipeline via
+// -ldflags "-X main.version=<tag> -X main.commitSha=<sha>". The runtime
+// version surfaced on /health and /api/status is composed by resolveVersion:
+// for stable releases the tag alone is unique enough (v0.1.2 differs from
+// v0.1.3), but the moving "dev-latest" tag is reused across consecutive dev
+// builds, so we append a short SHA suffix (semver +build metadata) so
+// /health byte-changes between two dev builds carrying the same tag.
+var (
+	version   = "dev"
+	commitSha = ""
+)
+
+// resolveVersion returns the runtime version string by composing the package
+// vars stamped at link time.
+func resolveVersion() string {
+	return composeVersion(version, commitSha)
+}
+
+// composeVersion is the pure form of resolveVersion: given a tag and a commit
+// SHA, return the runtime version string. When commitSha is empty it returns
+// the tag as-is (local `go build`); otherwise it appends a 7-char short SHA
+// using semver +build metadata. Whitespace in commitSha is trimmed so a stray
+// newline in the ldflag never leaks into /health or log output.
+func composeVersion(tag, sha string) string {
+	sha = strings.TrimSpace(sha)
+	if sha == "" {
+		return tag
+	}
+	if len(sha) > 7 {
+		sha = sha[:7]
+	}
+	return tag + "+" + sha
+}
 
 func main() {
 	listen := flag.String("listen", "127.0.0.1:8080", "address to listen on")
@@ -37,6 +70,8 @@ func main() {
 		"path to argon2id PHC password hash")
 	sessionTTL := flag.Duration("session-ttl", 24*time.Hour,
 		"sliding session TTL")
+	sessionsPath := flag.String("sessions-path", "",
+		"file to mirror session-token hashes to so logins survive a service restart (empty = in-memory only; the shipped unit passes a path under /run so a reboot still logs everyone out)")
 	argonTime := flag.Uint("argon2-time", uint(auth.DefaultParams.TimeCost),
 		"argon2id time cost")
 	argonMem := flag.Uint("argon2-memory-kb", uint(auth.DefaultParams.MemoryKB),
@@ -51,17 +86,17 @@ func main() {
 		"sliding window for failure counting")
 	lockoutDuration := flag.Duration("lockout-duration", 15*time.Minute,
 		"duration of an active lockout")
-	piHealthMode := flag.Bool("pi-health", false,
-		"emit a one-line pi-health summary and exit (for render-status / MOTD)")
-	piHealthTimeout := flag.Duration("pi-health-timeout", 2*time.Second,
-		"probe timeout for --pi-health (must be < the shell timeout wrapping the call)")
+	hardwareMode := flag.Bool("hardware", false,
+		"emit a one-line hardware-health summary and exit (for render-status / MOTD)")
+	hardwareTimeout := flag.Duration("hardware-timeout", 2*time.Second,
+		"probe timeout for --hardware (must be < the shell timeout wrapping the call)")
 	validateSudoers := flag.Bool("validate-sudoers", false,
-		"verify every DefaultPrivilegedArgv() shape is authorized by /etc/sudoers.d/010_* + 011_* and exit (exit 0 on parity, 1 on mismatch)")
+		"verify every DefaultPrivilegedArgv() shape is authorized by /etc/sudoers.d/010_* and exit (exit 0 on parity, 1 on mismatch)")
 	flag.Parse()
 
-	if *piHealthMode {
-		ph := pihealth.NewReader(pihealth.DefaultPaths(), pihealth.DefaultThresholds(), nil, nil)
-		os.Exit(runPiHealthCmd(os.Stdout, os.Stderr, ph.Probe, *piHealthTimeout))
+	if *hardwareMode {
+		hw := hardware.NewReader(hardware.DefaultPaths(), hardware.DefaultThresholds(), nil, nil)
+		os.Exit(runHardwareCmd(os.Stdout, os.Stderr, hw.Probe, *hardwareTimeout))
 	}
 
 	if *validateSudoers {
@@ -101,36 +136,47 @@ func main() {
 	cache := schemacache.New(priv.SchemaFeed, wexec.RealRunner)
 	loadCtx, loadCancel := context.WithTimeout(context.Background(), 15*time.Second)
 	if err := cache.Load(loadCtx); err != nil {
-		// Degraded mode: /api/config returns 503, but /api/update,
+		// Degraded mode: /api/config returns 503, but /api/orchestrator/*,
 		// /api/log/*, /api/reboot, /api/poweroff, and the auth endpoints
 		// stay alive so the operator can still recover via the dashboard.
 		log.Printf("schema: boot fetch failed (degraded mode, /api/config unavailable): %v", err)
 	}
 	loadCancel()
 
+	// Account-claim status: read-only, unprivileged `apl-feed claim status
+	// --json` behind a single-flight, identity-keyed cache.
+	claimStatusProber := claimstatus.Prober{Runner: wexec.RealRunner, Argv: claimstatus.DefaultArgv}
+	claimStatusCache := claimstatus.NewCache(claimStatusProber.Probe, nil)
+
+	// One config reader shared by the /api/config handlers and the
+	// identity claim-page link — both read through `apl-feed config show`.
+	feedEnv := feedenv.New()
+
+	effectiveVersion := resolveVersion()
 	srv := &http.Server{
 		Addr: *listen,
 		Handler: server.New(server.Deps{
-			Version:      version,
+			Version:      effectiveVersion,
 			Store:        auth.NewPasswordStore(*hashPath),
-			Sessions:     auth.NewSessions(*sessionTTL),
+			Sessions:     auth.NewPersistentSessions(*sessionTTL, *sessionsPath),
 			Lockout:      auth.NewLockout(*lockoutThreshold, *lockoutWindow, *lockoutDuration),
 			Guard:        guard,
 			Argon2Params: params,
-			Identity:     identity.NewReader(identity.DefaultPaths()),
-			FeedEnv:      feedenv.New(),
-			Status: status.NewReader(version, status.DefaultPaths(), nil,
-				status.WithPiHealth(pihealth.NewReader(
-					pihealth.DefaultPaths(),
-					pihealth.DefaultThresholds(),
+			Identity:     identity.NewReader(identity.DefaultPaths(), feedEnv),
+			FeedEnv:      feedEnv,
+			Status: status.NewReader(effectiveVersion, status.DefaultPaths(), nil,
+				status.WithHardware(hardware.NewReader(
+					hardware.DefaultPaths(),
+					hardware.DefaultThresholds(),
 					nil, // RealRunner
 					nil, // statfs-backed DiskProber
 				)),
 				status.WithWifi(wifi.NewSignalReader("/usr/bin/nmcli", nil)),
 			),
-			Logs:       logs.NewStreamer(nil),
-			Schema:     cache,
-			Privileged: priv,
+			Logs:        logs.NewStreamer(nil),
+			Schema:      cache,
+			ClaimStatus: claimStatusCache,
+			Privileged:  priv,
 		}),
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       15 * time.Second,
@@ -139,10 +185,11 @@ func main() {
 		MaxHeaderBytes:    1 << 14,
 	}
 
-	// SIGHUP refreshes the schema cache. The airplanes-update transient
-	// unit fires this after a feed update so a new feed-env-keys.sh
-	// can take effect without bouncing the webconfig session table
-	// (sessions are in-memory; a restart logs every operator out).
+	// SIGHUP refreshes the schema cache. The update orchestrator's
+	// transient unit fires this after its feed leg so a new
+	// feed-env-keys.sh can take effect without bouncing the whole
+	// process (sessions survive a restart when --sessions-path is set,
+	// but a reload is still cheaper than a restart).
 	hup := make(chan os.Signal, 1)
 	signal.Notify(hup, syscall.SIGHUP)
 	go func() {
@@ -159,7 +206,7 @@ func main() {
 	}()
 
 	go func() {
-		log.Printf("airplanes-webconfig %s listening on %s", version, *listen)
+		log.Printf("airplanes-webconfig %s listening on %s", effectiveVersion, *listen)
 		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			log.Fatalf("listen: %v", err)
 		}

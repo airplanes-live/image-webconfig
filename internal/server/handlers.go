@@ -10,13 +10,16 @@ import (
 	"log"
 	"net/http"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
 	"github.com/airplanes-live/image-webconfig/internal/auth"
 	"github.com/airplanes-live/image-webconfig/internal/feedmeta"
+	"github.com/airplanes-live/image-webconfig/internal/hardware"
 	"github.com/airplanes-live/image-webconfig/internal/identity"
 	"github.com/airplanes-live/image-webconfig/internal/logs"
+	"github.com/airplanes-live/image-webconfig/internal/status"
 )
 
 // MinPasswordLen is the minimum length we accept for setup / change-password.
@@ -114,6 +117,15 @@ func (s *Server) handleSetup(w http.ResponseWriter, r *http.Request) {
 		}
 		log.Printf("setup: store: %v", err)
 		writeJSONError(w, http.StatusInternalServerError, "store write failed")
+		return
+	}
+
+	// First-time setup must not inherit sessions from a previous life of
+	// this device (e.g. a hand-deleted password hash with the persisted
+	// session mirror left behind).
+	if err := s.sessions.RevokeAll(); err != nil {
+		log.Printf("setup: revoke sessions: %v", err)
+		writeJSONError(w, http.StatusInternalServerError, "session rotation failed")
 		return
 	}
 
@@ -264,15 +276,22 @@ func (s *Server) handleChangePassword(w http.ResponseWriter, r *http.Request) {
 		writeJSONError(w, http.StatusInternalServerError, "hash failed")
 		return
 	}
+	// Rotate ALL sessions (codex: don't preserve the current one — captured
+	// cookies survive a password change otherwise on LAN-HTTP). Rotation
+	// runs BEFORE the password commit: if the process dies between the
+	// two, the safe wreckage is "everyone logged out, password unchanged"
+	// — never "password changed, pre-change sessions still mirrored on
+	// disk for the next restart to resurrect".
+	if err := s.sessions.RevokeAll(); err != nil {
+		log.Printf("change-password: revoke sessions: %v", err)
+		writeJSONError(w, http.StatusInternalServerError, "session rotation failed")
+		return
+	}
 	if err := s.store.Replace(newPHC); err != nil {
 		log.Printf("change-password: store: %v", err)
 		writeJSONError(w, http.StatusInternalServerError, "store write failed")
 		return
 	}
-
-	// Rotate ALL sessions (codex: don't preserve the current one — captured
-	// cookies survive a password change otherwise on LAN-HTTP).
-	s.sessions.RevokeAll()
 	token, expires, err := s.sessions.Issue()
 	if err != nil {
 		log.Printf("change-password: issue: %v", err)
@@ -306,8 +325,8 @@ func (s *Server) handleIdentity(w http.ResponseWriter, _ *http.Request) {
 // /api/identity/secret (POST): full claim secret reveal. POST so it can't
 // be cached or logged in browser history; Cache-Control: no-store via
 // writeJSON.
-func (s *Server) handleIdentitySecret(w http.ResponseWriter, _ *http.Request) {
-	got, err := s.identity.Reveal()
+func (s *Server) handleIdentitySecret(w http.ResponseWriter, r *http.Request) {
+	got, err := s.identity.Reveal(r.Context())
 	if err != nil {
 		if errors.Is(err, identity.ErrNoClaimSecret) {
 			writeJSONError(w, http.StatusNotFound, "no claim secret yet — register first")
@@ -320,19 +339,163 @@ func (s *Server) handleIdentitySecret(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, http.StatusOK, got)
 }
 
-// /api/config (GET): feed.env values filtered against the schema-cached
-// readable_keys set. Returns 503 when the schema cache is unavailable
-// (boot-time apl-feed schema --json fetch failed and no SIGHUP has
-// since refreshed it).
-func (s *Server) handleConfigGet(w http.ResponseWriter, _ *http.Request) {
+// identityBackoutTimeout caps the per-call budget for the export and
+// import wrappers. apl-feed backup + restore both touch the secret
+// flock and (for restore on UUID change) the feed/mlat restart — 15s
+// is generous headroom for either.
+const identityBackoutTimeout = 15 * time.Second
+
+// identityBackupEnvelope is the canonical JSON shape apl-feed backup
+// emits and apl-feed restore consumes. Both endpoints below read and
+// write only this envelope.
+type identityBackupEnvelope struct {
+	SchemaVersion int    `json:"schema_version"`
+	CreatedAt     string `json:"created_at,omitempty"`
+	FeederUUID    string `json:"feeder_uuid"`
+	Claim         struct {
+		Secret  string `json:"secret"`
+		Version *int   `json:"version"`
+	} `json:"claim"`
+}
+
+// /api/identity/export (POST): pipes apl-feed backup -'s stdout straight
+// back to the client. POST (not GET) so the response stays uncacheable
+// and the route never lands in browser history.
+func (s *Server) handleIdentityExport(w http.ResponseWriter, r *http.Request) {
+	cctx, cancel := context.WithTimeout(r.Context(), identityBackoutTimeout)
+	defer cancel()
+	res, err := s.runner(cctx, s.priv.ExportIdentity)
+	if err != nil {
+		log.Printf("identity export: %v stderr=%q", err, strings.TrimSpace(string(res.Stderr)))
+		writeJSONError(w, http.StatusInternalServerError, "identity export failed")
+		return
+	}
+	// Validate the wrapper output is parseable canonical JSON before
+	// returning it — the SPA blob-downloads this verbatim, and a
+	// corrupted file would only surface much later on an import retry.
+	var probe identityBackupEnvelope
+	if perr := json.Unmarshal(res.Stdout, &probe); perr != nil || probe.SchemaVersion != 1 {
+		log.Printf("identity export: wrapper stdout not canonical JSON (schema=%d err=%v stderr=%q)",
+			probe.SchemaVersion, perr, strings.TrimSpace(string(res.Stderr)))
+		writeJSONError(w, http.StatusInternalServerError, "identity export produced invalid payload")
+		return
+	}
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-store")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(res.Stdout)
+}
+
+// /api/identity/import (POST): pipes the supplied apl-feed backup
+// envelope through apl-feed restore /dev/stdin --force. Validates the
+// envelope shape client-side before invocation to surface obvious
+// errors (wrong schema, missing fields, malformed UUID/secret) with a
+// 400 rather than burning a privileged call.
+func (s *Server) handleIdentityImport(w http.ResponseWriter, r *http.Request) {
+	var req identityBackupEnvelope
+	if err := readJSON(w, r, &req); err != nil {
+		writeJSONError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if req.SchemaVersion != 1 {
+		writeJSONError(w, http.StatusBadRequest, "unsupported schema_version (expected 1)")
+		return
+	}
+	if !isCanonicalUUID(req.FeederUUID) {
+		writeJSONError(w, http.StatusBadRequest, "feeder_uuid must be canonical 8-4-4-4-12 hex")
+		return
+	}
+	if !isCanonicalClaimSecret(req.Claim.Secret) {
+		writeJSONError(w, http.StatusBadRequest, "claim.secret must be 16 chars A-Z 0-9 (hyphens/spaces tolerated)")
+		return
+	}
+
+	// Re-serialize so the wrapper receives a normalized payload (and so
+	// we don't pipe the raw request body, which may include trailing
+	// whitespace the helper's jq calls would otherwise see).
+	body, err := json.Marshal(req)
+	if err != nil {
+		log.Printf("identity import: re-marshal: %v", err)
+		writeJSONError(w, http.StatusInternalServerError, "identity import failed")
+		return
+	}
+
+	cctx, cancel := context.WithTimeout(r.Context(), identityBackoutTimeout)
+	defer cancel()
+	res, runErr := s.stdinRunner(cctx, s.priv.ImportIdentity, bytes.NewReader(body))
+	if runErr != nil {
+		// Log the wrapper's stderr (which carries apl-feed's diagnostic
+		// reason) so operators have something to grep journalctl for,
+		// but don't echo it back to the client verbatim — apl-feed
+		// occasionally includes path or environment details.
+		log.Printf("identity import: %v stderr=%q", runErr, strings.TrimSpace(string(res.Stderr)))
+		writeJSONError(w, http.StatusInternalServerError, "identity import failed (see webconfig logs)")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"status": "imported"})
+}
+
+// isCanonicalUUID matches feed's read_backup_file regex
+// (^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$) after
+// canonicalisation: strip braces / brackets / whitespace, downcase hex.
+// Symmetrical with backup.sh's canonicalize_uuid so a webconfig accept
+// matches an apl-feed accept.
+func isCanonicalUUID(s string) bool {
+	if len(s) != 36 {
+		return false
+	}
+	for i, c := range s {
+		if i == 8 || i == 13 || i == 18 || i == 23 {
+			if c != '-' {
+				return false
+			}
+			continue
+		}
+		switch {
+		case c >= '0' && c <= '9':
+		case c >= 'a' && c <= 'f':
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+// isCanonicalClaimSecret tolerates the same input shapes apl-feed's
+// canonicalize_secret + validate_secret accept (uppercase letters and
+// digits after stripping whitespace and hyphens). 16 chars A-Z 0-9
+// canonical, but the input may be the human-friendly XXXX-XXXX-XXXX-XXXX
+// form.
+func isCanonicalClaimSecret(s string) bool {
+	count := 0
+	for _, c := range s {
+		switch {
+		case c == '-' || c == ' ' || c == '\t' || c == '\n' || c == '\r':
+			continue
+		case c >= 'A' && c <= 'Z':
+		case c >= 'a' && c <= 'z':
+		case c >= '0' && c <= '9':
+		default:
+			return false
+		}
+		count++
+	}
+	return count == 16
+}
+
+// /api/config (GET): config values read via `apl-feed config show`,
+// filtered against the schema-cached readable_keys set. Returns 503
+// when the schema cache is unavailable (boot-time apl-feed schema
+// --json fetch failed and no SIGHUP has since refreshed it).
+func (s *Server) handleConfigGet(w http.ResponseWriter, r *http.Request) {
 	if s.schema == nil || s.schema.Degraded() {
 		writeJSONError(w, http.StatusServiceUnavailable, "schema unavailable; retry after the next feed update")
 		return
 	}
-	values, err := s.feedEnv.ReadAll()
+	values, err := s.feedEnv.ReadAll(r.Context())
 	if err != nil {
 		log.Printf("feedenv read: %v", err)
-		writeJSONError(w, http.StatusInternalServerError, "feed.env read failed")
+		writeJSONError(w, http.StatusInternalServerError, "config read failed")
 		return
 	}
 	filtered := make(map[string]string, len(values))
@@ -344,6 +507,16 @@ func (s *Server) handleConfigGet(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"values": filtered})
 }
 
+// statusResponse is the /api/status body: the canonical status snapshot
+// plus the request-scoped display unit for CPU temperature. temp_unit is
+// presentation metadata derived from Accept-Language, so it lives here on
+// the HTTP response rather than on status.Status (which has non-HTTP
+// callers that have no locale).
+type statusResponse struct {
+	status.Status
+	TempUnit string `json:"temp_unit"`
+}
+
 // /api/status (GET): service states + manifest + feed snapshot.
 func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 	st, err := s.status.Read(r.Context())
@@ -352,7 +525,21 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 		writeJSONError(w, http.StatusInternalServerError, "status read failed")
 		return
 	}
-	writeJSON(w, http.StatusOK, st)
+
+	// Localize the hero-chip summary to the viewer's locale. Presentation
+	// only: the probed/canonical data stays Celsius. Copy HardwareHealth
+	// before mutating — it is a pointer and the summary string is the only
+	// field we rewrite.
+	unit := tempUnitFromAcceptLanguage(r.Header.Get("Accept-Language"))
+	if unit == "F" && st.HardwareHealth != nil && st.System.CPUTempCelsius != nil {
+		hh := *st.HardwareHealth
+		hh.Summary = hardware.LocalizeTempUnit(hh.Summary, st.System.CPUTempCelsius, unit)
+		st.HardwareHealth = &hh
+	}
+
+	// The body now varies by request locale.
+	w.Header().Set("Vary", "Accept-Language")
+	writeJSON(w, http.StatusOK, statusResponse{Status: st, TempUnit: unit})
 }
 
 // /api/log/{unit} (GET): SSE-stream journalctl output for the unit.
@@ -420,31 +607,7 @@ func (s *Server) handleConfigPost(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	s.configMu.Lock()
-	defer s.configMu.Unlock()
-
-	// Read current feed.env under the same configMu so the "did this
-	// tracked key actually change" determination is consistent against
-	// concurrent webconfig writers. A concurrent `apl-feed config sync`
-	// write is handled by the apply library's flock + LWW gate — the
-	// race is benign (worst case: one wasted no-op apply round trip).
-	//
-	// A read error is not fatal: fall back to a bare-string payload —
-	// every posted key passes through with no metadata, which matches
-	// the pre-DEV-383 behavior. We must NOT treat the read failure as
-	// bootstrap; that would attach metadata to every tracked key the
-	// form posts, including unchanged ones, and stamp fresh edited_at
-	// tuples across the sidecar on every save.
-	current, readErr := s.feedEnv.ReadAll()
-	var payload map[string]any
-	if readErr != nil {
-		log.Printf("config-post: feed.env pre-read for metadata gating failed; falling back to bare-string payload: %v", readErr)
-		payload = feedmeta.BareStringPayload(req.Updates)
-	} else {
-		payload = feedmeta.BuildApplyPayload(current, req.Updates, s.now())
-	}
-
-	resp, status, err := s.invokeApplyFeed(r.Context(), payload)
+	resp, status, err := s.applyConfigLocked(r.Context(), req.Updates)
 	if err != nil {
 		log.Printf("config-post: %v", err)
 		writeJSONError(w, http.StatusInternalServerError, "config write failed")
@@ -459,7 +622,60 @@ func (s *Server) handleConfigPost(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, status, resp)
 		return
 	}
+	// A real write landed — nudge the remote-config syncer so the change
+	// reaches airplanes.live on the next sync (seconds) rather than waiting
+	// for the ~60s config-sync timer tick. Fire-and-forget and outside
+	// configMu: the unit self-gates, so this never blocks or alters the save
+	// response. no_change writes skip it (nothing to propagate).
+	if resp.Status == "applied" {
+		s.triggerConfigSyncAsync()
+	}
 	writeJSON(w, http.StatusOK, resp)
+}
+
+// applyConfigLocked serialises the feed.env metadata-gating read and the apply
+// under configMu so both see a consistent view against concurrent webconfig
+// writers, then releases the lock. The caller writes the HTTP response and
+// fires any follow-up (e.g. the config-sync nudge) outside the lock.
+func (s *Server) applyConfigLocked(ctx context.Context, updates map[string]string) (applyFeedResponse, int, error) {
+	s.configMu.Lock()
+	defer s.configMu.Unlock()
+
+	// A concurrent `apl-feed config sync` write is handled by the apply
+	// library's flock + LWW gate — the race is benign (worst case: one
+	// wasted no-op apply round trip).
+	//
+	// A read error is not fatal: fall back to a bare-string payload — every
+	// posted key passes through with no metadata, which matches the
+	// pre-DEV-383 behavior. We must NOT treat the read failure as bootstrap;
+	// that would attach metadata to every tracked key the form posts,
+	// including unchanged ones, and stamp fresh edited_at tuples across the
+	// sidecar on every save. An absent feed.env is NOT an error: config
+	// show reports every key null, ReadAll returns an empty map, and the
+	// first save correctly stamps bootstrap metadata.
+	current, readErr := s.feedEnv.ReadAll(ctx)
+	var payload map[string]any
+	if readErr != nil {
+		log.Printf("config-post: config pre-read for metadata gating failed; falling back to bare-string payload: %v", readErr)
+		payload = feedmeta.BareStringPayload(updates)
+	} else {
+		payload = feedmeta.BuildApplyPayload(current, updates, s.now())
+	}
+	return s.invokeApplyFeed(ctx, payload)
+}
+
+// triggerConfigSyncAsync starts airplanes-config-sync.service in the background
+// so a saved config change is pushed promptly. Best-effort: failures are
+// logged, never surfaced on the save response, and the ~60s config-sync timer
+// stays the backstop. The unit's own gates (ConditionPathExists on the claim
+// secret + the REMOTE_CONFIG_ENABLED opt-in inside apl-feed) decide whether the
+// run actually contacts the server, so this carries no remote-config logic.
+func (s *Server) triggerConfigSyncAsync() {
+	go func() {
+		if err := s.runSudo(context.Background(), s.priv.SyncConfig, systemctlTimeout); err != nil {
+			log.Printf("config-sync: %v", err)
+		}
+	}()
 }
 
 // applyFeedResponse mirrors the JSON envelope emitted by
@@ -577,13 +793,11 @@ func (s *Server) runSudo(ctx context.Context, argv []string, timeout time.Durati
 }
 
 // maintenanceUnits is the set of transient maintenance units that must not
-// overlap each other or be interrupted by a reboot. Both run apt/dpkg and
-// would deadlock on the dpkg lock or leave half-configured state if either
-// happened concurrently with the other or with a shutdown.
+// be interrupted by a reboot. The orchestrator touches apt/dpkg and release
+// artefacts, and would deadlock on the dpkg lock or leave half-configured
+// state if it overlapped with a shutdown.
 var maintenanceUnits = []string{
-	"airplanes-system-upgrade.service",
-	"airplanes-update.service",
-	"airplanes-webconfig-update.service",
+	"airplanes-update-orchestrator.service",
 }
 
 // maintenanceUnitActive returns the name of any maintenance unit currently
@@ -606,70 +820,6 @@ func (s *Server) maintenanceUnitActive(ctx context.Context) string {
 		}
 	}
 	return ""
-}
-
-// startTransientUnit kicks off a transient systemd unit via the supplied
-// pinned argv (sudo systemd-run ...). It refuses with 409 if any maintenance
-// unit is already busy, and maps systemd-run's "already exists" stderr to a
-// 409 as well. On success it writes 202 + the unit name.
-//
-// The is-active guard and the systemd-run call are serialized via
-// maintenanceMu so two concurrent POSTs can't both observe an idle state and
-// then both kick off — by the time the second contender acquires the lock,
-// the first's transient unit is already registered and is-active reports it
-// as activating.
-func (s *Server) startTransientUnit(w http.ResponseWriter, r *http.Request, argv []string, unit, label string) {
-	s.maintenanceMu.Lock()
-	defer s.maintenanceMu.Unlock()
-	if busy := s.maintenanceUnitActive(r.Context()); busy != "" {
-		writeJSONError(w, http.StatusConflict, label+" refused: "+busy+" is in progress")
-		return
-	}
-	cctx, cancel := context.WithTimeout(r.Context(), systemctlTimeout)
-	defer cancel()
-	res, err := s.runner(cctx, argv)
-	if err != nil {
-		stderr := strings.TrimSpace(string(res.Stderr))
-		log.Printf("%s: %v stderr=%q", label, err, stderr)
-		if strings.Contains(stderr, "already exists") || strings.Contains(stderr, "already running") {
-			writeJSONError(w, http.StatusConflict, label+" is already in progress")
-			return
-		}
-		writeJSONError(w, http.StatusInternalServerError, label+" start failed")
-		return
-	}
-	writeJSON(w, http.StatusAccepted, map[string]string{
-		"status":     "running",
-		"unit":       unit,
-		"started_at": time.Now().UTC().Format(time.RFC3339),
-	})
-}
-
-// /api/update (POST): kicks off a transient airplanes-update.service via
-// systemd-run. Returns 202 + the unit name so the SPA can stream
-// /api/log/update for live output. systemd-run exits with non-zero on
-// "unit already exists" — we map that to 409. Also 409s when the
-// system-package upgrade unit is busy (both touch dpkg locks).
-func (s *Server) handleUpdate(w http.ResponseWriter, r *http.Request) {
-	s.startTransientUnit(w, r, s.priv.StartUpdate, "airplanes-update.service", "update")
-}
-
-// /api/system-upgrade (POST): kicks off a transient
-// airplanes-system-upgrade.service that runs apt-get update + upgrade. Same
-// shape as /api/update; the SPA streams /api/log/system-upgrade for output.
-func (s *Server) handleSystemUpgrade(w http.ResponseWriter, r *http.Request) {
-	s.startTransientUnit(w, r, s.priv.StartSystemUpgrade, "airplanes-system-upgrade.service", "system upgrade")
-}
-
-// /api/webconfig-update (POST): kicks off a transient
-// airplanes-webconfig-update.service that downloads the latest webconfig
-// release for the device's channel, verifies SHA256, atomic-swaps the
-// binary, extracts the new rootfs payload, restarts this service, and
-// rolls back if /health fails after the restart. Same 202 + unit-name
-// shape as /api/update — the SPA streams /api/log/webconfig-update for
-// live output and then polls /health to detect the restart.
-func (s *Server) handleWebconfigUpdate(w http.ResponseWriter, r *http.Request) {
-	s.startTransientUnit(w, r, s.priv.StartWebconfigUpdate, "airplanes-webconfig-update.service", "webconfig update")
 }
 
 // /api/reboot (POST): refuses with 409 if a maintenance unit is active
@@ -743,4 +893,60 @@ func (s *Server) handleClaimRegister(w http.ResponseWriter, r *http.Request) {
 		"status": "starting",
 		"unit":   "airplanes-claim.service",
 	})
+}
+
+// defaultClaimStatusMaxAge is the freshness window used when the caller
+// omits max_age (e.g. the dashboard's one-shot read on open). The cache
+// clamps every value up to its floor, so even max_age=0 ("Check now")
+// cannot probe faster than the per-identity rate limit.
+const defaultClaimStatusMaxAge = 60 * time.Second
+
+// /api/claim/status (GET): the feeder's account-claim status, cached
+// server-side. Always consults the apl-feed claim status CLI — the single
+// authority on local + server claim state — via the cache; the cache key
+// is the identity fingerprint so an import / rotation drops a stale
+// verdict. ?max_age=<seconds> sets the freshness window (0 forces a
+// refresh, still floored by the cache). The shared server-side cache means
+// any number of tabs/reloads collapse to one backend probe per window.
+func (s *Server) handleClaimStatus(w http.ResponseWriter, r *http.Request) {
+	if s.claimStatus == nil {
+		writeJSONError(w, http.StatusServiceUnavailable, "claim status unavailable")
+		return
+	}
+	maxAge := parseClaimStatusMaxAge(r.URL.Query().Get("max_age"))
+	resp := s.claimStatus.Get(r.Context(), s.claimStatusKey(), maxAge)
+	writeJSON(w, http.StatusOK, resp)
+}
+
+// claimStatusKey fingerprints the feeder identity so the claim-status cache
+// invalidates when the identity changes (import / rotate / regen). The
+// secret mtime + version come for free from identity.Read() — no extra
+// stat. Any read failure collapses to a single sentinel key; the CLI is
+// still authoritative for the verdict (no_identity etc.).
+func (s *Server) claimStatusKey() string {
+	id, err := s.identity.Read()
+	if err != nil {
+		return "\x00no-identity"
+	}
+	return id.FeederID + "|" + id.ClaimSecretUpdatedAt + "|" + strconv.Itoa(id.ClaimSecretVersion)
+}
+
+// parseClaimStatusMaxAge maps ?max_age=<seconds> to a duration. Absent or
+// malformed → the default window; "0" or negative → 0 (force refresh,
+// still floored by the cache); capped at 1h to bound a hostile value.
+func parseClaimStatusMaxAge(raw string) time.Duration {
+	if raw == "" {
+		return defaultClaimStatusMaxAge
+	}
+	n, err := strconv.Atoi(raw)
+	if err != nil {
+		return defaultClaimStatusMaxAge
+	}
+	if n <= 0 {
+		return 0
+	}
+	if n > 3600 {
+		n = 3600
+	}
+	return time.Duration(n) * time.Second
 }

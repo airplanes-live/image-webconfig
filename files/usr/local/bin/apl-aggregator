@@ -1,0 +1,2142 @@
+#!/bin/bash
+# apl-aggregator — privileged management of third-party feed aggregators
+# (FlightRadar24, FlightAware, ...) that a feeder may optionally feed in
+# addition to airplanes.live.
+#
+# Invoked by airplanes-webconfig via a fixed sudoers argv
+# (`sudo -n /usr/local/bin/apl-aggregator <verb> --json`). Emits exactly one
+# JSON envelope on stdout. Exit codes follow the apl-wifi / apl-feed contract:
+#
+#   0  ok
+#   2  rejected (unknown id / invalid field value)
+#   3  filesystem_error / state_error
+#   4  lock_timeout
+#   5  usage_error / parse_error
+#
+# Read verbs (status, list) take no stdin and emit {protocol_version,
+# aggregators:[...]}. Mutating verbs (enable, set, disable, reset) read a JSON
+# request object on stdin and emit {protocol_version, result:"ok", id} on
+# success. enable additionally takes {lat, lon, alt, fields:{…}} and, for a
+# vendor-installer adapter, fetches the pinned vendor binary on demand. export
+# emits a backup blob with identities (incl. secret values — the one verb that
+# does); import seeds identities from such a blob (enabled=false; refuses an
+# enabled adapter).
+#
+# Adapter descriptors are trusted, code-owned data sourced from AGG_DESC_DIR —
+# never loaded from /etc, never user-editable. Adapter ids are validated
+# against AGG_ID_RE and must match their descriptor filename before any path
+# interpolation. Per-adapter secret values (e.g. an FR24 sharing key) are read
+# only via jq stdin, never passed on argv (which `/proc/<pid>/cmdline` exposes).
+#
+# Test seams (default to production paths/commands; stripped by sudo env_reset
+# in production, same posture as apl-wifi's APL_WIFI_* seams):
+#   AGG_STATE_DIR      per-adapter JSON state dir
+#   AGG_INSTALL_ROOT   on-demand vendor binary install root
+#   AGG_DESC_DIR       descriptor directory
+#   AGG_SYSTEMCTL      systemctl binary
+#   AGG_DECODER_ADDR   local readsb BEAST endpoint
+#   AGG_DECODER_STATE  "up"/"down" to bypass the TCP probe in tests
+#   AGG_STATE_HOME     vendor runtime/config home (e.g. fr24feed.ini)
+#   AGG_FR24_BIN / AGG_FR24_INI         installed-binary / ini paths (enable)
+#   AGG_FR24_ACQUIRE_OVERRIDE <dest>    stub the .deb fetch+extract in tests
+#   AGG_FR24_SIGNUP_OVERRIDE <ini> <email>  stub the signup wizard in tests
+
+# Adapter descriptors are loaded with `source` (both inside the per-adapter
+# status subshell and at function scope in the piaware enable/reset paths). The
+# linter cannot follow that a descriptor var read at function scope was set by
+# `source`, not lost from an unrelated subshell, so SC2030/SC2031 are false
+# positives for this file's descriptor-sourcing pattern; disable them file-wide.
+# shellcheck disable=SC2030,SC2031
+set -Eeuo pipefail
+
+AGG_STATE_DIR="${AGG_STATE_DIR:-/etc/airplanes/aggregators}"
+AGG_INSTALL_ROOT="${AGG_INSTALL_ROOT:-/opt/airplanes-aggregators}"
+AGG_DESC_DIR="${AGG_DESC_DIR:-/usr/local/lib/airplanes-webconfig/aggregators}"
+AGG_SYSTEMCTL="${AGG_SYSTEMCTL:-systemctl}"
+AGG_DECODER_ADDR="${AGG_DECODER_ADDR:-127.0.0.1:30005}"
+AGG_LOCK="${AGG_LOCK:-/run/airplanes/aggregator.lock}"
+AGG_LOCK_TIMEOUT="${AGG_LOCK_TIMEOUT:-5}"
+AGG_STATE_HOME="${AGG_STATE_HOME:-/var/lib/airplanes-aggregators}"
+
+# --- pinned-deb / system seams (piaware) -----------------------------------
+# All system mutations route through these so bats can stub apt/dpkg/apt-mark/
+# piaware-config/systemctl and point /etc apt paths at a temp tree. Defaults are
+# the production paths/commands; sudo env_reset strips the overrides in production.
+AGG_APT_GET="${AGG_APT_GET:-apt-get}"
+AGG_APT_MARK="${AGG_APT_MARK:-apt-mark}"
+AGG_DPKG_QUERY="${AGG_DPKG_QUERY:-dpkg-query}"
+AGG_DPKG_DEB="${AGG_DPKG_DEB:-dpkg-deb}"
+AGG_PIAWARE_CONFIG="${AGG_PIAWARE_CONFIG:-piaware-config}"
+AGG_OS_RELEASE="${AGG_OS_RELEASE:-/etc/os-release}"
+AGG_DPKG_ARCH="${AGG_DPKG_ARCH:-}"          # empty => `dpkg --print-architecture`
+# Legacy apt-paths: no longer written (piaware now installs from a pinned .deb,
+# not an apt source), but still swept on enable/reset so a dev feeder that ran the
+# old apt-repo path doesn't keep a stale FlightAware source/pin/keyring.
+AGG_APT_SOURCES_DIR="${AGG_APT_SOURCES_DIR:-/etc/apt/sources.list.d}"
+AGG_APT_PREFS_DIR="${AGG_APT_PREFS_DIR:-/etc/apt/preferences.d}"
+AGG_KEYRING_DIR="${AGG_KEYRING_DIR:-/usr/share/keyrings}"
+AGG_POLICY_RCD="${AGG_POLICY_RCD:-/usr/sbin/policy-rc.d}"
+AGG_PIAWARE_FEEDER_ID_FILE="${AGG_PIAWARE_FEEDER_ID_FILE:-/var/cache/piaware/feeder_id}"
+AGG_PIAWARE_CONF="${AGG_PIAWARE_CONF:-/etc/piaware.conf}"
+AGG_PIAWARE_ID_WAIT="${AGG_PIAWARE_ID_WAIT:-15}"   # secs to wait for feeder-id after start
+AGG_LIVENESS_WAIT="${AGG_LIVENESS_WAIT:-2}"        # secs to settle before the post-start liveness check
+# Test seam: stub the piaware .deb fetch (mirrors AGG_FR24_ACQUIRE_OVERRIDE).
+# When set, invoked as `$AGG_PIAWARE_DEB_OVERRIDE <dest>` to drop a .deb at <dest>.
+AGG_PIAWARE_DEB_OVERRIDE="${AGG_PIAWARE_DEB_OVERRIDE:-}"
+
+# --- async-enable seams ----------------------------------------------------
+# enable is fire-and-forget: cmd_enable validates synchronously then launches a
+# detached worker via systemd-run, returning {result:"accepted"} in <1s. The
+# worker (a second invocation of this script in __enable-worker mode) does the
+# slow vendor acquire/signup and reports progress through AGG_ENABLE_STATE.
+AGG_SYSTEMD_RUN="${AGG_SYSTEMD_RUN:-systemd-run}"  # test seam: stub to run the worker inline
+AGG_ENABLE_UNIT="${AGG_ENABLE_UNIT:-airplanes-aggregator-enable.service}"
+AGG_REQ_DIR="${AGG_REQ_DIR:-/run/airplanes/aggregator-req}"      # 0700 root; secret request spool
+AGG_ENABLE_STATE="${AGG_ENABLE_STATE:-/run/airplanes/aggregator-enable.state}"  # async progress overlay
+AGG_ENABLE_GRACE="${AGG_ENABLE_GRACE:-10}"  # secs before a unit-less running overlay is reconciled to failed
+AGG_SELF="${AGG_SELF:-/usr/local/bin/apl-aggregator}"  # worker binary path for systemd-run
+
+readonly AGG_PROTOCOL_VERSION=1
+readonly AGG_ID_RE='^[a-z0-9][a-z0-9_-]*$'
+readonly AGG_STATE_MAX_BYTES=65536
+readonly AGG_STATE_SCHEMA_VERSION=1
+
+# WORKER_MODE=1 reroutes _emit_error/_emit_ok to the AGG_ENABLE_STATE progress
+# file instead of stdout (the worker has no HTTP caller). Set by __enable-worker.
+WORKER_MODE=0
+WORKER_OP="enable"  # mutation the worker is running: enable|reset|set (overlay tag)
+WORKER_ID=""        # adapter id the worker is acting on (for the progress overlay)
+WORKER_REQID=""     # request_id of the in-flight mutation
+WORKER_STARTED=0    # epoch secs the mutation was launched (for grace-window reconciliation)
+WORKER_STEP=""      # current phase label written into the overlay
+
+# --- output helpers --------------------------------------------------------
+
+_emitted=0
+
+_emit_json() {
+	_emitted=1
+	printf '%s\n' "$1"
+}
+
+_emit_error() {
+	local code="$1" message="$2" body
+	# In worker mode there is no HTTP caller: record the failure in the async
+	# progress overlay instead of printing an envelope to stdout. The existing
+	# _enable_fr24 `_emit_error …; exit N` call sites thus become progress
+	# writes with no change to that function.
+	if (( WORKER_MODE == 1 )); then
+		_write_enable_state failed "$code" "$message"
+		_emitted=1
+		return
+	fi
+	if ! body="$(jq -nc \
+		--argjson pv "$AGG_PROTOCOL_VERSION" --arg c "$code" --arg m "$message" \
+		'{protocol_version:$pv, result:"error", error_code:$c, message:$m}')"; then
+		printf '{"protocol_version":%d,"result":"error","error_code":"%s","message":"jq emit failed"}\n' \
+			"$AGG_PROTOCOL_VERSION" "$code"
+		_emitted=1
+		return
+	fi
+	_emit_json "$body"
+}
+
+# Last-resort envelope if the script exits without having emitted anything
+# (e.g. an unexpected error under `set -e`). Keeps the JSON contract — callers
+# always get one parseable object — and normalizes the process exit to 3
+# (state_error) so an errexit-propagated 1/127 can't masquerade as some other
+# contract code.
+# shellcheck disable=SC2317  # invoked indirectly via `trap _on_exit EXIT`
+_on_exit() {
+	local rc=$?
+	if (( _emitted != 0 )); then
+		return
+	fi
+	if (( WORKER_MODE == 1 )); then
+		# The worker died without writing a terminal state (e.g. errexit on an
+		# unexpected failure). Record a generic failure so status reconciles to
+		# failed instead of hanging on "installing". A SIGKILL/RuntimeMaxSec
+		# bypasses this trap entirely; status's grace+unit-liveness check is the
+		# backstop for that.
+		_write_enable_state failed state_error "apl-aggregator worker: unexpected error (exit $rc)"
+		_emitted=1
+		return
+	fi
+	printf '{"protocol_version":%d,"result":"error","error_code":"state_error","message":"apl-aggregator: unexpected error (exit %d)"}\n' \
+		"$AGG_PROTOCOL_VERSION" "$rc"
+	exit 3
+}
+trap _on_exit EXIT
+
+# --- async-enable progress overlay -----------------------------------------
+
+# _write_enable_state <status> [error_code] [message]: atomically write the
+# async progress overlay for the in-flight enable. status ∈
+# starting|running|done|failed; step is the current phase. Mode 0600 root.
+# WORKER_ID/WORKER_REQID identify the adapter; in the synchronous launch path
+# cmd_enable sets them before the first write.
+_write_enable_state() {
+	local status="$1" code="${2-}" message="${3-}" step="${WORKER_STEP:-$1}" tmp body
+	install -d -m 0755 "$(dirname "$AGG_ENABLE_STATE")" 2>/dev/null || true
+	body="$(jq -nc \
+		--argjson pv "$AGG_PROTOCOL_VERSION" --arg id "$WORKER_ID" --arg rid "$WORKER_REQID" \
+		--argjson started "${WORKER_STARTED:-0}" --arg op "${WORKER_OP:-enable}" \
+		--arg st "$status" --arg step "$step" --arg c "$code" --arg m "$message" \
+		'{protocol_version:$pv, id:$id, request_id:$rid, started_at:$started, op:$op, status:$st, step:$step}
+		 | (if $c != "" then .error_code = $c else . end)
+		 | (if $m != "" then .message = $m else . end)' 2>/dev/null)" || return 0
+	tmp="$(mktemp "${AGG_ENABLE_STATE}.XXXXXX" 2>/dev/null)" || return 0
+	if printf '%s\n' "$body" >"$tmp" 2>/dev/null && chmod 0600 "$tmp" 2>/dev/null; then
+		mv -f "$tmp" "$AGG_ENABLE_STATE" 2>/dev/null || rm -f -- "$tmp"
+	else
+		rm -f -- "$tmp"
+	fi
+}
+
+# _clear_enable_state <id> [reqid]: drop the overlay if it belongs to id (so
+# disable / reset / a fresh enable don't leave a stale failed/running overlay
+# shadowing the adapter). When reqid is given, clear only if it also matches —
+# so a rolled-back launch removes its OWN overlay, never one a concurrent enable
+# just published. A no-op if the overlay is for another adapter / request.
+_clear_enable_state() {
+	local id="$1" reqid="${2-}" raw oid orid
+	[[ -f "$AGG_ENABLE_STATE" ]] || return 0
+	raw="$(head -c "$AGG_STATE_MAX_BYTES" "$AGG_ENABLE_STATE" 2>/dev/null || true)"
+	oid="$(jq -r '.id // ""' <<<"$raw" 2>/dev/null || true)"
+	[[ "$oid" == "$id" ]] || return 0
+	if [[ -n "$reqid" ]]; then
+		orid="$(jq -r '.request_id // ""' <<<"$raw" 2>/dev/null || true)"
+		[[ "$orid" == "$reqid" ]] || return 0
+	fi
+	rm -f -- "$AGG_ENABLE_STATE"
+	return 0
+}
+
+# _enable_overlay <id>: echo the overlay JSON for id (reconciled), or empty.
+# A status:"running" overlay whose unit is no longer active/activating AND
+# whose started_at is past the grace window is reconciled to failed (the worker
+# died without writing terminal state). The reconciliation is computed
+# read-only and NOT written back: this runs under `status`, which holds no
+# lock, so persisting here could clobber a fresh overlay a concurrent enable
+# just published. The result is deterministic anyway — a --collect'd dead unit
+# never returns to active — so status reports failed consistently, and the next
+# lock-holding verb (enable/disable/reset) clears the stale file.
+_enable_overlay() {
+	local id="$1" raw oid status
+	[[ -f "$AGG_ENABLE_STATE" ]] || return 0
+	raw="$(head -c "$AGG_STATE_MAX_BYTES" "$AGG_ENABLE_STATE" 2>/dev/null || true)"
+	jq -e 'type == "object"' >/dev/null 2>&1 <<<"$raw" || return 0
+	oid="$(jq -r '.id // ""' <<<"$raw")"
+	[[ "$oid" == "$id" ]] || return 0
+	status="$(jq -r '.status // ""' <<<"$raw")"
+	if [[ "$status" == "running" || "$status" == "starting" ]]; then
+		local svc
+		svc="$(_service_state "$AGG_ENABLE_UNIT")"
+		if [[ "$svc" != "active" && "$svc" != "activating" ]]; then
+			# Worker not running. Within the grace window it may simply not have
+			# been observed by systemd yet; past it, treat as a dead worker.
+			local started age
+			started="$(jq -r '.started_at // 0' <<<"$raw")"
+			[[ "$started" =~ ^[0-9]+$ ]] || started=0
+			age=$(( $(date +%s 2>/dev/null || echo 0) - started ))
+			if (( started > 0 && age > AGG_ENABLE_GRACE )); then
+				raw="$(jq -c '.status = "failed"
+					| .error_code = (.error_code // "state_error")
+					| .message = (.message // "enable worker stopped unexpectedly")' <<<"$raw")"
+			fi
+		fi
+	fi
+	printf '%s' "$raw"
+}
+
+# --- probes ----------------------------------------------------------------
+
+# _decoder_reachable: does the local readsb BEAST endpoint accept a connection?
+# host/port are passed as positional args to a single-quoted inner script so a
+# malformed AGG_DECODER_ADDR can never inject into the root shell.
+_decoder_reachable() {
+	case "${AGG_DECODER_STATE:-}" in
+		up) return 0 ;;
+		down) return 1 ;;
+	esac
+	local host="${AGG_DECODER_ADDR%%:*}" port="${AGG_DECODER_ADDR##*:}"
+	[[ -n "$host" && "$port" =~ ^[0-9]+$ ]] || return 1
+	# $1/$2 are the inner bash's positional args (host/port), expanded at its
+	# runtime — deliberately single-quoted so the outer shell does not interpolate.
+	# shellcheck disable=SC2016
+	timeout 1 bash -c 'exec 3<>/dev/tcp/"$1"/"$2"' _ "$host" "$port" 2>/dev/null
+}
+
+# _service_state: the trimmed `systemctl is-active` word for a unit. is-active
+# exits non-zero for any non-active state, so the error is expected; the stdout
+# word is authoritative.
+_service_state() {
+	local unit="$1" out
+	out="$("$AGG_SYSTEMCTL" is-active "$unit" 2>/dev/null || true)"
+	out="${out//[$'\t\r\n ']/}"
+	if [[ -n "$out" ]]; then printf '%s' "$out"; else printf 'unknown'; fi
+}
+
+# _derive_state: availability + service state + persisted/install facts ->
+# reported lifecycle state. Mirrors the documented status enum.
+_derive_state() {
+	local available="$1" svc="$2" enabled="$3" installed="$4"
+	if [[ "$available" != "true" ]]; then printf 'unavailable'; return; fi
+	case "$svc" in
+		active) printf 'running'; return ;;
+		failed) printf 'failed'; return ;;
+	esac
+	if [[ "$enabled" == "true" || "$installed" == "true" ]]; then
+		printf 'stopped'
+	else
+		printf 'not_installed'
+	fi
+}
+
+# _assert_unit_live <unit> <name>: after `enable --now` returns 0, give the unit
+# a moment to settle and require it to be exactly `active`. enable --now succeeds
+# the moment systemd accepts the job, so a unit that starts then immediately
+# exits (and, with Restart=always, sits in `activating`) would otherwise read as
+# a successful enable. Emits the error envelope + exits on a non-active unit.
+_assert_unit_live() {
+	local unit="$1" name="$2"
+	sleep "$AGG_LIVENESS_WAIT" 2>/dev/null || true
+	[[ "$(_service_state "$unit")" == "active" ]] \
+		|| { _emit_error state_error "$name service did not stay running"; exit 3; }
+}
+
+# --- status ----------------------------------------------------------------
+
+# _adapter_json <desc_file> <decoder_json> -> one compact JSON status object.
+# Sourced descriptor vars are isolated in a subshell so adapters can't leak
+# into one another. Exits non-zero on a malformed descriptor (a code/ship bug);
+# the caller turns that into a loud state_error rather than silently dropping
+# the adapter.
+_adapter_json() {
+	local desc_file="$1" decoder_json="$2"
+	(
+		AGG_ID=""; AGG_DISPLAY_NAME=""; AGG_ACQUIRE_METHOD=""
+		AGG_SERVICE_UNIT=""; AGG_MLAT_CAPABLE="false"; AGG_MLAT_DEFAULT="false"
+		AGG_CLAIM_URL=""; AGG_SECRET_FIELDS=""; AGG_FIELDS_JSON="[]"
+		AGG_FR24_VERSION=""                                                # vendor-installer pin
+		AGG_PIAWARE_PACKAGE=""; AGG_PIAWARE_VERSION=""                     # pinned-deb pin
+		AGG_PIAWARE_SUPPORTED_ARCHES=""; AGG_PIAWARE_SUPPORTED_CODENAMES=""
+		# shellcheck source=/dev/null
+		source "$desc_file"
+
+		# id must be syntactically valid AND match the filename (also dedups,
+		# since filenames are unique within a directory).
+		local base
+		base="$(basename "$desc_file" .desc)"
+		[[ "$AGG_ID" =~ $AGG_ID_RE && "$AGG_ID" == "$base" ]] || {
+			printf 'apl-aggregator: descriptor id %q != filename %q (%s)\n' "$AGG_ID" "$base" "$desc_file" >&2
+			exit 1
+		}
+		[[ -n "$AGG_DISPLAY_NAME" && -n "$AGG_ACQUIRE_METHOD" && -n "$AGG_SERVICE_UNIT" ]] || {
+			printf 'apl-aggregator: descriptor %s missing required field(s)\n' "$desc_file" >&2
+			exit 1
+		}
+		# AGG_FIELDS_JSON is spliced verbatim into output; it must be valid JSON.
+		jq -e . >/dev/null 2>&1 <<<"$AGG_FIELDS_JSON" || {
+			printf 'apl-aggregator: descriptor %s has invalid AGG_FIELDS_JSON\n' "$desc_file" >&2
+			exit 1
+		}
+
+		local available reason
+		case "$AGG_ACQUIRE_METHOD" in
+			vendor-installer) available="true"; reason="" ;;
+			pinned-deb)
+				if _piaware_supported; then
+					available="true"; reason=""
+				else
+					available="false"; reason="not supported on this OS or architecture"
+				fi ;;
+			*) available="false"; reason="not yet supported on this device" ;;
+		esac
+
+		# State is JSON, parsed (never sourced) and size-capped. Strict typing:
+		# booleans must be literal true; a non-object document or non-object
+		# .fields degrades to "not configured" rather than failing the report
+		# (runtime data may be transiently corrupt — distinct from a descriptor
+		# bug, which fails loud above).
+		local raw='{}' enabled="false" mlat_enabled="false"
+		local state_path="$AGG_STATE_DIR/$AGG_ID.json"
+		if [[ -f "$state_path" ]]; then
+			local file_raw
+			file_raw="$(head -c "$AGG_STATE_MAX_BYTES" "$state_path" 2>/dev/null || true)"
+			if jq -e 'type == "object"' >/dev/null 2>&1 <<<"$file_raw"; then
+				raw="$file_raw"
+				enabled="$(jq -r '.enabled == true' <<<"$raw")"
+				mlat_enabled="$(jq -r '.mlat_enabled == true' <<<"$raw")"
+			fi
+		fi
+
+		# installed = the on-demand vendor dir exists AND is non-empty. A bare
+		# (partially-extracted or pre-created) directory must not read as
+		# installed, or a failed acquire would surface as "stopped" instead of
+		# "not_installed".
+		local installed="false"
+		case "$AGG_ACQUIRE_METHOD" in
+			vendor-installer)
+				if [[ -d "$AGG_INSTALL_ROOT/$AGG_ID" \
+					&& -n "$(ls -A "$AGG_INSTALL_ROOT/$AGG_ID" 2>/dev/null)" ]]; then
+					installed="true"
+				fi ;;
+			pinned-deb)
+				# Installed = the apt package is present. (Ownership — whether WE
+				# installed it vs. a pre-existing admin install — is tracked
+				# separately and only gates mutating verbs, not this status bit.)
+				if _pkg_installed "${AGG_PIAWARE_PACKAGE:-$AGG_ID}"; then installed="true"; fi ;;
+		esac
+
+		# Version surfacing: report the version actually on disk (the running
+		# truth), not the descriptor pin. installed_version is recorded into state
+		# at acquire time; for pinned-deb prefer the live dpkg version if present
+		# (an admin/manual change would diverge from state). desired_version is the
+		# descriptor pin; version_drift flags installed != desired so the UI can
+		# show an update is pending (or a reconcile failed and left the old build).
+		local installed_version desired_version="" version_drift="false"
+		installed_version="$(jq -r '.installed_version // ""' <<<"$raw")"
+		case "$AGG_ACQUIRE_METHOD" in
+			vendor-installer) desired_version="$AGG_FR24_VERSION" ;;
+			pinned-deb)
+				desired_version="$AGG_PIAWARE_VERSION"
+				if [[ "$installed" == "true" ]]; then
+					local live_ver
+					# shellcheck disable=SC2016
+					live_ver="$("$AGG_DPKG_QUERY" -W -f='${Version}' "${AGG_PIAWARE_PACKAGE:-$AGG_ID}" 2>/dev/null || true)"
+					[[ -n "$live_ver" ]] && installed_version="$live_ver"
+				fi ;;
+		esac
+		if [[ -n "$installed_version" && -n "$desired_version" && "$installed_version" != "$desired_version" ]]; then
+			version_drift="true"
+		fi
+
+		# reconcile_error: a failed background auto-apply (the post-overlay-update
+		# reconcile) stamps {error_code, message} into state. Surface it ONLY when
+		# well-formed — an object with a non-empty string error_code — and cap
+		# message, so a corrupt or root-written oversized state value can't inject
+		# arbitrary nested JSON or an unbounded string into every status reply.
+		# Absent/malformed degrades to null (dropped below), matching the tolerant
+		# posture the rest of this report takes with runtime state.
+		local reconcile_error_json
+		reconcile_error_json="$(jq -c '
+			(.reconcile_error // null)
+			| if (type == "object"
+			      and (.error_code | type == "string")
+			      and (.error_code | test("^[a-z][a-z_]*$"))
+			      and (.error_code | length <= 64))
+			  then {error_code: .error_code, message: ((.message // "") | tostring | .[0:300])}
+			  else null end' <<<"$raw" 2>/dev/null)"
+		[[ -n "$reconcile_error_json" ]] || reconcile_error_json="null"
+
+		local state
+		state="$(_derive_state "$available" "$(_service_state "$AGG_SERVICE_UNIT")" "$enabled" "$installed")"
+
+		# Async-mutation overlay: an in-flight or recently-failed enable/reset/set
+		# for this adapter takes precedence over the service-derived state, so the
+		# UI can show progress while the detached worker runs. The in-flight label
+		# is op-specific (installing/removing/applying); a failure of any op maps to
+		# "failed" with the worker's error_code/message carried in the raw overlay.
+		local overlay ov_json="null" ov_status ov_op
+		if overlay="$(_enable_overlay "$AGG_ID")" && [[ -n "$overlay" ]]; then
+			ov_json="$overlay"
+			ov_status="$(jq -r '.status // ""' <<<"$overlay")"
+			ov_op="$(jq -r '.op // "enable"' <<<"$overlay")"
+			case "$ov_status" in
+				starting|running)
+					case "$ov_op" in
+						reset) state="removing" ;;
+						set) state="applying" ;;
+						*) state="installing" ;;
+					esac ;;
+				failed) state="failed" ;;
+			esac
+		fi
+
+		# Secret-field presence is derived from state on jq STDIN — the secret
+		# VALUES never travel via argv (where /proc/<pid>/cmdline would expose
+		# them). Only the non-secret field NAMES go through --arg.
+		local secrets_present_json
+		secrets_present_json="$(jq -c --arg secrets "$AGG_SECRET_FIELDS" \
+			'((.fields // {}) | if type == "object" then . else {} end) as $f
+			 | ($secrets | split(" ") | map(select(length > 0)))
+			 | [ .[] | select( ($f[.] // "") != "" ) ]' <<<"$raw")"
+
+		# piaware's feeder-id is authoritatively the vendor cache file, provisioned
+		# on first connect and able to lag our state write. Surface it as present
+		# from the live file so the UI doesn't flap "unconfigured" in the gap
+		# between enable and the id landing in state.
+		if [[ "$AGG_ACQUIRE_METHOD" == "pinned-deb" && -s "$AGG_PIAWARE_FEEDER_ID_FILE" ]]; then
+			secrets_present_json="$(jq -c '(. + ["feeder_id"]) | unique' <<<"$secrets_present_json")"
+		fi
+
+		local configured="false"
+		if [[ "$enabled" == "true" ]] || (( $(jq 'length' <<<"$secrets_present_json") > 0 )); then
+			configured="true"
+		fi
+
+		jq -nc \
+			--arg id "$AGG_ID" \
+			--arg name "$AGG_DISPLAY_NAME" \
+			--arg acquire "$AGG_ACQUIRE_METHOD" \
+			--arg unit "$AGG_SERVICE_UNIT" \
+			--arg state "$state" \
+			--argjson enabled "$enabled" \
+			--argjson configured "$configured" \
+			--argjson available "$available" \
+			--arg reason "$reason" \
+			--argjson mlat_capable "$AGG_MLAT_CAPABLE" \
+			--argjson mlat_default "$AGG_MLAT_DEFAULT" \
+			--argjson conf_mlat "$mlat_enabled" \
+			--argjson fields "$AGG_FIELDS_JSON" \
+			--argjson secrets_present "$secrets_present_json" \
+			--argjson decoder "$decoder_json" \
+			--arg claim "$AGG_CLAIM_URL" \
+			--arg version "$installed_version" \
+			--arg desired_version "$desired_version" \
+			--argjson version_drift "$version_drift" \
+			--argjson reconcile_error "$reconcile_error_json" \
+			--argjson overlay "$ov_json" \
+			'{
+				id: $id, display_name: $name, acquire_method: $acquire, service_unit: $unit,
+				state: $state, enabled: $enabled, configured: $configured,
+				available: $available, unavailable_reason: $reason,
+				mlat_capable: $mlat_capable, mlat_default: $mlat_default,
+				configured_mlat_enabled: $conf_mlat, effective_mlat_enabled: $conf_mlat,
+				config_drift: false, fields: $fields, secret_fields_present: $secrets_present,
+				decoder_reachable: $decoder, claim_url: $claim,
+				version: $version, desired_version: $desired_version, version_drift: $version_drift,
+				reconcile_error: $reconcile_error
+			 }
+			 | (if .unavailable_reason == "" then del(.unavailable_reason) else . end)
+			 | (if .claim_url == "" then del(.claim_url) else . end)
+			 | (if .version == "" then del(.version) else . end)
+			 | (if .desired_version == "" then del(.desired_version) else . end)
+			 | (if .reconcile_error == null then del(.reconcile_error) else . end)
+			 | (if $overlay != null
+			    then .enable = ($overlay | {status, step, request_id, op}
+			         + (if .error_code then {error_code} else {} end)
+			         + (if .message then {message} else {} end))
+			    else . end)'
+	)
+}
+
+# --- status_detail (on-demand vendor status, the `detail` verb) -------------
+# Each producer reads the adapter's own status source (piaware's status.json /
+# fr24feed's monitor.json API) and turns it into a small whitelist of
+# {label,value,severity} rows for the manage page. They are deliberately NOT in
+# cmd_status (the 30s dashboard poll) — the probe is comparatively slow and the
+# dashboard never renders status_detail.
+#
+# Hard rules, because vendor output is undocumented, version-specific, and can
+# carry feeder IDs / coordinates / paths:
+#   - whitelist only recognized fields; never pass raw vendor text through;
+#   - _sd_clean every value (strip ANSI/control, length-cap);
+#   - the producer always returns a JSON array (possibly with a single
+#     "Status unavailable" row), never fails the verb.
+
+# _sd_clean <str>: strip ANSI escapes + control chars and cap length, so a value
+# can't smuggle escape sequences or an unbounded string into the report.
+_sd_clean() {
+	local s
+	s="$(LC_ALL=C sed -E $'s/\033\\[[0-9;]*[A-Za-z]//g' <<<"$1" | tr -d '[:cntrl:]')"
+	printf '%s' "${s:0:120}"
+}
+
+# _sd_obj <label> <value> <severity>: one cleaned status row as compact JSON.
+_sd_obj() {
+	jq -nc --arg l "$1" --arg v "$(_sd_clean "$2")" --arg s "$3" \
+		'{label:$l, value:$v, severity:$s}'
+}
+
+# _sd_array <obj>...: assemble the rows into a JSON array ([] when none).
+_sd_array() {
+	if (( $# == 0 )); then printf '[]'; else printf '%s\n' "$@" | jq -sc .; fi
+}
+
+# _sd_unavailable: the explicit "the vendor tool didn't answer" row, so a
+# timeout / missing binary never looks like a healthy adapter with no detail.
+_sd_unavailable() { _sd_array "$(_sd_obj "Status" "Status unavailable" warn)"; }
+
+# _status_detail_piaware: read piaware's machine-readable status file
+# (/run/piaware/status.json, rewritten every few seconds while piaware runs) and
+# map its per-component status code into rows. Far more robust than scraping
+# `piaware-status` text: the `radio` component reflects the real decoder health
+# directly, so there is no dump1090-vs-readsb false-alarm to special-case. A "red"
+# mlat is the normal pre-claim state (mlat only runs once the feeder is claimed),
+# so it is surfaced as informational (na), not an error. Each row's text is fixed
+# and controlled — the vendor `message` is never surfaced, so a future message
+# wording (or an identifier inside it) can neither leak nor break the UI.
+_status_detail_piaware() {
+	local sj raw rows=() comp
+	sj="${AGG_PIAWARE_STATUS_JSON:-/run/piaware/status.json}"
+	raw="$(head -c "${AGG_STATUS_MAX_BYTES:-16384}" "$sj" 2>/dev/null)"
+	jq -e 'type == "object"' >/dev/null 2>&1 <<<"$raw" || { _sd_unavailable; return 0; }
+	# Reject a stale snapshot: piaware stamps `expiry` (ms epoch) on each write, so
+	# a wedged-but-still-active piaware can't show stale green. Missing/non-numeric
+	# expiry (or a clock that can't be read) is tolerated for compatibility.
+	local expiry now_ms
+	expiry="$(jq -r '.expiry // ""' <<<"$raw" 2>/dev/null)"
+	if [[ "$expiry" =~ ^[0-9]+$ ]]; then
+		now_ms="$(date +%s%3N 2>/dev/null || echo 0)"
+		[[ "$now_ms" =~ ^[0-9]+$ ]] && (( now_ms > expiry )) && { _sd_unavailable; return 0; }
+	fi
+	# "<json-key>:<label>". Fixed text per (component, status); mlat "red" means
+	# MLAT is off (normal pre-claim), which is informational, not a fault.
+	for comp in "adept:FlightAware" "radio:ADS-B" "mlat:MLAT"; do
+		local key="${comp%%:*}" label="${comp#*:}" st value sev
+		st="$(jq -r --arg k "$key" '.[$k].status // ""' <<<"$raw" 2>/dev/null)"
+		[[ -n "$st" ]] || continue
+		case "$key:$st" in
+			adept:green) value="Connected";     sev=ok ;;
+			adept:red)   value="Not connected"; sev=err ;;
+			radio:green) value="Receiving";     sev=ok ;;
+			radio:red)   value="No data";       sev=err ;;
+			mlat:green)  value="Synchronized";  sev=ok ;;
+			mlat:red)    value="Off";           sev=na ;;
+			*:amber|*:yellow) value="Starting"; sev=warn ;;
+			*)           value="Unknown";       sev=na ;;
+		esac
+		rows+=("$(_sd_obj "$label" "$value" "$sev")")
+	done
+	(( ${#rows[@]} > 0 )) || { _sd_unavailable; return 0; }
+	_sd_array "${rows[@]}"
+}
+
+# _status_detail_fr24: query fr24feed's local monitor API (monitor.json on
+# 127.0.0.1:8754, served by default) and surface the real signals it exposes. The
+# vendor `fr24feed-status` tool is NOT used: it hard-codes a `systemctl status
+# fr24feed` check, so it always reports "failed" for our airplanes-aggregator@fr24
+# unit. monitor.json (1.0.48) has no explicit feed-server-link field, so we report
+# what it does expose — the receiver connection and the tracked-aircraft count.
+_status_detail_fr24() {
+	local url raw rows=() rx ac
+	url="${AGG_FR24_MONITOR_URL:-http://127.0.0.1:8754/monitor.json}"
+	# `if !` (not `; rc=$?`) so a curl failure is handled even under set -e.
+	if ! raw="$(curl -fsS --max-time "${AGG_STATUS_TIMEOUT:-5}" "$url" 2>/dev/null)"; then
+		_sd_unavailable; return 0
+	fi
+	raw="${raw:0:${AGG_STATUS_MAX_BYTES:-16384}}"
+	jq -e 'type == "object"' >/dev/null 2>&1 <<<"$raw" || { _sd_unavailable; return 0; }
+
+	rx="$(jq -r '.rx_connected // ""' <<<"$raw" 2>/dev/null)"
+	case "$rx" in
+		1) rows+=("$(_sd_obj "Receiver" "Connected" ok)") ;;
+		0) rows+=("$(_sd_obj "Receiver" "Not connected" err)") ;;
+	esac
+	ac="$(jq -r '.feed_num_ac_tracked // ""' <<<"$raw" 2>/dev/null)"
+	if [[ "$ac" =~ ^[0-9]+$ ]]; then
+		if (( ac > 0 )); then rows+=("$(_sd_obj "Aircraft tracked" "$ac" ok)")
+		else rows+=("$(_sd_obj "Aircraft tracked" "$ac" na)"); fi
+	fi
+
+	(( ${#rows[@]} > 0 )) || { _sd_unavailable; return 0; }
+	_sd_array "${rows[@]}"
+}
+
+# _status_detail <id>: the status_detail array for one adapter. Sources the
+# descriptor in its OWN scope (it cannot read vars back out of _adapter_json's
+# subshell) to pick the producer + the vendor command paths. The vendor binary
+# runs ONLY when the service is active and no async op is in flight — otherwise a
+# synthetic Service/Updating row, so an in-progress install or a stopped adapter
+# never shows stale vendor status.
+_status_detail() {
+	local id="$1"
+	(
+		AGG_ACQUIRE_METHOD=""; AGG_SERVICE_UNIT=""
+		# shellcheck source=/dev/null
+		source "$AGG_DESC_DIR/$id.desc"
+		local unit="$AGG_SERVICE_UNIT"
+
+		local ov ovs
+		if ov="$(_enable_overlay "$id")" && [[ -n "$ov" ]]; then
+			ovs="$(jq -r '.status // ""' <<<"$ov")"
+			case "$ovs" in
+				starting|running) _sd_array "$(_sd_obj "Status" "Updating…" na)"; return 0 ;;
+			esac
+		fi
+
+		local svc; svc="$(_service_state "$unit")"
+		if [[ "$svc" != "active" ]]; then
+			if [[ "$svc" == "failed" ]]; then
+				_sd_array "$(_sd_obj "Service" "Failed" err)"
+			else
+				_sd_array "$(_sd_obj "Service" "Stopped" na)"
+			fi
+			return 0
+		fi
+
+		# Each producer reads its own status source (piaware's status.json /
+		# fr24feed's monitor API), seamed via AGG_PIAWARE_STATUS_JSON /
+		# AGG_FR24_MONITOR_URL for tests.
+		case "$AGG_ACQUIRE_METHOD" in
+			pinned-deb)       _status_detail_piaware ;;
+			vendor-installer) _status_detail_fr24 ;;
+			*) printf '[]' ;;
+		esac
+	)
+}
+
+# cmd_detail (verb `detail`): one adapter's full status object PLUS status_detail.
+# id arrives on stdin like the per-id mutating verbs; _request_id is the security
+# gate (regex + descriptor-exists) before any path interpolation. The reply uses
+# the same envelope shape as `status` with a single-element aggregators array, so
+# the SPA's existing `.find(id)` consumption is unchanged.
+cmd_detail() {
+	_read_request
+	_request_id; local id="$REQ_ID"
+
+	local decoder_json="false"
+	if _decoder_reachable; then decoder_json="true"; fi
+
+	local obj
+	if ! obj="$(_adapter_json "$AGG_DESC_DIR/$id.desc" "$decoder_json")"; then
+		_emit_error state_error "aggregator descriptor failed: $id"; exit 3
+	fi
+
+	# Only run the vendor probe for a configured adapter — a never-set-up adapter
+	# has nothing to report and its manage page shows the setup form, where a
+	# "Service: Stopped" row would just be noise.
+	local detail="[]"
+	if [[ "$(jq -r '.configured == true' <<<"$obj" 2>/dev/null)" == "true" ]]; then
+		detail="$(_status_detail "$id" 2>/dev/null)"
+		jq -e 'type == "array"' >/dev/null 2>&1 <<<"$detail" || detail="[]"
+	fi
+
+	local body
+	body="$(jq -nc --argjson pv "$AGG_PROTOCOL_VERSION" --argjson a "$obj" --argjson d "$detail" \
+		'{protocol_version:$pv,
+		  aggregators:[ $a + (if ($d | length) > 0 then {status_detail:$d} else {} end) ]}')"
+	_emit_json "$body"
+}
+
+cmd_status() {
+	local decoder_json="false"
+	if _decoder_reachable; then decoder_json="true"; fi
+
+	local objs=() f obj
+	if [[ -d "$AGG_DESC_DIR" ]]; then
+		for f in "$AGG_DESC_DIR"/*.desc; do
+			[[ -e "$f" ]] || continue
+			if ! obj="$(_adapter_json "$f" "$decoder_json")"; then
+				# A malformed descriptor is a ship bug, not a runtime condition:
+				# fail loud instead of returning a partial/empty success.
+				_emit_error state_error "aggregator descriptor failed: $(basename "$f")"
+				exit 3
+			fi
+			objs+=("$obj")
+		done
+	fi
+
+	local body
+	if (( ${#objs[@]} == 0 )); then
+		body="$(jq -nc --argjson pv "$AGG_PROTOCOL_VERSION" '{protocol_version:$pv, aggregators:[]}')"
+	else
+		body="$(printf '%s\n' "${objs[@]}" | jq -sc \
+			--argjson pv "$AGG_PROTOCOL_VERSION" '{protocol_version:$pv, aggregators:.}')"
+	fi
+	_emit_json "$body"
+}
+
+# --- mutating verbs --------------------------------------------------------
+
+# _worker_progress <step>: in worker mode, advance the progress overlay to a
+# new phase (status stays "running"). A no-op outside the worker.
+_worker_progress() {
+	(( WORKER_MODE == 1 )) || return 0
+	WORKER_STEP="$1"
+	_write_enable_state running
+}
+
+_emit_ok() {
+	# $1 = id, $2 = optional extra-fields JSON object (default {})
+	local id="$1" extra="${2-}" body
+	# In worker mode there is no HTTP caller: record success in the async
+	# progress overlay (status:"done") instead of an envelope on stdout.
+	if (( WORKER_MODE == 1 )); then
+		WORKER_STEP="done"
+		_write_enable_state "done"
+		_emitted=1
+		return
+	fi
+	[[ -n "$extra" ]] || extra='{}'
+	if ! body="$(jq -nc --argjson pv "$AGG_PROTOCOL_VERSION" --arg id "$id" --argjson x "$extra" \
+		'{protocol_version:$pv, result:"ok", id:$id} + $x')"; then
+		_emit_error state_error "ok-envelope build failed"
+		exit 3
+	fi
+	_emit_json "$body"
+}
+
+# _read_request reads the JSON request object from stdin into REQ_JSON. Bad or
+# non-object input is a parse_error. Size-capped so a runaway producer can't
+# exhaust memory.
+REQ_JSON='{}'
+_read_request() {
+	REQ_JSON="$(head -c "$AGG_STATE_MAX_BYTES" || true)"
+	[[ -n "$REQ_JSON" ]] || { _emit_error parse_error "empty request body"; exit 5; }
+	# Slurp-validate: exactly one JSON text, and it is an object. (`jq -e
+	# 'type==...'` in streaming mode would accept a multi-document body whose
+	# last text happens to be an object.)
+	jq -e -s 'length == 1 and (.[0] | type == "object")' >/dev/null 2>&1 <<<"$REQ_JSON" \
+		|| { _emit_error parse_error "request body must be a single JSON object"; exit 5; }
+}
+
+# _request_id validates the adapter id from REQ_JSON into the global REQ_ID. It
+# must be called directly (NOT in a command substitution): on an unknown id it
+# emits not_found and exits the process — an exit inside $(...) would only kill
+# the subshell and leak the error JSON into the caller's capture. The id must
+# be a registered adapter (a descriptor file exists) — the security gate before
+# any path interpolation or systemd call.
+REQ_ID=""
+_request_id() {
+	REQ_ID="$(jq -r '.id // ""' <<<"$REQ_JSON")"
+	[[ "$REQ_ID" =~ $AGG_ID_RE && -f "$AGG_DESC_DIR/$REQ_ID.desc" ]] \
+		|| { _emit_error not_found "unknown aggregator id"; exit 2; }
+}
+
+# _descriptor_unit echoes the systemd unit for a (validated) adapter id.
+_descriptor_unit() {
+	local id="$1"
+	(
+		AGG_SERVICE_UNIT=""
+		# shellcheck source=/dev/null
+		source "$AGG_DESC_DIR/$id.desc"
+		printf '%s' "$AGG_SERVICE_UNIT"
+	)
+}
+
+# _descriptor_acquire echoes the acquire method for a (validated) adapter id.
+_descriptor_acquire() {
+	local id="$1"
+	(
+		AGG_ACQUIRE_METHOD=""
+		# shellcheck source=/dev/null
+		source "$AGG_DESC_DIR/$id.desc"
+		printf '%s' "$AGG_ACQUIRE_METHOD"
+	)
+}
+
+# _acquire_lock takes the process-wide aggregator lock so a concurrent
+# mutation (or a webconfig restart racing the CLI) cannot interleave with a
+# state write. fd 9 stays open for the process lifetime; the lock releases on
+# exit.
+_acquire_lock() {
+	mkdir -p "$(dirname "$AGG_LOCK")" 2>/dev/null || true
+	exec 9>"$AGG_LOCK" || { _emit_error state_error "cannot open lock $AGG_LOCK"; exit 3; }
+	flock -w "$AGG_LOCK_TIMEOUT" 9 \
+		|| { _emit_error lock_timeout "another aggregator operation is in progress"; exit 4; }
+}
+
+# _load_state echoes the persisted state object for id. An ABSENT file is {}
+# (a fresh adapter); a PRESENT-but-corrupt/wrong-schema file returns non-zero
+# so a mutation refuses to blindly overwrite the operator's prior config
+# (reset is the recovery path). Slurp-validated to a single object.
+_load_state() {
+	local id="$1" raw
+	local path="$AGG_STATE_DIR/$id.json"
+	[[ -f "$path" ]] || { printf '{}'; return 0; }
+	raw="$(head -c "$AGG_STATE_MAX_BYTES" "$path" 2>/dev/null || true)"
+	if jq -e -s 'length == 1 and (.[0] | type == "object" and ((.schema_version // 0) <= '"$AGG_STATE_SCHEMA_VERSION"'))' \
+		>/dev/null 2>&1 <<<"$raw"; then
+		printf '%s' "$raw"
+		return 0
+	fi
+	return 1
+}
+
+# _write_state atomically writes the state object for id at mode 0600.
+_write_state() {
+	local id="$1" json="$2" dir="$AGG_STATE_DIR" tmp
+	install -d -m 0750 "$dir" 2>/dev/null || true
+	tmp="$(mktemp "$dir/.$id.XXXXXX")" || { _emit_error state_error "mktemp failed in $dir"; exit 3; }
+	# Each filesystem step is checked so an ENOSPC/EIO/RO-fs failure emits a
+	# specific envelope and cleans up the temp file rather than relying on the
+	# generic EXIT-trap fallback.
+	if ! { printf '%s\n' "$json" >"$tmp" && chmod 0600 "$tmp" && mv -f "$tmp" "$dir/$id.json"; }; then
+		rm -f -- "$tmp"
+		_emit_error state_error "failed to write state for $id"
+		exit 3
+	fi
+}
+
+# cmd_set merges mlat_enabled / fields into an adapter's state. The merge + the
+# live-daemon reconcile (for piaware, piaware-config writes /etc/piaware.conf and
+# try-restarts) run in a detached worker so they escape the webconfig
+# ProtectSystem=strict sandbox; the foreground validates synchronously and
+# returns {result:"accepted"}. The worker carries the work in cmd_set_worker.
+cmd_set() {
+	_read_request
+	_request_id; local id="$REQ_ID"
+	# mlat_enabled, when present, must be a literal boolean.
+	if jq -e 'has("mlat_enabled") and (.mlat_enabled | type != "boolean")' \
+		>/dev/null 2>&1 <<<"$REQ_JSON"; then
+		_emit_error rejected "mlat_enabled must be a boolean"; exit 2
+	fi
+	# fields, when present, must be an object.
+	if jq -e 'has("fields") and (.fields | type != "object")' >/dev/null 2>&1 <<<"$REQ_JSON"; then
+		_emit_error rejected "fields must be an object"; exit 2
+	fi
+	_acquire_lock
+	if _mutation_in_progress; then
+		_emit_error lock_timeout "another aggregator operation is in progress; try again shortly"; exit 4
+	fi
+	_spawn_worker set "$id"
+}
+
+# cmd_disable stops + disables the adapter service and flags enabled=false,
+# keeping the installed binary/config so a re-enable needs no re-acquire.
+cmd_disable() {
+	_read_request
+	_request_id; local id="$REQ_ID"
+	_acquire_lock
+	if _mutation_in_progress; then
+		_emit_error lock_timeout "another aggregator operation is in progress; try again shortly"; exit 4
+	fi
+	# Validate state + descriptor BEFORE the systemctl side effect so a corrupt
+	# state fails fast with no half-applied change.
+	local cur unit next
+	cur="$(_load_state "$id")" \
+		|| { _emit_error state_error "existing state for $id is unreadable; reset to clear"; exit 3; }
+	if ! unit="$(_descriptor_unit "$id")"; then
+		_emit_error state_error "descriptor read failed for $id"; exit 3
+	fi
+	if [[ -n "$unit" ]]; then
+		"$AGG_SYSTEMCTL" disable --now "$unit" >/dev/null 2>&1 || true
+	fi
+	next="$(jq -nc --argjson cur "$cur" --argjson sv "$AGG_STATE_SCHEMA_VERSION" \
+		'$cur | .schema_version = $sv | .enabled = false')"
+	_write_state "$id" "$next"
+	_clear_enable_state "$id"
+	_emit_ok "$id"
+}
+
+# cmd_reset is the full teardown: stop+disable the unit, drop our state and the
+# on-demand install dir. Vendor-specific teardown (apt purge, keyring/source
+# removal, decoder-unit unmask) is layered in by the per-adapter acquire path.
+cmd_reset() {
+	_read_request
+	_request_id; local id="$REQ_ID"
+	# Guard the recursive delete: an absolute, non-root install root plus a
+	# registry-validated id (AGG_ID_RE forbids leading dash / slash / dots).
+	[[ "$AGG_INSTALL_ROOT" == /* && "$AGG_INSTALL_ROOT" != "/" ]] \
+		|| { _emit_error state_error "unsafe install root"; exit 3; }
+	_acquire_lock
+	if _mutation_in_progress; then
+		_emit_error lock_timeout "another aggregator operation is in progress; try again shortly"; exit 4
+	fi
+	# The teardown (apt purge / rm under the install root / conf removal) runs in a
+	# detached worker so it escapes the webconfig ProtectSystem=strict sandbox; the
+	# foreground returns {result:"accepted"}. Work carried in cmd_reset_worker.
+	_spawn_worker reset "$id"
+}
+
+# --- enable: on-demand vendor acquire + service start ----------------------
+
+_valid_email() {
+	[[ "$1" =~ ^[^[:space:]@]+@[^[:space:]@]+\.[^[:space:]@]+$ ]]
+}
+
+# _valid_geo lat lon alt(metres): numeric + sane ranges.
+_valid_geo() {
+	local lat="$1" lon="$2" alt="$3"
+	[[ "$lat" =~ ^-?[0-9]+(\.[0-9]+)?$ && "$lon" =~ ^-?[0-9]+(\.[0-9]+)?$ && "$alt" =~ ^-?[0-9]+(\.[0-9]+)?$ ]] || return 1
+	awk -v la="$lat" -v lo="$lon" -v al="$alt" \
+		'BEGIN { exit !(la >= -90 && la <= 90 && lo >= -180 && lo <= 180 && al >= -500 && al <= 12000) }'
+}
+
+# fr24 sharing keys are short alphanumerics. Validating before a key reaches an
+# ini line or the state file blocks ini-injection (a key bearing a quote or
+# newline) on both the provided-key and signup-extracted paths.
+_valid_fr24_key() {
+	[[ "$1" =~ ^[A-Za-z0-9]{6,40}$ ]]
+}
+
+# _download_verify <url> <sha256> <dest>: fetch url to dest and verify its
+# sha256. http and https are both accepted — integrity comes from the pin, not
+# the transport (the FlightAware pool is http-only) — but a non-empty sha is
+# REQUIRED, so an empty pin can never accept arbitrary bytes. The fetched bytes
+# are root-installed, so the pin is the trust anchor. Returns 0 ok, 1 on a
+# download or integrity failure.
+_download_verify() {
+	local url="$1" sha="$2" dest="$3" got
+	[[ "$url" == http://* || "$url" == https://* ]] || return 1
+	[[ -n "$sha" ]] || return 1
+	if ! curl -fsSL --max-time 120 -o "$dest" "$url"; then return 1; fi
+	got="$(sha256sum "$dest" 2>/dev/null | cut -d' ' -f1)"
+	printf 'apl-aggregator: fetched %s sha256=%s\n' "$url" "$got" >&2
+	[[ -n "$got" && "$got" == "$sha" ]]
+}
+
+# _fr24_acquire_binary <url> <sha256> <dest>: download the pinned fr24feed .deb,
+# verify its sha256 (a root-executed binary), extract just the binary (NOT the
+# vendor cron-updater or unit), and install it at <dest>.
+# Returns: 0 ok, 1 download/integrity failure (network class), 2 local fs/tool
+# failure. Test seam: AGG_FR24_ACQUIRE_OVERRIDE <dest>.
+_fr24_acquire_binary() {
+	local url="$1" sha="$2" dest="$3"
+	if [[ -n "${AGG_FR24_ACQUIRE_OVERRIDE:-}" ]]; then
+		"$AGG_FR24_ACQUIRE_OVERRIDE" "$dest"; return
+	fi
+	local tmp deb src
+	tmp="$(mktemp -d)" || return 2
+	deb="$tmp/fr24.deb"
+	if ! _download_verify "$url" "$sha" "$deb"; then rm -rf "$tmp"; return 1; fi
+	if ! dpkg -x "$deb" "$tmp/root" 2>/dev/null; then rm -rf "$tmp"; return 2; fi
+	src="$tmp/root/usr/bin/fr24feed"
+	[[ -f "$src" ]] || { rm -rf "$tmp"; return 1; }
+	install -D -m 0755 "$src" "$dest" || { rm -rf "$tmp"; return 2; }
+	rm -rf "$tmp"
+}
+
+# _fr24_write_ini <ini> <key>: configure fr24feed as a BEAST-TCP consumer of
+# the local decoder with the operator's sharing key (MLAT off, per the
+# adapter's FR24-MLAT-default-off contract).
+_fr24_write_ini() {
+	local ini="$1" key="$2" tmp
+	tmp="$(mktemp "${ini}.XXXXXX")" || return 1
+	if ! cat >"$tmp" <<EOF
+receiver="beast-tcp"
+host="127.0.0.1:30005"
+fr24key="$key"
+bs="no"
+raw="no"
+mlat="no"
+mlat-without-gps="no"
+EOF
+	then rm -f -- "$tmp"; return 1; fi
+	if ! { chmod 0640 "$tmp" && mv -f -- "$tmp" "$ini"; }; then
+		rm -f -- "$tmp"; return 1
+	fi
+}
+
+# _fr24_read_key <ini>: extract the quoted fr24key value (empty if absent or
+# malformed — strict, so a bare `fr24key=` never yields a bogus non-empty key).
+_fr24_read_key() {
+	sed -n 's/^fr24key="\([^"]*\)".*/\1/p' "$1" 2>/dev/null | head -1
+}
+
+# _fr24_finalize_perms <ini>: hand the ini + its dir to the service account if
+# it exists (created by the image build); on CI / older images it stays root.
+_fr24_finalize_perms() {
+	local ini="$1"
+	id -u airplanes-aggregator >/dev/null 2>&1 || return 0
+	chown airplanes-aggregator:airplanes-aggregator "$ini" 2>/dev/null || true
+	chown airplanes-aggregator:airplanes-aggregator "$(dirname "$ini")" 2>/dev/null || true
+}
+
+# _fr24_signup <bin> <ini> <email> <lat> <lon> <alt_m>: mint a fresh sharing key
+# by driving `fr24feed --signup --adsb`. fr24feed reads the wizard answers from
+# its controlling terminal, NOT stdin, so the answers are piped through a PTY
+# (`script`); a bare stdin pipe stalls forever on the first prompt. The answer
+# order tracks fr24feed 1.0.48's wizard: email, sharing-key (blank = skip),
+# MLAT yes/no, latitude, longitude, altitude (feet), confirm-position yes/no,
+# receiver type (1 = dump1090), additional dump1090 args (blank), RAW feed
+# yes/no, Basestation feed yes/no. Only the minted key is harvested — the caller
+# rewrites the ini as a BEAST-TCP consumer of the local decoder, so the wizard's
+# own receiver config is discarded. The binary/ini paths travel via the
+# environment so the `script -c` command stays a static literal (no path
+# injection into the shell string). Test seam: AGG_FR24_SIGNUP_OVERRIDE <ini> <email>.
+_fr24_signup() {
+	local bin="$1" ini="$2" email="$3" lat="$4" lon="$5" alt_m="$6" alt_ft
+	if [[ -n "${AGG_FR24_SIGNUP_OVERRIDE:-}" ]]; then
+		"$AGG_FR24_SIGNUP_OVERRIDE" "$ini" "$email"
+	else
+		alt_ft="$(awk -v m="$alt_m" 'BEGIN { printf "%d", m * 82 / 25 }')"
+		# shellcheck disable=SC2016  # $FR24_* are expanded by script's inner sh, by design
+		printf '%s\n' \
+			"$email" "" "no" "$lat" "$lon" "$alt_ft" "yes" "1" "" "no" "no" \
+			| FR24_BIN="$bin" FR24_INI="$ini" timeout --kill-after=5s "${AGG_FR24_SIGNUP_TIMEOUT:-180}" \
+				script -qec 'exec "$FR24_BIN" --signup --adsb --config-file="$FR24_INI"' /dev/null \
+				>/dev/null 2>&1 || true
+	fi
+	# Success is judged by a key landing in the ini, not the wizard's exit code.
+	[[ -f "$ini" ]] && grep -qs '^fr24key' "$ini"
+}
+
+_enable_fr24() {
+	local email key lat lon alt fields cur
+	# Existing state fields (e.g. seeded by `import`) are the base; request
+	# fields override. This lets a restored key/email be reused without
+	# re-entry. Both inputs go via jq stdin so secrets never touch argv. A
+	# present-but-corrupt state fails loud rather than being silently dropped.
+	cur="$(_load_state "fr24" 2>/dev/null)" \
+		|| { _emit_error state_error "existing fr24 state is unreadable; reset to clear"; exit 3; }
+	fields="$(printf '%s\n%s\n' "$cur" "$REQ_JSON" \
+		| jq -cn 'input as $cur | input as $req | (($cur.fields // {}) + ($req.fields // {}))')"
+	email="$(jq -r '.email // ""' <<<"$fields")"
+	key="$(jq -r '.sharing_key // ""' <<<"$fields")"
+	lat="$(jq -r 'if has("lat") then .lat else "" end' <<<"$REQ_JSON")"
+	lon="$(jq -r 'if has("lon") then .lon else "" end' <<<"$REQ_JSON")"
+	alt="$(jq -r 'if has("alt") then .alt else "" end' <<<"$REQ_JSON")"
+
+	# Email and geo are consumed only by the signup wizard (the no-key path). A
+	# keyed enable — a provided or restored key, e.g. "Start feeding" on a
+	# configured adapter, or a key-only restored backup (cmd_import permits one) —
+	# skips signup, so it needs neither.
+	if [[ -z "$key" ]]; then
+		_valid_email "$email" || { _emit_error rejected "a valid email address is required"; exit 2; }
+		_valid_geo "$lat" "$lon" "$alt" || { _emit_error rejected "valid latitude, longitude and altitude are required"; exit 2; }
+	fi
+	[[ -z "$key" ]] || _valid_fr24_key "$key" || { _emit_error rejected "invalid sharing key format"; exit 2; }
+	_decoder_reachable || { _emit_error decoder_unavailable "local decoder 127.0.0.1:30005 is not reachable"; exit 2; }
+
+	# Pinned vendor URL + checksum from the (trusted) descriptor, captured in a
+	# subshell so descriptor sourcing cannot clobber locals or write to stdout.
+	local desc_out url sha ver
+	# shellcheck source=/dev/null
+	desc_out="$( source "$AGG_DESC_DIR/fr24.desc" >/dev/null 2>&1; printf '%s\n%s\n%s\n' "${AGG_FR24_DEB_URL:-}" "${AGG_FR24_DEB_SHA256:-}" "${AGG_FR24_VERSION:-}" )"
+	url="$(sed -n 1p <<<"$desc_out")"
+	sha="$(sed -n 2p <<<"$desc_out")"
+	ver="$(sed -n 3p <<<"$desc_out")"
+
+	local bin ini
+	bin="${AGG_FR24_BIN:-$AGG_INSTALL_ROOT/fr24/fr24feed}"
+	ini="${AGG_FR24_INI:-$AGG_STATE_HOME/fr24/fr24feed.ini}"
+
+	local rc=0
+	_worker_progress acquiring
+	_fr24_acquire_binary "$url" "$sha" "$bin" || rc=$?
+	case "$rc" in
+		0) ;;
+		2) _emit_error state_error "failed to install fr24feed locally"; exit 3 ;;
+		*) _emit_error acquire_failed "could not download or verify fr24feed (check connectivity)"; exit 2 ;;
+	esac
+
+	_worker_progress configuring
+	install -d -m 0750 "$(dirname "$ini")" 2>/dev/null || true
+	if [[ -n "$key" ]]; then
+		_fr24_write_ini "$ini" "$key" || { _emit_error state_error "failed to write fr24feed.ini"; exit 3; }
+	else
+		if ! _fr24_signup "$bin" "$ini" "$email" "$lat" "$lon" "$alt"; then
+			_emit_error signup_failed "fr24 signup did not return a sharing key"; exit 2
+		fi
+		key="$(_fr24_read_key "$ini")"
+		_valid_fr24_key "$key" || { _emit_error signup_failed "fr24 signup did not return a usable key"; exit 2; }
+		# The wizard writes its own receiver config (dvbt/auto); overwrite it so the
+		# signup and keyed paths produce identical BEAST-TCP-to-local config. Only
+		# the minted key is kept from the wizard's run.
+		_fr24_write_ini "$ini" "$key" || { _emit_error state_error "failed to write fr24feed.ini"; exit 3; }
+	fi
+	_fr24_finalize_perms "$ini"
+
+	# Persist state BEFORE starting the unit, so a start failure leaves a
+	# visible enabled+stopped record rather than a running service with no
+	# state. Secrets travel via stdin to jq, never on its argv.
+	local state
+	state="$(printf '%s\n%s\n' "$email" "$key" | jq -Rn --argjson sv "$AGG_STATE_SCHEMA_VERSION" --arg ver "$ver" \
+		'(input) as $email | (input) as $key
+		 | {schema_version:$sv, enabled:true, mlat_enabled:false, installed_version:$ver, fields:{email:$email, sharing_key:$key}}')"
+	_write_state "fr24" "$state"
+
+	_worker_progress starting-service
+	if ! "$AGG_SYSTEMCTL" enable --now "airplanes-aggregator@fr24.service" >/dev/null 2>&1; then
+		_emit_error state_error "fr24 configured but the service failed to start"; exit 3
+	fi
+	_assert_unit_live "airplanes-aggregator@fr24.service" "fr24"
+	_emit_ok "fr24" '{"sharing_key_present":true}'
+}
+
+# _fr24_validate_sync: the fast synchronous validation cmd_enable runs before
+# launching the worker. Mirrors the head of _enable_fr24 — load + merge state
+# (so a restored email/key counts), then require a valid email/geo, a valid key
+# format if one is present, and a reachable decoder. Emits the error envelope +
+# exits on failure, so a bad request fails immediately instead of after a 202.
+_fr24_validate_sync() {
+	local email key lat lon alt fields cur
+	cur="$(_load_state "fr24" 2>/dev/null)" \
+		|| { _emit_error state_error "existing fr24 state is unreadable; reset to clear"; exit 3; }
+	fields="$(printf '%s\n%s\n' "$cur" "$REQ_JSON" \
+		| jq -cn 'input as $cur | input as $req | (($cur.fields // {}) + ($req.fields // {}))')"
+	email="$(jq -r '.email // ""' <<<"$fields")"
+	key="$(jq -r '.sharing_key // ""' <<<"$fields")"
+	lat="$(jq -r 'if has("lat") then .lat else "" end' <<<"$REQ_JSON")"
+	lon="$(jq -r 'if has("lon") then .lon else "" end' <<<"$REQ_JSON")"
+	alt="$(jq -r 'if has("alt") then .alt else "" end' <<<"$REQ_JSON")"
+	# Email and geo are consumed only by the signup wizard (the no-key path). A
+	# keyed enable — a provided or restored key, e.g. "Start feeding" on a
+	# configured adapter, or a key-only restored backup (cmd_import permits one) —
+	# skips signup, so it needs neither.
+	if [[ -z "$key" ]]; then
+		_valid_email "$email" || { _emit_error rejected "a valid email address is required"; exit 2; }
+		_valid_geo "$lat" "$lon" "$alt" || { _emit_error rejected "valid latitude, longitude and altitude are required"; exit 2; }
+	fi
+	[[ -z "$key" ]] || _valid_fr24_key "$key" || { _emit_error rejected "invalid sharing key format"; exit 2; }
+	_decoder_reachable || { _emit_error decoder_unavailable "local decoder 127.0.0.1:30005 is not reachable"; exit 2; }
+}
+
+# --- piaware (pinned-deb) --------------------------------------------------
+
+# _pkg_installed <pkg>: true iff dpkg reports the package currently installed.
+# Status-Abbrev is <desired-action><current-status>: the SECOND char is the
+# install state, the first is the desired action. A held package reads `hi` (hold
+# + installed), not `ii` — so test the status char, not an `ii` prefix, or every
+# package this helper holds would falsely read as not-installed.
+_pkg_installed() {
+	local st
+	# shellcheck disable=SC2016  # ${db:Status-Abbrev} is a dpkg-query field, not a shell var
+	st="$("$AGG_DPKG_QUERY" -W -f='${db:Status-Abbrev}' "$1" 2>/dev/null || true)"
+	[[ "${st:1:1}" == "i" ]]
+}
+
+# _host_arch: dpkg architecture (test seam AGG_DPKG_ARCH).
+_host_arch() {
+	if [[ -n "$AGG_DPKG_ARCH" ]]; then printf '%s' "$AGG_DPKG_ARCH"; return; fi
+	dpkg --print-architecture 2>/dev/null || true
+}
+
+# _os_codename: VERSION_CODENAME from the os-release seam, with a VERSION_ID map
+# fallback so a release file lacking CODENAME still resolves.
+_os_codename() {
+	local cn="" vid=""
+	if [[ -r "$AGG_OS_RELEASE" ]]; then
+		# shellcheck source=/dev/null
+		cn="$( . "$AGG_OS_RELEASE" >/dev/null 2>&1; printf '%s' "${VERSION_CODENAME:-}" )"
+		# shellcheck source=/dev/null
+		[[ -n "$cn" ]] || vid="$( . "$AGG_OS_RELEASE" >/dev/null 2>&1; printf '%s' "${VERSION_ID:-}" )"
+	fi
+	if [[ -z "$cn" ]]; then
+		case "$vid" in
+			11) cn=bullseye ;; 12) cn=bookworm ;; 13) cn=trixie ;;
+		esac
+	fi
+	printf '%s' "$cn"
+}
+
+# _piaware_supported: arch ∈ supported AND codename ∈ supported (descriptor
+# matrix). Requires the piaware descriptor to be sourced in scope.
+_piaware_supported() {
+	local arch cn a c ok_arch=1 ok_cn=1
+	arch="$(_host_arch)"; cn="$(_os_codename)"
+	[[ -n "$arch" && -n "$cn" ]] || return 1
+	for a in ${AGG_PIAWARE_SUPPORTED_ARCHES:-}; do [[ "$a" == "$arch" ]] && ok_arch=0; done
+	for c in ${AGG_PIAWARE_SUPPORTED_CODENAMES:-}; do [[ "$c" == "$cn" ]] && ok_cn=0; done
+	(( ok_arch == 0 && ok_cn == 0 ))
+}
+
+# _valid_feeder_id <s>: piaware feeder-ids are UUIDs.
+_valid_feeder_id() {
+	[[ "$1" =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$ ]]
+}
+
+# _apt <args…>: apt-get with non-interactive + no-restart env pinned, so it can
+# never prompt or bounce the feeder's network mid-install, plus a lock timeout.
+_apt() {
+	DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=l NEEDRESTART_SUSPEND=1 \
+		"$AGG_APT_GET" -o DPkg::Lock::Timeout=120 "$@"
+}
+
+# --- ownership markers ---
+# A sidecar (NOT the backup-exported state file) recording exactly what the
+# enable transaction mutated, so reset undoes ONLY what this helper owns and
+# never an admin's pre-existing piaware / apt source / config.
+_piaware_managed_path() { printf '%s/piaware.managed.json' "$AGG_STATE_DIR"; }
+
+_piaware_managed_read() {
+	local p raw; p="$(_piaware_managed_path)"
+	[[ -f "$p" ]] || { printf '{}'; return 0; }
+	raw="$(head -c "$AGG_STATE_MAX_BYTES" "$p" 2>/dev/null || true)"
+	if jq -e 'type=="object"' >/dev/null 2>&1 <<<"$raw"; then printf '%s' "$raw"; else printf '{}'; fi
+}
+
+# _piaware_managed_merge <patch-obj>: array-valued keys are unioned (so repeated
+# created_paths/installed_pkgs accumulate); scalar keys are overwritten.
+_piaware_managed_merge() {
+	local cur merged p tmp; p="$(_piaware_managed_path)"
+	cur="$(_piaware_managed_read)"
+	merged="$(jq -c --argjson patch "$1" '
+		reduce ($patch|to_entries[]) as $e (.;
+		  if ($e.value|type)=="array"
+		  then .[$e.key] = (((.[$e.key] // []) + $e.value) | unique)
+		  else .[$e.key] = $e.value end)' <<<"$cur")" || return 1
+	install -d -m 0750 "$AGG_STATE_DIR" 2>/dev/null || true
+	tmp="$(mktemp "$AGG_STATE_DIR/.piaware.managed.XXXXXX")" || return 1
+	if printf '%s\n' "$merged" >"$tmp" && chmod 0600 "$tmp" && mv -f "$tmp" "$p"; then :; else rm -f -- "$tmp"; return 1; fi
+}
+
+# policy-rc.d: blocks maintainer-script service autostart during apt install
+# (cleaner than masking piaware.service). Only created/removed if we own it.
+_piaware_set_policy_rcd() {
+	[[ -e "$AGG_POLICY_RCD" ]] && return 0   # respect a pre-existing one
+	# Mark BEFORE creating, so a crash between create and mark still lets reset
+	# find + remove this global install guard (a stray policy-rc.d breaks apt).
+	_piaware_managed_merge "$(jq -nc '{policy_rcd:true}')"
+	install -d -m 0755 "$(dirname "$AGG_POLICY_RCD")" 2>/dev/null || true
+	printf '#!/bin/sh\n# airplanes-webconfig install guard; removed after configure.\nexit 101\n' >"$AGG_POLICY_RCD" || return 1
+	chmod 0755 "$AGG_POLICY_RCD" || return 1
+}
+_piaware_clear_policy_rcd() {
+	[[ "$(jq -r '.policy_rcd == true' <<<"$(_piaware_managed_read)")" == "true" ]] || return 0
+	rm -f -- "$AGG_POLICY_RCD"
+	_piaware_managed_merge "$(jq -nc '{policy_rcd:false}')"
+}
+
+# _piaware_configure <host> <port> <mlat:yes|no> <feeder_id>: point piaware at
+# the local Beast decoder and set MLAT (+ optional reclaim feeder-id).
+_piaware_configure() {
+	local host="$1" port="$2" mlat="$3" feeder_id="$4"
+	"$AGG_PIAWARE_CONFIG" receiver-type other   >/dev/null 2>&1 || return 1
+	"$AGG_PIAWARE_CONFIG" receiver-host "$host"  >/dev/null 2>&1 || return 1
+	"$AGG_PIAWARE_CONFIG" receiver-port "$port"  >/dev/null 2>&1 || return 1
+	"$AGG_PIAWARE_CONFIG" allow-mlat "$mlat"     >/dev/null 2>&1 || return 1
+	if [[ -n "$feeder_id" ]]; then
+		"$AGG_PIAWARE_CONFIG" feeder-id "$feeder_id" >/dev/null 2>&1 || return 1
+	fi
+}
+
+# _piaware_legacy_sweep: best-effort removal of an apt source / origin-pin /
+# keyring left by an earlier (now-retired) apt-repo install of piaware. piaware
+# now installs from a pinned .deb with no persisted FlightAware source, so a
+# leftover source could otherwise float the package on a manual apt run. Only
+# touches files in our own airplanes-flightaware namespace; never emits/exits.
+_piaware_legacy_sweep() {
+	local removed=0 f
+	for f in "$AGG_APT_SOURCES_DIR/airplanes-flightaware.sources" \
+	         "$AGG_APT_PREFS_DIR/airplanes-flightaware.pref" \
+	         "$AGG_KEYRING_DIR/airplanes-flightaware-archive-keyring.gpg"; do
+		[[ -e "$f" ]] && rm -f -- "$f" 2>/dev/null && removed=1
+	done
+	(( removed )) && { _apt update >/dev/null 2>&1 || true; }
+	return 0
+}
+
+# _piaware_acquire_deb <dest>: drop the pinned piaware .deb at <dest> using the
+# descriptor's pinned URL + sha256 (must be sourced in scope). Returns 0 ok, 1 on
+# a download/integrity failure. Test seam: AGG_PIAWARE_DEB_OVERRIDE <dest>.
+_piaware_acquire_deb() {
+	local dest="$1"
+	if [[ -n "$AGG_PIAWARE_DEB_OVERRIDE" ]]; then
+		"$AGG_PIAWARE_DEB_OVERRIDE" "$dest"; return
+	fi
+	_download_verify "$AGG_PIAWARE_DEB_URL" "$AGG_PIAWARE_DEB_SHA256" "$dest"
+}
+
+# _piaware_install_deb <deb>: validate the .deb's metadata against the pin BEFORE
+# letting apt run it (its maintainer scripts run as root), simulate-guard, install
+# the local .deb (resolving the tcl/* deps from Debian), and hold it at the pinned
+# version. The ownership markers (we_installed, installed_pkgs, hold) are written
+# BEFORE the install — and treated as fatal — so reset can always unhold + purge
+# what we added even after a crash mid-install, and so a marker-write failure can
+# never leave an untracked package. Returns 0 ok, or non-zero with _AGG_ERRCODE/
+# _AGG_ERRMSG set — the enable path turns those into an envelope+exit; reconcile
+# records them. Never emits/exits itself.
+_AGG_ERRCODE=""
+_AGG_ERRMSG=""
+_piaware_install_deb() {
+	local deb="$1" sim newpkgs deny pkg ver arch harch
+	_AGG_ERRCODE=""; _AGG_ERRMSG=""
+	# Pre-install metadata check: confirm the (sha-verified) .deb really is the
+	# pinned piaware build for this arch BEFORE apt runs its root maintainer
+	# scripts, so an inconsistent descriptor fails closed instead of half-applied.
+	pkg="$("$AGG_DPKG_DEB" -f "$deb" Package 2>/dev/null || true)"
+	ver="$("$AGG_DPKG_DEB" -f "$deb" Version 2>/dev/null || true)"
+	arch="$("$AGG_DPKG_DEB" -f "$deb" Architecture 2>/dev/null || true)"
+	if [[ "$pkg" != "$AGG_PIAWARE_PACKAGE" ]]; then
+		_AGG_ERRCODE="acquire_failed"; _AGG_ERRMSG="unexpected package '${pkg:-?}' in the piaware .deb"; return 2
+	fi
+	if [[ -n "$AGG_PIAWARE_VERSION" && "$ver" != "$AGG_PIAWARE_VERSION" ]]; then
+		_AGG_ERRCODE="acquire_failed"; _AGG_ERRMSG="piaware .deb version ${ver:-unknown} != pinned $AGG_PIAWARE_VERSION"; return 2
+	fi
+	harch="$(_host_arch)"
+	if [[ -n "$arch" && "$arch" != "all" && -n "$harch" && "$arch" != "$harch" ]]; then
+		_AGG_ERRCODE="acquire_failed"; _AGG_ERRMSG="piaware .deb arch ${arch} != host ${harch}"; return 2
+	fi
+	# Simulate the local-.deb install: abort on ANY removal or any protected
+	# package in the resolver plan. LC_ALL=C keeps the Inst/Remv prefixes parseable.
+	if ! sim="$(LC_ALL=C _apt -s install --no-install-recommends "$deb" 2>&1)"; then
+		_AGG_ERRCODE="acquire_failed"; _AGG_ERRMSG="could not resolve piaware (dependencies unavailable)"; return 2
+	fi
+	if grep -qE '^Remv ' <<<"$sim"; then
+		_AGG_ERRCODE="acquire_failed"; _AGG_ERRMSG="installing piaware would remove other packages; aborting"; return 2
+	fi
+	for deny in $AGG_PIAWARE_DENY_PKGS; do
+		if grep -qE "^(Inst|Remv|Conf) ${deny}( |:)" <<<"$sim"; then
+			_AGG_ERRCODE="acquire_failed"; _AGG_ERRMSG="installing piaware would disturb '${deny}'; aborting"; return 2
+		fi
+	done
+	# Record the exact set this install NEWLY adds, for a targeted reset. An
+	# upgrade line is `Inst pkg [oldver] (newver …)` (3rd field starts with `[`); a
+	# fresh install is `Inst pkg (ver …)`. Recording only fresh installs keeps
+	# reset from later autoremoving a package piaware merely upgraded. Fatal: an
+	# unrecorded install is worse than no install (reset couldn't purge it).
+	newpkgs="$(awk '/^Inst / && $3 !~ /^\[/ {print $2}' <<<"$sim" | tr '\n' ' ')"
+	if ! _piaware_managed_merge "$(jq -nc --arg pkgs "$newpkgs" '{we_installed:true, installed_pkgs:($pkgs|split(" ")|map(select(length>0)))}')"; then
+		_AGG_ERRCODE="state_error"; _AGG_ERRMSG="could not record install ownership"; return 2
+	fi
+	# Mark the hold BEFORE applying it: reset must unhold even if we die between
+	# the apt install and the marker write (a stray hold would block later apt ops).
+	if ! _piaware_managed_merge "$(jq -nc '{hold:true}')"; then
+		_AGG_ERRCODE="state_error"; _AGG_ERRMSG="could not record install ownership"; return 2
+	fi
+	# --allow-downgrades for a pin/overlay rollback to an older .deb;
+	# --allow-change-held-packages because a re-acquire installs over the held pin.
+	if ! _apt install -y --no-install-recommends --allow-downgrades --allow-change-held-packages "$deb" >/dev/null 2>&1; then
+		_AGG_ERRCODE="acquire_failed"; _AGG_ERRMSG="failed to install piaware"; return 2
+	fi
+	# Re-hold at the new version. A failed hold defeats the pin, so it is fatal —
+	# reset still recovers via the we_installed marker.
+	if ! "$AGG_APT_MARK" hold "$AGG_PIAWARE_PACKAGE" >/dev/null 2>&1; then
+		_AGG_ERRCODE="state_error"; _AGG_ERRMSG="installed piaware but could not hold it at the pinned version"; return 2
+	fi
+	if ! _pkg_installed "$AGG_PIAWARE_PACKAGE"; then
+		_AGG_ERRCODE="acquire_failed"; _AGG_ERRMSG="piaware did not install cleanly"; return 2
+	fi
+	return 0
+}
+
+# _piaware_install: fetch the pinned .deb and install it (tcl/* deps from Debian),
+# under the policy-rc.d autostart guard. Emits the error envelope and exits on any
+# failure.
+_piaware_install() {
+	local tmp deb
+	_piaware_legacy_sweep
+	_piaware_set_policy_rcd || { _emit_error state_error "failed to set up install guard"; exit 3; }
+	# Refresh Debian indices so the .deb's tcl/* deps resolve on older images.
+	_apt update >/dev/null 2>&1 || true
+	tmp="$(mktemp -d)" || { _emit_error state_error "mktemp failed"; exit 3; }
+	deb="$tmp/piaware.deb"
+	if ! _piaware_acquire_deb "$deb"; then
+		rm -rf "$tmp"
+		_emit_error acquire_failed "could not download or verify piaware (check connectivity)"; exit 2
+	fi
+	if ! _piaware_install_deb "$deb"; then
+		rm -rf "$tmp"
+		_emit_error "${_AGG_ERRCODE:-acquire_failed}" "${_AGG_ERRMSG:-failed to install piaware}"; exit 2
+	fi
+	rm -rf "$tmp"
+}
+
+# _enable_piaware: worker-context enable for the pinned-deb adapter.
+_enable_piaware() {
+	# shellcheck source=/dev/null
+	source "$AGG_DESC_DIR/piaware.desc"
+
+	local cur fields feeder_id mlat host port
+	cur="$(_load_state "piaware" 2>/dev/null)" \
+		|| { _emit_error state_error "existing piaware state is unreadable; reset to clear"; exit 3; }
+	fields="$(printf '%s\n%s\n' "$cur" "$REQ_JSON" \
+		| jq -cn 'input as $cur | input as $req | (($cur.fields // {}) + ($req.fields // {}))')"
+	feeder_id="$(jq -r '.feeder_id // ""' <<<"$fields")"
+	# MLAT preference: the request's mlat_enabled if present, else the descriptor
+	# default. (allow-mlat is the local gate; MLAT only activates once the feeder
+	# is claimed + located on the FlightAware website.)
+	if jq -e 'has("mlat_enabled")' >/dev/null 2>&1 <<<"$REQ_JSON"; then
+		mlat="$(jq -r 'if .mlat_enabled then "yes" else "no" end' <<<"$REQ_JSON")"
+	else
+		mlat="$([[ "$AGG_MLAT_DEFAULT" == "true" ]] && echo yes || echo no)"
+	fi
+
+	_piaware_supported || { _emit_error rejected "FlightAware is not supported on this OS or architecture"; exit 2; }
+	[[ -z "$feeder_id" ]] || _valid_feeder_id "$feeder_id" || { _emit_error rejected "invalid feeder ID format"; exit 2; }
+	_decoder_reachable || { _emit_error decoder_unavailable "local decoder ${AGG_DECODER_ADDR} is not reachable"; exit 2; }
+
+	# Never touch a piaware this helper did not install or configure.
+	if { _pkg_installed "$AGG_PIAWARE_PACKAGE" || [[ -e "$AGG_PIAWARE_CONF" ]]; } \
+		&& [[ "$(jq -r '.we_installed == true' <<<"$(_piaware_managed_read)")" != "true" ]]; then
+		_emit_error state_error "piaware is already installed or configured on this device and is not managed by airplanes.live"; exit 3
+	fi
+
+	host="${AGG_DECODER_ADDR%%:*}"; port="${AGG_DECODER_ADDR##*:}"
+
+	# Install when piaware is absent OR installed at a version other than the pin,
+	# so a disabled-but-managed piaware left on an old build is brought current on
+	# re-enable rather than re-enabling stale.
+	local need_install=0 cur_ver=""
+	if ! _pkg_installed "$AGG_PIAWARE_PACKAGE"; then
+		need_install=1
+	else
+		# shellcheck disable=SC2016
+		cur_ver="$("$AGG_DPKG_QUERY" -W -f='${Version}' "$AGG_PIAWARE_PACKAGE" 2>/dev/null || true)"
+		[[ -n "$AGG_PIAWARE_VERSION" && "$cur_ver" != "$AGG_PIAWARE_VERSION" ]] && need_install=1
+	fi
+	if (( need_install )); then
+		_worker_progress acquiring
+		_piaware_install   # emits + exits on failure
+	fi
+
+	_worker_progress configuring
+	_piaware_configure "$host" "$port" "$mlat" "$feeder_id" \
+		|| { _emit_error state_error "failed to configure piaware"; exit 3; }
+
+	# The local decoder must have survived the apt transaction.
+	if [[ "$(_service_state readsb.service)" != "active" ]] || ! _decoder_reachable; then
+		_emit_error state_error "local readsb decoder is no longer healthy after install"; exit 3
+	fi
+
+	_worker_progress starting-service
+	_piaware_clear_policy_rcd
+	if ! "$AGG_SYSTEMCTL" enable --now "$AGG_SERVICE_UNIT" >/dev/null 2>&1; then
+		_emit_error state_error "piaware installed but the service failed to start"; exit 3
+	fi
+	_assert_unit_live "$AGG_SERVICE_UNIT" "piaware"
+
+	# Settle on the feeder-id to persist. A reclaim id supplied in the request is
+	# authoritative (we set it via piaware-config) — don't race a stale cache file
+	# for it. Otherwise capture the auto-provisioned id with a bounded wait,
+	# accepting only a well-formed UUID; never fail enable on a slow/garbage cache
+	# (status reads the live cache as the fallback).
+	local got_id="" i cache_id
+	if [[ -n "$feeder_id" ]]; then
+		got_id="$feeder_id"
+	else
+		for (( i=0; i<AGG_PIAWARE_ID_WAIT; i++ )); do
+			if [[ -s "$AGG_PIAWARE_FEEDER_ID_FILE" ]]; then
+				cache_id="$(head -c 64 "$AGG_PIAWARE_FEEDER_ID_FILE" 2>/dev/null | tr -d '[:space:]')"
+				if _valid_feeder_id "$cache_id"; then got_id="$cache_id"; break; fi
+			fi
+			sleep 1
+		done
+	fi
+
+	# Re-verify liveness after the feeder-id wait: a unit that crash-looped during
+	# the wait would otherwise be persisted as enabled+running.
+	[[ "$(_service_state "$AGG_SERVICE_UNIT")" == "active" ]] \
+		|| { _emit_error state_error "piaware service did not stay running"; exit 3; }
+
+	local mlat_bool state iv
+	mlat_bool="$([[ "$mlat" == "yes" ]] && echo true || echo false)"
+	# shellcheck disable=SC2016
+	iv="$("$AGG_DPKG_QUERY" -W -f='${Version}' "$AGG_PIAWARE_PACKAGE" 2>/dev/null || true)"
+	[[ -n "$iv" ]] || iv="$AGG_PIAWARE_VERSION"
+	state="$(printf '%s\n' "$got_id" | jq -Rn --argjson sv "$AGG_STATE_SCHEMA_VERSION" --argjson m "$mlat_bool" --arg iv "$iv" \
+		'(input) as $fid
+		 | {schema_version:$sv, enabled:true, mlat_enabled:$m, installed_version:$iv,
+		    fields:(if $fid != "" then {feeder_id:$fid} else {} end)}')"
+	_write_state "piaware" "$state"
+	_emit_ok "piaware" "$(jq -nc --argjson p "$([[ -n "$got_id" ]] && echo true || echo false)" '{feeder_id_present:$p}')"
+}
+
+# _piaware_validate_sync: fast synchronous checks cmd_enable runs before
+# launching the worker (mirrors the head of _enable_piaware).
+_piaware_validate_sync() {
+	# shellcheck source=/dev/null
+	source "$AGG_DESC_DIR/piaware.desc"
+	# Type-check the request fields up front so a malformed mlat_enabled/fields is
+	# a clean rejection, not a downstream jq failure (a JSON string "false" is
+	# truthy in jq and would otherwise flip MLAT on).
+	if jq -e 'has("mlat_enabled") and (.mlat_enabled | type != "boolean")' >/dev/null 2>&1 <<<"$REQ_JSON"; then
+		_emit_error rejected "mlat_enabled must be a boolean"; exit 2
+	fi
+	if jq -e 'has("fields") and (.fields | type != "object")' >/dev/null 2>&1 <<<"$REQ_JSON"; then
+		_emit_error rejected "fields must be an object"; exit 2
+	fi
+	local cur fields feeder_id
+	cur="$(_load_state "piaware" 2>/dev/null)" \
+		|| { _emit_error state_error "existing piaware state is unreadable; reset to clear"; exit 3; }
+	fields="$(printf '%s\n%s\n' "$cur" "$REQ_JSON" \
+		| jq -cn 'input as $cur | input as $req | (($cur.fields // {}) + ($req.fields // {}))')"
+	feeder_id="$(jq -r '.feeder_id // ""' <<<"$fields")"
+	_piaware_supported || { _emit_error rejected "FlightAware is not supported on this OS or architecture"; exit 2; }
+	[[ -z "$feeder_id" ]] || _valid_feeder_id "$feeder_id" || { _emit_error rejected "invalid feeder ID format"; exit 2; }
+	_decoder_reachable || { _emit_error decoder_unavailable "local decoder ${AGG_DECODER_ADDR} is not reachable"; exit 2; }
+	# Refuse to adopt a piaware this helper did not install OR configure — an
+	# installed package or a leftover /etc/piaware.conf without our marker is
+	# admin-owned. (Our own enable sets we_installed before writing the conf, so
+	# this never blocks a retry of our own in-flight setup.)
+	if { _pkg_installed "$AGG_PIAWARE_PACKAGE" || [[ -e "$AGG_PIAWARE_CONF" ]]; } \
+		&& [[ "$(jq -r '.we_installed == true' <<<"$(_piaware_managed_read)")" != "true" ]]; then
+		_emit_error state_error "piaware is already installed or configured on this device and is not managed by airplanes.live"; exit 3
+	fi
+}
+
+# _piaware_reconcile_mlat <merged-state>: apply allow-mlat live + try-restart, so
+# the UI never reports "saved" while piaware runs stale config. Only acts on a
+# managed, installed piaware.
+_piaware_reconcile_mlat() {
+	local merged="$1" mlat
+	[[ "$(jq -r '.we_installed == true' <<<"$(_piaware_managed_read)")" == "true" ]] || return 0
+	_pkg_installed piaware || return 0
+	mlat="$(jq -r 'if .mlat_enabled == true then "yes" else "no" end' <<<"$merged")"
+	"$AGG_PIAWARE_CONFIG" allow-mlat "$mlat" >/dev/null 2>&1 || return 1
+	"$AGG_SYSTEMCTL" try-restart piaware.service >/dev/null 2>&1 || true
+}
+
+# _piaware_teardown: reset for the pinned-deb adapter. Acts ONLY on what we own:
+# the PACKAGE is removed only when we installed it (unhold + purge — never an
+# admin's piaware); the policy-rc.d install guard is ALWAYS removed (even after a
+# partial acquire) so a failed enable never strands it. A legacy apt-repo install
+# may have recorded apt source/keyring/pin paths under created_paths — those are
+# removed too, and a stray FlightAware source is swept as a final safety net.
+_piaware_teardown() {
+	# shellcheck source=/dev/null
+	source "$AGG_DESC_DIR/piaware.desc"
+	local managed; managed="$(_piaware_managed_read)"
+
+	if [[ "$(jq -r '.we_installed == true' <<<"$managed")" == "true" ]]; then
+		"$AGG_SYSTEMCTL" disable --now piaware.service >/dev/null 2>&1 || true
+		# Release the version hold before purge, else apt refuses to remove it.
+		"$AGG_APT_MARK" unhold "$AGG_PIAWARE_PACKAGE" >/dev/null 2>&1 || true
+		_apt purge -y "$AGG_PIAWARE_PACKAGE" >/dev/null 2>&1 || true
+		if _pkg_installed "$AGG_PIAWARE_PACKAGE"; then
+			# Purge failed (apt/dpkg lock?). Stop here and KEEP the markers + apt
+			# files so a retry can resume — don't tear down config/identity into an
+			# installed-but-unmanageable state.
+			_emit_error state_error "could not remove piaware; try again shortly"; exit 3
+		fi
+		# Targeted dependency cleanup: purge EXACTLY the orphaned packages we
+		# recorded installing (and never a protected one), rather than a blanket
+		# autoremove — so a resolver-state change between simulate and execution
+		# can't take an unrelated package.
+		local sim removed recorded pkg d bad; local -a victims=()
+		sim="$(LC_ALL=C _apt -s autoremove --purge 2>&1 || true)"
+		removed="$(awk '/^(Remv|Purg) /{print $2}' <<<"$sim")"
+		recorded=" $(jq -r '(.installed_pkgs // []) | join(" ")' <<<"$managed") "
+		for pkg in $removed; do
+			[[ "$recorded" == *" $pkg "* ]] || continue          # not one we installed
+			bad=0; for d in $AGG_PIAWARE_DENY_PKGS readsb; do [[ "$pkg" == "$d" ]] && bad=1; done
+			(( bad )) && continue
+			victims+=("$pkg")
+		done
+		(( ${#victims[@]} > 0 )) && { _apt purge -y "${victims[@]}" >/dev/null 2>&1 || true; }
+
+		rm -f -- "$AGG_PIAWARE_CONF"
+		rm -rf -- "$(dirname "$AGG_PIAWARE_FEEDER_ID_FILE")"
+	fi
+
+	# Marker-recorded apt files + policy-rc.d are always ours to remove (we created
+	# them), whether or not the package install completed.
+	local p had_apt=0
+	while IFS= read -r p; do [[ -n "$p" ]] && { rm -f -- "$p"; had_apt=1; }; done \
+		< <(jq -r '(.created_paths // [])[]' <<<"$managed")
+	_piaware_clear_policy_rcd
+	(( had_apt )) && { _apt update >/dev/null 2>&1 || true; }
+	# Belt-and-suspenders: also sweep a marker-less stale FlightAware source/pin/
+	# keyring from a pre-pin install whose markers were lost.
+	_piaware_legacy_sweep
+
+	rm -f -- "$(_piaware_managed_path)"
+}
+
+# _gen_reqid: a filesystem- and argv-safe request id for one enable run.
+_gen_reqid() {
+	local u
+	u="$(cat /proc/sys/kernel/random/uuid 2>/dev/null || true)"
+	[[ -n "$u" ]] || u="$(date +%s%N 2>/dev/null || echo 0)$$$RANDOM"
+	printf '%s' "${u//[^a-z0-9-]/}"
+}
+
+# _spool_request <id> <reqid>: persist the (already-validated, single-object)
+# REQ_JSON — which carries secrets — to a 0600 root file under a 0700 dir, so
+# the detached worker can read it by id. Atomic temp+rename.
+_spool_request() {
+	local reqid="$1" tmp path="$AGG_REQ_DIR/$1.json"
+	( umask 077; install -d -m 0700 "$AGG_REQ_DIR" ) 2>/dev/null || true
+	tmp="$(mktemp "$AGG_REQ_DIR/.$reqid.XXXXXX" 2>/dev/null)" || return 1
+	if printf '%s\n' "$REQ_JSON" >"$tmp" 2>/dev/null && chmod 0600 "$tmp" 2>/dev/null; then
+		mv -f "$tmp" "$path" 2>/dev/null || { rm -f -- "$tmp"; return 1; }
+	else
+		rm -f -- "$tmp"; return 1
+	fi
+}
+
+_rm_spool() { rm -f -- "$AGG_REQ_DIR/$1.json" 2>/dev/null || true; }
+
+# _mutation_in_progress: is a mutation worker (enable/reset/set) running, or just
+# launched? True if the shared worker unit is active/activating, or a
+# running/starting overlay was published within the grace window (the worker
+# hasn't become visible to systemd yet). A stale overlay past the grace window is
+# NOT in-progress. Op-agnostic — one mutation at a time across every verb.
+_mutation_in_progress() {
+	local svc
+	svc="$(_service_state "$AGG_ENABLE_UNIT")"
+	[[ "$svc" == "active" || "$svc" == "activating" ]] && return 0
+	[[ -f "$AGG_ENABLE_STATE" ]] || return 1
+	local raw st started age
+	raw="$(head -c "$AGG_STATE_MAX_BYTES" "$AGG_ENABLE_STATE" 2>/dev/null || true)"
+	st="$(jq -r '.status // ""' <<<"$raw" 2>/dev/null || true)"
+	[[ "$st" == "running" || "$st" == "starting" ]] || return 1
+	started="$(jq -r '.started_at // 0' <<<"$raw" 2>/dev/null || echo 0)"
+	[[ "$started" =~ ^[0-9]+$ ]] || started=0
+	age=$(( $(date +%s 2>/dev/null || echo 0) - started ))
+	(( started > 0 && age <= AGG_ENABLE_GRACE ))
+}
+
+# _emit_accepted <id> <reqid>: the fire-and-forget response shared by every async
+# mutation (enable/reset/set).
+_emit_accepted() {
+	local id="$1" reqid="$2" body
+	if ! body="$(jq -nc --argjson pv "$AGG_PROTOCOL_VERSION" --arg id "$id" --arg rid "$reqid" \
+		'{protocol_version:$pv, result:"accepted", step:"starting", id:$id, request_id:$rid}')"; then
+		_emit_error state_error "accepted-envelope build failed"; exit 3
+	fi
+	_emit_json "$body"
+}
+
+# _spawn_worker <op> <id>: shared async-launch tail for enable/reset/set. The
+# caller holds the lock, has confirmed no other mutation is in progress, and has
+# finished synchronous validation. Generates a reqid, spools the (already-read)
+# REQ_JSON, publishes the op-tagged running overlay BEFORE releasing the lock —
+# so the launch-to-active window reads as in-progress, never as a dead worker —
+# launches the detached worker, and returns {result:"accepted"}; on a launch
+# failure it rolls back ONLY its own overlay + spool and reports transient-busy.
+_spawn_worker() {
+	local op="$1" id="$2" reqid worker
+	case "$op" in
+		enable) worker="__enable-worker" ;;
+		reset)  worker="__reset-worker" ;;
+		set)    worker="__set-worker" ;;
+		*) _emit_error state_error "unknown worker op $op"; exit 3 ;;
+	esac
+	reqid="$(_gen_reqid)"
+	[[ -n "$reqid" ]] || { _emit_error state_error "could not generate a request id"; exit 3; }
+	WORKER_OP="$op"; WORKER_ID="$id"; WORKER_REQID="$reqid"
+	WORKER_STARTED="$(date +%s 2>/dev/null || echo 0)"
+	# We hold the lock and no mutation is in progress, so any spool file still on
+	# disk is orphaned (a prior worker that died, or a launch that never execed its
+	# worker). Sweep before spooling so a never-consumed secret can't accumulate.
+	rm -f -- "$AGG_REQ_DIR"/*.json 2>/dev/null || true
+	_spool_request "$reqid" || { _emit_error state_error "failed to spool $op request"; exit 3; }
+
+	# Clear any stale terminal unit so the fixed systemd-run name is free, then
+	# publish the running overlay BEFORE launch (the grace window in _enable_overlay
+	# covers the launch-to-active latency so this can't read as a dead worker).
+	"$AGG_SYSTEMCTL" reset-failed "$AGG_ENABLE_UNIT" >/dev/null 2>&1 || true
+	WORKER_STEP="starting"; _write_enable_state running
+	exec 9>&-  # release the flock so the worker can take it
+
+	# Pass the request id AND the adapter id: the id lets the worker stamp a
+	# correctly-attributed overlay even if it dies before reading the spool (the id
+	# is not a secret; only reqid indexes the secret payload).
+	if ! "$AGG_SYSTEMD_RUN" --unit="$AGG_ENABLE_UNIT" --collect \
+		"$AGG_SELF" "$worker" "$reqid" "$id" >/dev/null 2>&1; then
+		_rm_spool "$reqid"
+		_clear_enable_state "$id" "$reqid"
+		_emit_error lock_timeout "could not launch $op (another may be in progress)"; exit 4
+	fi
+	_emit_accepted "$id" "$reqid"
+}
+
+# _worker_init <reqid> <id>: shared detached-worker preamble (systemd-run target,
+# root). Validates reqid+id from the trusted argv, loads the spooled REQ_JSON and
+# unlinks the secret spool BEFORE the work (a SIGKILL mid-op leaves no secret on
+# disk), confirms the spool's id matches, republishes the running overlay, and
+# takes the lock. The caller sets WORKER_OP before calling.
+_worker_init() {
+	local reqid="$1" id="$2"
+	WORKER_MODE=1
+	WORKER_REQID="$reqid"
+	WORKER_STARTED="$(date +%s 2>/dev/null || echo 0)"
+	# Set WORKER_ID up front (from the trusted argv, not the spool) so EVERY
+	# failure path below — including a missing/corrupt spool — writes an overlay
+	# attributed to the right adapter, not an id:"" record status would ignore.
+	[[ "$reqid" =~ ^[a-z0-9-]+$ ]] || { _emit_error usage_error "invalid worker request id"; exit 5; }
+	[[ "$id" =~ $AGG_ID_RE && -f "$AGG_DESC_DIR/$id.desc" ]] || { _emit_error not_found "unknown aggregator id"; exit 2; }
+	WORKER_ID="$id"
+	local path="$AGG_REQ_DIR/$reqid.json"
+	if [[ ! -f "$path" ]]; then
+		_emit_error state_error "${WORKER_OP} request spool missing"; exit 3
+	fi
+	# Load into memory, then delete the secret spool BEFORE the slow work so a
+	# SIGKILL / RuntimeMaxSec mid-op leaves no secret on disk.
+	REQ_JSON="$(head -c "$AGG_STATE_MAX_BYTES" "$path" 2>/dev/null || true)"
+	_rm_spool "$reqid"
+	jq -e -s 'length == 1 and (.[0] | type == "object")' >/dev/null 2>&1 <<<"$REQ_JSON" \
+		|| { _emit_error parse_error "spooled request is not a single JSON object"; exit 5; }
+	# Defence in depth: the spool's id must match the id we were launched with.
+	_request_id
+	[[ "$REQ_ID" == "$id" ]] || { _emit_error rejected "spooled request id mismatch"; exit 2; }
+	WORKER_STEP="starting"; _write_enable_state running
+	_acquire_lock
+}
+
+# cmd_enable validates synchronously, then launches the slow vendor acquire as a
+# detached transient unit (systemd-run) and returns {result:"accepted"} in <1s.
+# The flock guards validation + spool; it is released before the worker is
+# launched (the worker re-acquires it for its whole transaction). One mutation at
+# a time is enforced by _mutation_in_progress + the fixed unit name.
+cmd_enable() {
+	_read_request
+	_request_id; local id="$REQ_ID"
+	_acquire_lock
+	if _mutation_in_progress; then
+		_emit_error lock_timeout "another aggregator operation is in progress; try again shortly"; exit 4
+	fi
+	case "$id" in
+		fr24) _fr24_validate_sync ;;
+		piaware) _piaware_validate_sync ;;
+		*) _emit_error rejected "enable is not yet supported for $id"; exit 2 ;;
+	esac
+	_spawn_worker enable "$id"
+}
+
+# cmd_enable_worker is the detached worker for enable (systemd-run target, root).
+# Not a sudoers verb — webconfig can only invoke `enable --json`.
+cmd_enable_worker() {
+	local reqid="$1" id="$2"
+	WORKER_OP="enable"
+	_worker_init "$reqid" "$id"
+	case "$REQ_ID" in
+		fr24) _enable_fr24 ;;
+		piaware) _enable_piaware ;;
+		*) _emit_error rejected "enable is not yet supported for $REQ_ID"; exit 2 ;;
+	esac
+}
+
+# cmd_reset_worker / cmd_set_worker are the detached workers for reset and set.
+# They run unsandboxed (a PID1-spawned transient unit) so their privileged
+# filesystem mutations — apt purge / rm under the install root / piaware-config
+# writing /etc/piaware.conf — are not blocked by the webconfig service's
+# ProtectSystem=strict mount namespace, which the old synchronous (in-sandbox)
+# path could not write through.
+cmd_reset_worker() {
+	local reqid="$1" id="$2"
+	WORKER_OP="reset"
+	_worker_init "$reqid" "$id"
+	# Guard the recursive delete again in the worker context (defence in depth).
+	[[ "$AGG_INSTALL_ROOT" == /* && "$AGG_INSTALL_ROOT" != "/" ]] \
+		|| { _emit_error state_error "unsafe install root"; exit 3; }
+	local acquire; acquire="$(_descriptor_acquire "$id")"
+	if [[ "$acquire" == "pinned-deb" ]]; then
+		# pinned-deb teardown owns its own service-stop + package removal (unhold +
+		# purge), acting ONLY on what this helper installed — never an admin's piaware.
+		case "$id" in
+			piaware) _piaware_teardown ;;
+			*) _emit_error state_error "no teardown for pinned-deb adapter $id"; exit 3 ;;
+		esac
+	else
+		# vendor-installer / default: stop the unit + drop the on-demand install dir.
+		local unit
+		if ! unit="$(_descriptor_unit "$id")"; then
+			_emit_error state_error "descriptor read failed for $id"; exit 3
+		fi
+		if [[ -n "$unit" ]]; then
+			"$AGG_SYSTEMCTL" disable --now "$unit" >/dev/null 2>&1 || true
+		fi
+		rm -rf -- "${AGG_INSTALL_ROOT:?}/$id"
+	fi
+	rm -f -- "$AGG_STATE_DIR/$id.json"
+	_emit_ok "$id"
+}
+
+cmd_set_worker() {
+	local reqid="$1" id="$2"
+	WORKER_OP="set"
+	_worker_init "$reqid" "$id"
+	local cur merged
+	cur="$(_load_state "$id")" \
+		|| { _emit_error state_error "existing state for $id is unreadable; reset to clear"; exit 3; }
+	merged="$(jq -nc \
+		--argjson cur "$cur" --argjson req "$REQ_JSON" --argjson sv "$AGG_STATE_SCHEMA_VERSION" \
+		'$cur
+		 | .schema_version = $sv
+		 | (if $req | has("mlat_enabled") then .mlat_enabled = $req.mlat_enabled else . end)
+		 | (if $req | has("fields")
+		    then .fields = (((.fields // {}) | if type == "object" then . else {} end) + $req.fields)
+		    else . end)')"
+	# piaware applies config to the live daemon BEFORE we persist, so state never
+	# claims a setting the daemon didn't accept. piaware-config writes
+	# /etc/piaware.conf — reachable only because this worker runs unsandboxed.
+	if [[ "$id" == "piaware" ]]; then
+		_piaware_reconcile_mlat "$merged" \
+			|| { _emit_error state_error "failed to apply the MLAT setting to piaware"; exit 3; }
+	fi
+	_write_state "$id" "$merged"
+	_emit_ok "$id"
+}
+
+# --- backup / restore ------------------------------------------------------
+
+# cmd_export emits a backup blob with the recoverable identities (INCLUDING
+# secret values) of every adapter that has state. This is the one verb that
+# returns secrets — an explicit, session-authenticated backup. jq reads the
+# state files directly, so secrets never enter a bash variable or jq argv.
+cmd_export() {
+	_acquire_lock
+	local ids=() files=() f id
+	if [[ -d "$AGG_DESC_DIR" ]]; then
+		for f in "$AGG_DESC_DIR"/*.desc; do
+			[[ -e "$f" ]] || continue
+			id="$(basename "$f" .desc)"
+			[[ "$id" =~ $AGG_ID_RE && -f "$AGG_STATE_DIR/$id.json" ]] || continue
+			# Skip a corrupt/empty/multi-doc state file: only single valid
+			# objects are included, keeping the `[inputs]`/ids[] arrays aligned.
+			_load_state "$id" >/dev/null 2>&1 || continue
+			ids+=("$id"); files+=("$AGG_STATE_DIR/$id.json")
+		done
+	fi
+	local body
+	if (( ${#ids[@]} == 0 )); then
+		body="$(jq -nc --argjson pv "$AGG_PROTOCOL_VERSION" --argjson sv "$AGG_STATE_SCHEMA_VERSION" \
+			'{protocol_version:$pv, result:"ok", kind:"aggregator-backup", schema_version:$sv, aggregators:{}}')" \
+			|| { _emit_error state_error "export failed"; exit 3; }
+	else
+		local ids_json
+		ids_json="$(jq -nc --args '$ARGS.positional' "${ids[@]}")"
+		body="$(jq -n --argjson pv "$AGG_PROTOCOL_VERSION" --argjson sv "$AGG_STATE_SCHEMA_VERSION" --argjson ids "$ids_json" \
+			'[inputs] as $st
+			 | {protocol_version:$pv, result:"ok", kind:"aggregator-backup", schema_version:$sv,
+			    aggregators: (reduce range(0; ($ids|length)) as $i ({};
+			      . + {($ids[$i]): {mlat_enabled: ($st[$i].mlat_enabled // false), fields: ($st[$i].fields // {})}}))}' \
+			"${files[@]}")" \
+			|| { _emit_error state_error "export failed"; exit 3; }
+	fi
+	_emit_json "$body"
+}
+
+# cmd_import restores identities from a backup blob on stdin. It validates the
+# whole blob first (all-or-nothing), refuses to overwrite an ENABLED adapter
+# (avoid state/vendor-config split-brain), then seeds each adapter's state with
+# enabled=false — a later enable reuses the restored identity. Secrets stay on
+# jq stdin throughout.
+cmd_import() {
+	_read_request
+	# Thorough structural validation up front: kind/schema, every adapter key
+	# is a syntactically valid id (so the mapfile split below is safe), every
+	# value is an object with object fields, boolean mlat, string key, and the
+	# fr24 sharing key (if present) matches the key alphabet.
+	jq -e --argjson sv "$AGG_STATE_SCHEMA_VERSION" '
+		(.kind == "aggregator-backup")
+		and ((.schema_version // 0) <= $sv)
+		and (.aggregators | type == "object")
+		and (.aggregators | keys | all(test("^[a-z0-9][a-z0-9_-]*$")))
+		and (.aggregators | to_entries | all(.value as $a
+			| ($a | type == "object")
+			and (($a.fields // {}) | type == "object")
+			and (($a.mlat_enabled // false) | type == "boolean")
+			and (($a.fields.sharing_key // "") | type == "string")))
+		and ((.aggregators.fr24.fields.sharing_key // "")
+			| (. == "" or test("^[A-Za-z0-9]{6,40}$")))
+	' >/dev/null 2>&1 <<<"$REQ_JSON" \
+		|| { _emit_error parse_error "not a valid aggregator backup"; exit 5; }
+
+	local ids id
+	mapfile -t ids < <(jq -r '.aggregators | keys[]' <<<"$REQ_JSON")
+	(( ${#ids[@]} > 0 )) || { _emit_error rejected "backup contains no aggregators"; exit 2; }
+
+	_acquire_lock
+	if _mutation_in_progress; then
+		_emit_error lock_timeout "another aggregator operation is in progress; try again shortly"; exit 4
+	fi
+	# Validate against on-device state and pre-build every seeded record BEFORE
+	# writing any, so a rejected adapter can't leave a half-applied restore.
+	local -a write_ids=() write_states=()
+	for id in "${ids[@]}"; do
+		[[ -f "$AGG_DESC_DIR/$id.desc" ]] \
+			|| { _emit_error rejected "backup references unknown adapter '$id'"; exit 2; }
+		local cur
+		cur="$(_load_state "$id" 2>/dev/null)" \
+			|| { _emit_error state_error "$id state is unreadable; reset to clear"; exit 3; }
+		if [[ "$(jq -r '.enabled == true' <<<"$cur")" == "true" ]]; then
+			_emit_error rejected "$id is enabled; disable it before importing"; exit 2
+		fi
+		local seeded
+		seeded="$(jq -c --argjson sv "$AGG_STATE_SCHEMA_VERSION" --arg id "$id" \
+			'.aggregators[$id] as $a
+			 | {schema_version:$sv, enabled:false, mlat_enabled:($a.mlat_enabled // false), fields:($a.fields // {})}' \
+			<<<"$REQ_JSON")"
+		write_ids+=("$id"); write_states+=("$seeded")
+	done
+	local i
+	for i in "${!write_ids[@]}"; do
+		_write_state "${write_ids[$i]}" "${write_states[$i]}"
+		# A restored identity supersedes any prior failed-enable overlay.
+		_clear_enable_state "${write_ids[$i]}"
+	done
+	local body
+	body="$(jq -nc --argjson pv "$AGG_PROTOCOL_VERSION" --argjson n "${#write_ids[@]}" \
+		'{protocol_version:$pv, result:"ok", imported:$n}')"
+	_emit_json "$body"
+}
+
+# --- reconcile (overlay-update auto-apply) ---------------------------------
+
+# _reconcile_stamp <id> <installed_version|""> <status> <code> <msg>: best-effort
+# state update used by reconcile. Records installed_version when a non-empty one
+# is given (the build now on disk, even if a later restart failed); on ok clears
+# any reconcile_error, on failure stamps it (so status keeps showing the problem).
+# Never emits/exits — reconcile must not abort on a state-write hiccup.
+_reconcile_stamp() {
+	local id="$1" iv="$2" status="$3" code="$4" msg="$5" cur merged tmp dir="$AGG_STATE_DIR"
+	cur="$(_load_state "$id" 2>/dev/null || printf '{}')"
+	merged="$(jq -c --arg v "$iv" --arg st "$status" --arg c "$code" --arg m "$msg" '
+		(if $v != "" then .installed_version=$v else . end)
+		| (if $st == "ok" then del(.reconcile_error)
+		   else .reconcile_error={error_code:$c, message:$m} end)' <<<"$cur" 2>/dev/null)" || return 0
+	install -d -m 0750 "$dir" 2>/dev/null || true
+	tmp="$(mktemp "$dir/.$id.XXXXXX" 2>/dev/null)" || return 0
+	if printf '%s\n' "$merged" >"$tmp" 2>/dev/null && chmod 0600 "$tmp" 2>/dev/null; then
+		mv -f "$tmp" "$dir/$id.json" 2>/dev/null || rm -f -- "$tmp"
+	else
+		rm -f -- "$tmp"
+	fi
+}
+
+# _reconcile_one <id>: bring a single managed+installed adapter to its descriptor
+# pin, restarting it if enabled. Echoes one JSON summary object, or nothing if the
+# adapter is not ours/installed (skipped). Runs in a subshell (descriptor sourced,
+# isolated) with errexit off so a failure is captured into the summary, never
+# aborts the caller.
+_reconcile_one() {
+	local id="$1"
+	(
+		set +e
+		AGG_ACQUIRE_METHOD=""; AGG_SERVICE_UNIT=""
+		AGG_FR24_DEB_URL=""; AGG_FR24_DEB_SHA256=""; AGG_FR24_VERSION=""
+		AGG_PIAWARE_DEB_URL=""; AGG_PIAWARE_DEB_SHA256=""; AGG_PIAWARE_VERSION=""
+		AGG_PIAWARE_PACKAGE=""; AGG_PIAWARE_DENY_PKGS=""
+		AGG_PIAWARE_SUPPORTED_ARCHES=""; AGG_PIAWARE_SUPPORTED_CODENAMES=""
+		# shellcheck source=/dev/null
+		source "$AGG_DESC_DIR/$id.desc"
+
+		local state enabled installed_version desired_version=""
+		state="$(_load_state "$id" 2>/dev/null || printf '{}')"
+		enabled="$(jq -r '.enabled == true' <<<"$state" 2>/dev/null || echo false)"
+		installed_version="$(jq -r '.installed_version // ""' <<<"$state")"
+
+		local action="noop" status="ok" code="" msg="" from="" to="" unit="$AGG_SERVICE_UNIT" newver=""
+		case "$AGG_ACQUIRE_METHOD" in
+			vendor-installer)
+				desired_version="$AGG_FR24_VERSION"
+				[[ -d "$AGG_INSTALL_ROOT/$id" && -n "$(ls -A "$AGG_INSTALL_ROOT/$id" 2>/dev/null)" ]] || exit 0
+				from="$installed_version"; to="$desired_version"
+				if [[ -n "$desired_version" && "$installed_version" != "$desired_version" ]]; then
+					action="update"
+					if _fr24_acquire_binary "$AGG_FR24_DEB_URL" "$AGG_FR24_DEB_SHA256" "${AGG_FR24_BIN:-$AGG_INSTALL_ROOT/fr24/fr24feed}"; then
+						_fr24_finalize_perms "${AGG_FR24_INI:-$AGG_STATE_HOME/fr24/fr24feed.ini}"
+						newver="$desired_version"
+					else
+						status="failed"; code="acquire_failed"; msg="could not download or verify fr24feed"
+					fi
+				fi ;;
+			pinned-deb)
+				desired_version="$AGG_PIAWARE_VERSION"
+				_pkg_installed "${AGG_PIAWARE_PACKAGE:-$id}" || exit 0
+				[[ "$(jq -r '.we_installed == true' <<<"$(_piaware_managed_read)")" == "true" ]] || exit 0
+				# Sweep a stale apt source a pre-pin (apt-repo) install may have left,
+				# so migrating a feeder fully removes it even on a same-version run.
+				_piaware_legacy_sweep
+				# shellcheck disable=SC2016
+				installed_version="$("$AGG_DPKG_QUERY" -W -f='${Version}' "${AGG_PIAWARE_PACKAGE:-$id}" 2>/dev/null || true)"
+				from="$installed_version"; to="$desired_version"
+				if [[ -n "$desired_version" && "$installed_version" != "$desired_version" ]]; then
+					action="update"
+					local tmp deb
+					tmp="$(mktemp -d 2>/dev/null)"
+					if [[ -n "$tmp" ]]; then
+						deb="$tmp/piaware.deb"
+						# Block maintainer-script autostart during the apt install so a
+						# disabled adapter is not silently started by the .deb's postinst.
+						_piaware_set_policy_rcd || true
+						if _piaware_acquire_deb "$deb" && _piaware_install_deb "$deb"; then
+							newver="$AGG_PIAWARE_VERSION"
+						else
+							status="failed"; code="${_AGG_ERRCODE:-acquire_failed}"; msg="${_AGG_ERRMSG:-failed to reconcile piaware}"
+						fi
+						_piaware_clear_policy_rcd
+						rm -rf "$tmp"
+					else
+						status="failed"; code="state_error"; msg="mktemp failed"
+					fi
+				fi ;;
+			*) exit 0 ;;
+		esac
+
+		# Restart the enabled ones: a successful update needs the new build live; a
+		# no-op still try-restarts so a changed unit/wrapper takes effect. Then prove
+		# it actually stayed up — a crash after a "successful" update is a failure.
+		if [[ "$enabled" == "true" && "$status" == "ok" && -n "$unit" ]]; then
+			"$AGG_SYSTEMCTL" try-restart "$unit" >/dev/null 2>&1 || true
+			[[ "$action" == "noop" ]] && action="restart"
+			sleep "$AGG_LIVENESS_WAIT" 2>/dev/null || true
+			if [[ "$(_service_state "$unit")" != "active" ]]; then
+				status="failed"; code="state_error"; msg="$id did not stay running after the update"
+			fi
+		fi
+		# Single state stamp: record the version now on disk (newver, if any) and
+		# set/clear reconcile_error by the final status.
+		_reconcile_stamp "$id" "$newver" "$status" "$code" "$msg"
+
+		jq -nc --arg id "$id" --arg action "$action" --arg from "$from" --arg to "$to" \
+			--arg status "$status" --arg code "$code" --arg msg "$msg" \
+			'{id:$id, action:$action, from:$from, to:$to, status:$status}
+			 | (if $code != "" then .error_code=$code else . end)
+			 | (if $msg != "" then .message=$msg else . end)'
+	)
+}
+
+# _reconcile_skip <reason>: emit an ok envelope with an empty reconciled[] and a
+# skipped reason, then exit 0. Used for the soft cases (lock busy / enable in
+# flight) so reconcile is ALWAYS exit 0 and can never abort the overlay update.
+_reconcile_skip() {
+	local body
+	body="$(jq -nc --argjson pv "$AGG_PROTOCOL_VERSION" --arg r "$1" \
+		'{protocol_version:$pv, result:"ok", reconciled:[], skipped:$r}')"
+	_emit_json "$body"; exit 0
+}
+
+# cmd_reconcile brings every managed+installed adapter to its descriptor's pinned
+# version, then restarts the ones left enabled. Invoked by the overlay self-update
+# (as root) after a new overlay flips `current`, so a release that bumps a pin
+# auto-applies on the next "Update System". NOT a sudoers verb — webconfig never
+# calls it. ALWAYS exits 0 (fail-soft per adapter; soft-skips when busy) so it can
+# never fail the update. Emits {result:"ok", reconciled:[…]}.
+cmd_reconcile() {
+	# Soft lock: never exit 4 (which would let a caller without `|| true` abort the
+	# update) — a busy lock just skips this round.
+	mkdir -p "$(dirname "$AGG_LOCK")" 2>/dev/null || true
+	exec 9>"$AGG_LOCK" || _reconcile_skip lock_error
+	flock -w "$AGG_LOCK_TIMEOUT" 9 || _reconcile_skip busy
+	# Don't fight an enable the user just kicked off.
+	_mutation_in_progress && _reconcile_skip enable_in_progress
+	local results=() f id obj
+	if [[ -d "$AGG_DESC_DIR" ]]; then
+		for f in "$AGG_DESC_DIR"/*.desc; do
+			[[ -e "$f" ]] || continue
+			id="$(basename "$f" .desc)"
+			[[ "$id" =~ $AGG_ID_RE ]] || continue
+			obj="$(_reconcile_one "$id")" || true
+			[[ -n "$obj" ]] && results+=("$obj")
+		done
+	fi
+	local body
+	if (( ${#results[@]} == 0 )); then
+		body="$(jq -nc --argjson pv "$AGG_PROTOCOL_VERSION" '{protocol_version:$pv, result:"ok", reconciled:[]}')"
+	else
+		body="$(printf '%s\n' "${results[@]}" | jq -sc \
+			--argjson pv "$AGG_PROTOCOL_VERSION" '{protocol_version:$pv, result:"ok", reconciled:.}')"
+	fi
+	_emit_json "$body"
+}
+
+# --- dispatch --------------------------------------------------------------
+
+main() {
+	command -v jq >/dev/null 2>&1 || { _emit_error state_error "jq is required"; exit 3; }
+
+	# Internal worker modes (not sudoers verbs; launched only by systemd-run as
+	# root). Argv is `__<op>-worker <request_id> <id>`, no --json. These run
+	# unsandboxed so the privileged filesystem work escapes the webconfig sandbox.
+	if [[ "${1-}" == "__enable-worker" ]]; then
+		[[ $# -eq 3 ]] || { _emit_error usage_error "usage: apl-aggregator __enable-worker <request_id> <id>"; exit 5; }
+		cmd_enable_worker "$2" "$3"; exit 0
+	fi
+	if [[ "${1-}" == "__reset-worker" ]]; then
+		[[ $# -eq 3 ]] || { _emit_error usage_error "usage: apl-aggregator __reset-worker <request_id> <id>"; exit 5; }
+		cmd_reset_worker "$2" "$3"; exit 0
+	fi
+	if [[ "${1-}" == "__set-worker" ]]; then
+		[[ $# -eq 3 ]] || { _emit_error usage_error "usage: apl-aggregator __set-worker <request_id> <id>"; exit 5; }
+		cmd_set_worker "$2" "$3"; exit 0
+	fi
+
+	if [[ $# -ne 2 || "${2-}" != "--json" ]]; then
+		_emit_error usage_error "usage: apl-aggregator {status|list|detail|enable|set|disable|reset|reconcile|export|import} --json"
+		exit 5
+	fi
+	case "$1" in
+		status|list) cmd_status; exit 0 ;;
+		detail) cmd_detail; exit 0 ;;
+		enable) cmd_enable; exit 0 ;;
+		set) cmd_set; exit 0 ;;
+		disable) cmd_disable; exit 0 ;;
+		reset) cmd_reset; exit 0 ;;
+		# reconcile is root-invoked by the overlay self-update, not a sudoers verb.
+		reconcile) cmd_reconcile; exit 0 ;;
+		export) cmd_export; exit 0 ;;
+		import) cmd_import; exit 0 ;;
+		*) _emit_error usage_error "unknown verb '$1'; use status|list|detail|enable|set|disable|reset|reconcile|export|import --json"; exit 5 ;;
+	esac
+}
+
+main "$@"

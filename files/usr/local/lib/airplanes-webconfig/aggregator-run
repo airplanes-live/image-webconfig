@@ -1,0 +1,30 @@
+#!/bin/bash
+# aggregator-run <id> — ExecStart shim for airplanes-aggregator@<id>.service.
+#
+# Validates the instance id, confirms a (trusted, code-owned) descriptor exists,
+# and execs the vendor feeder binary that `apl-aggregator enable` installed.
+# Per-adapter exec is hardcoded here (the id is validated) — descriptors carry
+# data, never command strings.
+set -Eeuo pipefail
+
+AGG_INSTALL_ROOT="${AGG_INSTALL_ROOT:-/opt/airplanes-aggregators}"
+AGG_DESC_DIR="${AGG_DESC_DIR:-/usr/local/lib/airplanes-webconfig/aggregators}"
+AGG_STATE_HOME="${AGG_STATE_HOME:-/var/lib/airplanes-aggregators}"
+
+id="${1:-}"
+[[ "$id" =~ ^[a-z0-9][a-z0-9_-]*$ ]] || { echo "aggregator-run: invalid id '$id'" >&2; exit 64; }
+[[ -f "$AGG_DESC_DIR/$id.desc" ]] || { echo "aggregator-run: no descriptor for '$id'" >&2; exit 64; }
+
+case "$id" in
+	fr24)
+		bin="$AGG_INSTALL_ROOT/fr24/fr24feed"
+		ini="$AGG_STATE_HOME/fr24/fr24feed.ini"
+		[[ -x "$bin" ]] || { echo "aggregator-run: fr24feed not installed at $bin" >&2; exit 69; }
+		[[ -f "$ini" ]] || { echo "aggregator-run: fr24feed.ini missing at $ini" >&2; exit 78; }
+		exec "$bin" --config-file="$ini"
+		;;
+	*)
+		echo "aggregator-run: unsupported aggregator '$id'" >&2
+		exit 64
+		;;
+esac

@@ -12,43 +12,42 @@ Every published release carries exactly five assets:
 - `manifest.json` — `{version, kind, commit_sha, build_date, arches}`
 - `SHA256SUMS` — covers all four of the above
 
-The set is a contract. Build-mode install (`install.sh --build-mode`) and the on-device self-update helper both expect all five and fail loudly if any is missing or its SHA256 doesn't match.
+The set is a contract. Build-mode install (`install.sh --build-mode`) and the runtime overlay both expect all five and fail loudly if any is missing or its SHA256 doesn't match.
 
 **Don't ship a binary without a matching rootfs.tar.gz.** The systemd unit, sudoers, and helper scripts must version with the binary (see "sudoers/argv parity" below). Shipping only a new ELF leaves the policy stale.
 
 ## Sudoers / argv parity
 
-`internal/server/server.go`'s `DefaultPrivilegedArgv()` hard-codes every `/usr/bin/sudo -n …` argv shape the binary invokes. Each shape must appear byte-for-byte in `files/etc/sudoers.d/010_airplanes-webconfig` (base privileges) or `files/etc/sudoers.d/011_airplanes-webconfig-update` (self-update grant — placeholder until the helper lands).
+`internal/server/server.go`'s `DefaultPrivilegedArgv()` hard-codes every `/usr/bin/sudo -n …` argv shape the binary invokes. Each shape must appear byte-for-byte in `files/etc/sudoers.d/010_airplanes-webconfig`.
 
-The Go test `TestDefaultPrivilegedArgv_SudoersParity` enforces this from the binary side; the `visudo` CI job verifies the sudoers files parse. Both ship in the same release tarball, so a new argv requires a paired sudoers change in the same PR.
+The Go test `TestDefaultPrivilegedArgv_SudoersParity` enforces this from the binary side; the `visudo` CI job verifies the sudoers file parses. Both ship in the same release tarball, so a new argv requires a paired sudoers change in the same PR.
 
 **Don't**:
 
-- Don't let `010`/`011` live in `airplanes-live/image` while the argv lives here. Parity has to be enforceable in one repo.
+- Don't let `010` live in `airplanes-live/image` while the argv lives here. Parity has to be enforceable in one repo.
 - Don't add a new argv shape without adding a sudoers line for it AND a parity-test case.
 - Don't broaden a sudoers entry to a wildcard (e.g. `apl-feed apply *`) to "fix" a parity failure. Pin the exact argv.
 
 ## Install-mode contract
 
-`install.sh` has two modes:
+`install.sh` has a single mode: `--build-mode`. It runs from a cloned source tree at pi-gen's build host. `ROOTFS_DIR` is the pi-gen staging rootfs; `ARCH` is set to `arm64` or `armhf`; `AIRPLANES_WEBCONFIG_BRANCH` is the concrete tag (stable) or branch (dev) the image config pinned. It downloads the matching release, extracts the rootfs payload, installs the binary, and writes the manifest into `ROOTFS_DIR`. It does no `systemctl` and no user creation — those happen in the chroot step. It cross-checks `manifest.json.commit_sha` against `git rev-parse HEAD` of the cloned tree and hard-fails on mismatch.
 
-- `--build-mode` (or `AIRPLANES_BUILD_MODE=1`): runs from a cloned source tree at pi-gen's build host. `ROOTFS_DIR` is the pi-gen staging rootfs; `ARCH` is set to `arm64` or `armhf`; `AIRPLANES_WEBCONFIG_BRANCH` is the concrete tag (stable) or branch (dev) the image config pinned. **Does not read `/etc/airplanes/release-channel`** — that file is written by pi-gen `stage 06`, which runs AFTER `stage 05`. Cross-checks `manifest.json.commit_sha` against `git rev-parse HEAD` of the cloned tree and hard-fails on mismatch.
-- `--runtime`: runs on a booted feeder, invoked by the sudoers-pinned self-update helper. Reads `/etc/airplanes/release-channel`, resolves `stable` (highest semver tag) or `dev` (`dev-latest` moving tag), saves the previous binary as `.prev` for rollback, atomic-renames in the new one, extracts the rootfs payload, writes the manifest. Caller restarts the service and probes `/health`.
+On-device updates do not run `install.sh`. Webconfig is delivered and updated through the runtime overlay (`airplanes-live/image`); there is no in-product self-update path.
 
 **Don't**:
 
-- Don't read `/etc/airplanes/release-channel` from build mode. It's not there yet.
-- Don't write directly over `/usr/local/bin/airplanes-webconfig` while the service is running — `ETXTBSY`. Use the two-step rename through `.new`.
-- Don't skip the `manifest.json.commit_sha` cross-check in build mode. A baked binary that doesn't match the baked rootfs payload is a release-pipeline bug and a silent one when shipped.
+- Don't read `/etc/airplanes/release-channel` from `install.sh`. In build mode that file isn't there yet (pi-gen `stage 06` writes it after `stage 05`).
+- Don't skip the `manifest.json.commit_sha` cross-check. A baked binary that doesn't match the baked rootfs payload is a release-pipeline bug and a silent one when shipped.
 
 ## Channel resolution
 
-Allowlist: `stable`, `dev`, `main`. `main` is a legacy alias for `stable` — kept consistent with feed's contract so a feeder migrating between feed and webconfig update mechanisms has one rule. Anything else aborts with a clear error rather than silently falling through.
+`AIRPLANES_WEBCONFIG_BRANCH` is passed through `airplanes_webconfig_resolve_tag`:
 
-- `stable` → `airplanes_webconfig_resolve_latest_stable_tag()` → `git ls-remote --tags --refs` filtered by strict semver regex `^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$` (no leading zeroes, no prereleases) → highest via `sort -V`.
-- `dev` → `airplanes_webconfig_resolve_dev_latest_tag()` → the moving `dev-latest` tag that the release workflow force-pushes on every dev build. Single rewritable tag avoids JSON-parsing the Releases API on a feeder.
+- A concrete `v[MAJOR].[MINOR].[PATCH]` tag is echoed back unchanged.
+- `dev` → `airplanes_webconfig_resolve_dev_latest_tag()` → the moving `dev-latest` tag that the release workflow force-pushes on every dev build.
+- Anything else aborting cleanly is preferable to silently falling through.
 
-**Don't add a third channel** unless there's a real reason. Each channel multiplies test surface and operator confusion.
+`airplanes_webconfig_resolve_latest_stable_tag()` (`git ls-remote --tags --refs` filtered by strict semver regex `^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$`, highest via `sort -V`) remains available for resolving `stable`.
 
 ## Manifest cross-check rationale
 
@@ -63,28 +62,33 @@ The cross-check turns either of those into a build failure rather than a silentl
 
 `airplanes-live/image-webconfig` was seeded by `git filter-repo --subdirectory-filter webconfig` over a clone of `airplanes-live/image`. **No tags were pushed during seeding** — image had a `dev-latest` tag whose history now lives only in `airplanes-live/image`, and image's semver tags don't apply to this repo's release namespace. The release namespace here starts fresh at `v0.1.0`.
 
-## Runtime dependencies on the Pi
+## Build-host dependencies
 
-The on-device updater needs `git` (used by `airplanes_webconfig_resolve_latest_stable_tag` / `airplanes_webconfig_resolve_dev_latest_tag` for `git ls-remote`), `curl`, `tar`, `sha256sum`, `flock`, and `python3` (one-liner JSON parse in `airplanes_webconfig_verify_manifest_*`). The image install path covers all of these (`git` and `python3` already needed elsewhere in the feed/cloud-init stack); a hand-installed webconfig on a stripped-down OS without `git` would fail tag resolution with what looks like a network error. If we ever drop `git` as a runtime dep, replace `git ls-remote` with a curl-against-the-releases-API path and refactor the resolver.
+`install.sh --build-mode` needs `git` (used by `airplanes_webconfig_resolve_*` for `git ls-remote`), `curl`, `tar`, `sha256sum`, and `python3` (one-liner JSON parse in `airplanes_webconfig_verify_manifest_*`). These run on the pi-gen build host, not on the feeder.
 
 ## GNU-only target
 
-`install.sh`, `update.sh`, and `scripts/lib/install-common.sh` use `sort -V`, GNU `tar`, `flock`, and `sha256sum -c` — Linux/GNU only. The target is Raspberry Pi OS, so this is fine. Don't try to support these scripts on BSD/macOS; write Go for anything that needs cross-platform reach.
+`install.sh` and `scripts/lib/install-common.sh` use `sort -V`, GNU `tar`, and `sha256sum -c` — Linux/GNU only. The build host is Linux, so this is fine. Don't try to support these scripts on BSD/macOS; write Go for anything that needs cross-platform reach.
 
-## Self-update privilege boundary (PR-3 contract)
+## Updates are delivered through the runtime overlay
 
-When the on-device self-update helper invokes `update.sh` via the sudoers-pinned `systemd-run` line, it must:
+Webconfig has no in-product self-update path. Updates ship as part of the runtime overlay release in `airplanes-live/image`, which extracts the new binary + rootfs payload and restarts the service. `install.sh` runs only at image-build time.
 
-- Run with `env -i` (or equivalent) so the running webconfig service (compromised attacker) cannot pass `AIRPLANES_WEBCONFIG_REPO=…` or `AIRPLANES_WEBCONFIG_DOWNLOAD_BASE=…` to point downloads at an attacker server.
-- Set only the safe defaults inside the helper: `PATH=/usr/sbin:/usr/bin:/sbin:/bin`, no other AIRPLANES_* env.
-- Reset the lock-file path to a hard-coded value (no `AIRPLANES_WEBCONFIG_LOCK_DIR` override from the caller's env).
+### Upgrade-state HTTP surface
 
-The script files themselves still accept the env-var overrides because the bats tests rely on them — that's safe as long as the sudo-pinned helper scrubs the environment before invocation. The test suite covers the env-override path; the production privilege boundary is the helper's responsibility.
+`GET /api/status/upgrade` returns `{"state": "clean" | "in-progress" | "failed" | "unknown"}`. `unknown` covers every operationally-indistinct case the caller cannot triage: missing file, empty, malformed, unparseable, read error. The marker is written by the overlay update path; a feeder that has never been upgraded — or one without the marker — reports `unknown`.
+
+`/health` stays plain-text `ok <version>`: JSON-ifying it would misreport a rolled-back-with-`failed`-marker device as a successful upgrade because the version byte-changes after a partial extract. Upgrade state belongs on a dedicated status endpoint, not a health probe.
+
+### Upgrade-state file ownership
+
+Parent dir `/var/lib/airplanes-webconfig-upgrade/` is `0755 root:root`. File `/var/lib/airplanes-webconfig-upgrade/upgrade-state` is `0644 root:root`. The unprivileged `airplanes-webconfig` service account can read but cannot unlink/replace — intentionally NOT `/var/lib/airplanes-webconfig/`, which is `0700 airplanes-webconfig:airplanes-webconfig` and would let the account replace the marker regardless of file ownership.
+
+The directory is provisioned two ways (idempotent): `install.sh --build-mode` calls `airplanes_webconfig_ensure_upgrade_state_dir` (mode 0755), and the rootfs tarball ships `files/var/lib/airplanes-webconfig-upgrade/.gitkeep` so `tar --owner=0 --group=0` lays the dir down as `root:root` during extract.
 
 ## Accepted v1 limitations
 
-These are known, deferred to a follow-up rather than fixed in the install/update pipeline:
+These are known, deferred to a follow-up:
 
-- **TOFU on the release server.** Verification is SHA256 + HTTPS to `github.com`. A repo-admin compromise (or a sufficiently-deep GitHub compromise) lets an attacker serve an arbitrary `rootfs.tar.gz` + `airplanes-webconfig-arm64` and matching `SHA256SUMS`, and devices will install them. Mitigation in the roadmap: detached minisign signatures (the helper is structured to verify an extra `SHA256SUMS.minisig` next to `SHA256SUMS` once the signing key is provisioned in CI).
-- **Atomic rootfs swap.** The runtime path extracts `rootfs.tar.gz` first, then atomic-swaps the binary, then writes the manifest. A power loss or ENOSPC mid-extraction can leave systemd units and helper scripts updated against the still-old binary. The binary's `.prev` rollback covers the most common failure (new binary doesn't start), but a partial tarball is not rolled back. Acceptable because (a) the binary is the one that breaks user-visible boot, and (b) the helper's `/health` probe + binary rollback recovers from the only failure that takes the UI down. A future hardening adds staged tar extract + bulk rename.
-- **Operator discipline for tag pushes.** A `v[0-9]+.[0-9]+.[0-9]+` tag pushed without a successful release pipeline run will be picked up by `airplanes_webconfig_resolve_latest_stable_tag` and lead to a "release assets not found" failure on every device that resolves it. Don't push semver tags by hand — let the release workflow create them, or push from a state where you can confirm the workflow ran green before any device picks the tag up.
+- **TOFU on the release server.** Build-mode verification is SHA256 + HTTPS to `github.com`. A repo-admin compromise (or a sufficiently-deep GitHub compromise) lets an attacker serve an arbitrary `rootfs.tar.gz` + `airplanes-webconfig-arm64` and matching `SHA256SUMS`, and the build would bake them. Mitigation in the roadmap: detached minisign signatures over the release assets once the signing key is provisioned in CI.
+- **Operator discipline for tag pushes.** A `v[0-9]+.[0-9]+.[0-9]+` tag pushed without a successful release pipeline run will be picked up by `airplanes_webconfig_resolve_latest_stable_tag` and lead to a "release assets not found" failure on any build that resolves it. Don't push semver tags by hand — let the release workflow create them.

@@ -1,6 +1,8 @@
 // Package auth implements webconfig's password hashing, session management,
 // login throttling, and password store. Hashing uses argon2id with the PHC
-// string format; sessions are in-memory only (service restart = logout).
+// string format; sessions are held in memory keyed by token hash and can be
+// mirrored to a tmpfs file so they survive a service restart (reboot still
+// logs everyone out) — see Sessions.
 package auth
 
 import (

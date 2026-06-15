@@ -94,6 +94,12 @@ func injectID(body []byte, id string) ([]byte, error) {
 			return nil, errors.New("request body must be a JSON object")
 		}
 	}
+	// json.Unmarshal of a literal `null` leaves m nil (no error); writing to a
+	// nil map panics. Treat null (and any non-object that decoded to nil) as a
+	// bad request rather than crashing the handler.
+	if m == nil {
+		return nil, errors.New("request body must be a JSON object")
+	}
 	idJSON, _ := json.Marshal(id)
 	m["id"] = idJSON
 	return json.Marshal(m)
@@ -190,8 +196,10 @@ func (s *Server) handleWifiDelete(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleWifiActivate(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
-	if !wifi.ValidID(id) {
-		writeJSONError(w, http.StatusBadRequest, "invalid id; expected airplanes-config-wifi or airplanes-wifi-<slug>")
+	// Activation is a runtime-only nmcli op, so a foreign network may be
+	// activated too — the helper re-validates the uuid before touching NM.
+	if !wifi.ValidActivatableID(id) {
+		writeJSONError(w, http.StatusBadRequest, "invalid id; expected airplanes-config-wifi, airplanes-wifi-<slug>, or foreign-<uuid>")
 		return
 	}
 	// activate ignores any client body, but still go through the same path
@@ -205,6 +213,29 @@ func (s *Server) handleWifiActivate(w http.ResponseWriter, r *http.Request) {
 	if ierr != nil {
 		log.Printf("wifi activate: %v", ierr)
 		writeJSONError(w, http.StatusInternalServerError, "wifi activate failed")
+		return
+	}
+	s.writeWifiResponse(w, resp, httpStatus)
+}
+
+// handleWifiAdopt re-homes a foreign (netplan/flash-time) network into a managed
+// keyfile. Only `foreign-<uuid>` ids are accepted; the helper does the real
+// work (read fields, write keyfile, drop the netplan source) and owns rollback.
+func (s *Server) handleWifiAdopt(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if !wifi.ValidForeignID(id) {
+		writeJSONError(w, http.StatusBadRequest, "invalid id; adopt expects foreign-<uuid>")
+		return
+	}
+	body, err := injectID([]byte("{}"), id)
+	if err != nil {
+		writeJSONError(w, http.StatusInternalServerError, "adopt body marshal failed")
+		return
+	}
+	resp, httpStatus, ierr := s.invokeWifi(r.Context(), s.priv.WifiAdopt, body)
+	if ierr != nil {
+		log.Printf("wifi adopt: %v", ierr)
+		writeJSONError(w, http.StatusInternalServerError, "wifi adopt failed")
 		return
 	}
 	s.writeWifiResponse(w, resp, httpStatus)

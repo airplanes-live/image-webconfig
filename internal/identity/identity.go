@@ -13,29 +13,37 @@
 package identity
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io/fs"
 	"os"
 	"regexp"
+	"strconv"
 	"strings"
+	"time"
+
+	"github.com/airplanes-live/image-webconfig/internal/feedenv"
 )
 
 // Paths webconfig reads. Override per-test.
 type Paths struct {
-	FeederIDFile    string // /etc/airplanes/feeder-id
-	ClaimSecretFile string // /etc/airplanes/feeder-claim-secret
-	ClaimPageURL    string // https://airplanes.live/feeder/claim
+	FeederIDFile     string // /etc/airplanes/feeder-id
+	ClaimSecretFile  string // /etc/airplanes/feeder-claim-secret
+	ClaimVersionFile string // /etc/airplanes/feeder-claim-secret.version
 }
 
-const defaultClaimPageURL = "https://airplanes.live/feeder/claim"
+const (
+	defaultWebsiteURL       = "https://airplanes.live"
+	defaultClaimVersionFile = "/etc/airplanes/feeder-claim-secret.version"
+)
 
 // DefaultPaths returns production paths.
 func DefaultPaths() Paths {
 	return Paths{
-		FeederIDFile:    "/etc/airplanes/feeder-id",
-		ClaimSecretFile: "/etc/airplanes/feeder-claim-secret",
-		ClaimPageURL:    defaultClaimPageURL,
+		FeederIDFile:     "/etc/airplanes/feeder-id",
+		ClaimSecretFile:  "/etc/airplanes/feeder-claim-secret",
+		ClaimVersionFile: defaultClaimVersionFile,
 	}
 }
 
@@ -43,21 +51,58 @@ func DefaultPaths() Paths {
 // Paths to point at fixture files.
 type Reader struct {
 	paths Paths
+	env   *feedenv.Reader
 }
 
-// NewReader builds a Reader. Empty ClaimPageURL falls back to the
-// production default so callers don't have to specify it.
-func NewReader(p Paths) *Reader {
-	if p.ClaimPageURL == "" {
-		p.ClaimPageURL = defaultClaimPageURL
+// NewReader builds a Reader. env supplies APL_FEED_WEBSITE_URL for the
+// claim-page link; nil falls back to the production CLI-backed reader.
+// An empty ClaimVersionFile falls back to the production default so
+// callers don't have to specify it (and so test fixtures that don't
+// care about it still work).
+func NewReader(p Paths, env *feedenv.Reader) *Reader {
+	if p.ClaimVersionFile == "" {
+		p.ClaimVersionFile = defaultClaimVersionFile
 	}
-	return &Reader{paths: p}
+	if env == nil {
+		env = feedenv.New()
+	}
+	return &Reader{paths: p, env: env}
 }
 
-// Identity is the GET /api/identity payload.
+// claimPage builds the claim page URL from APL_FEED_WEBSITE_URL — the same
+// backend pointer apl-feed registers the secret against — falling back to
+// production when unset. Mirrors feed's claim.sh claim_page_url so the UI
+// link and the CLI instructions point at the same site. Resolved per call,
+// not at construction: the value can change under a running webconfig.
+func (r *Reader) claimPage(ctx context.Context) string {
+	base := strings.TrimRight(r.env.WebsiteURL(ctx), "/")
+	if base == "" {
+		base = defaultWebsiteURL
+	}
+	return base + "/feeder/claim/"
+}
+
+// Identity is the GET /api/identity payload. All fields are always
+// emitted (no `omitempty`) so the wire shape is stable for downstream
+// consumers — an unclaimed feeder returns `"claim_secret_updated_at":""`
+// and `"claim_secret_version":0`, not omitted keys.
 type Identity struct {
 	FeederID           string `json:"feeder_id"`
 	ClaimSecretPresent bool   `json:"claim_secret_present"`
+	// ISO 8601 UTC mtime of /etc/airplanes/feeder-claim-secret, empty
+	// when no secret is on disk. Tracks the moment the secret file was
+	// last replaced — claim register (mv pending→final), claim rotate
+	// (same mv), claim set (write_secret_file). Not the server-accept
+	// moment: claim register's `mv` preserves the pending file's mtime,
+	// so on a retried registration this can lag server acceptance by
+	// the retry window.
+	ClaimSecretUpdatedAt string `json:"claim_secret_updated_at"`
+	// Numeric version from /etc/airplanes/feeder-claim-secret.version,
+	// 0 when the file is missing or unparseable. Best-effort: feed sets
+	// it after a successful register/rotate; claim set deliberately
+	// removes it (the file on disk no longer matches whatever version
+	// the server last confirmed).
+	ClaimSecretVersion int `json:"claim_secret_version"`
 }
 
 // IdentityWithSecret is the POST /api/identity/secret payload.
@@ -80,7 +125,8 @@ var ErrNoClaimSecret = errors.New("identity: claim secret missing")
 var canonicalSecret = regexp.MustCompile(`^[A-Z0-9]{16}$`)
 
 // Read returns the redacted identity. The feeder-id file is plain-text and
-// readable by anyone; the claim-secret file we only stat for presence.
+// readable by anyone; the claim-secret file we stat for presence + mtime,
+// and read a sibling .version file (best-effort).
 func (r *Reader) Read() (Identity, error) {
 	feederID, err := readSingleLine(r.paths.FeederIDFile)
 	if err != nil {
@@ -92,14 +138,59 @@ func (r *Reader) Read() (Identity, error) {
 	if feederID == "" {
 		return Identity{}, ErrNoFeederID
 	}
-	present := false
-	if info, err := os.Stat(r.paths.ClaimSecretFile); err == nil && info.Size() > 0 {
-		present = true
+
+	id := Identity{FeederID: feederID}
+
+	// Stat the secret file. Missing → not present (the freshly-flashed
+	// case). Any other stat error (permission denied, ELOOP, EIO, ...)
+	// is a real failure and must not masquerade as "unclaimed" — a
+	// claimed feeder rendering "Not yet claimed" because of a transient
+	// permission glitch would mislead the operator into pressing Register
+	// when the actual issue is elsewhere.
+	info, err := os.Stat(r.paths.ClaimSecretFile)
+	switch {
+	case err == nil:
+		// Match feed's atomic write contract: a freshly-renamed secret
+		// is non-empty. A size-0 file is malformed (aborted write or
+		// hand-edit). Treat it as not-present here — Reveal() will
+		// surface the malformed state when the operator next reaches
+		// for the secret. This intentionally diverges from systemd's
+		// ConditionPathExists semantics; the UI copy compensates by
+		// not promising a periodic retry cadence.
+		if info.Size() > 0 {
+			id.ClaimSecretPresent = true
+			id.ClaimSecretUpdatedAt = info.ModTime().UTC().Format(time.RFC3339)
+		}
+	case errors.Is(err, fs.ErrNotExist):
+		// Genuine "no secret yet" case. Leave id.ClaimSecretPresent=false.
+	default:
+		return Identity{}, fmt.Errorf("stat claim secret: %w", err)
 	}
-	return Identity{
-		FeederID:           feederID,
-		ClaimSecretPresent: present,
-	}, nil
+
+	if id.ClaimSecretPresent {
+		id.ClaimSecretVersion = readClaimSecretVersion(r.paths.ClaimVersionFile)
+	}
+
+	return id, nil
+}
+
+// readClaimSecretVersion returns the numeric version from the version
+// sidecar, or 0 if missing / unreadable / unparseable / non-positive.
+// Best-effort by design — feed writes it after a successful
+// register/rotate but removes it on `claim set`, so absence is a normal
+// state, not an error to surface.
+func readClaimSecretVersion(path string) int {
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return 0
+	}
+	first, _, _ := strings.Cut(string(raw), "\n")
+	first = strings.TrimSpace(first)
+	v, err := strconv.Atoi(first)
+	if err != nil || v <= 0 {
+		return 0
+	}
+	return v
 }
 
 // Reveal returns the full claim secret. Reads /etc/airplanes/feeder-claim-secret
@@ -110,7 +201,7 @@ func (r *Reader) Read() (Identity, error) {
 // canonicalize to a valid 16-char A-Z 0-9 secret is treated as malformed,
 // not absent — surfacing real corruption instead of telling the operator
 // to register a secret they already have.
-func (r *Reader) Reveal() (IdentityWithSecret, error) {
+func (r *Reader) Reveal(ctx context.Context) (IdentityWithSecret, error) {
 	feederID, err := readSingleLine(r.paths.FeederIDFile)
 	if err != nil {
 		if errors.Is(err, fs.ErrNotExist) {
@@ -144,7 +235,7 @@ func (r *Reader) Reveal() (IdentityWithSecret, error) {
 	return IdentityWithSecret{
 		FeederID:    feederID,
 		ClaimSecret: format4x4(canonical),
-		ClaimPage:   r.paths.ClaimPageURL,
+		ClaimPage:   r.claimPage(ctx),
 	}, nil
 }
 

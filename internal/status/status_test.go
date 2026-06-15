@@ -12,7 +12,7 @@ import (
 	"time"
 
 	wexec "github.com/airplanes-live/image-webconfig/internal/exec"
-	"github.com/airplanes-live/image-webconfig/internal/pihealth"
+	"github.com/airplanes-live/image-webconfig/internal/hardware"
 	"github.com/airplanes-live/image-webconfig/internal/wifi"
 )
 
@@ -20,10 +20,12 @@ func newTestPaths(t *testing.T) (Paths, string) {
 	t.Helper()
 	dir := t.TempDir()
 	return Paths{
-		ManifestFile:     filepath.Join(dir, "build-manifest.json"),
-		AircraftJSONFile: filepath.Join(dir, "aircraft.json"),
-		SystemctlBinary:  "/usr/bin/systemctl",
-		IsActiveTimeout:  2 * time.Second,
+		ImageManifestFile:   filepath.Join(dir, "build-manifest.json"),
+		RuntimeManifestFile: filepath.Join(dir, "runtime-manifest.json"),
+		AircraftJSONFile:    filepath.Join(dir, "aircraft.json"),
+		ReadsbStatsFile:     filepath.Join(dir, "stats.json"),
+		SystemctlBinary:     "/usr/bin/systemctl",
+		IsActiveTimeout:     2 * time.Second,
 	}, dir
 }
 
@@ -81,42 +83,142 @@ func TestRead_TimeoutReportsUnknown(t *testing.T) {
 	}
 }
 
-func TestRead_ManifestPassthrough(t *testing.T) {
+func TestRead_ImageManifestPassthrough(t *testing.T) {
 	t.Parallel()
 	p, _ := newTestPaths(t)
 	manifest := []byte(`{"schema_version":1,"channel":"dev","arch":"arm64"}`)
-	if err := os.WriteFile(p.ManifestFile, manifest, 0o644); err != nil {
+	if err := os.WriteFile(p.ImageManifestFile, manifest, 0o644); err != nil {
 		t.Fatal(err)
 	}
 	r := NewReader("v", p, fixedRunner("active", nil))
 	got, _ := r.Read(context.Background())
 	var roundtrip map[string]any
-	if err := json.Unmarshal(got.Manifest, &roundtrip); err != nil {
+	if err := json.Unmarshal(got.ImageManifest, &roundtrip); err != nil {
 		t.Fatal(err)
 	}
 	if roundtrip["channel"] != "dev" {
-		t.Errorf("manifest channel = %v, want dev", roundtrip["channel"])
+		t.Errorf("image manifest channel = %v, want dev", roundtrip["channel"])
 	}
 }
 
-func TestRead_ManifestMissingOmitted(t *testing.T) {
+func TestRead_ImageManifestMissingOmitted(t *testing.T) {
 	t.Parallel()
 	p, _ := newTestPaths(t)
 	r := NewReader("v", p, fixedRunner("active", nil))
 	got, _ := r.Read(context.Background())
-	if got.Manifest != nil {
-		t.Errorf("Manifest = %s, want nil (file missing)", got.Manifest)
+	if got.ImageManifest != nil {
+		t.Errorf("ImageManifest = %s, want nil (file missing)", got.ImageManifest)
 	}
 }
 
-func TestRead_ManifestCorruptOmitted(t *testing.T) {
+func TestRead_ImageManifestCorruptOmitted(t *testing.T) {
 	t.Parallel()
 	p, _ := newTestPaths(t)
-	_ = os.WriteFile(p.ManifestFile, []byte("not json"), 0o644)
+	_ = os.WriteFile(p.ImageManifestFile, []byte("not json"), 0o644)
 	r := NewReader("v", p, fixedRunner("active", nil))
 	got, _ := r.Read(context.Background())
-	if got.Manifest != nil {
-		t.Errorf("Manifest passed through corrupt JSON: %s", got.Manifest)
+	if got.ImageManifest != nil {
+		t.Errorf("ImageManifest passed through corrupt JSON: %s", got.ImageManifest)
+	}
+}
+
+func TestRead_RuntimeManifestPassthrough(t *testing.T) {
+	t.Parallel()
+	p, _ := newTestPaths(t)
+	manifest := []byte(`{"channel":"dev","components":{"feed_scripts":{"version":"dev"}}}`)
+	if err := os.WriteFile(p.RuntimeManifestFile, manifest, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	r := NewReader("v", p, fixedRunner("active", nil))
+	got, _ := r.Read(context.Background())
+	var roundtrip map[string]any
+	if err := json.Unmarshal(got.RuntimeManifest, &roundtrip); err != nil {
+		t.Fatal(err)
+	}
+	if roundtrip["channel"] != "dev" {
+		t.Errorf("runtime manifest channel = %v, want dev", roundtrip["channel"])
+	}
+}
+
+func TestRead_RuntimeManifestMissingOmitted(t *testing.T) {
+	t.Parallel()
+	p, _ := newTestPaths(t)
+	r := NewReader("v", p, fixedRunner("active", nil))
+	got, _ := r.Read(context.Background())
+	if got.RuntimeManifest != nil {
+		t.Errorf("RuntimeManifest = %s, want nil (file missing)", got.RuntimeManifest)
+	}
+}
+
+func TestRead_RuntimeManifestCorruptOmitted(t *testing.T) {
+	t.Parallel()
+	p, _ := newTestPaths(t)
+	_ = os.WriteFile(p.RuntimeManifestFile, []byte("not json"), 0o644)
+	r := NewReader("v", p, fixedRunner("active", nil))
+	got, _ := r.Read(context.Background())
+	if got.RuntimeManifest != nil {
+		t.Errorf("RuntimeManifest passed through corrupt JSON: %s", got.RuntimeManifest)
+	}
+}
+
+// The two manifests are read independently: a present image manifest must
+// not be suppressed by a missing runtime manifest, and vice versa.
+func TestRead_ManifestsIndependent(t *testing.T) {
+	t.Parallel()
+	p, _ := newTestPaths(t)
+	if err := os.WriteFile(p.ImageManifestFile, []byte(`{"pi_gen":"abc"}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// RuntimeManifestFile deliberately absent.
+	r := NewReader("v", p, fixedRunner("active", nil))
+	got, _ := r.Read(context.Background())
+	if got.ImageManifest == nil {
+		t.Error("ImageManifest nil, want present")
+	}
+	if got.RuntimeManifest != nil {
+		t.Errorf("RuntimeManifest = %s, want nil", got.RuntimeManifest)
+	}
+}
+
+// A syntactically-valid but non-object manifest (null / array / scalar) must
+// be omitted, never surfaced as e.g. `"runtime_manifest": null`.
+func TestRead_RuntimeManifestNonObjectOmitted(t *testing.T) {
+	t.Parallel()
+	for _, body := range []string{"null", "[1,2]", `"x"`, "42"} {
+		p, _ := newTestPaths(t)
+		if err := os.WriteFile(p.RuntimeManifestFile, []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		r := NewReader("v", p, fixedRunner("active", nil))
+		got, _ := r.Read(context.Background())
+		if got.RuntimeManifest != nil {
+			t.Errorf("body %q: RuntimeManifest = %s, want nil", body, got.RuntimeManifest)
+		}
+	}
+}
+
+// On a real feeder /etc/airplanes/runtime-manifest.json is a symlink into the
+// active overlay; the reader must follow it to the target.
+func TestRead_RuntimeManifestSymlinkFollowed(t *testing.T) {
+	t.Parallel()
+	p, dir := newTestPaths(t)
+	target := filepath.Join(dir, "overlay-manifest.json")
+	if err := os.WriteFile(target, []byte(`{"channel":"dev"}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(dir, "runtime-link.json")
+	if err := os.Symlink(target, link); err != nil {
+		t.Fatal(err)
+	}
+	p.RuntimeManifestFile = link
+	r := NewReader("v", p, fixedRunner("active", nil))
+	got, _ := r.Read(context.Background())
+	var roundtrip map[string]any
+	if err := json.Unmarshal(got.RuntimeManifest, &roundtrip); err != nil {
+		t.Fatalf("symlinked manifest not read: %v", err)
+	}
+	if roundtrip["channel"] != "dev" {
+		t.Errorf("channel = %v, want dev", roundtrip["channel"])
 	}
 }
 
@@ -235,13 +337,14 @@ func newDecisionTestPaths(t *testing.T) Paths {
 	t.Helper()
 	dir := t.TempDir()
 	return Paths{
-		ManifestFile:     filepath.Join(dir, "build-manifest.json"),
-		AircraftJSONFile: filepath.Join(dir, "aircraft.json"),
-		MlatStateFile:    filepath.Join(dir, "run", "airplanes-mlat", "state"),
-		FeedStateFile:    filepath.Join(dir, "run", "airplanes-feed", "state"),
-		UAT978StateFile:  filepath.Join(dir, "run", "airplanes-978", "state"),
-		SystemctlBinary:  "systemctl",
-		IsActiveTimeout:  2 * time.Second,
+		ImageManifestFile: filepath.Join(dir, "build-manifest.json"),
+		AircraftJSONFile:  filepath.Join(dir, "aircraft.json"),
+		MlatStateFile:     filepath.Join(dir, "run", "airplanes-mlat", "state"),
+		FeedStateFile:     filepath.Join(dir, "run", "airplanes-feed", "state"),
+		UAT978StateFile:   filepath.Join(dir, "run", "airplanes-978", "state"),
+		ReadsbStateFile:   filepath.Join(dir, "run", "readsb", "state"),
+		SystemctlBinary:   "systemctl",
+		IsActiveTimeout:   2 * time.Second,
 	}
 }
 
@@ -527,50 +630,127 @@ func TestRead_RebootRequiredFlag(t *testing.T) {
 	}
 }
 
-// stubPiHealthProbe returns a fixed *pihealth.PiHealth.
-type stubPiHealthProbe struct{ payload *pihealth.PiHealth }
+// stubHardwareProbe returns a fixed *hardware.Snapshot.
+type stubHardwareProbe struct{ payload *hardware.Snapshot }
 
-func (s stubPiHealthProbe) Probe(_ context.Context) *pihealth.PiHealth { return s.payload }
+func (s stubHardwareProbe) Probe(_ context.Context) *hardware.Snapshot { return s.payload }
 
-func TestRead_PiHealthEmbedded(t *testing.T) {
+func float64Ptr(v float64) *float64 { return &v }
+
+func TestRead_HardwareEmbedded(t *testing.T) {
 	t.Parallel()
 	p, _ := newTestPaths(t)
-	payload := &pihealth.PiHealth{
-		Severity:       "ok",
-		Summary:        "healthy · 56°C",
-		IsRaspberryPi:  true,
-		ThrottleProbed: true,
-		TempProbed:     true,
-		CPUTempCelsius: 56,
+	payload := &hardware.Snapshot{
+		PiThrottle: &hardware.Throttle{},
+		System: hardware.System{
+			CPUTempCelsius: float64Ptr(56),
+		},
+		Health: hardware.Health{
+			Severity:      "ok",
+			Summary:       "healthy · 56°C",
+			IsRaspberryPi: true,
+		},
 	}
-	r := NewReader("v", p, fixedRunner("active", nil), WithPiHealth(stubPiHealthProbe{payload}))
+	r := NewReader("v", p, fixedRunner("active", nil), WithHardware(stubHardwareProbe{payload}))
 	got, err := r.Read(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got.PiHealth == nil {
-		t.Fatal("PiHealth = nil, want populated")
+	if got.PiThrottle == nil {
+		t.Fatal("PiThrottle = nil, want populated")
 	}
-	if got.PiHealth.Summary != "healthy · 56°C" {
-		t.Errorf("PiHealth.Summary = %q", got.PiHealth.Summary)
+	if got.HardwareHealth == nil || got.HardwareHealth.Summary != "healthy · 56°C" {
+		t.Errorf("HardwareHealth = %+v", got.HardwareHealth)
+	}
+	if got.System.CPUTempCelsius == nil || *got.System.CPUTempCelsius != 56 {
+		t.Errorf("System.CPUTempCelsius = %v, want 56", got.System.CPUTempCelsius)
 	}
 	blob, _ := json.Marshal(got)
-	if !strings.Contains(string(blob), `"pi_health"`) {
-		t.Errorf("marshaled JSON missing pi_health field: %s", blob)
+	for _, want := range []string{`"pi_throttle"`, `"system"`, `"hardware_health"`} {
+		if !strings.Contains(string(blob), want) {
+			t.Errorf("marshaled JSON missing %s: %s", want, blob)
+		}
+	}
+	if strings.Contains(string(blob), `"pi_health"`) {
+		t.Errorf("marshaled JSON contains legacy pi_health key: %s", blob)
 	}
 }
 
-func TestRead_NoPiHealthOption_OmitsField(t *testing.T) {
+func TestRead_NoHardwareOption_EmitsEmptySystem(t *testing.T) {
 	t.Parallel()
 	p, _ := newTestPaths(t)
 	r := NewReader("v", p, fixedRunner("active", nil))
 	got, _ := r.Read(context.Background())
-	if got.PiHealth != nil {
-		t.Errorf("PiHealth = %+v, want nil (no WithPiHealth)", got.PiHealth)
+	if got.PiThrottle != nil {
+		t.Errorf("PiThrottle = %+v, want nil (no WithHardware)", got.PiThrottle)
+	}
+	if got.HardwareHealth != nil {
+		t.Errorf("HardwareHealth = %+v, want nil (no WithHardware)", got.HardwareHealth)
 	}
 	blob, _ := json.Marshal(got)
-	if strings.Contains(string(blob), `"pi_health"`) {
-		t.Errorf("marshaled JSON should omit pi_health: %s", blob)
+	if strings.Contains(string(blob), `"pi_throttle"`) {
+		t.Errorf("marshaled JSON should omit pi_throttle: %s", blob)
+	}
+	if strings.Contains(string(blob), `"hardware_health"`) {
+		t.Errorf("marshaled JSON should omit hardware_health: %s", blob)
+	}
+	// Universal-always contract: system emits at least `{}`.
+	if !strings.Contains(string(blob), `"system":{}`) {
+		t.Errorf("marshaled JSON should contain `\"system\":{}` even with no probe: %s", blob)
+	}
+}
+
+// HardwareProbe is wired but returns nil (e.g. a transient construction
+// failure or a stub that's intentionally empty). The Read() path must
+// not panic and must omit pi_throttle + hardware_health while still
+// emitting `system: {}`.
+func TestRead_HardwareProbeReturnsNil_NoPanic(t *testing.T) {
+	t.Parallel()
+	p, _ := newTestPaths(t)
+	r := NewReader("v", p, fixedRunner("active", nil), WithHardware(stubHardwareProbe{nil}))
+	got, _ := r.Read(context.Background())
+	if got.PiThrottle != nil {
+		t.Errorf("PiThrottle should be nil when probe returned nil, got %+v", got.PiThrottle)
+	}
+	if got.HardwareHealth != nil {
+		t.Errorf("HardwareHealth should be nil when probe returned nil, got %+v", got.HardwareHealth)
+	}
+	blob, _ := json.Marshal(got)
+	if !strings.Contains(string(blob), `"system":{}`) {
+		t.Errorf("system key must remain present as {} even with nil probe: %s", blob)
+	}
+}
+
+// Codex sentinel: non-Pi feeder. PiThrottle absent, system present,
+// hardware_health.is_raspberry_pi false. Pi_throttle key must not leak.
+func TestRead_NonPi_OmitsPiThrottle(t *testing.T) {
+	t.Parallel()
+	p, _ := newTestPaths(t)
+	payload := &hardware.Snapshot{
+		PiThrottle: nil,
+		System: hardware.System{
+			CPUTempCelsius: float64Ptr(56),
+		},
+		Health: hardware.Health{
+			Severity:      "ok",
+			Summary:       "generic Linux · healthy · 56°C",
+			IsRaspberryPi: false,
+		},
+	}
+	r := NewReader("v", p, fixedRunner("active", nil), WithHardware(stubHardwareProbe{payload}))
+	got, _ := r.Read(context.Background())
+	if got.PiThrottle != nil {
+		t.Errorf("PiThrottle = %+v, want nil on non-Pi", got.PiThrottle)
+	}
+	if got.HardwareHealth == nil || got.HardwareHealth.IsRaspberryPi {
+		t.Errorf("HardwareHealth.IsRaspberryPi should be false, got %+v", got.HardwareHealth)
+	}
+	blob, _ := json.Marshal(got)
+	if strings.Contains(string(blob), `"pi_throttle"`) {
+		t.Errorf("marshaled JSON should omit pi_throttle on non-Pi: %s", blob)
+	}
+	if !strings.Contains(string(blob), `"system"`) {
+		t.Errorf("marshaled JSON should keep system on non-Pi: %s", blob)
 	}
 }
 
@@ -635,3 +815,218 @@ func TestRead_WifiOption_ProbeReturnsNil_OmitsField(t *testing.T) {
 		t.Errorf("marshaled JSON should omit wifi when probe returned nil: %s", blob)
 	}
 }
+
+func TestRead_ReadsbDecisionNoHardwareWhenActive(t *testing.T) {
+	t.Parallel()
+	p := newDecisionTestPaths(t)
+	writeStateFile(t, p.ReadsbStateFile, "schema_version=1\nservice=readsb\nstate=disabled\nreason=no_hardware\n")
+	r := NewReader("v", p, perArgvRunner(map[string]func(unit string) (string, error){
+		"is-active:default": func(_ string) (string, error) { return "active", nil },
+	}))
+	got, err := r.Read(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.ReadsbDecision == nil {
+		t.Fatalf("ReadsbDecision = nil, want non-nil")
+	}
+	if got.ReadsbDecision.State != "disabled" || got.ReadsbDecision.Reason != "no_hardware" {
+		t.Errorf("ReadsbDecision = %+v, want disabled/no_hardware", *got.ReadsbDecision)
+	}
+}
+
+func TestRead_ReadsbDecisionNilWhenStateFileAbsent(t *testing.T) {
+	t.Parallel()
+	p := newDecisionTestPaths(t)
+	r := NewReader("v", p, perArgvRunner(map[string]func(unit string) (string, error){
+		"is-active:default": func(_ string) (string, error) { return "active", nil },
+	}))
+	got, _ := r.Read(context.Background())
+	if got.ReadsbDecision != nil {
+		t.Errorf("ReadsbDecision = %+v, want nil (no state file → systemd fallback)", got.ReadsbDecision)
+	}
+}
+
+func TestRead_ReadsbDecisionNilWhenInactive(t *testing.T) {
+	t.Parallel()
+	p := newDecisionTestPaths(t)
+	// readsb has no exit-64 path, so a non-active unit must never consult the
+	// (possibly stale) state file.
+	writeStateFile(t, p.ReadsbStateFile, "schema_version=1\nstate=disabled\nreason=no_hardware\n")
+	r := NewReader("v", p, perArgvRunner(map[string]func(unit string) (string, error){
+		"is-active:readsb.service": func(_ string) (string, error) { return "failed", errors.New("exit 3") },
+		"is-active:default":        func(_ string) (string, error) { return "active", nil },
+	}))
+	got, _ := r.Read(context.Background())
+	if got.ReadsbDecision != nil {
+		t.Errorf("ReadsbDecision = %+v, want nil for non-active readsb", got.ReadsbDecision)
+	}
+}
+
+func TestRead_ReadsbDecisionNilOnDisallowedReason(t *testing.T) {
+	t.Parallel()
+	p := newDecisionTestPaths(t)
+	// A reason outside AllowedReasonsReadsb (e.g. a 978-only token) is dropped,
+	// not passed through.
+	writeStateFile(t, p.ReadsbStateFile, "schema_version=1\nstate=disabled\nreason=uat_disabled\n")
+	r := NewReader("v", p, perArgvRunner(map[string]func(unit string) (string, error){
+		"is-active:default": func(_ string) (string, error) { return "active", nil },
+	}))
+	got, _ := r.Read(context.Background())
+	if got.ReadsbDecision != nil {
+		t.Errorf("ReadsbDecision = %+v, want nil for disallowed reason", got.ReadsbDecision)
+	}
+}
+
+func TestRead_FeedSuppressedWhenReadsbDisabled(t *testing.T) {
+	t.Parallel()
+	p := newDecisionTestPaths(t)
+	// A preserved (stale) aircraft.json must not be reported as live when the
+	// decoder self-disabled for a missing pinned SDR.
+	writeStateFile(t, p.AircraftJSONFile, `{"now":1717000000,"messages":1234,"aircraft":[{},{},{}]}`)
+	writeStateFile(t, p.ReadsbStateFile, "schema_version=1\nstate=disabled\nreason=no_hardware\n")
+	r := NewReader("v", p, perArgvRunner(map[string]func(unit string) (string, error){
+		"is-active:default": func(_ string) (string, error) { return "active", nil },
+	}))
+	got, _ := r.Read(context.Background())
+	if got.Feed != nil {
+		t.Errorf("Feed = %+v, want nil (suppressed while readsb disabled)", *got.Feed)
+	}
+}
+
+func TestRead_FeedPresentWhenReadsbEnabled(t *testing.T) {
+	t.Parallel()
+	p := newDecisionTestPaths(t)
+	writeStateFile(t, p.AircraftJSONFile, `{"now":1717000000,"messages":1234,"aircraft":[{},{},{}]}`)
+	writeStateFile(t, p.ReadsbStateFile, "schema_version=1\nstate=enabled\nreason=ok\n")
+	r := NewReader("v", p, perArgvRunner(map[string]func(unit string) (string, error){
+		"is-active:default": func(_ string) (string, error) { return "active", nil },
+	}))
+	got, _ := r.Read(context.Background())
+	if got.Feed == nil {
+		t.Fatal("Feed = nil, want populated when readsb enabled")
+	}
+	if got.Feed.AircraftCount != 3 {
+		t.Errorf("AircraftCount = %d, want 3", got.Feed.AircraftCount)
+	}
+}
+
+// writeStatsFile writes a stats.json into a fresh temp dir and returns its path.
+func writeStatsFile(t *testing.T, body string) string {
+	t.Helper()
+	p := filepath.Join(t.TempDir(), "stats.json")
+	if err := os.WriteFile(p, []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	return p
+}
+
+func TestReadReadsbStats_Parsed(t *testing.T) {
+	t.Parallel()
+	got := readReadsbStats(writeStatsFile(t, `{"gain_db":49.6,"messages":1}`))
+	if got == nil {
+		t.Fatal("readReadsbStats = nil, want non-nil")
+	}
+	if got.GainDB != 49.6 {
+		t.Errorf("GainDB = %v, want 49.6", got.GainDB)
+	}
+	if got.AgeSec < 0 || got.AgeSec > 5 {
+		t.Errorf("AgeSec = %d, want ~0 for a freshly written file", got.AgeSec)
+	}
+}
+
+func TestReadReadsbStats_MissingFile(t *testing.T) {
+	t.Parallel()
+	if got := readReadsbStats(filepath.Join(t.TempDir(), "nope.json")); got != nil {
+		t.Errorf("readReadsbStats(missing) = %+v, want nil", got)
+	}
+}
+
+// A JSON string for gain_db must be rejected so the Go reader and the
+// render-status `jq '.gain_db | numbers'` type-gate agree on what counts.
+func TestReadReadsbStats_NonNumericOrAbsent(t *testing.T) {
+	t.Parallel()
+	for _, body := range []string{
+		`{"gain_db":null}`,   // explicit null
+		`{"gain_db":"49.6"}`, // string, not number
+		`{"messages":1}`,     // key absent
+		`{"gain_db":49.6`,    // truncated / corrupt
+		`not json at all`,    // garbage
+		``,                   // empty file
+	} {
+		if got := readReadsbStats(writeStatsFile(t, body)); got != nil {
+			t.Errorf("readReadsbStats(%q) = %+v, want nil", body, got)
+		}
+	}
+}
+
+func TestReadReadsbStats_RangeGate(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		gain string
+		want *float64
+	}{
+		{"0", f64(0)}, // valid low boundary, distinct from absent
+		{"49.6", f64(49.6)},
+		{"99", f64(99)}, // upper boundary kept
+		{"100", nil},    // just over → dropped
+		{"-10", nil},    // negative → RTL AGC sentinel / garbage
+	}
+	for _, c := range cases {
+		got := readReadsbStats(writeStatsFile(t, `{"gain_db":`+c.gain+`}`))
+		switch {
+		case c.want == nil && got != nil:
+			t.Errorf("gain_db=%s: got %+v, want nil", c.gain, got)
+		case c.want != nil && got == nil:
+			t.Errorf("gain_db=%s: got nil, want %v", c.gain, *c.want)
+		case c.want != nil && got != nil && got.GainDB != *c.want:
+			t.Errorf("gain_db=%s: GainDB = %v, want %v", c.gain, got.GainDB, *c.want)
+		}
+	}
+}
+
+func TestReadReadsbStats_AgeFromMtime(t *testing.T) {
+	t.Parallel()
+	p := writeStatsFile(t, `{"gain_db":40.2}`)
+	old := time.Now().Add(-120 * time.Second)
+	if err := os.Chtimes(p, old, old); err != nil {
+		t.Fatal(err)
+	}
+	got := readReadsbStats(p)
+	if got == nil {
+		t.Fatal("readReadsbStats = nil, want non-nil")
+	}
+	if got.AgeSec < 115 || got.AgeSec > 125 {
+		t.Errorf("AgeSec = %d, want ~120 (from backdated mtime)", got.AgeSec)
+	}
+}
+
+// Read() wires stats.json through to the payload, and omits the field entirely
+// when the file is absent (so a pre-first-write decoder doesn't break the shape).
+func TestRead_ReadsbStatsWiredAndOmitted(t *testing.T) {
+	t.Parallel()
+
+	p, dir := newTestPaths(t)
+	if err := os.WriteFile(filepath.Join(dir, "stats.json"), []byte(`{"gain_db":33.3}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	got, _ := NewReader("v", p, fixedRunner("active", nil)).Read(context.Background())
+	if got.ReadsbStats == nil || got.ReadsbStats.GainDB != 33.3 {
+		t.Fatalf("ReadsbStats = %+v, want GainDB 33.3", got.ReadsbStats)
+	}
+	if blob, _ := json.Marshal(got); !strings.Contains(string(blob), `"readsb_stats"`) {
+		t.Errorf("marshaled JSON should contain readsb_stats: %s", blob)
+	}
+
+	// No stats file → field omitted.
+	p2, _ := newTestPaths(t) // ReadsbStatsFile points at a non-existent path
+	got2, _ := NewReader("v", p2, fixedRunner("active", nil)).Read(context.Background())
+	if got2.ReadsbStats != nil {
+		t.Errorf("ReadsbStats = %+v, want nil with no stats file", got2.ReadsbStats)
+	}
+	if blob, _ := json.Marshal(got2); strings.Contains(string(blob), `"readsb_stats"`) {
+		t.Errorf("marshaled JSON should omit readsb_stats when absent: %s", blob)
+	}
+}
+
+func f64(v float64) *float64 { return &v }

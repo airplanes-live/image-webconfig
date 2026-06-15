@@ -20,8 +20,8 @@ airplanes-webconfig ALL=(root) NOPASSWD: /usr/local/bin/apl-feed apply --json --
 # /usr/local/bin/apl-wifi reads /etc/NetworkManager/system-connections/* (root
 # 0600) and writes keyfiles + runs nmcli. Each subcommand has its own pinned
 # argv so a compromised webconfig cannot drift between the read-only (list,
-# status) and mutating (add, update, delete, test, activate) surfaces via one
-# grant. `--json` is mandatory in argv so a future text-mode helper variant
+# status) and mutating (add, update, delete, test, activate, adopt) surfaces via
+# one grant. `--json` is mandatory in argv so a future text-mode helper variant
 # can't be reached through this entry.
 airplanes-webconfig ALL=(root) NOPASSWD: /usr/local/bin/apl-wifi list --json
 airplanes-webconfig ALL=(root) NOPASSWD: /usr/local/bin/apl-wifi add --json
@@ -29,10 +29,47 @@ airplanes-webconfig ALL=(root) NOPASSWD: /usr/local/bin/apl-wifi update --json
 airplanes-webconfig ALL=(root) NOPASSWD: /usr/local/bin/apl-wifi delete --json
 airplanes-webconfig ALL=(root) NOPASSWD: /usr/local/bin/apl-wifi test --json
 airplanes-webconfig ALL=(root) NOPASSWD: /usr/local/bin/apl-wifi activate --json
+airplanes-webconfig ALL=(root) NOPASSWD: /usr/local/bin/apl-wifi adopt --json
 airplanes-webconfig ALL=(root) NOPASSWD: /usr/local/bin/apl-wifi status --json
 
 airplanes-webconfig ALL=(root) NOPASSWD: /usr/bin/systemctl reboot
 airplanes-webconfig ALL=(root) NOPASSWD: /usr/bin/systemctl poweroff
 airplanes-webconfig ALL=(root) NOPASSWD: /usr/bin/systemctl start --no-block airplanes-claim.service
-airplanes-webconfig ALL=(root) NOPASSWD: /usr/bin/systemd-run --unit=airplanes-update --collect --property=ExecStopPost=/usr/bin/systemctl kill -s HUP airplanes-webconfig.service /usr/local/share/airplanes/update.sh
-airplanes-webconfig ALL=(root) NOPASSWD: /usr/bin/systemd-run --unit=airplanes-system-upgrade --collect /usr/local/lib/airplanes-webconfig/system-upgrade.sh
+# Nudge the remote-config syncer after a config save so a change (e.g. enabling
+# remote configuration) reaches airplanes.live in seconds instead of waiting for
+# the ~60s timer tick. The unit self-gates (ConditionPathExists=feeder-claim-secret
+# and the REMOTE_CONFIG_ENABLED opt-in inside apl-feed), so a re-trigger is a no-op.
+airplanes-webconfig ALL=(root) NOPASSWD: /usr/bin/systemctl start --no-block airplanes-config-sync.service
+
+# Unified update orchestrator (apt → runtime overlay).
+# The trampoline at /usr/local/lib/airplanes-webconfig/start-orchestrator.sh
+# is shipped by airplanes-live/image (pi-gen stage 06d); it execs into the
+# orchestrator binary inside the active runtime release. --collect drops
+# the transient unit record on exit so a repeat invocation doesn't 409 on
+# a stale unit name. ExecStopPost HUPs this service so the schema cache
+# reloads after the orchestrator's overlay leg may have rewritten
+# /etc/airplanes/*.
+airplanes-webconfig ALL=(root) NOPASSWD: /usr/bin/systemd-run --unit=airplanes-update-orchestrator.service --collect --property=ExecStopPost=/usr/bin/systemctl kill -s HUP airplanes-webconfig.service /usr/local/lib/airplanes-webconfig/start-orchestrator.sh
+
+# Feeder identity export/import. Wrapper scripts call apl-feed backup -
+# (export → stdout) and apl-feed restore /dev/stdin --force (import).
+# Wrappers exist instead of bare apl-feed argv so the grant cannot drift
+# across apl-feed subcommands.
+airplanes-webconfig ALL=(root) NOPASSWD: /usr/local/lib/airplanes-webconfig/identity-export.sh
+airplanes-webconfig ALL=(root) NOPASSWD: /usr/local/lib/airplanes-webconfig/identity-import.sh
+
+# /usr/local/bin/apl-aggregator manages optional third-party feed aggregators
+# (FlightRadar24, ...). Each verb is its own pinned argv so a compromised
+# webconfig cannot drift between the read-only (status, detail, export) and mutating
+# (enable, disable, set, reset, import) surfaces via one grant. `--json` is
+# mandatory in argv. The JSON request — including secret values such as an
+# FR24 sharing key — is read on the helper's stdin, never passed on argv
+# (which /proc/<pid>/cmdline would expose).
+airplanes-webconfig ALL=(root) NOPASSWD: /usr/local/bin/apl-aggregator status --json
+airplanes-webconfig ALL=(root) NOPASSWD: /usr/local/bin/apl-aggregator detail --json
+airplanes-webconfig ALL=(root) NOPASSWD: /usr/local/bin/apl-aggregator enable --json
+airplanes-webconfig ALL=(root) NOPASSWD: /usr/local/bin/apl-aggregator disable --json
+airplanes-webconfig ALL=(root) NOPASSWD: /usr/local/bin/apl-aggregator set --json
+airplanes-webconfig ALL=(root) NOPASSWD: /usr/local/bin/apl-aggregator reset --json
+airplanes-webconfig ALL=(root) NOPASSWD: /usr/local/bin/apl-aggregator export --json
+airplanes-webconfig ALL=(root) NOPASSWD: /usr/local/bin/apl-aggregator import --json

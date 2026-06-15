@@ -2,8 +2,8 @@ package server
 
 import (
 	"encoding/json"
+	"errors"
 	"net/http"
-	"os"
 	"regexp"
 	"testing"
 	"time"
@@ -92,13 +92,9 @@ func assertFieldUpdate(t *testing.T, key string, raw json.RawMessage, wantValue 
 }
 
 func TestConfigPost_TrackedKeyChangedCarriesMetadata(t *testing.T) {
-	// feed.env known state: MLAT_USER=alice. POST flips it to bob.
+	// Config known state: MLAT_USER=alice. POST flips it to bob.
 	h := newWriteHarness(t)
-	if err := os.WriteFile(h.feedEnvPath,
-		[]byte(`MLAT_USER=alice`+"\n"), 0o644,
-	); err != nil {
-		t.Fatal(err)
-	}
+	h.setFeedEnv(map[string]string{"MLAT_USER": "alice"})
 	start := time.Now().UTC().Add(-time.Second)
 	got := captureUpdates(t, h, map[string]string{"MLAT_USER": "bob"})
 	end := time.Now().UTC().Add(time.Second)
@@ -110,17 +106,13 @@ func TestConfigPost_TrackedKeyChangedCarriesMetadata(t *testing.T) {
 }
 
 func TestConfigPost_UnchangedTrackedKeyIsBareString(t *testing.T) {
-	// feed.env has MLAT_USER=alice. POST resends the same value plus a
+	// Config has MLAT_USER=alice. POST resends the same value plus a
 	// non-tracked key. The captured stdin must contain MLAT_USER as a
 	// bare string (no metadata) so the apply library does not bump
 	// the sidecar's edited_at for an unchanged value, AND must contain
 	// GAIN as a bare string (non-tracked passthrough).
 	h := newWriteHarness(t)
-	if err := os.WriteFile(h.feedEnvPath,
-		[]byte(`MLAT_USER=alice`+"\n"+`GAIN=40`+"\n"), 0o644,
-	); err != nil {
-		t.Fatal(err)
-	}
+	h.setFeedEnv(map[string]string{"MLAT_USER": "alice", "GAIN": "40"})
 	got := captureUpdates(t, h, map[string]string{
 		"MLAT_USER": "alice",
 		"GAIN":      "42",
@@ -140,12 +132,7 @@ func TestConfigPost_UnchangedLatLonPreservedForGeoDerive(t *testing.T) {
 	// value changed. The webconfig must therefore keep unchanged lat/lon
 	// in the payload (as bare strings) instead of dropping them.
 	h := newWriteHarness(t)
-	if err := os.WriteFile(h.feedEnvPath,
-		[]byte(`LATITUDE=47.0`+"\n"+`LONGITUDE=8.0`+"\n"+`MLAT_USER=alice`+"\n"),
-		0o644,
-	); err != nil {
-		t.Fatal(err)
-	}
+	h.setFeedEnv(map[string]string{"LATITUDE": "47.0", "LONGITUDE": "8.0", "MLAT_USER": "alice"})
 	got := captureUpdates(t, h, map[string]string{
 		"LATITUDE":  "47.0",
 		"LONGITUDE": "8.0",
@@ -161,9 +148,7 @@ func TestConfigPost_UnchangedLatLonPreservedForGeoDerive(t *testing.T) {
 
 func TestConfigPost_NonTrackedKeyPassesThroughAsString(t *testing.T) {
 	h := newWriteHarness(t)
-	if err := os.WriteFile(h.feedEnvPath, []byte(`GAIN=40`+"\n"), 0o644); err != nil {
-		t.Fatal(err)
-	}
+	h.setFeedEnv(map[string]string{"GAIN": "40"})
 	got := captureUpdates(t, h, map[string]string{"GAIN": "42"})
 	if got["GAIN"] == nil {
 		t.Fatal("GAIN missing")
@@ -174,12 +159,14 @@ func TestConfigPost_NonTrackedKeyPassesThroughAsString(t *testing.T) {
 }
 
 func TestConfigPost_BootstrapTrackedKeyHasMetadata(t *testing.T) {
-	// feed.env is missing the tracked key entirely. The POST is treated
-	// as a bootstrap write — metadata attached.
+	// The config is missing the tracked key entirely. The POST is treated
+	// as a bootstrap write — metadata attached. This is also the fresh-
+	// device shape: an absent feed.env makes `config show` report every
+	// key null, so ReadAll returns an empty map with NO error (a
+	// deliberate change from the old file parser's ErrNotFound) and the
+	// first save correctly stamps bootstrap metadata.
 	h := newWriteHarness(t)
-	if err := os.WriteFile(h.feedEnvPath, []byte(``), 0o644); err != nil {
-		t.Fatal(err)
-	}
+	h.setFeedEnv(map[string]string{})
 	start := time.Now().UTC().Add(-time.Second)
 	got := captureUpdates(t, h, map[string]string{"ALTITUDE": "120m"})
 	end := time.Now().UTC().Add(time.Second)
@@ -190,17 +177,15 @@ func TestConfigPost_MixedChangeUnchangedPassthrough(t *testing.T) {
 	// Mirror the "user edits one MLAT field, form posts every visible
 	// field" scenario end-to-end through the HTTP path.
 	h := newWriteHarness(t)
-	if err := os.WriteFile(h.feedEnvPath, []byte(
-		`LATITUDE=47.0`+"\n"+
-			`LONGITUDE=8.0`+"\n"+
-			`ALTITUDE=120m`+"\n"+
-			`MLAT_USER=alice`+"\n"+
-			`MLAT_ENABLED=true`+"\n"+
-			`MLAT_PRIVATE=false`+"\n"+
-			`GAIN=40`+"\n",
-	), 0o644); err != nil {
-		t.Fatal(err)
-	}
+	h.setFeedEnv(map[string]string{
+		"LATITUDE":     "47.0",
+		"LONGITUDE":    "8.0",
+		"ALTITUDE":     "120m",
+		"MLAT_USER":    "alice",
+		"MLAT_ENABLED": "true",
+		"MLAT_PRIVATE": "false",
+		"GAIN":         "40",
+	})
 	start := time.Now().UTC().Add(-time.Second)
 	got := captureUpdates(t, h, map[string]string{
 		"LATITUDE":     "47.0",
@@ -243,16 +228,52 @@ func TestConfigPost_MixedChangeUnchangedPassthrough(t *testing.T) {
 	}
 }
 
+// TestConfigPost_PrivacyTogglesPassThroughAsBareStrings is the HTTP-level
+// regression for REPORT_STATUS and REMOTE_CONFIG_ENABLED. These keys are
+// privacy gates, not user-edited state, so the apply payload must carry
+// them as bare strings — never wrapped in a FieldUpdate metadata object —
+// regardless of whether their value differs from the on-disk current.
+func TestConfigPost_PrivacyTogglesPassThroughAsBareStrings(t *testing.T) {
+	h := newWriteHarness(t)
+	h.setFeedEnv(map[string]string{"REPORT_STATUS": "true", "REMOTE_CONFIG_ENABLED": "false"})
+	got := captureUpdates(t, h, map[string]string{
+		"REPORT_STATUS":         "false",
+		"REMOTE_CONFIG_ENABLED": "true",
+	})
+	for k, wantWire := range map[string]string{
+		"REPORT_STATUS":         `"false"`,
+		"REMOTE_CONFIG_ENABLED": `"true"`,
+	} {
+		raw, ok := got[k]
+		if !ok {
+			t.Errorf("%s missing from apply payload; want bare string %s", k, wantWire)
+			continue
+		}
+		if string(raw) != wantWire {
+			t.Errorf("%s wire shape = %s, want bare string %s (privacy gate must not carry metadata)", k, string(raw), wantWire)
+		}
+		// Defence-in-depth: confirm raw does not parse as a metadata object.
+		var probe struct {
+			Value    string `json:"value"`
+			EditedAt string `json:"edited_at"`
+			EditedBy string `json:"edited_by"`
+		}
+		if err := json.Unmarshal(raw, &probe); err == nil && (probe.EditedBy != "" || probe.EditedAt != "") {
+			t.Errorf("%s decoded as FieldUpdate %#v; privacy keys must be bare strings", k, probe)
+		}
+	}
+}
+
 // TestConfigPost_FeedEnvReadFailureFallsBackToBareStrings proves the
-// degrade-rather-than-refuse posture: if feed.env can't be read at the
-// metadata-gate step, every key passes through as a bare string (no
-// metadata at all). This matches the pre-DEV-383 behavior so a transient
-// read failure does not silently stamp every tracked key as bootstrap.
+// degrade-rather-than-refuse posture: if the `apl-feed config show`
+// exec fails at the metadata-gate step, every key passes through as a
+// bare string (no metadata at all). This matches the pre-DEV-383
+// behavior so a transient read failure does not silently stamp every
+// tracked key as bootstrap. (An absent feed.env is NOT this case — it
+// reads as an empty map with no error; see the bootstrap test above.)
 func TestConfigPost_FeedEnvReadFailureFallsBackToBareStrings(t *testing.T) {
 	h := newWriteHarness(t)
-	if err := os.Remove(h.feedEnvPath); err != nil {
-		t.Fatal(err)
-	}
+	h.setFeedEnvErr(errors.New("config show exploded"))
 	got := captureUpdates(t, h, map[string]string{
 		"MLAT_USER": "bob",
 		"GAIN":      "42",

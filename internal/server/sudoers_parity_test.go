@@ -12,7 +12,6 @@ func TestValidatePrivilegedArgvParity_PassesAgainstInTreeFiles(t *testing.T) {
 	if err := ValidatePrivilegedArgvParity(
 		DefaultPrivilegedArgv(),
 		filepath.Join("..", "..", "files", "etc", "sudoers.d", "010_airplanes-webconfig"),
-		filepath.Join("..", "..", "files", "etc", "sudoers.d", "011_airplanes-webconfig-update"),
 	); err != nil {
 		t.Fatalf("parity check failed against in-tree sudoers: %v", err)
 	}
@@ -38,10 +37,46 @@ func TestValidatePrivilegedArgvParity_FailsOnMissingEntry(t *testing.T) {
 	msg := err.Error()
 	// Must surface at least one missing entry by name so the diagnostic
 	// helps an operator triage cross-version drift on a feeder.
-	for _, want := range []string{"Reboot", "StartUpdate", "WifiList"} {
+	for _, want := range []string{"Reboot", "StartOrchestrator", "WifiList"} {
 		if !strings.Contains(msg, want) {
 			t.Errorf("error message missing %q: %s", want, msg)
 		}
+	}
+}
+
+func TestValidatePrivilegedArgvParity_FailsOnExtraEntry(t *testing.T) {
+	t.Parallel()
+	// Synthesize a sudoers file with every current argv authorized PLUS
+	// one extra NOPASSWD entry for a deprecated argv shape that no longer
+	// appears in DefaultPrivilegedArgv(). The extras side must flag it —
+	// a stale grant for an argv shape since removed from the binary is
+	// dead code that an attacker pivoting into the service account would
+	// inherit unnecessarily.
+	dir := t.TempDir()
+	path := filepath.Join(dir, "010_with_extra")
+	priv := DefaultPrivilegedArgv()
+
+	var body strings.Builder
+	for _, tc := range privilegedArgvCases(priv) {
+		body.WriteString("airplanes-webconfig ALL=(root) NOPASSWD: " + strings.Join(tc.argv[2:], " ") + "\n")
+	}
+	extra := "/usr/bin/systemctl restart some-deprecated.service"
+	body.WriteString("airplanes-webconfig ALL=(root) NOPASSWD: " + extra + "\n")
+
+	if err := os.WriteFile(path, []byte(body.String()), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	err := ValidatePrivilegedArgvParity(priv, path)
+	if err == nil {
+		t.Fatal("expected error from extra sudoers entry, got nil")
+	}
+	msg := err.Error()
+	if !strings.Contains(msg, extra) {
+		t.Errorf("error message missing extra entry %q: %s", extra, msg)
+	}
+	if !strings.Contains(msg, "no matching argv shape") {
+		t.Errorf("error message doesn't clearly label extras as such: %s", msg)
 	}
 }
 
