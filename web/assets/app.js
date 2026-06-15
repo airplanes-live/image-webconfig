@@ -1168,6 +1168,19 @@
 
     // ===== Service tiles =====
 
+    // setTileStatus paints a tile's left status ribbon by toggling the
+    // wc-tile--status-* class on the root. It replaces the per-tile status
+    // dot: the ribbon colour carries the same ok/warn/err/na signal the dot
+    // used to, and dropping the dot frees the right edge (chevron / link
+    // icon no longer crowd against a coloured dot).
+    const TILE_STATUSES = ["ok", "warn", "err", "na"];
+    function setTileStatus(root, status) {
+        const s = TILE_STATUSES.indexOf(status) === -1 ? "na" : status;
+        for (const x of TILE_STATUSES) {
+            root.classList.toggle("wc-tile--status-" + x, x === s);
+        }
+    }
+
     function buildTile(unit) {
         const slug = UNIT_TO_LOG_SLUG[unit];
         const iconPath = SERVICE_ICONS[unit];
@@ -1176,10 +1189,9 @@
         const title = unit.replace(/\.service$/, "");
         const titleEl = el("span", { class: "wc-tile__title" }, title);
         const metaEl = el("span", { class: "wc-tile__meta" }, "—");
-        const dotEl = el("span", { class: "wc-tile__dot wc-tile__dot--na" });
 
         const tag = slug ? "a" : "div";
-        const attrs = { class: "wc-tile wc-tile--service", "data-state": "unknown" };
+        const attrs = { class: "wc-tile wc-tile--service wc-tile--status-na", "data-state": "unknown" };
         if (slug) {
             attrs.href = "#";
             attrs.role = "button";
@@ -1191,16 +1203,15 @@
         const root = el(tag, attrs,
             iconNode,
             el("span", { class: "wc-tile__body" }, titleEl, metaEl),
-            dotEl,
         );
-        return { root, titleEl, metaEl, dotEl };
+        return { root, titleEl, metaEl };
     }
 
     function updateTile(tile, unit, payload) {
         const services = payload.services || {};
         const state = services[unit] || "unknown";
         const c = classifyService(unit, state, payload);
-        tile.dotEl.className = "wc-tile__dot wc-tile__dot--" + c.dot;
+        setTileStatus(tile.root, c.dot);
         tile.metaEl.textContent = c.meta;
         // title= recovers the full meta string when CSS ellipsis truncates
         // the tile (the fixed-row grid means long reasons clip on narrow
@@ -1213,26 +1224,24 @@
         const iconNode = el("span", { class: "wc-tile__icon" }, svgIcon(HARDWARE_ICON));
         const titleEl  = el("span", { class: "wc-tile__title" }, "Hardware");
         const metaEl   = el("span", { class: "wc-tile__meta" }, "—");
-        const dotEl    = el("span", { class: "wc-tile__dot wc-tile__dot--na" });
         const chev     = el("span", { class: "wc-tile__chev", "aria-hidden": "true" }, "›");
         const root = el("button", {
             type: "button",
-            class: "wc-tile wc-tile--hardware wc-tile--nav",
+            class: "wc-tile wc-tile--hardware wc-tile--nav wc-tile--status-na",
             "data-state": "unknown",
             onclick: () => navigate(piHealthPanel, { title: "System metrics", showBack: true }),
         },
             iconNode,
             el("span", { class: "wc-tile__body" }, titleEl, metaEl),
             chev,
-            dotEl,
         );
-        return { root, titleEl, metaEl, dotEl };
+        return { root, titleEl, metaEl };
     }
 
     function updateHardwareTile(tile, payload) {
         const hh = (payload && payload.hardware_health) || null;
         if (!hh) {
-            tile.dotEl.className = "wc-tile__dot wc-tile__dot--na";
+            setTileStatus(tile.root, "na");
             tile.metaEl.textContent = "—";
             tile.root.title = "";
             tile.root.setAttribute("data-state", "unknown");
@@ -1240,7 +1249,7 @@
         }
         const sev = hh.severity || "na";
         const summary = hh.summary || "—";
-        tile.dotEl.className = "wc-tile__dot wc-tile__dot--" + sev;
+        setTileStatus(tile.root, sev);
         tile.metaEl.textContent = summary;
         tile.root.title = summary;
         tile.root.setAttribute("data-state", sev);
@@ -1272,25 +1281,23 @@
         const iconNode = el("span", { class: "wc-tile__icon" }, svgIcon(WIFI_ICON));
         const titleEl  = el("span", { class: "wc-tile__title" }, "Wi-Fi");
         const metaEl   = el("span", { class: "wc-tile__meta" }, "—");
-        const dotEl    = el("span", { class: "wc-tile__dot wc-tile__dot--na" });
         const chev     = el("span", { class: "wc-tile__chev", "aria-hidden": "true" }, "›");
         const root = el("button", {
             type: "button",
-            class: "wc-tile wc-tile--wifi wc-tile--nav",
+            class: "wc-tile wc-tile--wifi wc-tile--nav wc-tile--status-na",
             "data-state": "unknown",
             onclick: () => navigate(wifiPanel, { title: "Wi-Fi networks", showBack: true }),
         },
             iconNode,
             el("span", { class: "wc-tile__body" }, titleEl, metaEl),
             chev,
-            dotEl,
         );
-        return { root, titleEl, metaEl, dotEl };
+        return { root, titleEl, metaEl };
     }
 
     function updateWifiTile(tile, payload) {
         const c = classifyWifi(payload && payload.wifi);
-        tile.dotEl.className = "wc-tile__dot wc-tile__dot--" + c.dot;
+        setTileStatus(tile.root, c.dot);
         tile.metaEl.textContent = c.meta;
         tile.root.title = c.meta || "";
         tile.root.setAttribute("data-state", c.dot);
@@ -1338,11 +1345,10 @@
 
         const titleEl = el("span", { class: "wc-tile__title" }, app.label);
         const metaEl = el("span", { class: "wc-tile__meta" }, app.meta || "—");
-        const dotEl = el("span", { class: "wc-tile__dot wc-tile__dot--na" });
         const chev = el("span", { class: "wc-tile__chev", "aria-hidden": "true" }, "↗");
 
         const root = el("a", {
-            class: "wc-tile wc-tile--app",
+            class: "wc-tile wc-tile--app wc-tile--status-na",
             "data-state": "unknown",
             href: app.href,
             target: "_blank",
@@ -1351,9 +1357,8 @@
             iconNode,
             el("span", { class: "wc-tile__body" }, titleEl, metaEl),
             chev,
-            dotEl,
         );
-        return { root, titleEl, metaEl, dotEl, href: app.href };
+        return { root, titleEl, metaEl, href: app.href };
     }
 
     async function probeApp(href) {
@@ -1385,7 +1390,7 @@
             if (!tile) return;
             const ok = results[i];
             const meta = ok ? a.meta : (a.meta + " · unreachable");
-            tile.dotEl.className = "wc-tile__dot wc-tile__dot--" + (ok ? "ok" : "err");
+            setTileStatus(tile.root, ok ? "ok" : "err");
             tile.metaEl.textContent = meta;
             tile.root.title = meta || "";
             tile.root.setAttribute("data-state", ok ? "active" : "inactive");
@@ -3959,10 +3964,9 @@
         const titleEl  = el("span", { class: "wc-tile__title" }, a.display_name || a.id);
         const metaEl   = el("span", { class: "wc-tile__meta" }, a.reconcile_error ? pair[0] + " · Update failed" : pair[0]);
         const chev     = el("span", { class: "wc-tile__chev", "aria-hidden": "true" }, "›");
-        const dotEl    = el("span", { class: "wc-tile__dot wc-tile__dot--" + pair[1] });
         const root = el("button", {
             type: "button",
-            class: "wc-tile wc-tile--nav",
+            class: "wc-tile wc-tile--nav wc-tile--status-" + pair[1],
             "data-state": pair[1],
             title: pair[0],
             onclick: () => navigate(() => adapterPanel(a.id), { title: a.display_name || a.id, showBack: true }),
@@ -3970,7 +3974,6 @@
             iconNode,
             el("span", { class: "wc-tile__body" }, titleEl, metaEl),
             chev,
-            dotEl,
         );
         return root;
     }
