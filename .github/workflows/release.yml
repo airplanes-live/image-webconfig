@@ -151,22 +151,44 @@ jobs:
           TAG: dev-latest
           SHA: ${{ github.sha }}
         run: |
-          # Force-move dev-latest to point at the current commit and
-          # rebuild the release in place. Concurrency: cancel-in-progress on
-          # dev means an older run cannot land after this one. The release
-          # is marked prerelease so the repo home page still shows the
-          # latest stable tag as "Latest".
-          if gh release view "$TAG" >/dev/null 2>&1; then
-            gh release delete "$TAG" --yes --cleanup-tag
-          fi
+          # Force-move dev-latest to point at the current commit and refresh
+          # the release in place. Update-in-place (never delete) so the
+          # release object never disappears mid-publish: a delete-then-recreate
+          # leaves a window — and, if `gh release create` loses the race with
+          # the freshly force-pushed tag, a permanent gap — during which every
+          # consumer (e.g. the image build's stage-webconfig) 404s. For an
+          # existing release, upload the assets first, then flip metadata last
+          # with --draft=false so the new labelling only appears once the new
+          # payload is in place and any release a prior failed run left as a
+          # draft is republished. First publish uses --target to pin the
+          # release to $SHA without depending on the moved tag already being
+          # visible through the API. Mirrors the stable path above.
+          # Concurrency: cancel-in-progress on dev means an older run cannot
+          # land after this one. Marked prerelease so the repo home page still
+          # shows the latest stable tag as "Latest".
           git tag -f "$TAG" "$SHA"
           git push origin "refs/tags/$TAG" --force
-          gh release create "$TAG" \
-            --title "dev-latest (${SHA:0:8})" \
-            --notes "Moving prerelease for the dev channel. Commit: $SHA" \
-            --prerelease \
-            dist/airplanes-webconfig-arm64 \
-            dist/airplanes-webconfig-armhf \
-            dist/rootfs.tar.gz \
-            dist/manifest.json \
-            dist/SHA256SUMS
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" --clobber \
+              dist/airplanes-webconfig-arm64 \
+              dist/airplanes-webconfig-armhf \
+              dist/rootfs.tar.gz \
+              dist/manifest.json \
+              dist/SHA256SUMS
+            gh release edit "$TAG" \
+              --draft=false \
+              --title "dev-latest (${SHA:0:8})" \
+              --notes "Moving prerelease for the dev channel. Commit: $SHA" \
+              --prerelease
+          else
+            gh release create "$TAG" \
+              --target "$SHA" \
+              --title "dev-latest (${SHA:0:8})" \
+              --notes "Moving prerelease for the dev channel. Commit: $SHA" \
+              --prerelease \
+              dist/airplanes-webconfig-arm64 \
+              dist/airplanes-webconfig-armhf \
+              dist/rootfs.tar.gz \
+              dist/manifest.json \
+              dist/SHA256SUMS
+          fi
