@@ -44,6 +44,11 @@
   --wc-radius: 8px;
   --wc-radius-sm: 6px;
   --wc-shadow-soft: 0 1px 2px rgba(20, 32, 51, 0.04);
+
+  /* Single spacing knob for the dashboard tile grid: the gap between
+     tiles, the gap between stacked tile rows, and the hero-to-grid gap
+     all resolve to this so the whole dashboard reads as one even grid. */
+  --wc-tile-gap: 0.75rem;
 }
 
 /* User-chosen dark — overrides OS preference */
@@ -343,7 +348,7 @@ main {
   align-items: center;
   gap: 1rem;
   padding: 1.25rem 1.5rem;
-  margin-bottom: 1rem;
+  margin-bottom: var(--wc-tile-gap);
   background: var(--wc-surface-1);
   border: 1px solid var(--wc-line-soft);
   border-radius: var(--wc-radius);
@@ -388,7 +393,9 @@ main {
 
 .wc-grid--tiles {
   display: grid;
-  gap: 0.75rem;
+  /* Column gap, wrap-row gap, and the gap between stacked tile grids
+     (margin-bottom, below) all resolve to the shared --wc-tile-gap. */
+  gap: var(--wc-tile-gap);
   /* minmax(0, 1fr) ignores the items' intrinsic min-content widths so
      each track is exactly (container − gap) / N. Two adjacent tile
      grids (services + apps) with different tile contents otherwise
@@ -396,9 +403,11 @@ main {
      visibly drifts off the columns above it. */
   grid-template-columns: minmax(0, 1fr);
   /* Lock every tile row to the same height so content-driven sub-pixel
-     drift doesn't make adjacent rows look uneven. */
-  grid-auto-rows: 4rem;
-  margin-bottom: 1.25rem;
+     drift doesn't make adjacent rows look uneven. Sized to fit a single-line
+     title plus a two-line meta value (.wc-tile__meta clamps at two lines), so
+     longer status strings wrap instead of truncating mid-word. */
+  grid-auto-rows: 5.25rem;
+  margin-bottom: var(--wc-tile-gap);
 }
 @media (min-width: 576px) {
   .wc-grid--tiles { grid-template-columns: repeat(2, minmax(0, 1fr)); }
@@ -408,6 +417,7 @@ main {
 }
 
 .wc-tile {
+  position: relative;
   display: flex;
   align-items: center;
   gap: 0.75rem;
@@ -421,6 +431,26 @@ main {
   text-decoration: none;
   transition: transform 0.12s ease, border-color 0.12s ease, background 0.12s ease;
 }
+
+/* Left status ribbon — the per-tile health signal, replacing the old
+   right-edge status dot. A pseudo-element (not border-left) so the hover
+   border-color change can't recolour it. Colour is set by the
+   wc-tile--status-* modifier the tile carries; defaults to na (grey). */
+.wc-tile::before {
+  content: "";
+  position: absolute;
+  left: 0;
+  top: 0;
+  bottom: 0;
+  width: 3px;
+  border-radius: var(--wc-radius-sm) 0 0 var(--wc-radius-sm);
+  background: var(--wc-status-na);
+}
+.wc-tile--status-ok::before   { background: var(--wc-status-ok); }
+.wc-tile--status-warn::before { background: var(--wc-status-warn); }
+.wc-tile--status-err::before  { background: var(--wc-status-err); }
+.wc-tile--status-na::before   { background: var(--wc-status-na); }
+
 .wc-tile:hover,
 .wc-tile:focus-visible {
   background: var(--wc-surface-3);
@@ -461,9 +491,13 @@ main {
 .wc-tile__meta {
   font-size: 0.8rem;
   color: var(--wc-ink-3);
-  white-space: nowrap;
+  /* Wrap up to two lines, then clamp with an ellipsis. Replaces the former
+     single-line nowrap clamp that truncated longer status strings. */
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+  line-clamp: 2;
   overflow: hidden;
-  text-overflow: ellipsis;
   font-family: var(--wc-font-mono);
   font-variant-numeric: tabular-nums;
   margin-top: 0.15rem;
@@ -532,13 +566,10 @@ main {
   color: var(--wc-accent);
 }
 
-/* Infrastructure tiles (hardware health, WiFi) share a visual register
-   that's distinct from service tiles. Same grid cell, but the left-
-   border accent + muted icon tint reads as a different category. */
-.wc-tile--hardware,
-.wc-tile--wifi {
-  border-left: 3px solid var(--wc-accent);
-}
+/* Infrastructure tiles (hardware health, WiFi) keep a muted icon tint so
+   they read as a different category from service tiles. The left status
+   ribbon (.wc-tile::before) is now shared by every tile, so there's no
+   category-specific border here. */
 .wc-tile--hardware .wc-tile__icon,
 .wc-tile--wifi .wc-tile__icon {
   color: var(--wc-ink-2);
@@ -562,10 +593,6 @@ button.wc-tile {
   text-align: left;
   justify-content: flex-start;
   cursor: pointer;
-}
-button.wc-tile--wifi,
-button.wc-tile--hardware {
-  border-left: 3px solid var(--wc-accent);
 }
 button.wc-tile:hover {
   background: var(--wc-surface-3);
