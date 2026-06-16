@@ -4263,7 +4263,11 @@
 
         const start = el("button", { type: "button", class: "wc-btn-primary", disabled: "", title: tip }, "Start feeding");
 
-        const remove = el("button", { type: "button", class: "wc-btn-danger" }, "Remove");
+        // Label the button by what it actually deletes: in the conflict case it
+        // clears ONLY our managed copy (never the external install), so spell that
+        // out rather than a bare "Remove" that reads like it removes their feeder.
+        const remove = el("button", { type: "button", class: "wc-btn-danger" },
+            a.managed_install ? "Remove airplanes.live copy" : "Remove");
         if (a.managed_install) {
             remove.onclick = async () => {
                 if (!confirm("Remove the airplanes.live-managed " + name + " copy? This stops and deletes " +
