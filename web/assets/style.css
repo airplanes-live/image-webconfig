@@ -1113,9 +1113,9 @@ textarea:focus {
    the global full-width sizing and keeps its vertical centering on hover
    (the global button:hover translateY(-1px) would otherwise undo the
    translateY(-50%) centering). */
-.wifi-pw-field { position: relative; }
-.wifi-pw-field .wifi-pw-input { padding-right: 4.25rem; }
-.wifi-pw-toggle {
+.wc-pw-field { position: relative; }
+.wc-pw-field .wc-pw-input { padding-right: 4.25rem; }
+.wc-pw-toggle {
   position: absolute;
   top: 50%;
   right: 0.35rem;
@@ -1129,7 +1129,7 @@ textarea:focus {
   color: var(--wc-ink-1);
   border: 1px solid var(--wc-line-soft);
 }
-.wifi-pw-toggle:hover { transform: translateY(-50%); background: var(--wc-surface-3); }
+.wc-pw-toggle:hover { transform: translateY(-50%); background: var(--wc-surface-3); }
 
 .wifi-flash:empty { display: none; }
 .wifi-flash-ok,
