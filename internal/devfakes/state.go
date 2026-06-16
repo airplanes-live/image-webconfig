@@ -131,6 +131,11 @@ type State struct {
 	// just lets the SPA exercise enable / disable / config / backup flows
 	// without a Pi.
 	aggregators map[string]*aggRecord
+	// ssh holds dev-only SSH-access state for the pi account. Purely
+	// in-memory — the production apl-ssh helper touches /etc/shadow + the sshd
+	// drop-in + the managed key file; the fake just lets the SPA exercise the
+	// enable/rotate/disable + set-key/clear-key flows without a Pi.
+	ssh sshFakeState
 	// orchestratorOutcome selects how a simulated update-orchestrator
 	// run ends (OrchestratorOutcome* constants). Empty means ok.
 	orchestratorOutcome string
@@ -155,6 +160,50 @@ type aggRecord struct {
 	// helper stamps {error_code, message} into state when a post-update
 	// reconcile fails, and surfaces it via _adapter_json. nil = no failure.
 	reconcileError map[string]string
+}
+
+// sshFakeState is the dev-fake SSH-access state for the pi account. Seeded as
+// "pi present, nothing webconfig-managed" so the card opens on the "Enable SSH"
+// affordance, mirroring a fresh feeder.
+type sshFakeState struct {
+	piPresent       bool
+	passwordEnabled bool // a webconfig-set password exists AND is unlocked
+	keyPresent      bool // a managed key is set
+}
+
+// SSHStatus returns the current dev SSH facts under the state lock.
+func (s *State) SSHStatus() (piPresent, passwordEnabled, keyPresent bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.ssh.piPresent, s.ssh.passwordEnabled, s.ssh.keyPresent
+}
+
+// SSHEnablePassword marks the pi password set + unlocked (enable/rotate).
+func (s *State) SSHEnablePassword() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.ssh.passwordEnabled = true
+}
+
+// SSHDisablePassword locks the pi password (always, like production).
+func (s *State) SSHDisablePassword() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.ssh.passwordEnabled = false
+}
+
+// SSHSetKey marks a managed key present.
+func (s *State) SSHSetKey() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.ssh.keyPresent = true
+}
+
+// SSHClearKey removes the managed key.
+func (s *State) SSHClearKey() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.ssh.keyPresent = false
 }
 
 // aggInstallDuration is how long the dev fake pretends a vendor acquire takes,
@@ -246,6 +295,9 @@ func NewState(p Paths) *State {
 				},
 			},
 		},
+		// SSH: the pi account exists but nothing is webconfig-managed yet, so the
+		// SSH card opens on the "Enable SSH for pi" affordance like a fresh feeder.
+		ssh: sshFakeState{piPresent: true},
 	}
 }
 

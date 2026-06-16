@@ -40,7 +40,18 @@ PrivateTmp=yes
 # keyfiles; the sudo child inherits this unit's mount namespace so the path
 # must be in ReadWritePaths or atomic-rename fails on the booted feeder
 # (chroot tests don't see this).
-ReadWritePaths=/var/lib/airplanes-webconfig /etc/airplanes /etc/airplanes/webconfig /run/airplanes /etc/NetworkManager/system-connections
+#
+# The apl-ssh helper (also a sudo child sharing this mount namespace under
+# ProtectSystem=strict) writes the 99-airplanes-ssh-pi.conf snippet, the managed
+# `pi` key file, and sets the pi password. chpasswd/passwd don't rewrite
+# /etc/shadow in place — they create a temp file in /etc and rename over it, and
+# take the /etc/.pwd.lock advisory lock — so /etc as a whole must be writable in
+# this namespace, not just individual files. DAC still applies: the unprivileged
+# service account owns none of these root-owned files, so only the sudo-root
+# child can write them. Without /etc writable, chpasswd fails with EROFS on the
+# booted feeder even though the sudoers grant authorises the call (chroot tests
+# don't see this).
+ReadWritePaths=/var/lib/airplanes-webconfig /etc/airplanes /etc/airplanes/webconfig /run/airplanes /etc/NetworkManager/system-connections /etc
 
 # Webconfig invokes `sudo -n systemctl ...` for service restart, so
 # NoNewPrivileges must stay false. The sudoers entry constrains the

@@ -1461,6 +1461,19 @@ input[aria-invalid="true"] {
 
 .wc-agg-form { margin-top: 0.5rem; }
 .wc-agg-backup { margin-top: 1rem; }
+
+/* SSH access card sections (password login + public key). Each section groups
+   a state line and one or two inline re-auth forms. */
+.wc-ssh-section { margin-top: 1.25rem; }
+.wc-ssh-section h3 { margin: 0 0 0.35rem; }
+.wc-ssh-state { display: flex; align-items: center; gap: 0.5rem; margin: 0 0 0.6rem; }
+.wc-ssh-action { margin: 0 0 0.9rem; }
+.wc-ssh-action:last-child { margin-bottom: 0; }
+.wc-ssh-action textarea { width: 100%; font-family: var(--wc-mono, monospace); resize: vertical; }
+.wc-ssh-action .actions { margin-top: 0.5rem; }
+.wc-ssh-action .actions .wc-btn-primary,
+.wc-ssh-action .actions .wc-btn-danger { width: auto; flex: 0 0 auto; }
+
 /* Inline checkbox + label (e.g. the FlightAware MLAT toggle). */
 .wc-checkbox { display: flex; align-items: center; gap: 0.5rem; cursor: pointer; }
 .wc-checkbox input[type="checkbox"] { width: auto; margin: 0; flex: 0 0 auto; }

@@ -109,6 +109,7 @@
     const refreshBtn = document.getElementById("wc-refresh-btn");
     const userMenu = document.getElementById("wc-user-menu");
     const userMenuAggregators = document.getElementById("wc-user-aggregators");
+    const userMenuSSH = document.getElementById("wc-user-ssh");
     const userMenuChangePw = document.getElementById("wc-user-change-pw");
     const userMenuLogout = document.getElementById("wc-user-logout");
     const userMenuReboot = document.getElementById("wc-user-reboot");
@@ -4925,6 +4926,178 @@
         pw.focus();
     }
 
+    // ===== SSH access (pi account) =====
+
+    // The SSH card manages ONLY the pi account: a per-device password
+    // (enable / rotate / disable) and a single webconfig-managed authorized
+    // key (set / clear). Every mutating action re-authenticates with the
+    // webconfig password, which the server re-verifies against a fresh hash and
+    // strips before forwarding to the privileged apl-ssh helper.
+    const SSH_IMAGER_NOTE =
+        "Set up SSH in Raspberry Pi Imager? Manage that login from your own session.";
+
+    async function sshPanel() {
+        render(el("div", { class: "wc-card" }, el("p", { class: "muted" }, "loading SSH access…")));
+        const resp = await getJSON("/api/ssh");
+        if (handleAuthFailure(resp)) return;
+        const pf = consumePendingFlash();
+        if (!resp.ok) {
+            render(el("section", { class: "wc-card" },
+                el("h2", {}, "SSH access"),
+                pf && pf.text ? el("div", { class: "wc-flash wc-flash--" + (pf.level || "ok") }, pf.text) : null,
+                el("p", { class: "error", role: "alert" }, "Could not load SSH status."),
+                el("button", { type: "button", class: "wc-btn-primary", onclick: () => sshPanel() }, "Retry"),
+            ));
+            return;
+        }
+        const st = resp.payload || {};
+        // password_auth_allowed / password_hash_unlocked may be null (helper
+        // couldn't determine). Treat "password enabled" as both being true; any
+        // null/false falls back to the enable affordance.
+        const passwordOn = st.password_auth_allowed === true && st.password_hash_unlocked === true;
+        const keyOn = st.managed_key_present === true;
+        const piPresent = st.pi_present === true;
+
+        const flashEl = el("div", {});
+        if (pf && pf.text) flashEl.appendChild(el("div", { class: "wc-flash wc-flash--" + (pf.level || "ok") }, pf.text));
+
+        const sections = [];
+        if (!piPresent) {
+            sections.push(el("p", { class: "error", role: "alert" },
+                "The pi account does not exist on this device, so webconfig can't manage SSH access for it."));
+        } else {
+            sections.push(buildSSHPasswordSection(passwordOn));
+            sections.push(buildSSHKeySection(keyOn));
+        }
+
+        render(el("section", { class: "wc-card" },
+            el("h2", {}, "SSH access"),
+            el("p", { class: "muted" },
+                "Manage SSH login for the ", el("code", {}, "pi"), " account: a per-device password and a single public key. ",
+                "Other accounts are unaffected."),
+            el("p", { class: "muted" }, SSH_IMAGER_NOTE),
+            flashEl,
+            ...sections,
+        ));
+    }
+
+    // sshReauthForm builds a small inline form: a webconfig-password field, any
+    // extra fields (e.g. the new SSH password or the public key), and a submit
+    // button that re-auths + POSTs to path. body() returns the request body
+    // EXCLUDING current_password (added here). On success it sets a pending
+    // flash and re-renders the SSH panel.
+    function sshReauthForm(opts) {
+        const err = errorEl();
+        const pwField = el("input", {
+            type: "password", name: "current-password", autocomplete: "current-password",
+            required: true, placeholder: "Your webconfig password",
+        });
+        const username = hiddenUsernameField();
+        const submit = el("button", { type: "submit", class: opts.danger ? "wc-btn-danger" : "wc-btn-primary" }, opts.submitLabel);
+
+        const form = el("form", { class: "wc-ssh-action" },
+            username,
+            ...(opts.extraFields || []),
+            el("div", { class: "field" },
+                el("label", {}, "Confirm with your webconfig password"), pwField),
+            el("div", { class: "actions" }, submit),
+            err,
+        );
+        form.addEventListener("submit", async (e) => {
+            e.preventDefault();
+            err.textContent = "";
+            if (opts.validate) {
+                const v = opts.validate();
+                if (v) { err.textContent = v; return; }
+            }
+            submit.disabled = true;
+            const prevLabel = submit.textContent;
+            submit.textContent = "Working…";
+            const body = Object.assign({ current_password: pwField.value }, opts.body ? opts.body() : {});
+            const r = await postJSON(opts.path, body);
+            submit.disabled = false;
+            submit.textContent = prevLabel;
+            if (handleAuthFailure(r)) return;
+            if (!r.ok) {
+                err.textContent = (r.payload && (r.payload.message || r.payload.error)) || "Operation failed.";
+                return;
+            }
+            pendingFlash = { text: opts.successText, level: "ok" };
+            await sshPanel();
+        });
+        return form;
+    }
+
+    function buildSSHPasswordSection(passwordOn) {
+        const wrap = el("div", { class: "wc-ssh-section" },
+            el("h3", {}, "Password login"),
+        );
+        const dot = el("span", { class: "wc-tile__dot wc-tile__dot--" + (passwordOn ? "ok" : "na") });
+        wrap.appendChild(el("p", { class: "wc-ssh-state" }, dot,
+            passwordOn ? " Password login is enabled for pi." : " Password login is disabled."));
+
+        const newPw = el("input", {
+            type: "password", name: "new-ssh-password", autocomplete: "new-password",
+            required: true, minlength: "12", placeholder: "New pi password (≥12 characters)",
+        });
+        const pwField = () => el("div", { class: "field" },
+            el("label", {}, passwordOn ? "New password for pi" : "Password for pi"), newPw);
+
+        wrap.appendChild(sshReauthForm({
+            path: passwordOn ? "/api/ssh/set-password" : "/api/ssh/enable-password",
+            submitLabel: passwordOn ? "Rotate password" : "Enable password",
+            extraFields: [pwField()],
+            validate: () => (newPw.value.length < 12 ? "The pi password must be at least 12 characters." : ""),
+            body: () => ({ password: newPw.value }),
+            successText: passwordOn ? "pi password rotated." : "Password login enabled for pi.",
+        }));
+
+        if (passwordOn) {
+            wrap.appendChild(sshReauthForm({
+                path: "/api/ssh/disable-password",
+                submitLabel: "Disable password login",
+                danger: true,
+                successText: "Password login disabled for pi.",
+            }));
+        }
+        return wrap;
+    }
+
+    function buildSSHKeySection(keyOn) {
+        const wrap = el("div", { class: "wc-ssh-section" },
+            el("h3", {}, "Public key"),
+        );
+        const dot = el("span", { class: "wc-tile__dot wc-tile__dot--" + (keyOn ? "ok" : "na") });
+        wrap.appendChild(el("p", { class: "wc-ssh-state" }, dot,
+            keyOn ? " A webconfig-managed key is set for pi." : " No webconfig-managed key is set."));
+
+        const keyInput = el("textarea", {
+            name: "ssh-public-key", rows: "3", autocomplete: "off", spellcheck: "false",
+            placeholder: "ssh-ed25519 AAAA… comment",
+        });
+        const keyField = el("div", { class: "field" },
+            el("label", {}, keyOn ? "Replace the managed key" : "Public key"), keyInput);
+
+        wrap.appendChild(sshReauthForm({
+            path: "/api/ssh/set-key",
+            submitLabel: keyOn ? "Replace key" : "Set key",
+            extraFields: [keyField],
+            validate: () => (keyInput.value.trim() === "" ? "Paste a public key." : ""),
+            body: () => ({ key: keyInput.value.trim() }),
+            successText: keyOn ? "Managed key replaced." : "Managed key set for pi.",
+        }));
+
+        if (keyOn) {
+            wrap.appendChild(sshReauthForm({
+                path: "/api/ssh/clear-key",
+                submitLabel: "Clear key",
+                danger: true,
+                successText: "Managed key cleared.",
+            }));
+        }
+        return wrap;
+    }
+
     function changePasswordPanel() {
         const err = errorEl();
         const username = hiddenUsernameField();
@@ -5342,6 +5515,10 @@
     if (userMenuAggregators) userMenuAggregators.addEventListener("click", () => {
         closeUserMenu();
         navigate(aggregatorsPanel, { title: "Third-party aggregators", showBack: true });
+    });
+    if (userMenuSSH) userMenuSSH.addEventListener("click", () => {
+        closeUserMenu();
+        navigate(sshPanel, { title: "SSH access", showBack: true });
     });
     if (userMenuChangePw) userMenuChangePw.addEventListener("click", () => {
         closeUserMenu();

@@ -73,3 +73,17 @@ airplanes-webconfig ALL=(root) NOPASSWD: /usr/local/bin/apl-aggregator set --jso
 airplanes-webconfig ALL=(root) NOPASSWD: /usr/local/bin/apl-aggregator reset --json
 airplanes-webconfig ALL=(root) NOPASSWD: /usr/local/bin/apl-aggregator export --json
 airplanes-webconfig ALL=(root) NOPASSWD: /usr/local/bin/apl-aggregator import --json
+
+# /usr/local/bin/apl-ssh manages SSH access for the pi account only: a
+# per-device password (enable/rotate/disable) and a single webconfig-managed
+# authorized key (set/clear). Each verb is its own pinned argv so a compromised
+# webconfig cannot drift between the read-only (status) and mutating
+# (enable/set/disable/clear) surfaces via one grant. `--json` is mandatory in
+# argv. The pi password value is read on the helper's stdin, never passed on
+# argv (which /proc/<pid>/cmdline would expose).
+airplanes-webconfig ALL=(root) NOPASSWD: /usr/local/bin/apl-ssh status --json
+airplanes-webconfig ALL=(root) NOPASSWD: /usr/local/bin/apl-ssh enable-password --json
+airplanes-webconfig ALL=(root) NOPASSWD: /usr/local/bin/apl-ssh set-password --json
+airplanes-webconfig ALL=(root) NOPASSWD: /usr/local/bin/apl-ssh disable-password --json
+airplanes-webconfig ALL=(root) NOPASSWD: /usr/local/bin/apl-ssh set-key --json
+airplanes-webconfig ALL=(root) NOPASSWD: /usr/local/bin/apl-ssh clear-key --json

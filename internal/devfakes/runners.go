@@ -69,32 +69,38 @@ func validateDump978GainValue(v string) string {
 // DefaultPrivilegedArgv().
 func StubPrivilegedArgv() server.PrivilegedArgv {
 	return server.PrivilegedArgv{
-		ApplyFeed:         []string{"dev-stub", "apl-feed", "apply"},
-		SchemaFeed:        []string{"dev-stub", "apl-feed", "schema"},
-		ConfigShowFeed:    []string{"dev-stub", "apl-feed", "config", "show"},
-		Reboot:            []string{"dev-stub", "systemctl", "reboot"},
-		Poweroff:          []string{"dev-stub", "systemctl", "poweroff"},
-		StartOrchestrator: []string{"dev-stub", "systemd-run", "airplanes-update-orchestrator"},
-		RegisterClaim:     []string{"dev-stub", "systemctl", "claim-register"},
-		SyncConfig:        []string{"dev-stub", "systemctl", "config-sync"},
-		WifiList:          []string{"dev-stub", "apl-wifi", "list"},
-		WifiAdd:           []string{"dev-stub", "apl-wifi", "add"},
-		WifiUpdate:        []string{"dev-stub", "apl-wifi", "update"},
-		WifiDelete:        []string{"dev-stub", "apl-wifi", "delete"},
-		WifiTest:          []string{"dev-stub", "apl-wifi", "test"},
-		WifiActivate:      []string{"dev-stub", "apl-wifi", "activate"},
-		WifiAdopt:         []string{"dev-stub", "apl-wifi", "adopt"},
-		WifiStatus:        []string{"dev-stub", "apl-wifi", "status"},
-		ExportIdentity:    []string{"dev-stub", "identity", "export"},
-		ImportIdentity:    []string{"dev-stub", "identity", "import"},
-		AggregatorStatus:  []string{"dev-stub", "apl-aggregator", "status"},
-		AggregatorDetail:  []string{"dev-stub", "apl-aggregator", "detail"},
-		AggregatorEnable:  []string{"dev-stub", "apl-aggregator", "enable"},
-		AggregatorDisable: []string{"dev-stub", "apl-aggregator", "disable"},
-		AggregatorSet:     []string{"dev-stub", "apl-aggregator", "set"},
-		AggregatorReset:   []string{"dev-stub", "apl-aggregator", "reset"},
-		AggregatorExport:  []string{"dev-stub", "apl-aggregator", "export"},
-		AggregatorImport:  []string{"dev-stub", "apl-aggregator", "import"},
+		ApplyFeed:          []string{"dev-stub", "apl-feed", "apply"},
+		SchemaFeed:         []string{"dev-stub", "apl-feed", "schema"},
+		ConfigShowFeed:     []string{"dev-stub", "apl-feed", "config", "show"},
+		Reboot:             []string{"dev-stub", "systemctl", "reboot"},
+		Poweroff:           []string{"dev-stub", "systemctl", "poweroff"},
+		StartOrchestrator:  []string{"dev-stub", "systemd-run", "airplanes-update-orchestrator"},
+		RegisterClaim:      []string{"dev-stub", "systemctl", "claim-register"},
+		SyncConfig:         []string{"dev-stub", "systemctl", "config-sync"},
+		WifiList:           []string{"dev-stub", "apl-wifi", "list"},
+		WifiAdd:            []string{"dev-stub", "apl-wifi", "add"},
+		WifiUpdate:         []string{"dev-stub", "apl-wifi", "update"},
+		WifiDelete:         []string{"dev-stub", "apl-wifi", "delete"},
+		WifiTest:           []string{"dev-stub", "apl-wifi", "test"},
+		WifiActivate:       []string{"dev-stub", "apl-wifi", "activate"},
+		WifiAdopt:          []string{"dev-stub", "apl-wifi", "adopt"},
+		WifiStatus:         []string{"dev-stub", "apl-wifi", "status"},
+		ExportIdentity:     []string{"dev-stub", "identity", "export"},
+		ImportIdentity:     []string{"dev-stub", "identity", "import"},
+		AggregatorStatus:   []string{"dev-stub", "apl-aggregator", "status"},
+		AggregatorDetail:   []string{"dev-stub", "apl-aggregator", "detail"},
+		AggregatorEnable:   []string{"dev-stub", "apl-aggregator", "enable"},
+		AggregatorDisable:  []string{"dev-stub", "apl-aggregator", "disable"},
+		AggregatorSet:      []string{"dev-stub", "apl-aggregator", "set"},
+		AggregatorReset:    []string{"dev-stub", "apl-aggregator", "reset"},
+		AggregatorExport:   []string{"dev-stub", "apl-aggregator", "export"},
+		AggregatorImport:   []string{"dev-stub", "apl-aggregator", "import"},
+		SSHStatus:          []string{"dev-stub", "apl-ssh", "status"},
+		SSHEnablePassword:  []string{"dev-stub", "apl-ssh", "enable-password"},
+		SSHSetPassword:     []string{"dev-stub", "apl-ssh", "set-password"},
+		SSHDisablePassword: []string{"dev-stub", "apl-ssh", "disable-password"},
+		SSHSetKey:          []string{"dev-stub", "apl-ssh", "set-key"},
+		SSHClearKey:        []string{"dev-stub", "apl-ssh", "clear-key"},
 	}
 }
 
@@ -223,6 +229,8 @@ func dispatchStub(state *State, priv server.PrivilegedArgv, argv []string, body 
 		return wifiCmd(state, argv[2], body)
 	case "apl-aggregator":
 		return aggregatorCmd(state, argv[2], body)
+	case "apl-ssh":
+		return sshCmd(state, argv[2], body)
 	case "systemctl":
 		switch argv[2] {
 		case "reboot":
