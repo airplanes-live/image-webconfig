@@ -102,6 +102,8 @@ type PrivilegedArgv struct {
 	WifiActivate      []string
 	WifiAdopt         []string
 	WifiStatus        []string
+	WifiExport        []string // sudo -n /usr/local/bin/apl-wifi export --json (PSK-bearing; backup only)
+	WifiImport        []string // sudo -n /usr/local/bin/apl-wifi import --json (non-disruptive restore)
 	ExportIdentity    []string // sudo -n /usr/local/lib/airplanes-webconfig/identity-export.sh
 	ImportIdentity    []string // sudo -n /usr/local/lib/airplanes-webconfig/identity-import.sh
 	// Aggregator* target the apl-aggregator helper installed by the runtime
@@ -188,6 +190,10 @@ func DefaultPrivilegedArgv() PrivilegedArgv {
 		WifiActivate: sudo("/usr/local/bin/apl-wifi", "activate", "--json"),
 		WifiAdopt:    sudo("/usr/local/bin/apl-wifi", "adopt", "--json"),
 		WifiStatus:   sudo("/usr/local/bin/apl-wifi", "status", "--json"),
+		// export reads PSKs from root-only keyfiles for the combined backup;
+		// import writes keyfiles non-disruptively. One pinned argv per verb.
+		WifiExport: sudo("/usr/local/bin/apl-wifi", "export", "--json"),
+		WifiImport: sudo("/usr/local/bin/apl-wifi", "import", "--json"),
 		// Identity export/import call wrapper scripts (not bare apl-feed)
 		// so each surface is its own fixed argv in sudoers. The wrappers
 		// invoke `apl-feed backup -` and `apl-feed restore /dev/stdin

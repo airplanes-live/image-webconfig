@@ -38,6 +38,10 @@ APL_WIFI_FIRST_RUN_ID="airplanes-config-wifi"
 APL_WIFI_MANAGED_PREFIX="airplanes-wifi-"
 APL_WIFI_KEYFILE_EXT=".nmconnection"
 
+# Backup envelope schema version emitted by `export` and accepted by `import`.
+# Bumped only on a breaking change to the network object shape.
+APL_WIFI_BACKUP_SCHEMA_VERSION=1
+
 # Managed id regex: the first-run keyfile or airplanes-wifi-<slug>, where the
 # slug is 1-41 lowercase alnum-or-hyphen chars starting alphanumerically. This
 # matches apl_wifi_slugify's output. Enforced server-side so a path-traversal
@@ -1361,11 +1365,198 @@ _cmd_test_locked() {
 	return 2
 }
 
+# --- subcommand: export ----------------------------------------------------
+# Emit every managed Wi-Fi network — including the PSK — as a backup envelope
+# for the combined-backup feature. Foreign (netplan/flash-time) profiles have
+# no /etc keyfile and are deliberately excluded: they can't round-trip and the
+# user is told flash-time Wi-Fi isn't backed up. Read-only, so no lock (mirrors
+# list/status). The PSK is included here and nowhere else — list reports only
+# has_psk — so a leak of this output is the only PSK-bearing wifi surface.
+
+cmd_export() {
+	local nets='[]' id file ctype ssid psk hidden priority hidden_bool entry
+	while IFS= read -r id; do
+		[[ -n "$id" ]] || continue
+		apl_wifi_is_managed_id "$id" || continue
+		file="$(apl_wifi_keyfile_path "$id")"
+		[[ -f "$file" ]] || continue
+		ctype="$(_apl_wifi_keyfile_field "$file" connection type)"
+		[[ "$ctype" == "wifi" || "$ctype" == "802-11-wireless" ]] || continue
+		ssid="$(_apl_wifi_keyfile_field "$file" wifi ssid)"
+		psk="$(_apl_wifi_keyfile_field "$file" wifi-security psk)"
+		hidden="$(_apl_wifi_keyfile_field "$file" wifi hidden)"
+		priority="$(_apl_wifi_keyfile_field "$file" connection autoconnect-priority)"
+		[[ "$priority" =~ ^[0-9]+$ ]] || priority=0
+		hidden_bool=false
+		[[ "$hidden" == "true" ]] && hidden_bool=true
+		entry="$(jq -nc \
+			--arg id "$id" --arg ssid "$ssid" --arg psk "$psk" \
+			--argjson hidden "$hidden_bool" --argjson priority "$priority" \
+			'{id:$id, ssid:$ssid, psk:$psk, hidden:$hidden, priority:$priority}')" || continue
+		nets="$(jq -c --argjson e "$entry" '. + [$e]' <<< "$nets")"
+	done < <(_apl_wifi_list_keyfile_ids)
+
+	_emit_json "$(jq -nc \
+		--argjson sv "$APL_WIFI_BACKUP_SCHEMA_VERSION" \
+		--argjson nets "$nets" \
+		'{status:"ok", schema_version:$sv, networks:$nets}')"
+}
+
+# --- subcommand: import ----------------------------------------------------
+# Restore managed Wi-Fi networks from a backup envelope. Deliberately
+# NON-DISRUPTIVE: each network is written as a keyfile (fresh NM uuid) and
+# loaded so NM knows it for autoconnect, but nothing is brought up or down and
+# the currently-active connection is never rewritten. This guarantees the
+# restore request — which on a fresh flash may itself arrive over Wi-Fi —
+# cannot drop the link mid-operation. All entries are validated before any are
+# written; each network then reports its own applied/skipped/failed result so a
+# single bad keyfile write never silently produces a partial restore.
+
+cmd_import() {
+	_apl_wifi_read_request "schema_version,networks"
+
+	local sv
+	sv="$(jq -r 'if has("schema_version") then .schema_version else 1 end' <<< "$APL_WIFI_REQ_JSON")"
+	if ! [[ "$sv" =~ ^[0-9]+$ ]] || (( sv > APL_WIFI_BACKUP_SCHEMA_VERSION )); then
+		_emit_error parse_error "unsupported wifi backup schema_version: $sv"
+		return 5
+	fi
+	if ! jq -e '.networks | type == "array"' >/dev/null 2>&1 <<< "$APL_WIFI_REQ_JSON"; then
+		_emit_error parse_error "networks must be an array"
+		return 5
+	fi
+
+	_apl_wifi_with_lock _cmd_import_locked
+}
+
+# Read a string-coerced field from a single network object ($1) with a default.
+_apl_wifi_net_field() {
+	local net="$1" key="$2" default="${3:-}"
+	jq -r --arg key "$key" --arg default "$default" \
+		'if has($key) and (.[$key] != null) then (.[$key] | tostring) else $default end' <<< "$net"
+}
+
+_cmd_import_locked() {
+	local count
+	count="$(jq '.networks | length' <<< "$APL_WIFI_REQ_JSON")"
+
+	# Pass 1 — validate every entry. Any malformed entry rejects the whole
+	# import before a single keyfile is touched (all-or-nothing on input).
+	local verrors='[]' i net ssid psk hidden priority req_id
+	for (( i = 0; i < count; i++ )); do
+		net="$(jq -c ".networks[$i]" <<< "$APL_WIFI_REQ_JSON")"
+		if ! jq -e 'type == "object"' >/dev/null 2>&1 <<< "$net"; then
+			verrors="$(jq -c --argjson idx "$i" '. + [{index:$idx, error:"not an object"}]' <<< "$verrors")"
+			continue
+		fi
+		# Enforce JSON field types BEFORE string coercion. Without this, a
+		# null/missing psk would tostring to "" and silently restore a secured
+		# network as open, and a number/object would be coerced into a
+		# valid-looking ssid/psk. Reject those rather than guess.
+		if ! jq -e '
+			(has("ssid") and (.ssid | type == "string"))
+			and ((has("psk") | not) or (.psk | type == "string"))
+			and ((has("id") | not) or (.id | type == "string"))
+			and ((has("hidden") | not) or (.hidden | type == "boolean"))
+			and ((has("priority") | not) or (.priority | type == "number"))
+		' >/dev/null 2>&1 <<< "$net"; then
+			verrors="$(jq -c --argjson idx "$i" '. + [{index:$idx, error:"invalid field types"}]' <<< "$verrors")"
+			continue
+		fi
+		ssid="$(_apl_wifi_net_field "$net" ssid "")"
+		psk="$(_apl_wifi_net_field "$net" psk "")"
+		hidden="$(_apl_wifi_net_field "$net" hidden false)"
+		priority="$(_apl_wifi_net_field "$net" priority 0)"
+		req_id="$(_apl_wifi_net_field "$net" id "")"
+
+		if ! apl_wifi_valid_ssid "$ssid"; then
+			verrors="$(jq -c --argjson idx "$i" '. + [{index:$idx, error:"invalid ssid"}]' <<< "$verrors")"
+		fi
+		if [[ -n "$psk" ]] && ! apl_wifi_valid_psk "$psk"; then
+			verrors="$(jq -c --argjson idx "$i" '. + [{index:$idx, error:"invalid psk"}]' <<< "$verrors")"
+		fi
+		if [[ "$hidden" != "true" && "$hidden" != "false" ]]; then
+			verrors="$(jq -c --argjson idx "$i" '. + [{index:$idx, error:"hidden must be true or false"}]' <<< "$verrors")"
+		fi
+		if ! apl_wifi_valid_priority "$priority"; then
+			verrors="$(jq -c --argjson idx "$i" '. + [{index:$idx, error:"invalid priority"}]' <<< "$verrors")"
+		fi
+		if [[ -n "$req_id" ]] && ! apl_wifi_is_managed_id "$req_id"; then
+			verrors="$(jq -c --argjson idx "$i" '. + [{index:$idx, error:"id is not a managed keyfile id"}]' <<< "$verrors")"
+		fi
+	done
+
+	if [[ "$verrors" != '[]' ]]; then
+		_emit_json "$(jq -nc --argjson e "$verrors" '{status:"rejected", reason:"invalid_networks", errors:$e}')"
+		return 2
+	fi
+
+	# Pass 2 — apply. NM state gives us the active uuid so we never rewrite the
+	# live connection. Every network reports its own result.
+	_apl_wifi_load_nm_state
+	local results='[]' out_id uuid dest existing_uuid status reason entry
+	for (( i = 0; i < count; i++ )); do
+		net="$(jq -c ".networks[$i]" <<< "$APL_WIFI_REQ_JSON")"
+		ssid="$(_apl_wifi_net_field "$net" ssid "")"
+		psk="$(_apl_wifi_net_field "$net" psk "")"
+		hidden="$(_apl_wifi_net_field "$net" hidden false)"
+		priority="$(_apl_wifi_net_field "$net" priority 0)"
+		req_id="$(_apl_wifi_net_field "$net" id "")"
+		status="applied"
+		reason=""
+
+		# Honour a managed id from the backup; otherwise derive a unique one
+		# from the SSID (also resolves collisions with -2, -3, …).
+		if [[ -n "$req_id" ]] && apl_wifi_is_managed_id "$req_id"; then
+			out_id="$req_id"
+		elif ! out_id="$(apl_wifi_unique_id "$ssid")"; then
+			results="$(jq -c --arg id "" --arg ssid "$ssid" \
+				'. + [{id:$id, ssid:$ssid, status:"failed", reason:"slug_exhausted"}]' <<< "$results")"
+			continue
+		fi
+		dest="$(apl_wifi_keyfile_path "$out_id")"
+
+		# Never disturb the active uplink: if this id already exists and is the
+		# live connection, skip it rather than rewrite the in-use profile.
+		if [[ -f "$dest" ]]; then
+			existing_uuid="$(_apl_wifi_keyfile_field "$dest" connection uuid)"
+			if [[ -n "$existing_uuid" && "$existing_uuid" == "$NMCLI_ACTIVE_WIFI_UUID" ]]; then
+				status="skipped"
+				reason="active"
+			fi
+		fi
+
+		if [[ "$status" == "applied" ]]; then
+			if ! uuid="$(cat "$APL_WIFI_UUID_SOURCE" 2>/dev/null)"; then
+				status="failed"
+				reason="uuid_source"
+			elif apl_wifi_write_keyfile "$dest" "$out_id" "$uuid" "$ssid" "$psk" "$hidden" "$priority" true; then
+				_apl_wifi_nmcli_load "$dest" || true
+			else
+				status="failed"
+				reason="write_failed"
+			fi
+		fi
+
+		entry="$(jq -nc --arg id "$out_id" --arg ssid "$ssid" --arg status "$status" --arg reason "$reason" \
+			'{id:$id, ssid:$ssid, status:$status} + (if $reason == "" then {} else {reason:$reason} end)')"
+		results="$(jq -c --argjson e "$entry" '. + [$e]' <<< "$results")"
+	done
+
+	local imported
+	imported="$(jq '[.[] | select(.status == "applied")] | length' <<< "$results")"
+	_emit_json "$(jq -nc \
+		--argjson sv "$APL_WIFI_BACKUP_SCHEMA_VERSION" \
+		--argjson n "$imported" \
+		--argjson r "$results" \
+		'{status:"applied", schema_version:$sv, imported:$n, results:$r}')"
+}
+
 # --- dispatcher ------------------------------------------------------------
 
 _apl_wifi_usage() {
 	cat >&2 <<'USAGE'
-usage: apl-wifi {list|add|update|delete|test|activate|adopt|status} --json
+usage: apl-wifi {list|add|update|delete|test|activate|adopt|status|export|import} --json
 
 Reads JSON on stdin for mutating subcommands; emits a JSON envelope on
 stdout for every status. Exit codes:
@@ -1388,6 +1579,8 @@ main() {
 		activate:--json) cmd_activate ;;
 		adopt:--json) cmd_adopt ;;
 		status:--json) cmd_status ;;
+		export:--json) cmd_export ;;
+		import:--json) cmd_import ;;
 		-h:*|--help:*|help:*)
 			_apl_wifi_emitted=1
 			_apl_wifi_usage
@@ -1397,7 +1590,7 @@ main() {
 			# JSON only on stdout — the human-readable usage hint stays in
 			# the message field so the caller (webconfig) can render it
 			# without parsing stderr.
-			_emit_error usage_error "unknown subcommand or missing --json: '$sub $mode'. Use: list|add|update|delete|test|activate|adopt|status --json"
+			_emit_error usage_error "unknown subcommand or missing --json: '$sub $mode'. Use: list|add|update|delete|test|activate|adopt|status|export|import --json"
 			return 5
 			;;
 	esac
