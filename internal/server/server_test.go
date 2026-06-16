@@ -225,6 +225,13 @@ type writeHarness struct {
 	// skipSetup, when true, leaves the device uninitialized (no password) so
 	// the public first-run paths can be exercised. Set via withoutSetup().
 	skipSetup bool
+	// unclaimedIdentity, when true, leaves the feeder without a claim secret so
+	// the identity-omitted export path can be exercised. Set via withoutIdentity().
+	unclaimedIdentity bool
+	// corruptIdentity, when true, writes a feeder-id plus a non-canonical claim
+	// secret so the fail-loud-on-corruption export path can be exercised. Set
+	// via withCorruptIdentity().
+	corruptIdentity bool
 	// upgradeStatePath is wired into Deps.UpgradeStatePath. Set via
 	// withUpgradeStatePath() before harness construction; defaults to
 	// the production path (which doesn't exist in tests, surfacing
@@ -357,6 +364,23 @@ func newWriteHarness(t *testing.T, opts ...harnessOption) *writeHarness {
 		SSHClearKey:        []string{"sudo-stub", "apl-ssh", "clear-key", "--json"},
 	}
 
+	idPaths := identity.Paths{
+		FeederIDFile:     filepath.Join(dir, "feeder-id"),
+		ClaimSecretFile:  filepath.Join(dir, "feeder-claim-secret"),
+		ClaimVersionFile: filepath.Join(dir, "feeder-claim-secret.version"),
+	}
+	switch {
+	case h.corruptIdentity:
+		// feeder-id present but a non-canonical claim secret on disk — real
+		// corruption, which the export must surface rather than silently omit.
+		_ = os.WriteFile(idPaths.FeederIDFile, []byte("11111111-2222-3333-4444-555555555555\n"), 0o644)
+		_ = os.WriteFile(idPaths.ClaimSecretFile, []byte("tooshort\n"), 0o640)
+	case !h.unclaimedIdentity:
+		_ = os.WriteFile(idPaths.FeederIDFile, []byte("11111111-2222-3333-4444-555555555555\n"), 0o644)
+		_ = os.WriteFile(idPaths.ClaimSecretFile, []byte("ABCDEFGHIJKLMNOP\n"), 0o640)
+		_ = os.WriteFile(idPaths.ClaimVersionFile, []byte("1\n"), 0o640)
+	}
+
 	deps := Deps{
 		Version:      "test-sha",
 		Store:        auth.NewPasswordStore(hashPath),
@@ -364,7 +388,7 @@ func newWriteHarness(t *testing.T, opts ...harnessOption) *writeHarness {
 		Lockout:      auth.NewLockout(5, time.Minute, 15*time.Minute),
 		Guard:        guard,
 		Argon2Params: fastTestParams,
-		Identity:     identity.NewReader(identity.Paths{FeederIDFile: filepath.Join(dir, "feeder-id")}, feedEnv),
+		Identity:     identity.NewReader(idPaths, feedEnv),
 		FeedEnv:      feedEnv,
 		Status: status.NewReader("test-sha", status.Paths{
 			SystemctlBinary: "/bin/true", IsActiveTimeout: time.Second,
@@ -401,6 +425,18 @@ func newWriteHarness(t *testing.T, opts ...harnessOption) *writeHarness {
 // the public first-run restore path can be exercised.
 func withoutSetup() harnessOption {
 	return func(h *writeHarness) { h.skipSetup = true }
+}
+
+// withoutIdentity leaves the feeder unclaimed (no claim secret), so the
+// identity section is legitimately omitted from an export.
+func withoutIdentity() harnessOption {
+	return func(h *writeHarness) { h.unclaimedIdentity = true }
+}
+
+// withCorruptIdentity writes a feeder-id plus a non-canonical claim secret, so
+// the export's fail-loud-on-corruption path can be exercised.
+func withCorruptIdentity() harnessOption {
+	return func(h *writeHarness) { h.corruptIdentity = true }
 }
 
 // setFeedEnv replaces the value set the fake `apl-feed config show`

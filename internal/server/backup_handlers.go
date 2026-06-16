@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/airplanes-live/image-webconfig/internal/auth"
+	"github.com/airplanes-live/image-webconfig/internal/identity"
 )
 
 // Combined device backup/restore.
@@ -112,7 +113,13 @@ func (s *Server) handleBackupExport(w http.ResponseWriter, r *http.Request) {
 			writeJSONError(w, http.StatusInternalServerError, "backup export failed ("+sec.name+")")
 			return
 		}
-		sections[sec.name] = raw
+		// A nil payload with no error means the section is legitimately empty
+		// (e.g. identity on a feeder that hasn't been claimed yet) — omit it
+		// rather than embed an empty/placeholder section. Distinct from an
+		// error, which fails the whole export above.
+		if raw != nil {
+			sections[sec.name] = raw
+		}
 	}
 
 	env := combinedBackupEnvelope{
@@ -136,6 +143,18 @@ func (s *Server) handleBackupExport(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) exportIdentitySection(ctx context.Context) (json.RawMessage, error) {
+	// An unclaimed feeder has no identity to back up — omit the section so a
+	// not-yet-claimed feeder can still back up its settings, Wi-Fi, and
+	// password. Reveal() distinguishes the cases Read() conflates: a missing
+	// feeder-id or a missing claim-secret file are "unclaimed" (omit), but a
+	// present-but-non-canonical claim secret is corruption — fail loud rather
+	// than silently drop a broken identity from the backup.
+	if _, rerr := s.identity.Reveal(ctx); errors.Is(rerr, identity.ErrNoFeederID) || errors.Is(rerr, identity.ErrNoClaimSecret) {
+		return nil, nil
+	} else if rerr != nil {
+		return nil, fmt.Errorf("identity status: %w", rerr)
+	}
+
 	cctx, cancel := context.WithTimeout(ctx, backupSectionTimeout)
 	defer cancel()
 	res, err := s.runner(cctx, s.priv.ExportIdentity)

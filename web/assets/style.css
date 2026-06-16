@@ -1446,6 +1446,15 @@ input[aria-invalid="true"] {
 .wc-agg-row__actions .wc-btn-ghost,
 .wc-agg-row__actions .wc-btn-danger { width: auto; flex: 0 0 auto; }
 
+/* Secondary action under a form/card (e.g. "Restore from backup instead" on the
+   setup screen) — separated from the primary action above it. */
+.wc-setup-alt {
+  margin-top: 1rem;
+  padding-top: 1rem;
+  border-top: 1px solid var(--wc-line-soft);
+  text-align: center;
+}
+
 .wc-agg-badge {
   display: inline-block;
   font-size: 0.75rem;
