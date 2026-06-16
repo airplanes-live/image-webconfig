@@ -30,6 +30,26 @@ printf '%s\n' "${SVC_STATE-inactive}"
 EOF
     chmod +x "$SYSTEMCTL"
     export AGG_SYSTEMCTL="$SYSTEMCTL"
+
+    # dpkg-query stub: a package reads installed iff $AGG_TEST_DPKG_DIR/<pkg>
+    # exists. Default-clean so fr24's external-install package probe is
+    # deterministic on any host (the build box may or may not have fr24feed).
+    export AGG_TEST_DPKG_DIR="$WORK/dpkg"; mkdir -p "$AGG_TEST_DPKG_DIR"
+    DQ="$WORK/fake-dpkg-query"
+    cat > "$DQ" <<'EOF'
+#!/usr/bin/env bash
+pkg="${@: -1}"
+[ -f "$AGG_TEST_DPKG_DIR/$pkg" ] || exit 1
+printf 'ii '
+exit 0
+EOF
+    chmod +x "$DQ"; export AGG_DPKG_QUERY="$DQ"
+
+    # Point fr24's external-install signals at temp paths so a real vendor
+    # fr24feed on the build host can't leak into these tests; default-absent.
+    mkdir -p "$WORK/fr24"
+    export AGG_FR24_SYSTEM_BIN="$WORK/fr24/usr-bin-fr24feed"
+    export AGG_FR24_SYSTEM_UNIT_PATHS="$WORK/fr24/fr24feed.service"
 }
 
 teardown() {
@@ -52,6 +72,43 @@ teardown() {
     echo "$output" | jq -e '.aggregators[0].decoder_reachable == true'
     echo "$output" | jq -e '.aggregators[0].secret_fields_present == []'
     echo "$output" | jq -e '.aggregators[0].fields | length == 2'
+}
+
+@test "status on a fresh device reports fr24 neither external nor managed" {
+    run "$APLAGG" status --json
+    [ "$status" -eq 0 ]
+    echo "$output" | jq -e '.aggregators[] | select(.id=="fr24")
+        | .external_install==false and .managed_install==false'
+}
+
+@test "status flags a manually-installed fr24 binary as external_install" {
+    : > "$AGG_FR24_SYSTEM_BIN"; chmod +x "$AGG_FR24_SYSTEM_BIN"
+    run "$APLAGG" status --json
+    [ "$status" -eq 0 ]
+    echo "$output" | jq -e '.aggregators[] | select(.id=="fr24")
+        | .external_install==true and .managed_install==false'
+}
+
+@test "status flags a vendor fr24feed.service unit as external_install" {
+    : > "$AGG_FR24_SYSTEM_UNIT_PATHS"
+    run "$APLAGG" status --json
+    [ "$status" -eq 0 ]
+    echo "$output" | jq -e '.aggregators[] | select(.id=="fr24") | .external_install==true'
+}
+
+@test "status flags an apt-installed fr24feed package as external_install" {
+    : > "$AGG_TEST_DPKG_DIR/fr24feed"
+    run "$APLAGG" status --json
+    [ "$status" -eq 0 ]
+    echo "$output" | jq -e '.aggregators[] | select(.id=="fr24") | .external_install==true'
+}
+
+@test "status reports our own fr24 install as managed_install, not external" {
+    install -D -m 0755 /dev/null "$AGG_INSTALL_ROOT/fr24/fr24feed"
+    run "$APLAGG" status --json
+    [ "$status" -eq 0 ]
+    echo "$output" | jq -e '.aggregators[] | select(.id=="fr24")
+        | .managed_install==true and .external_install==false'
 }
 
 @test "list is an alias for status" {
