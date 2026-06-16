@@ -84,6 +84,15 @@ AGG_LIVENESS_WAIT="${AGG_LIVENESS_WAIT:-2}"        # secs to settle before the p
 # When set, invoked as `$AGG_PIAWARE_DEB_OVERRIDE <dest>` to drop a .deb at <dest>.
 AGG_PIAWARE_DEB_OVERRIDE="${AGG_PIAWARE_DEB_OVERRIDE:-}"
 
+# --- fr24 external-install detection seams ----------------------------------
+# A user may install Flightradar24 manually (vendor .deb or signup script) outside
+# our control. Our managed fr24 lives under AGG_INSTALL_ROOT, runs the
+# airplanes-aggregator@fr24 template unit, and never creates any of these system
+# artifacts — so any one of them present means an unmanaged vendor install.
+AGG_FR24_SYSTEM_PACKAGE="${AGG_FR24_SYSTEM_PACKAGE:-fr24feed}"
+AGG_FR24_SYSTEM_BIN="${AGG_FR24_SYSTEM_BIN:-/usr/bin/fr24feed}"
+AGG_FR24_SYSTEM_UNIT_PATHS="${AGG_FR24_SYSTEM_UNIT_PATHS:-/etc/systemd/system/fr24feed.service /lib/systemd/system/fr24feed.service /usr/lib/systemd/system/fr24feed.service}"
+
 # --- async-enable seams ----------------------------------------------------
 # enable is fire-and-forget: cmd_enable validates synchronously then launches a
 # detached worker via systemd-run, returning {result:"accepted"} in <1s. The
@@ -389,6 +398,24 @@ _adapter_json() {
 				if _pkg_installed "${AGG_PIAWARE_PACKAGE:-$AGG_ID}"; then installed="true"; fi ;;
 		esac
 
+		# Ownership: external_install = a vendor/admin copy we don't own; managed_install
+		# = we have our own install/state here. Independent — both true is a conflict the
+		# UI surfaces (unmanaged status, but Remove stays enabled to clear our copy).
+		local external_install="false" managed_install="false"
+		_adapter_external_install "$AGG_ID" && external_install="true"
+		case "$AGG_ID" in
+			piaware)
+				# Our we_installed marker, or any persisted state (e.g. an imported
+				# identity). reset is safe in both cases — the teardown only purges the
+				# package when we_installed, otherwise it just clears our own state — so
+				# either lets the UI offer Remove to clean up what is ours.
+				{ [[ "$(jq -r '.we_installed == true' <<<"$(_piaware_managed_read)")" == "true" ]] \
+					|| [[ -f "$state_path" ]]; } && managed_install="true" ;;
+			fr24)
+				# Our vendor binary under AGG_INSTALL_ROOT, or any persisted state.
+				{ [[ "$installed" == "true" ]] || [[ -f "$state_path" ]]; } && managed_install="true" ;;
+		esac
+
 		# Version surfacing: report the version actually on disk (the running
 		# truth), not the descriptor pin. installed_version is recorded into state
 		# at acquire time; for pinned-deb prefer the live dpkg version if present
@@ -497,6 +524,8 @@ _adapter_json() {
 			--arg desired_version "$desired_version" \
 			--argjson version_drift "$version_drift" \
 			--argjson reconcile_error "$reconcile_error_json" \
+			--argjson external_install "$external_install" \
+			--argjson managed_install "$managed_install" \
 			--argjson overlay "$ov_json" \
 			'{
 				id: $id, display_name: $name, acquire_method: $acquire, service_unit: $unit,
@@ -507,6 +536,7 @@ _adapter_json() {
 				config_drift: false, fields: $fields, secret_fields_present: $secrets_present,
 				decoder_reachable: $decoder, claim_url: $claim,
 				version: $version, desired_version: $desired_version, version_drift: $version_drift,
+				external_install: $external_install, managed_install: $managed_install,
 				reconcile_error: $reconcile_error
 			 }
 			 | (if .unavailable_reason == "" then del(.unavailable_reason) else . end)
@@ -894,6 +924,12 @@ cmd_disable() {
 	if _mutation_in_progress; then
 		_emit_error lock_timeout "another aggregator operation is in progress; try again shortly"; exit 4
 	fi
+	# Never act on an unmanaged install: for piaware the unit is the admin's shared
+	# piaware.service, so an unguarded disable would stop their feeder. The UI never
+	# offers Stop on the unmanaged card; this closes the direct-API path.
+	if _adapter_external_install "$id"; then
+		_emit_error state_error "$id is installed on this device by another tool and is not managed by airplanes.live"; exit 3
+	fi
 	# Validate state + descriptor BEFORE the systemctl side effect so a corrupt
 	# state fails fast with no half-applied change.
 	local cur unit next
@@ -1056,6 +1092,12 @@ _fr24_signup() {
 }
 
 _enable_fr24() {
+	# Never stack our managed fr24feed on top of an admin's vendor install — a
+	# second instance collides on the monitor port / decoder feed. Guard before any
+	# field validation so the ownership error wins over "email required".
+	if _fr24_external_install; then
+		_emit_error state_error "Flightradar24 is already installed on this device by another tool and is not managed by airplanes.live"; exit 3
+	fi
 	local email key lat lon alt fields cur
 	# Existing state fields (e.g. seeded by `import`) are the base; request
 	# fields override. This lets a restored key/email be reused without
@@ -1144,6 +1186,11 @@ _enable_fr24() {
 # format if one is present, and a reachable decoder. Emits the error envelope +
 # exits on failure, so a bad request fails immediately instead of after a 202.
 _fr24_validate_sync() {
+	# Refuse before field validation when a vendor fr24feed already owns the
+	# device (mirrors _enable_fr24; the worker re-checks as defence in depth).
+	if _fr24_external_install; then
+		_emit_error state_error "Flightradar24 is already installed on this device by another tool and is not managed by airplanes.live"; exit 3
+	fi
 	local email key lat lon alt fields cur
 	cur="$(_load_state "fr24" 2>/dev/null)" \
 		|| { _emit_error state_error "existing fr24 state is unreadable; reset to clear"; exit 3; }
@@ -1178,6 +1225,44 @@ _pkg_installed() {
 	# shellcheck disable=SC2016  # ${db:Status-Abbrev} is a dpkg-query field, not a shell var
 	st="$("$AGG_DPKG_QUERY" -W -f='${db:Status-Abbrev}' "$1" 2>/dev/null || true)"
 	[[ "${st:1:1}" == "i" ]]
+}
+
+# --- managed-vs-external ownership detection -------------------------------
+# Whether each aggregator is installed OUTSIDE our control (a user's manual
+# vendor/apt install) and/or has an airplanes.live-managed install. The two are
+# independent: a device can carry both at once (an external vendor install plus a
+# half-applied managed copy), which is exactly the conflict the UI must let the
+# user clean up. Self-contained: globals + defaults only, no descriptor sourcing,
+# so the mutating verbs (enable/disable) can call them at function scope.
+
+# _piaware_external_install: the piaware package (or its conf) is present but our
+# we_installed ownership marker is not set — i.e. an admin's piaware, not ours.
+# Mirrors the long-standing enable-time guard, hoisted into a reusable helper.
+_piaware_external_install() {
+	{ _pkg_installed "${AGG_PIAWARE_PACKAGE:-piaware}" || [[ -e "$AGG_PIAWARE_CONF" ]]; } \
+		&& [[ "$(jq -r '.we_installed == true' <<<"$(_piaware_managed_read)")" != "true" ]]
+}
+
+# _fr24_external_install: a vendor fr24feed exists outside our managed tree. Any
+# one signal suffices (a .deb registers the package + installs the binary + a
+# fr24feed.service unit; the signup-script path installs the binary + unit). The
+# vendor's stale /etc/fr24feed.ini is deliberately NOT a signal — it can outlive a
+# purge and would wrongly block a fresh managed setup.
+_fr24_external_install() {
+	_pkg_installed "${AGG_FR24_SYSTEM_PACKAGE:-fr24feed}" && return 0
+	[[ -x "$AGG_FR24_SYSTEM_BIN" ]] && return 0
+	local p
+	for p in $AGG_FR24_SYSTEM_UNIT_PATHS; do [[ -e "$p" ]] && return 0; done
+	return 1
+}
+
+# _adapter_external_install <id>: per-adapter external-install dispatch.
+_adapter_external_install() {
+	case "$1" in
+		piaware) _piaware_external_install ;;
+		fr24)    _fr24_external_install ;;
+		*)       return 1 ;;
+	esac
 }
 
 # _host_arch: dpkg architecture (test seam AGG_DPKG_ARCH).
@@ -1412,6 +1497,12 @@ _enable_piaware() {
 	# shellcheck source=/dev/null
 	source "$AGG_DESC_DIR/piaware.desc"
 
+	# Never touch a piaware this helper did not install or configure — and let the
+	# ownership error win over any field/support/decoder error (mirrors _enable_fr24).
+	if _piaware_external_install; then
+		_emit_error state_error "piaware is already installed or configured on this device and is not managed by airplanes.live"; exit 3
+	fi
+
 	local cur fields feeder_id mlat host port
 	cur="$(_load_state "piaware" 2>/dev/null)" \
 		|| { _emit_error state_error "existing piaware state is unreadable; reset to clear"; exit 3; }
@@ -1430,12 +1521,6 @@ _enable_piaware() {
 	_piaware_supported || { _emit_error rejected "FlightAware is not supported on this OS or architecture"; exit 2; }
 	[[ -z "$feeder_id" ]] || _valid_feeder_id "$feeder_id" || { _emit_error rejected "invalid feeder ID format"; exit 2; }
 	_decoder_reachable || { _emit_error decoder_unavailable "local decoder ${AGG_DECODER_ADDR} is not reachable"; exit 2; }
-
-	# Never touch a piaware this helper did not install or configure.
-	if { _pkg_installed "$AGG_PIAWARE_PACKAGE" || [[ -e "$AGG_PIAWARE_CONF" ]]; } \
-		&& [[ "$(jq -r '.we_installed == true' <<<"$(_piaware_managed_read)")" != "true" ]]; then
-		_emit_error state_error "piaware is already installed or configured on this device and is not managed by airplanes.live"; exit 3
-	fi
 
 	host="${AGG_DECODER_ADDR%%:*}"; port="${AGG_DECODER_ADDR##*:}"
 
@@ -1512,6 +1597,13 @@ _enable_piaware() {
 _piaware_validate_sync() {
 	# shellcheck source=/dev/null
 	source "$AGG_DESC_DIR/piaware.desc"
+	# Refuse to adopt a piaware this helper did not install OR configure (an
+	# installed package or a leftover /etc/piaware.conf without our we_installed
+	# marker is admin-owned), and let that ownership error win over any field/
+	# support/decoder error — mirrors _fr24_validate_sync.
+	if _piaware_external_install; then
+		_emit_error state_error "piaware is already installed or configured on this device and is not managed by airplanes.live"; exit 3
+	fi
 	# Type-check the request fields up front so a malformed mlat_enabled/fields is
 	# a clean rejection, not a downstream jq failure (a JSON string "false" is
 	# truthy in jq and would otherwise flip MLAT on).
@@ -1530,14 +1622,6 @@ _piaware_validate_sync() {
 	_piaware_supported || { _emit_error rejected "FlightAware is not supported on this OS or architecture"; exit 2; }
 	[[ -z "$feeder_id" ]] || _valid_feeder_id "$feeder_id" || { _emit_error rejected "invalid feeder ID format"; exit 2; }
 	_decoder_reachable || { _emit_error decoder_unavailable "local decoder ${AGG_DECODER_ADDR} is not reachable"; exit 2; }
-	# Refuse to adopt a piaware this helper did not install OR configure — an
-	# installed package or a leftover /etc/piaware.conf without our marker is
-	# admin-owned. (Our own enable sets we_installed before writing the conf, so
-	# this never blocks a retry of our own in-flight setup.)
-	if { _pkg_installed "$AGG_PIAWARE_PACKAGE" || [[ -e "$AGG_PIAWARE_CONF" ]]; } \
-		&& [[ "$(jq -r '.we_installed == true' <<<"$(_piaware_managed_read)")" != "true" ]]; then
-		_emit_error state_error "piaware is already installed or configured on this device and is not managed by airplanes.live"; exit 3
-	fi
 }
 
 # _piaware_reconcile_mlat <merged-state>: apply allow-mlat live + try-restart, so

@@ -160,6 +160,10 @@ type aggRecord struct {
 	// helper stamps {error_code, message} into state when a post-update
 	// reconcile fails, and surfaces it via _adapter_json. nil = no failure.
 	reconcileError map[string]string
+	// external marks an adapter as installed OUTSIDE airplanes.live (a manual
+	// vendor/apt install), so the SPA renders the read-only "Unmanaged" view.
+	// Seeded from AGG_DEV_EXTERNAL; mirrors the helper's external_install bit.
+	external bool
 }
 
 // sshFakeState is the dev-fake SSH-access state for the pi account. Seeded as
@@ -218,7 +222,7 @@ const devFakeFeederUUID = "11111111-2222-3333-4444-555555555555"
 // place to land its temp files.
 func NewState(p Paths) *State {
 	now := time.Now()
-	return &State{
+	st := &State{
 		Paths: p,
 		uuid:  devFakeFeederUUID,
 		feedEnv: map[string]string{
@@ -299,6 +303,38 @@ func NewState(p Paths) *State {
 		// SSH card opens on the "Enable SSH for pi" affordance like a fresh feeder.
 		ssh: sshFakeState{piPresent: true},
 	}
+	// AGG_DEV_EXTERNAL=<id>[:conflict][,...] simulates a manual vendor install so
+	// the read-only "Unmanaged" view is exercisable in the dev UI. Plain "<id>"
+	// renders a pure unmanaged install (managed_install=false; Remove disabled);
+	// "<id>:conflict" keeps a managed copy too (managed_install=true; Remove
+	// enabled) — the reporter's vendor-copy-plus-our-copy scenario.
+	for _, tok := range strings.Split(os.Getenv("AGG_DEV_EXTERNAL"), ",") {
+		tok = strings.TrimSpace(tok)
+		if tok == "" {
+			continue
+		}
+		id, mode, _ := strings.Cut(tok, ":")
+		r := st.aggRecordLocked(id)
+		r.external = true
+		r.reconcileError = nil
+		if mode == "conflict" {
+			r.enabled = true // configured=true → managed_install=true
+		} else {
+			r.enabled = false
+			r.mlat = false
+			r.fields = map[string]string{}
+		}
+	}
+	return st
+}
+
+// AggregatorExternal reports whether id is seeded as an external (unmanaged)
+// install — the dev analogue of the helper's external_install bit.
+func (s *State) AggregatorExternal(id string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	r, ok := s.aggregators[id]
+	return ok && r.external
 }
 
 // AggregatorRecord returns a copy of the dev aggregator record for id:
@@ -400,11 +436,17 @@ func (s *State) AggregatorDisable(id string) {
 	s.services[aggregatorUnit(id)] = "inactive"
 }
 
-// AggregatorReset drops the record entirely and stops the unit. Mirrors `reset`.
+// AggregatorReset drops the airplanes.live-managed copy and stops the unit.
+// Mirrors `reset`: production tears down only what we own, so an unmanaged vendor
+// install (the conflict case) survives — keep the external marker if it was set.
 func (s *State) AggregatorReset(id string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	delete(s.aggregators, id)
+	if r, ok := s.aggregators[id]; ok && r.external {
+		s.aggregators[id] = &aggRecord{fields: map[string]string{}, external: true}
+	} else {
+		delete(s.aggregators, id)
+	}
 	s.services[aggregatorUnit(id)] = "inactive"
 }
 

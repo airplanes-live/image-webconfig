@@ -3951,16 +3951,28 @@
         decoder_unavailable: ["Decoder not ready",  "warn"],
         network_unavailable: ["Network unavailable", "warn"],
         unavailable:         ["Unavailable",        "na"],
+        unmanaged:           ["Unmanaged",          "na"],
     };
     function aggStateBadge(state) {
         const pair = AGG_STATE_BADGE[state] || [state || "—", "na"];
         return el("span", { class: "wc-agg-badge wc-agg-badge--" + pair[1] }, pair[0]);
     }
 
+    // aggDisplayState collapses an adapter to the state its badge should show. An
+    // externally-installed (unmanaged) adapter reads "unmanaged" — EXCEPT while one
+    // of our own mutations is in flight or has just failed, which stays visible so a
+    // conflicting managed copy can still be cleaned up.
+    function aggDisplayState(a) {
+        const s = a.state;
+        if (s === "installing" || s === "removing" || s === "applying" || s === "failed") return s;
+        return a.external_install ? "unmanaged" : s;
+    }
+
     // buildAdapterTile renders one configured/active adapter as a nav tile that
     // opens its manage page. The state label + dot come from AGG_STATE_BADGE.
     function buildAdapterTile(a) {
-        const pair = AGG_STATE_BADGE[a.state] || [a.state || "—", "na"];
+        const ds = aggDisplayState(a);
+        const pair = AGG_STATE_BADGE[ds] || [ds || "—", "na"];
         const iconNode = el("span", { class: "wc-tile__icon" }, svgIcon(AGGREGATOR_ICON));
         const titleEl  = el("span", { class: "wc-tile__title" }, a.display_name || a.id);
         const metaEl   = el("span", { class: "wc-tile__meta" }, a.reconcile_error ? pair[0] + " · Update failed" : pair[0]);
@@ -3987,12 +3999,13 @@
         if (!container) return;
         const all = (resp && resp.ok && resp.payload && resp.payload.aggregators) || [];
         const adapters = all.filter(a =>
-            a.configured || a.enabled ||
+            a.configured || a.enabled || a.external_install ||
             a.state === "installing" || a.state === "removing" || a.state === "failed");
         // Signature covers everything a tile renders + membership flags, so a
         // change to any of them re-renders rather than going stale behind state.
         const sig = adapters.map(a =>
             [a.id, a.state || "", a.display_name || "", a.configured ? 1 : 0, a.enabled ? 1 : 0,
+             a.external_install ? 1 : 0,
              (a.reconcile_error && a.reconcile_error.error_code) || ""].join(":")
         ).join("|");
         if (container.__sig === sig) return;
@@ -4050,7 +4063,8 @@
 
     function buildAggregatorRow(a) {
         const manageable = adapterManageable(a.id);
-        const pair = AGG_STATE_BADGE[a.state] || [a.state || "—", "na"];
+        const ds = aggDisplayState(a);
+        const pair = AGG_STATE_BADGE[ds] || [ds || "—", "na"];
         // A failed auto-update is sticky and easy to miss on the manage page, so
         // surface it on the row too; a pending (self-healing) drift is not noisy here.
         let status = a.version ? pair[0] + " · v" + a.version : pair[0];
@@ -4224,7 +4238,63 @@
         return el("section", { class: "wc-card wc-agg-status-card" }, el("h3", {}, "Status"), rows);
     }
 
+    // renderAggExternalManaged: read-only view for an adapter installed OUTSIDE
+    // airplanes.live (external_install). The vendor/admin tool owns it, so our
+    // enable/disable/logs verbs can't act on it — show what we can read and present
+    // the actions disabled rather than letting a click error. Remove stays enabled
+    // only when WE also have a copy here (managed_install): the conflict case where
+    // reset usefully clears our duplicate and leaves the external install alone.
+    function renderAggExternalManaged(a, name) {
+        const inlineErr = el("p", { class: "error", role: "alert" });
+        const tip = name + " is managed by another tool on this device, not by airplanes.live.";
+        // A failed managed mutation (e.g. a Remove of our conflicting copy) lands
+        // here once it leaves the in-flight states — surface it instead of swallowing.
+        if (a.enable && (a.enable.error_code || a.enable.status === "failed")) {
+            inlineErr.textContent = aggEnableErrorMessage({ payload: a.enable });
+        }
+
+        const note = a.managed_install
+            ? name + " is installed on this device by another tool. An airplanes.live-managed copy " +
+              "was also set up but can't run alongside it. Use Remove to clear the airplanes.live copy " +
+              "— the other install is left untouched."
+            : name + " is already installed on this device by another tool, so airplanes.live can't " +
+              "start, stop, or remove it here. To let airplanes.live manage " + name + " instead, remove " +
+              "the existing install over SSH, then set it up here.";
+
+        const start = el("button", { type: "button", class: "wc-btn-primary", disabled: "", title: tip }, "Start feeding");
+
+        const remove = el("button", { type: "button", class: "wc-btn-danger" }, "Remove");
+        if (a.managed_install) {
+            remove.onclick = async () => {
+                if (!confirm("Remove the airplanes.live-managed " + name + " copy? This stops and deletes " +
+                    "only the airplanes.live copy; the install added by the other tool is left as-is.")) return;
+                remove.disabled = true;
+                const r = await postJSON("/api/aggregators/" + a.id + "/reset", {});
+                if (handleAuthFailure(r)) return;
+                if (r.status === 202) {
+                    navigate(() => aggregatorMutationProgress(a.id, r.payload && r.payload.request_id, "reset"),
+                        { title: "Removing " + name, showBack: true });
+                    return;
+                }
+                remove.disabled = false; inlineErr.textContent = aggEnableErrorMessage(r);
+            };
+        } else {
+            remove.disabled = true;
+            remove.title = tip;
+        }
+
+        render(el("section", { class: "wc-card" },
+            aggDetailHead(name, aggDisplayState(a)),
+            el("p", { class: "muted" }, "Installed on this device by another tool."),
+            buildAggStatusBlock(a),
+            el("p", { class: "wc-agg-caveat" }, note),
+            inlineErr,
+            el("div", { class: "wc-agg-row__actions" }, start, remove),
+        ));
+    }
+
     function renderFr24Form(a, cfg) {
+        if (a.external_install) return renderAggExternalManaged(a, "Flightradar24");
         cfg = cfg || {};
         const configured = !!(a.configured || a.enabled);
         const inlineErr = el("p", { class: "error", role: "alert" });
@@ -4398,6 +4468,7 @@
     }
 
     function renderPiawareForm(a) {
+        if (a.external_install) return renderAggExternalManaged(a, "FlightAware");
         const configured = !!(a.configured || a.enabled);
         const inlineErr = el("p", { class: "error", role: "alert" });
         const mlatOn = a.configured_mlat_enabled != null ? !!a.configured_mlat_enabled : !!a.mlat_default;

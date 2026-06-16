@@ -86,6 +86,16 @@ INI
 EOF
     chmod +x "$SIGN"
     export AGG_FR24_SIGNUP_OVERRIDE="$SIGN"
+
+    # Keep the fr24 external-install probe negative by default (the build host may
+    # have a real fr24feed): clean dpkg + temp, absent system paths. The
+    # unmanaged-refusal test below opts in by creating one of these.
+    DQ="$WORK/fake-dpkg-query"
+    printf '#!/usr/bin/env bash\nexit 1\n' > "$DQ"; chmod +x "$DQ"
+    export AGG_DPKG_QUERY="$DQ"
+    export AGG_FR24_SYSTEM_BIN="$WORK/sys/fr24feed"
+    export AGG_FR24_SYSTEM_UNIT_PATHS="$WORK/sys/fr24feed.service"
+    mkdir -p "$WORK/sys"
 }
 
 teardown() {
@@ -232,6 +242,17 @@ EOF
     [ "$status" -eq 2 ]
     echo "$output" | jq -e '.error_code == "rejected"'
     [ ! -f "$AGG_ENABLE_STATE" ]   # no overlay, no worker
+}
+
+@test "enable refuses fr24 when a vendor fr24feed is already installed (before field validation)" {
+    : > "$AGG_FR24_SYSTEM_BIN"; chmod +x "$AGG_FR24_SYSTEM_BIN"
+    # Empty fields would normally fail on "email required" first; the ownership
+    # guard must win, proving it runs before field validation.
+    agg enable '{"id":"fr24","fields":{}}'
+    [ "$status" -eq 3 ]
+    echo "$output" | jq -e '.error_code == "state_error"'
+    echo "$output" | jq -e '.message | test("not managed by airplanes.live")'
+    [ ! -f "$AGG_ENABLE_STATE" ]   # refused synchronously, no worker
 }
 
 @test "enable rejects a malformed sharing key synchronously" {
