@@ -104,6 +104,17 @@ teardown() {
     [ ! -f "$APL_SSH_SNIPPET" ]
 }
 
+@test "enable-password rejects a password containing a newline (chpasswd injection guard)" {
+    # The \n is a JSON escape, so the parsed password contains a real newline.
+    # chpasswd reads user:password line-by-line, so a newline would inject a
+    # second record (e.g. root:...). The validator must reject before chpasswd.
+    run "$APLSSH" enable-password --json <<< '{"password":"abcdefghijkl\nroot:pwned1234567"}'
+    [ "$status" -eq 2 ]
+    echo "$output" | jq -e '.status == "rejected"'
+    ! grep -q chpasswd "$ACTIONS"
+    [ ! -f "$APL_SSH_SNIPPET" ]
+}
+
 @test "enable-password sets the password and writes the byte-exact snippet" {
     run "$APLSSH" enable-password --json <<< '{"password":"longenoughpassword"}'
     [ "$status" -eq 0 ]

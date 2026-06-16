@@ -9,10 +9,11 @@
 # minimum, matching the webconfig password-min check in handlers.go.
 #
 # Two validators:
-#  - apl_ssh_valid_password: at least APL_SSH_MIN_PASSWORD_LEN (12) characters.
-#    No upper bound and no character-class rules — a per-device SSH password is
-#    operator-chosen and chpasswd accepts any byte string; the only contract is
-#    the shared 12-char floor.
+#  - apl_ssh_valid_password: at least APL_SSH_MIN_PASSWORD_LEN (12) characters
+#    and free of C0/DEL control bytes. No upper bound and no other character-class
+#    rules — a per-device SSH password is operator-chosen — but a newline must be
+#    rejected: chpasswd reads user:password line-by-line, so an embedded newline
+#    would inject a second record (e.g. setting root's password).
 #  - apl_ssh_valid_pubkey: a single OpenSSH public key line: a known type token,
 #    a base64 blob, and an optional comment. Rejects multi-line input, control
 #    bytes, and unknown key types so a crafted value can't inject a second
@@ -25,6 +26,15 @@ APL_SSH_MIN_PASSWORD_LEN="${APL_SSH_MIN_PASSWORD_LEN:-12}"
 #   via ${#v} so a multibyte passphrase isn't under-counted.
 apl_ssh_valid_password() {
 	local v="$1"
+	# Reject any C0 control byte (0x00-0x1F) or DEL (0x7F). A newline would let
+	# the value inject a second `user:password` record into chpasswd's line-based
+	# stdin (e.g. setting root's password); chpasswd otherwise accepts any byte.
+	# Done with tr so an embedded LF can't slip past a regex that treats LF as a
+	# line separator.
+	local stripped total
+	total="$(LC_ALL=C printf '%s' "$v" | wc -c)"
+	stripped="$(LC_ALL=C printf '%s' "$v" | LC_ALL=C tr -d '\000-\037\177' | wc -c)"
+	[[ "$stripped" == "$total" ]] || return 1
 	(( ${#v} >= APL_SSH_MIN_PASSWORD_LEN ))
 }
 

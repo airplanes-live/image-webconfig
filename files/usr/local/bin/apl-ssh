@@ -219,7 +219,10 @@ _apl_ssh_write_snippet() {
 }
 
 _apl_ssh_remove_snippet() {
-	rm -f "$APL_SSH_SNIPPET" 2>/dev/null || true
+	rm -f "$APL_SSH_SNIPPET" 2>/dev/null
+	# Idempotent on absence, but a file that survives removal (EROFS, perms) must
+	# surface as a failure — a revocation that silently no-ops is dangerous.
+	[[ -e "$APL_SSH_SNIPPET" ]] && return 1
 	return 0
 }
 
@@ -236,7 +239,10 @@ _apl_ssh_write_key() {
 }
 
 _apl_ssh_remove_key() {
-	rm -f "$APL_SSH_KEY_FILE" 2>/dev/null || true
+	rm -f "$APL_SSH_KEY_FILE" 2>/dev/null
+	# A key that survives removal must surface as a failure — clear-key is a
+	# revocation, and reporting success while the key remains usable is unsafe.
+	[[ -e "$APL_SSH_KEY_FILE" ]] && return 1
 	return 0
 }
 
@@ -343,7 +349,10 @@ _cmd_disable_password_locked() {
 	if ! _apl_ssh_pi_present; then
 		# Nothing to lock, but still strip the snippet so password auth can't be
 		# resurrected for a later-created pi account from a stale snippet.
-		_apl_ssh_remove_snippet
+		if ! _apl_ssh_remove_snippet; then
+			_emit_error filesystem_error "failed to remove the sshd configuration"
+			return 3
+		fi
 		local reloaded_np=false
 		_apl_ssh_reload && reloaded_np=true
 		_emit_json "$(jq -nc --argjson reloaded "$reloaded_np" \
@@ -354,7 +363,10 @@ _cmd_disable_password_locked() {
 		_emit_error filesystem_error "failed to lock the password"
 		return 3
 	fi
-	_apl_ssh_remove_snippet
+	if ! _apl_ssh_remove_snippet; then
+		_emit_error filesystem_error "failed to remove the sshd configuration"
+		return 3
+	fi
 	local reloaded=false
 	_apl_ssh_reload && reloaded=true
 	_emit_json "$(jq -nc --argjson reloaded "$reloaded" \
