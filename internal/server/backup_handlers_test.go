@@ -179,6 +179,42 @@ func TestBackupExport_AssemblesAllSections(t *testing.T) {
 	}
 }
 
+func TestBackupExport_OmitsIdentityWhenUnclaimed(t *testing.T) {
+	// A feeder that hasn't been claimed has no identity to back up — the
+	// identity section is omitted, but the rest of the backup still succeeds.
+	h := newWriteHarness(t, withoutIdentity())
+	h.stdinResultFor = okStdin
+	r := postJSON(t, h.client, h.ts.URL+"/api/backup/export", map[string]any{})
+	defer r.Body.Close()
+	if r.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", r.StatusCode)
+	}
+	var env combinedBackupEnvelope
+	if err := json.Unmarshal(readBody(t, r), &env); err != nil {
+		t.Fatalf("decode envelope: %v", err)
+	}
+	if _, ok := env.Sections["identity"]; ok {
+		t.Error("identity section present, want omitted for an unclaimed feeder")
+	}
+	for _, name := range []string{"settings", "wifi", "password"} {
+		if _, ok := env.Sections[name]; !ok {
+			t.Errorf("missing section %q on an unclaimed-feeder backup", name)
+		}
+	}
+}
+
+func TestBackupExport_FailsOnCorruptIdentity(t *testing.T) {
+	// A present-but-corrupt claim secret is NOT "unclaimed" — the export must
+	// fail loud, never produce an identity-less backup that hides the damage.
+	h := newWriteHarness(t, withCorruptIdentity())
+	h.stdinResultFor = okStdin
+	r := postJSON(t, h.client, h.ts.URL+"/api/backup/export", map[string]any{})
+	defer r.Body.Close()
+	if r.StatusCode != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want 500 (corrupt identity must fail loud)", r.StatusCode)
+	}
+}
+
 func TestBackupExport_FailsLoudlyOnSectionError(t *testing.T) {
 	h := newWriteHarness(t)
 	// Identity export returns non-canonical JSON → the whole export must 500,

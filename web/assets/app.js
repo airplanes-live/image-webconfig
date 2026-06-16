@@ -109,6 +109,7 @@
     const refreshBtn = document.getElementById("wc-refresh-btn");
     const userMenu = document.getElementById("wc-user-menu");
     const userMenuAggregators = document.getElementById("wc-user-aggregators");
+    const userMenuBackup = document.getElementById("wc-user-backup");
     const userMenuSSH = document.getElementById("wc-user-ssh");
     const userMenuChangePw = document.getElementById("wc-user-change-pw");
     const userMenuLogout = document.getElementById("wc-user-logout");
@@ -4151,6 +4152,263 @@
         );
     }
 
+    // ===== Combined device backup / restore =====
+
+    // The five sections a combined backup carries, in display order. Restore
+    // applies them in a slightly different order server-side, but the checklist
+    // is keyed by section so arrival order doesn't matter.
+    const BACKUP_SECTIONS = [
+        { key: "settings", label: "Feeder settings" },
+        { key: "identity", label: "Feeder identity" },
+        { key: "aggregators", label: "Third-party aggregators" },
+        { key: "wifi", label: "Saved Wi-Fi networks" },
+        { key: "password", label: "Admin password" },
+    ];
+
+    // buildRestoreChecklist renders one row per section and returns a setStatus
+    // updater so the live NDJSON stream can tick each row as it lands.
+    function buildRestoreChecklist() {
+        const rows = {};
+        const container = el("div", { class: "wc-agg-status", role: "status", "aria-live": "polite" });
+        for (const s of BACKUP_SECTIONS) {
+            const dot = el("span", { class: "wc-tile__dot wc-tile__dot--na" });
+            const state = el("span", { class: "wc-agg-status__value" }, "waiting…");
+            rows[s.key] = { dot, state };
+            container.appendChild(el("div", { class: "wc-agg-status__row" },
+                dot, el("span", { class: "wc-agg-status__label" }, s.label), state));
+        }
+        const setStatus = (key, status, reason) => {
+            const r = rows[key];
+            if (!r) return;
+            let sev = "na", text = status;
+            if (status === "applied") { sev = "ok"; text = "restored"; }
+            else if (status === "skipped") { sev = "na"; text = "skipped" + (reason ? " — " + reason : ""); }
+            else if (status === "failed") { sev = "err"; text = "failed" + (reason ? " — " + reason : ""); }
+            r.dot.className = "wc-tile__dot wc-tile__dot--" + sev;
+            r.state.textContent = text;
+        };
+        return { node: container, setStatus };
+    }
+
+    // streamRestore POSTs a backup envelope and reads the NDJSON restore stream,
+    // calling onEvent(ev) per event so the checklist updates live. A pre-stream
+    // rejection (4xx) is a normal JSON error body, not NDJSON. Returns
+    // {ok, status, summary, error}. Deliberately uses its own fetch (not
+    // sendJSON, which buffers + parses one JSON value) and does NOT register an
+    // AbortController: the server finishes the restore under its own background
+    // context regardless, so navigating away must not interrupt a write in
+    // flight.
+    async function streamRestore(path, body, onEvent) {
+        let resp;
+        try {
+            resp = await fetch(path, {
+                method: "POST",
+                credentials: "same-origin",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify(body),
+            });
+        } catch (_) {
+            return { ok: false, status: 0, error: "network error" };
+        }
+        if (!resp.ok) {
+            let payload = null;
+            try { payload = await resp.json(); } catch (_) {}
+            return { ok: false, status: resp.status, error: (payload && payload.error) || "Restore failed." };
+        }
+        if (!resp.body || typeof resp.body.getReader !== "function") {
+            return { ok: false, status: resp.status, error: "restore stream unavailable" };
+        }
+        let summary = null;
+        const handleLine = (line) => {
+            line = line.trim();
+            if (!line) return;
+            let ev;
+            try { ev = JSON.parse(line); } catch (_) { return; }
+            if (ev.type === "summary") summary = ev;
+            onEvent(ev);
+        };
+        const reader = resp.body.getReader();
+        const decoder = new TextDecoder();
+        let buf = "";
+        for (;;) {
+            let chunk;
+            try { chunk = await reader.read(); }
+            catch (_) { return { ok: false, status: resp.status, error: "connection lost during restore" }; }
+            if (chunk.done) break;
+            buf += decoder.decode(chunk.value, { stream: true });
+            let nl;
+            while ((nl = buf.indexOf("\n")) >= 0) {
+                handleLine(buf.slice(0, nl));
+                buf = buf.slice(nl + 1);
+            }
+        }
+        buf += decoder.decode(); // flush any trailing multi-byte sequence
+        handleLine(buf);
+        // A stream that ends without the terminal summary line was truncated
+        // (dropped connection, killed server) — report it as a failure rather
+        // than letting the caller treat a partial restore as complete.
+        if (!summary) {
+            return { ok: false, status: resp.status, error: "restore ended unexpectedly — it may be incomplete" };
+        }
+        return { ok: true, status: resp.status, summary };
+    }
+
+    // parseBackupFile reads + validates an uploaded file client-side: size cap
+    // (mirrors the server's 128 KiB), JSON parse, and the combined-backup kind.
+    // Returns {ok, value, error}.
+    async function parseBackupFile(file) {
+        if (!file) return { ok: false, error: "" };
+        if (file.size > 131072) return { ok: false, error: "That file is too large to be a valid backup." };
+        let parsed;
+        try { parsed = JSON.parse(await file.text()); }
+        catch (_) { return { ok: false, error: "That file isn't a valid backup." }; }
+        if (!parsed || parsed.kind !== "airplanes-combined-backup") {
+            return { ok: false, error: "That file isn't an airplanes.live feeder backup." };
+        }
+        return { ok: true, value: parsed };
+    }
+
+    function backupPanel() {
+        render(buildBackupExportCard(), buildBackupRestoreCard());
+    }
+
+    function buildBackupExportCard() {
+        const msg = el("div", {});
+        const setMsg = (text, kind) => msg.replaceChildren(text ? el("div", { class: "wc-flash wc-flash--" + (kind || "ok") }, text) : el("span"));
+        const exportBtn = el("button", { type: "button", class: "wc-btn-ghost" }, "Download backup");
+        exportBtn.onclick = async () => {
+            setMsg("");
+            exportBtn.disabled = true;
+            const r = await postJSON("/api/backup/export", {});
+            exportBtn.disabled = false;
+            if (handleAuthFailure(r)) return;
+            if (!r.ok) { setMsg((r.payload && r.payload.error) || "Backup failed.", "warn"); return; }
+            try {
+                const blob = new Blob([JSON.stringify(r.payload, null, 2)], { type: "application/json" });
+                const url = URL.createObjectURL(blob);
+                const a = el("a", { href: url, download: "airplanes-feeder-backup.json" });
+                document.body.appendChild(a); a.click(); a.remove();
+                setTimeout(() => URL.revokeObjectURL(url), 1000);
+                setMsg("Backup downloaded — keep it private.", "ok");
+            } catch (_) { setMsg("Could not start the download.", "warn"); }
+        };
+        return el("section", { class: "wc-card" },
+            el("h2", {}, "Back up this feeder"),
+            el("p", { class: "muted" },
+                "Download one file with this feeder's identity, settings, third-party aggregator sign-ins, saved Wi-Fi networks (including passwords), and the admin password. Use it to restore the feeder after reflashing. The file holds every secret this feeder stores — keep it private."),
+            el("div", { class: "wc-agg-row__actions" }, exportBtn),
+            msg,
+        );
+    }
+
+    function buildBackupRestoreCard() {
+        const msg = el("div", {});
+        const setMsg = (text, kind) => msg.replaceChildren(text ? el("div", { class: "wc-flash wc-flash--" + (kind || "ok") }, text) : el("span"));
+        const progress = el("div", {});
+        const fileInput = el("input", { type: "file", accept: "application/json,.json", hidden: true });
+        const importBtn = el("button", { type: "button", class: "wc-btn-ghost" }, "Restore from backup");
+        importBtn.onclick = () => fileInput.click();
+        fileInput.onchange = async () => {
+            const file = fileInput.files && fileInput.files[0];
+            fileInput.value = "";
+            progress.replaceChildren();
+            const parsed = await parseBackupFile(file);
+            if (!parsed.ok) { if (parsed.error) setMsg(parsed.error, "warn"); return; }
+            if (!confirm("Restore this backup? It overwrites this feeder's settings, identity, aggregators, and Wi-Fi, and replaces the admin password — you'll be logged out and must log in with the password from the backup.")) return;
+            setMsg("");
+            importBtn.disabled = true;
+            const checklist = buildRestoreChecklist();
+            progress.replaceChildren(el("h3", {}, "Restoring…"), checklist.node);
+            let failed = 0;
+            let res;
+            try {
+                res = await streamRestore("/api/backup/restore", parsed.value, (ev) => {
+                    if (ev.type === "section") {
+                        checklist.setStatus(ev.section, ev.status, ev.reason);
+                        if (ev.status === "failed") failed++;
+                    }
+                });
+            } finally {
+                importBtn.disabled = false;
+            }
+            if (handleAuthFailure(res)) return;
+            if (!res.ok) { setMsg(res.error || "Restore failed.", "warn"); return; }
+            if (res.summary && res.summary.password_changed) {
+                navigate(() => loginPanel(failed > 0
+                    ? "Password restored, but some items couldn't be restored — log in and re-check Backup & restore."
+                    : "Password restored — log in with the password from your backup."), {});
+                return;
+            }
+            if (failed > 0) { setMsg("Restore finished, but some items couldn't be restored — see above.", "warn"); return; }
+            setMsg("Restore complete.", "ok");
+        };
+        return el("section", { class: "wc-card" },
+            el("h2", {}, "Restore from a backup"),
+            el("p", { class: "muted" },
+                "Upload a backup file to restore it onto this feeder. Saved Wi-Fi networks are added without disturbing the connection you're using now."),
+            el("div", { class: "wc-agg-row__actions" }, importBtn, fileInput),
+            progress,
+            msg,
+        );
+    }
+
+    // setupRestorePanel is the first-run counterpart reached from the password
+    // setup screen: it restores a backup onto a freshly-flashed feeder (no
+    // password set yet) and auto-logs-in. The backup MUST carry a password
+    // section — that's what completes setup.
+    function setupRestorePanel() {
+        const msg = el("div", {});
+        const setMsg = (text, kind) => msg.replaceChildren(text ? el("div", { class: "wc-flash wc-flash--" + (kind || "ok") }, text) : el("span"));
+        const progress = el("div", {});
+        const fileInput = el("input", { type: "file", accept: "application/json,.json", hidden: true });
+        const importBtn = el("button", { type: "button", class: "wc-btn-primary" }, "Choose backup file");
+        importBtn.onclick = () => fileInput.click();
+        fileInput.onchange = async () => {
+            const file = fileInput.files && fileInput.files[0];
+            fileInput.value = "";
+            progress.replaceChildren();
+            const parsed = await parseBackupFile(file);
+            if (!parsed.ok) { if (parsed.error) setMsg(parsed.error, "warn"); return; }
+            if (!(parsed.value.sections && parsed.value.sections.password)) {
+                setMsg("This backup has no saved admin password, so it can't complete setup. Use “Set a password instead”.", "warn");
+                return;
+            }
+            setMsg("");
+            importBtn.disabled = true;
+            const checklist = buildRestoreChecklist();
+            progress.replaceChildren(el("h3", {}, "Restoring…"), checklist.node);
+            let failed = 0;
+            let res;
+            try {
+                res = await streamRestore("/api/backup/restore-setup", parsed.value, (ev) => {
+                    if (ev.type === "section") {
+                        checklist.setStatus(ev.section, ev.status, ev.reason);
+                        if (ev.status === "failed") failed++;
+                    }
+                });
+            } finally {
+                importBtn.disabled = false;
+            }
+            if (!res.ok) { setMsg(res.error || "Restore failed.", "warn"); return; }
+            // The device is initialized and we're auto-logged-in; carry a warning
+            // to the dashboard if any section failed, then boot() routes there.
+            if (failed > 0) {
+                pendingFlash = { text: "Signed in. Some items couldn't be restored — check Backup & restore.", level: "warn" };
+            }
+            await boot();
+        };
+        render(el("section", { class: "wc-card" },
+            el("h2", {}, "Restore from backup"),
+            el("p", {},
+                "Upload a backup from another airplanes.live feeder (or an earlier flash of this one) to restore its identity, settings, and admin password. You'll be signed in automatically."),
+            el("div", { class: "wc-agg-row__actions" }, importBtn, fileInput),
+            progress,
+            msg,
+            el("div", { class: "wc-setup-alt" },
+                el("button", { type: "button", class: "wc-btn-ghost", onclick: () => navigate(setupPanel, { title: "First-time setup", showBack: false }) }, "Set a password instead")),
+        ));
+    }
+
     // aggEnableErrorMessage turns a failed enable/disable/reset response (or a
     // failed progress overlay) into operator-facing guidance.
     function aggEnableErrorMessage(r) {
@@ -4966,6 +5224,11 @@
             el("div", { class: "field" }, el("label", { for: "setup-pw" }, "Password"), pwReveal(pw)),
             el("div", { class: "field" }, el("label", { for: "setup-pw-confirm" }, "Confirm password"), pwReveal(confirmInput)),
             submit,
+            el("div", { class: "wc-setup-alt" },
+                el("button", {
+                    type: "button", class: "wc-btn-ghost",
+                    onclick: () => navigate(setupRestorePanel, { title: "Restore from backup", showBack: false }),
+                }, "Restore from backup instead")),
             err,
         );
         render(form);
@@ -5599,6 +5862,10 @@
     if (userMenuAggregators) userMenuAggregators.addEventListener("click", () => {
         closeUserMenu();
         navigate(aggregatorsPanel, { title: "Third-party aggregators", showBack: true });
+    });
+    if (userMenuBackup) userMenuBackup.addEventListener("click", () => {
+        closeUserMenu();
+        navigate(backupPanel, { title: "Backup & restore", showBack: true });
     });
     if (userMenuSSH) userMenuSSH.addEventListener("click", () => {
         closeUserMenu();
