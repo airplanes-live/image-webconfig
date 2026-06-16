@@ -129,6 +129,8 @@ func newTestServer(t *testing.T) (*httptest.Server, *Server) {
 		WifiActivate:       []string{"sudo-stub", "apl-wifi", "activate", "--json"},
 		WifiAdopt:          []string{"sudo-stub", "apl-wifi", "adopt", "--json"},
 		WifiStatus:         []string{"sudo-stub", "apl-wifi", "status", "--json"},
+		WifiExport:         []string{"sudo-stub", "apl-wifi", "export", "--json"},
+		WifiImport:         []string{"sudo-stub", "apl-wifi", "import", "--json"},
 		ExportIdentity:     []string{"sudo-stub", "identity-export"},
 		ImportIdentity:     []string{"sudo-stub", "identity-import"},
 		AggregatorStatus:   []string{"sudo-stub", "apl-aggregator", "status", "--json"},
@@ -216,6 +218,13 @@ type writeHarness struct {
 	runnerResultFor func(argv []string) wexec.Result // optional: per-argv canned Result (stdout+stderr); falls back to zero value
 	stdinErr        error
 	stdinResult     wexec.Result
+	// stdinResultFor, when non-nil, returns a per-argv canned Result for the
+	// stdin runner (falls back to stdinResult). Needed when one request fans
+	// out to several distinct stdin shell-outs (e.g. combined backup/restore).
+	stdinResultFor func(argv []string) wexec.Result
+	// skipSetup, when true, leaves the device uninitialized (no password) so
+	// the public first-run paths can be exercised. Set via withoutSetup().
+	skipSetup bool
 	// upgradeStatePath is wired into Deps.UpgradeStatePath. Set via
 	// withUpgradeStatePath() before harness construction; defaults to
 	// the production path (which doesn't exist in tests, surfacing
@@ -304,7 +313,11 @@ func newWriteHarness(t *testing.T, opts ...harnessOption) *writeHarness {
 		h.stdinCalls = append(h.stdinCalls, stdinCall{argv: append([]string(nil), argv...), stdin: body})
 		err := h.stdinErr
 		res := h.stdinResult
+		fn := h.stdinResultFor
 		h.mu.Unlock()
+		if fn != nil {
+			res = fn(argv)
+		}
 		return res, err
 	}
 
@@ -324,6 +337,8 @@ func newWriteHarness(t *testing.T, opts ...harnessOption) *writeHarness {
 		WifiActivate:       []string{"sudo-stub", "apl-wifi", "activate", "--json"},
 		WifiAdopt:          []string{"sudo-stub", "apl-wifi", "adopt", "--json"},
 		WifiStatus:         []string{"sudo-stub", "apl-wifi", "status", "--json"},
+		WifiExport:         []string{"sudo-stub", "apl-wifi", "export", "--json"},
+		WifiImport:         []string{"sudo-stub", "apl-wifi", "import", "--json"},
 		ExportIdentity:     []string{"sudo-stub", "identity-export"},
 		ImportIdentity:     []string{"sudo-stub", "identity-import"},
 		AggregatorStatus:   []string{"sudo-stub", "apl-aggregator", "status", "--json"},
@@ -369,12 +384,23 @@ func newWriteHarness(t *testing.T, opts ...harnessOption) *writeHarness {
 	h.ts = httptest.NewServer(New(deps))
 	t.Cleanup(h.ts.Close)
 	h.client = httpClient(t)
+	if h.skipSetup {
+		// Leave the device uninitialized for first-run-path tests; the client
+		// has no session.
+		return h
+	}
 	r := postJSON(t, h.client, h.ts.URL+"/api/setup", map[string]string{"password": testPassword})
 	r.Body.Close()
 	if r.StatusCode != http.StatusOK {
 		t.Fatalf("setup status = %d", r.StatusCode)
 	}
 	return h
+}
+
+// withoutSetup leaves the harness device uninitialized (no password set), so
+// the public first-run restore path can be exercised.
+func withoutSetup() harnessOption {
+	return func(h *writeHarness) { h.skipSetup = true }
 }
 
 // setFeedEnv replaces the value set the fake `apl-feed config show`
