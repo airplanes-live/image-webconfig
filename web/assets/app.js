@@ -347,6 +347,29 @@
         return node;
     }
 
+    // Wrap a password <input> with a Show/Hide reveal toggle and return the
+    // wrapping element (the input itself is unchanged, so callers keep their
+    // reference for .value/.focus()). The toggle flips input.type between
+    // password and text. aria-pressed is set as a string because el() drops
+    // falsey attrs. type="button" so it never submits the enclosing form.
+    // Named pwReveal (not pwField) to avoid colliding with the local pwField
+    // identifiers in the SSH forms.
+    function pwReveal(input) {
+        input.classList.add("wc-pw-input");
+        const toggle = el("button", {
+            type: "button", class: "wc-pw-toggle",
+            "aria-label": "Show password", "aria-pressed": "false",
+        }, "Show");
+        toggle.onclick = () => {
+            const reveal = input.type === "password";
+            input.type = reveal ? "text" : "password";
+            toggle.textContent = reveal ? "Hide" : "Show";
+            toggle.setAttribute("aria-pressed", reveal ? "true" : "false");
+            toggle.setAttribute("aria-label", reveal ? "Hide password" : "Show password");
+        };
+        return el("div", { class: "wc-pw-field" }, input, toggle);
+    }
+
     function clear() { app.replaceChildren(); }
     function render(...nodes) { clear(); for (const n of nodes) app.appendChild(n); }
     function errorEl() { return el("div", { class: "error", role: "alert" }); }
@@ -3590,24 +3613,10 @@
             const ssid = el("input", { id: "wifi-ssid", name: "ssid", type: "text", value: existing ? (existing.ssid || "") : "" });
             const psk = el("input", {
                 id: "wifi-psk", name: "psk",
-                type: "password", autocomplete: "new-password", class: "wifi-pw-input",
+                type: "password", autocomplete: "new-password",
                 placeholder: isEdit && existing.has_psk ? "(unchanged — leave blank to keep)" : "8-63 chars or 64-hex",
             });
-            // Reveal toggle. aria-pressed is set as a string both here and in
-            // the handler because el() drops falsey attrs (a boolean false
-            // would never reach the DOM).
-            const pwToggle = el("button", {
-                type: "button", class: "wifi-pw-toggle",
-                "aria-label": "Show password", "aria-pressed": "false",
-            }, "Show");
-            pwToggle.onclick = () => {
-                const reveal = psk.type === "password";
-                psk.type = reveal ? "text" : "password";
-                pwToggle.textContent = reveal ? "Hide" : "Show";
-                pwToggle.setAttribute("aria-pressed", reveal ? "true" : "false");
-                pwToggle.setAttribute("aria-label", reveal ? "Hide password" : "Show password");
-            };
-            const pwField = el("div", { class: "wifi-pw-field" }, psk, pwToggle);
+            const pwField = pwReveal(psk);
             const hidden = el("input", { id: "wifi-hidden", name: "hidden", type: "checkbox" });
             if (existing && existing.hidden) hidden.checked = true;
             const priority = el("input", {
@@ -4954,8 +4963,8 @@
             el("h2", {}, "Set webconfig password"),
             el("p", {}, "Choose the password used to administer this feeder. Minimum 12 characters."),
             username,
-            el("div", { class: "field" }, el("label", { for: "setup-pw" }, "Password"), pw),
-            el("div", { class: "field" }, el("label", { for: "setup-pw-confirm" }, "Confirm password"), confirmInput),
+            el("div", { class: "field" }, el("label", { for: "setup-pw" }, "Password"), pwReveal(pw)),
+            el("div", { class: "field" }, el("label", { for: "setup-pw-confirm" }, "Confirm password"), pwReveal(confirmInput)),
             submit,
             err,
         );
@@ -4993,7 +5002,7 @@
         },
             el("h2", {}, "Log in"),
             username,
-            el("div", { class: "field" }, el("label", { for: "login-pw" }, "Password"), pw),
+            el("div", { class: "field" }, el("label", { for: "login-pw" }, "Password"), pwReveal(pw)),
             submit,
             err,
         );
@@ -5074,7 +5083,7 @@
             username,
             ...(opts.extraFields || []),
             el("div", { class: "field" },
-                el("label", {}, "Confirm with your webconfig password"), pwField),
+                el("label", {}, "Confirm with your webconfig password"), pwReveal(pwField)),
             el("div", { class: "actions" }, submit),
             err,
         );
@@ -5116,7 +5125,7 @@
             required: true, minlength: "12", placeholder: "New pi password (≥12 characters)",
         });
         const pwField = () => el("div", { class: "field" },
-            el("label", {}, passwordOn ? "New password for pi" : "Password for pi"), newPw);
+            el("label", {}, passwordOn ? "New password for pi" : "Password for pi"), pwReveal(newPw));
 
         wrap.appendChild(sshReauthForm({
             path: passwordOn ? "/api/ssh/set-password" : "/api/ssh/enable-password",
@@ -5212,9 +5221,9 @@
         },
             el("h2", {}, "Change webconfig password"),
             username,
-            el("div", { class: "field" }, el("label", { for: "change-pw-old" }, "Current password"), oldPw),
-            el("div", { class: "field" }, el("label", { for: "change-pw-new" }, "New password"), newPw),
-            el("div", { class: "field" }, el("label", { for: "change-pw-confirm" }, "Confirm new password"), confirmInput),
+            el("div", { class: "field" }, el("label", { for: "change-pw-old" }, "Current password"), pwReveal(oldPw)),
+            el("div", { class: "field" }, el("label", { for: "change-pw-new" }, "New password"), pwReveal(newPw)),
+            el("div", { class: "field" }, el("label", { for: "change-pw-confirm" }, "Confirm new password"), pwReveal(confirmInput)),
             el("div", { class: "actions" }, cancel, submit),
             err,
         );
