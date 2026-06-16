@@ -338,6 +338,13 @@ func New(d Deps) http.Handler {
 	mux.HandleFunc("POST /api/identity/secret", s.requireSession(s.handleIdentitySecret))
 	mux.HandleFunc("POST /api/identity/export", s.requireSession(s.handleIdentityExport))
 	mux.HandleFunc("POST /api/identity/import", s.requireSession(s.handleIdentityImport))
+	// Combined device backup / restore. export + the configured-device restore
+	// require a session; restore-setup is public but gated on the uninitialized
+	// state (the same trust window as POST /api/setup) so a fresh flash can be
+	// restored before a password exists. Restore streams NDJSON progress.
+	mux.HandleFunc("POST /api/backup/export", s.requireSession(s.handleBackupExport))
+	mux.HandleFunc("POST /api/backup/restore", s.requireSession(s.handleBackupRestore))
+	mux.HandleFunc("POST /api/backup/restore-setup", s.handleBackupRestoreSetup)
 	mux.HandleFunc("GET /api/config", s.requireSession(s.handleConfigGet))
 	mux.HandleFunc("GET /api/sdr", s.requireSession(s.handleSDRList))
 	mux.HandleFunc("GET /api/status", s.requireSession(s.handleStatus))
