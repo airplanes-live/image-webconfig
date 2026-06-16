@@ -82,6 +82,12 @@ func privilegedArgvCases(priv PrivilegedArgv) []privilegedArgvCase {
 		{"AggregatorReset", priv.AggregatorReset},
 		{"AggregatorExport", priv.AggregatorExport},
 		{"AggregatorImport", priv.AggregatorImport},
+		{"SSHStatus", priv.SSHStatus},
+		{"SSHEnablePassword", priv.SSHEnablePassword},
+		{"SSHSetPassword", priv.SSHSetPassword},
+		{"SSHDisablePassword", priv.SSHDisablePassword},
+		{"SSHSetKey", priv.SSHSetKey},
+		{"SSHClearKey", priv.SSHClearKey},
 	}
 }
 

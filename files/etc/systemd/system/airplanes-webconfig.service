@@ -40,7 +40,18 @@ PrivateTmp=yes
 # keyfiles; the sudo child inherits this unit's mount namespace so the path
 # must be in ReadWritePaths or atomic-rename fails on the booted feeder
 # (chroot tests don't see this).
-ReadWritePaths=/var/lib/airplanes-webconfig /etc/airplanes /etc/airplanes/webconfig /run/airplanes /etc/NetworkManager/system-connections
+#
+# The apl-ssh helper (also a sudo child sharing this mount namespace under
+# ProtectSystem=strict) needs the full set chpasswd/passwd touch plus the two
+# SSH config drop-in trees:
+#   /etc/ssh/sshd_config.d   — the 99-airplanes-ssh-pi.conf snippet (enable/disable)
+#   /etc/ssh/authorized_keys.d — the managed `pi` key file (set/clear)
+#   /etc/shadow, /etc/shadow- — chpasswd/passwd rewrite the hash + back up the old one
+#   /etc/passwd               — passwd may touch it (e.g. lastlog/aging fields)
+#   /etc/.pwd.lock            — the pwck/passwd advisory lock file shadow-utils takes
+# Without these, chpasswd/passwd fail with EROFS on the booted feeder even
+# though the sudoers grant authorises the call (chroot tests don't see this).
+ReadWritePaths=/var/lib/airplanes-webconfig /etc/airplanes /etc/airplanes/webconfig /run/airplanes /etc/NetworkManager/system-connections /etc/ssh/sshd_config.d /etc/ssh/authorized_keys.d /etc/shadow /etc/shadow- /etc/passwd /etc/.pwd.lock
 
 # Webconfig invokes `sudo -n systemctl ...` for service restart, so
 # NoNewPrivileges must stay false. The sudoers entry constrains the

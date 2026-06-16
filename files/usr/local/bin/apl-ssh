@@ -1,0 +1,449 @@
+#!/bin/bash
+# apl-ssh — privileged SSH-access management for airplanes-webconfig.
+#
+# Manages ONLY the `pi` account: a per-device password (enable / rotate /
+# disable) and a single webconfig-managed authorized key (set / clear). Reads
+# JSON on stdin for the mutating verbs, emits exactly one JSON envelope on
+# stdout for every status. Exit codes follow the apl-wifi / apl-feed contract:
+#   0  ok
+#   2  rejected (validation failure: password too short, bad pubkey)
+#   3  filesystem_error
+#   4  lock_timeout
+#   5  parse_error / usage_error
+#
+# The webconfig caller's sudoers grants pin one argv per verb
+# (`apl-ssh <verb> --json`), so the trust boundary is the sudoers layer.
+#
+# Two contract artifacts are shared byte-for-byte with the boot-config flow
+# (airplanes-first-run, in airplanes-live/image):
+#   1. The sshd drop-in /etc/ssh/sshd_config.d/99-airplanes-ssh-pi.conf, which
+#      Match-scopes PasswordAuthentication=yes to the pi account only (the
+#      device default from 90-airplanes.conf stays "no" for everyone else).
+#   2. The managed key file /etc/ssh/authorized_keys.d/pi: a single key,
+#      atomically overwritten.
+#
+# The pi password value is never echoed to stdout or any log.
+
+set -Eeuo pipefail
+
+# --- paths + constants -----------------------------------------------------
+
+APL_SSH_LIB_DIR="${APL_SSH_LIB_DIR:-/usr/local/lib/airplanes}"
+APL_SSH_LOCK="${APL_SSH_LOCK:-/run/airplanes/ssh.lock}"
+APL_SSH_LOCK_TIMEOUT="${APL_SSH_LOCK_TIMEOUT:-5}"
+
+# Account this helper manages. Hard-coded — the webconfig surface is "pi SSH
+# access", never an arbitrary account.
+APL_SSH_USER="${APL_SSH_USER:-pi}"
+
+# sshd drop-in snippet (contract 1). 0644 root:root, atomic.
+APL_SSH_SNIPPET="${APL_SSH_SNIPPET:-/etc/ssh/sshd_config.d/99-airplanes-ssh-pi.conf}"
+
+# Managed authorized_keys file (contract 2). 0644 root:root, single key, atomic
+# overwrite. The directory is referenced by sshd's AuthorizedKeysFile default
+# (.ssh/authorized_keys plus /etc/ssh/authorized_keys.d/%u on this image).
+APL_SSH_KEY_DIR="${APL_SSH_KEY_DIR:-/etc/ssh/authorized_keys.d}"
+APL_SSH_KEY_FILE="${APL_SSH_KEY_FILE:-$APL_SSH_KEY_DIR/$APL_SSH_USER}"
+
+# Test seams (default to production commands; sudo env_reset strips overrides in
+# production, same posture as apl-wifi's APL_WIFI_* seams).
+APL_SSH_GETENT="${APL_SSH_GETENT:-getent}"
+APL_SSH_CHPASSWD="${APL_SSH_CHPASSWD:-chpasswd}"
+APL_SSH_PASSWD="${APL_SSH_PASSWD:-passwd}"
+APL_SSH_SSHD="${APL_SSH_SSHD:-sshd}"
+APL_SSH_SYSTEMCTL="${APL_SSH_SYSTEMCTL:-systemctl}"
+# Unit to reload after a config/credential change. ssh.service on Debian.
+APL_SSH_RELOAD_UNIT="${APL_SSH_RELOAD_UNIT:-ssh}"
+
+# Exact snippet body. MUST stay byte-identical to the copy airplanes-first-run
+# writes (airplanes-live/image) — a diff between the two would mean a feeder's
+# boot-time and webconfig-time SSH config disagree.
+read -r -d '' APL_SSH_SNIPPET_BODY <<'SNIPPET' || true
+# airplanes.live per-device opt-in: enables password SSH for the pi account
+# only (Match-scoped, so other users keep the 90-airplanes.conf default of
+# PasswordAuthentication no). Written by airplanes-first-run (boot config) and
+# webconfig's apl-ssh helper.
+Match User pi
+    PasswordAuthentication yes
+Match all
+SNIPPET
+
+# --- JSON envelope helpers + traps -----------------------------------------
+#
+# Trap is installed BEFORE library sourcing so a missing/corrupt library can
+# still surface as a JSON envelope rather than empty stdout.
+
+_apl_ssh_emitted=0
+
+_emit_json() {
+	_apl_ssh_emitted=1
+	printf '%s\n' "$1"
+}
+
+# _emit_error STATUS MESSAGE [jq-args...] — emits {status,message,...named}.
+_emit_error() {
+	local status="$1" message="$2"
+	shift 2
+	local body
+	if ! body="$(jq -nc --arg s "$status" --arg m "$message" "$@" '{status:$s, message:$m} + $ARGS.named')"; then
+		printf '{"status":"%s","message":"jq emit failed"}\n' "$status"
+		_apl_ssh_emitted=1
+		return
+	fi
+	_emit_json "$body"
+}
+
+_apl_ssh_err_trap() {
+	local rc=$?
+	if (( _apl_ssh_emitted == 0 )); then
+		printf '{"status":"filesystem_error","message":"apl-ssh: unexpected error (exit %d)"}\n' "$rc"
+	fi
+	exit "$rc"
+}
+
+trap _apl_ssh_err_trap ERR
+
+# shellcheck source=../lib/airplanes/ssh-validators.sh disable=SC1091
+. "$APL_SSH_LIB_DIR/ssh-validators.sh"
+
+# --- locking ---------------------------------------------------------------
+
+_apl_ssh_with_lock() {
+	local fn="$1"
+	shift
+	mkdir -p "$(dirname "$APL_SSH_LOCK")" 2>/dev/null || true
+	exec 9>"$APL_SSH_LOCK"
+	if ! flock -w "$APL_SSH_LOCK_TIMEOUT" -x 9; then
+		_emit_error lock_timeout "another ssh operation is in progress; retry in a few seconds"
+		exit 4
+	fi
+	"$fn" "$@"
+	local rc=$?
+	exec 9>&-
+	return "$rc"
+}
+
+# --- input parsing ---------------------------------------------------------
+
+APL_SSH_REQ_JSON=""
+_apl_ssh_read_request() {
+	local allowed_csv="$1" buf
+	buf="$(cat)"
+	# Empty stdin is a valid empty object for verbs that take no fields.
+	[[ -n "$buf" ]] || buf='{}'
+	if ! jq -e 'type == "object"' >/dev/null 2>&1 <<< "$buf"; then
+		_emit_error parse_error "request body must be a JSON object"
+		exit 5
+	fi
+	if ! jq -e --arg allowed "$allowed_csv" \
+		'(keys - ($allowed | split(","))) as $extra | $extra | length == 0' \
+		>/dev/null 2>&1 <<< "$buf"; then
+		local extras
+		extras="$(jq -r --arg allowed "$allowed_csv" \
+			'(keys - ($allowed | split(","))) | join(",")' <<< "$buf")"
+		_emit_error parse_error "unknown field(s): $extras"
+		exit 5
+	fi
+	APL_SSH_REQ_JSON="$buf"
+}
+
+_apl_ssh_req_string() {
+	local key="$1" default="${2:-}"
+	jq -r --arg key "$key" --arg default "$default" \
+		'if has($key) then .[$key] else $default end' <<< "$APL_SSH_REQ_JSON"
+}
+
+_apl_ssh_req_has() {
+	local key="$1"
+	jq -e --arg key "$key" 'has($key)' >/dev/null 2>&1 <<< "$APL_SSH_REQ_JSON"
+}
+
+# --- fact probes -----------------------------------------------------------
+
+# pi account exists in passwd?
+_apl_ssh_pi_present() {
+	"$APL_SSH_GETENT" passwd "$APL_SSH_USER" >/dev/null 2>&1
+}
+
+# Is password auth effectively allowed for the pi account? Reads sshd's
+# resolved config for user=pi (this folds in the Match block + global default).
+# Echoes "true"/"false"; "unknown" if sshd -T fails (e.g. config error).
+_apl_ssh_password_auth_allowed() {
+	local out val
+	if ! out="$("$APL_SSH_SSHD" -T -C "user=$APL_SSH_USER" 2>/dev/null)"; then
+		printf 'unknown'
+		return 0
+	fi
+	val="$(LC_ALL=C awk 'tolower($1)=="passwordauthentication"{print tolower($2); exit}' <<< "$out")"
+	case "$val" in
+		yes) printf 'true' ;;
+		no)  printf 'false' ;;
+		*)   printf 'unknown' ;;
+	esac
+}
+
+# Is the pi password hash unlocked (usable)? `passwd -S pi` field 2 is the
+# status: P=usable password, L=locked, NP=no password. Echoes "true"/"false";
+# "unknown" if passwd -S fails.
+_apl_ssh_password_hash_unlocked() {
+	local out field2
+	if ! out="$("$APL_SSH_PASSWD" -S "$APL_SSH_USER" 2>/dev/null)"; then
+		printf 'unknown'
+		return 0
+	fi
+	field2="$(awk '{print $2; exit}' <<< "$out")"
+	case "$field2" in
+		P) printf 'true' ;;
+		L|NP) printf 'false' ;;
+		*) printf 'unknown' ;;
+	esac
+}
+
+# Is a managed key present (file exists and is non-empty)?
+_apl_ssh_managed_key_present() {
+	[[ -s "$APL_SSH_KEY_FILE" ]]
+}
+
+# --- snippet / key writers -------------------------------------------------
+
+# Atomically write the 99 snippet (contract 1) as 0644 root:root.
+_apl_ssh_write_snippet() {
+	local dir tmp
+	dir="$(dirname "$APL_SSH_SNIPPET")"
+	mkdir -p "$dir" 2>/dev/null || true
+	tmp="$(mktemp "$dir/.99-airplanes-ssh-pi.XXXXXX")" || return 1
+	printf '%s\n' "$APL_SSH_SNIPPET_BODY" > "$tmp" || { rm -f "$tmp"; return 1; }
+	chmod 0644 "$tmp" 2>/dev/null || true
+	mv -f "$tmp" "$APL_SSH_SNIPPET" || { rm -f "$tmp"; return 1; }
+	return 0
+}
+
+_apl_ssh_remove_snippet() {
+	rm -f "$APL_SSH_SNIPPET" 2>/dev/null || true
+	return 0
+}
+
+# Atomically OVERWRITE the managed key file (contract 2) as 0644 root:root.
+# Arg: the validated single-line public key.
+_apl_ssh_write_key() {
+	local key="$1" tmp
+	mkdir -p "$APL_SSH_KEY_DIR" 2>/dev/null || true
+	tmp="$(mktemp "$APL_SSH_KEY_DIR/.$APL_SSH_USER.XXXXXX")" || return 1
+	printf '%s\n' "$key" > "$tmp" || { rm -f "$tmp"; return 1; }
+	chmod 0644 "$tmp" 2>/dev/null || true
+	mv -f "$tmp" "$APL_SSH_KEY_FILE" || { rm -f "$tmp"; return 1; }
+	return 0
+}
+
+_apl_ssh_remove_key() {
+	rm -f "$APL_SSH_KEY_FILE" 2>/dev/null || true
+	return 0
+}
+
+# Reload sshd so a config/credential change takes effect on new connections.
+# Best-effort: a reload failure is logged via the envelope's reloaded flag but
+# does not fail the mutation (the on-disk change already landed).
+_apl_ssh_reload() {
+	"$APL_SSH_SYSTEMCTL" reload "$APL_SSH_RELOAD_UNIT" >/dev/null 2>&1
+}
+
+# --- status snapshot -------------------------------------------------------
+
+_apl_ssh_status_json() {
+	local pi_present=false pw_allowed pw_unlocked key_present=false
+	_apl_ssh_pi_present && pi_present=true
+	pw_allowed="$(_apl_ssh_password_auth_allowed)"
+	pw_unlocked="$(_apl_ssh_password_hash_unlocked)"
+	_apl_ssh_managed_key_present && key_present=true
+
+	# pw_allowed / pw_unlocked are "true"/"false"/"unknown". Emit booleans for
+	# true/false and JSON null for unknown so the UI can distinguish "definitely
+	# off" from "could not determine".
+	local allowed_json unlocked_json
+	case "$pw_allowed" in
+		true) allowed_json=true ;; false) allowed_json=false ;; *) allowed_json=null ;;
+	esac
+	case "$pw_unlocked" in
+		true) unlocked_json=true ;; false) unlocked_json=false ;; *) unlocked_json=null ;;
+	esac
+
+	jq -nc \
+		--argjson pi_present "$pi_present" \
+		--argjson password_auth_allowed "$allowed_json" \
+		--argjson password_hash_unlocked "$unlocked_json" \
+		--argjson managed_key_present "$key_present" \
+		'{status:"ok",
+		  pi_present:$pi_present,
+		  password_auth_allowed:$password_auth_allowed,
+		  password_hash_unlocked:$password_hash_unlocked,
+		  managed_key_present:$managed_key_present}'
+}
+
+# --- subcommand: status ----------------------------------------------------
+
+cmd_status() {
+	_emit_json "$(_apl_ssh_status_json)"
+}
+
+# --- subcommand: enable-password / set-password ----------------------------
+# Both set (or rotate) the pi password, write the 99 snippet, and reload sshd.
+# They are identical operations; two verbs exist only so the sudoers grant and
+# the UI intent ("enable" vs "rotate") read clearly.
+
+cmd_set_password() {
+	_apl_ssh_read_request "password"
+	if ! _apl_ssh_req_has password; then
+		_emit_error parse_error "password is required"
+		return 5
+	fi
+	local pw
+	pw="$(_apl_ssh_req_string password)"
+	if ! apl_ssh_valid_password "$pw"; then
+		_emit_json "$(jq -nc --argjson min "$APL_SSH_MIN_PASSWORD_LEN" \
+			'{status:"rejected", reason:"password_too_short", message:"password must be at least \($min) characters"}')"
+		return 2
+	fi
+	_apl_ssh_with_lock _cmd_set_password_locked "$pw"
+}
+
+_cmd_set_password_locked() {
+	local pw="$1"
+	if ! _apl_ssh_pi_present; then
+		_emit_json "$(jq -nc --arg u "$APL_SSH_USER" '{status:"rejected", reason:"no_pi_account", message:"the \($u) account does not exist on this device"}')"
+		return 2
+	fi
+	# Set the password. printf keeps the value off argv (/proc/<pid>/cmdline);
+	# chpasswd reads user:password from stdin. The value is never echoed.
+	if ! printf '%s:%s\n' "$APL_SSH_USER" "$pw" | "$APL_SSH_CHPASSWD" >/dev/null 2>&1; then
+		_emit_error filesystem_error "failed to set the password"
+		return 3
+	fi
+	if ! _apl_ssh_write_snippet; then
+		_emit_error filesystem_error "failed to write the sshd configuration"
+		return 3
+	fi
+	local reloaded=false
+	_apl_ssh_reload && reloaded=true
+	_emit_json "$(jq -nc --argjson reloaded "$reloaded" \
+		'{status:"applied", password_set:true, reloaded:$reloaded}')"
+}
+
+# --- subcommand: disable-password ------------------------------------------
+# ALWAYS lock the pi password AND remove the 99 snippet — never conditional on
+# key presence. A global cloud-init / drop-in override elsewhere could re-enable
+# password auth even with no snippet here; locking the hash makes the password
+# unusable regardless. Key-based auth is unaffected by locking the password.
+
+cmd_disable_password() {
+	_apl_ssh_read_request ""
+	_apl_ssh_with_lock _cmd_disable_password_locked
+}
+
+_cmd_disable_password_locked() {
+	if ! _apl_ssh_pi_present; then
+		# Nothing to lock, but still strip the snippet so password auth can't be
+		# resurrected for a later-created pi account from a stale snippet.
+		_apl_ssh_remove_snippet
+		local reloaded_np=false
+		_apl_ssh_reload && reloaded_np=true
+		_emit_json "$(jq -nc --argjson reloaded "$reloaded_np" \
+			'{status:"applied", password_disabled:true, reloaded:$reloaded}')"
+		return 0
+	fi
+	if ! "$APL_SSH_PASSWD" -l "$APL_SSH_USER" >/dev/null 2>&1; then
+		_emit_error filesystem_error "failed to lock the password"
+		return 3
+	fi
+	_apl_ssh_remove_snippet
+	local reloaded=false
+	_apl_ssh_reload && reloaded=true
+	_emit_json "$(jq -nc --argjson reloaded "$reloaded" \
+		'{status:"applied", password_disabled:true, reloaded:$reloaded}')"
+}
+
+# --- subcommand: set-key ---------------------------------------------------
+
+cmd_set_key() {
+	_apl_ssh_read_request "key"
+	if ! _apl_ssh_req_has key; then
+		_emit_error parse_error "key is required"
+		return 5
+	fi
+	local key
+	key="$(_apl_ssh_req_string key)"
+	# Trim surrounding whitespace the operator may have pasted; the validator
+	# then re-checks the trimmed value.
+	key="${key#"${key%%[![:space:]]*}"}"
+	key="${key%"${key##*[![:space:]]}"}"
+	if ! apl_ssh_valid_pubkey "$key"; then
+		_emit_json '{"status":"rejected","reason":"invalid_pubkey","message":"not a valid OpenSSH public key (expected: <type> <base64-key> [comment])"}'
+		return 2
+	fi
+	_apl_ssh_with_lock _cmd_set_key_locked "$key"
+}
+
+_cmd_set_key_locked() {
+	local key="$1"
+	if ! _apl_ssh_write_key "$key"; then
+		_emit_error filesystem_error "failed to write the authorized key"
+		return 3
+	fi
+	# No sshd reload needed: AuthorizedKeysFile is read per-connection.
+	_emit_json '{"status":"applied","key_set":true}'
+}
+
+# --- subcommand: clear-key -------------------------------------------------
+
+cmd_clear_key() {
+	_apl_ssh_read_request ""
+	_apl_ssh_with_lock _cmd_clear_key_locked
+}
+
+_cmd_clear_key_locked() {
+	if ! _apl_ssh_remove_key; then
+		_emit_error filesystem_error "failed to remove the authorized key"
+		return 3
+	fi
+	_emit_json '{"status":"applied","key_cleared":true}'
+}
+
+# --- dispatcher ------------------------------------------------------------
+
+_apl_ssh_usage() {
+	cat >&2 <<'USAGE'
+usage: apl-ssh {status|enable-password|set-password|disable-password|set-key|clear-key} --json
+
+Reads JSON on stdin for the mutating verbs; emits a JSON envelope on stdout for
+every status. Exit codes:
+  0  ok | applied
+  2  rejected (validation failure)
+  3  filesystem_error
+  4  lock_timeout
+  5  parse_error | usage_error
+USAGE
+}
+
+main() {
+	local sub="${1:-}" mode="${2:-}"
+	case "$sub:$mode" in
+		status:--json) cmd_status ;;
+		enable-password:--json) cmd_set_password ;;
+		set-password:--json) cmd_set_password ;;
+		disable-password:--json) cmd_disable_password ;;
+		set-key:--json) cmd_set_key ;;
+		clear-key:--json) cmd_clear_key ;;
+		-h:*|--help:*|help:*)
+			_apl_ssh_emitted=1
+			_apl_ssh_usage
+			return 0
+			;;
+		*)
+			_emit_error usage_error "unknown subcommand or missing --json: '$sub $mode'. Use: status|enable-password|set-password|disable-password|set-key|clear-key --json"
+			return 5
+			;;
+	esac
+}
+
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+	main "$@"
+fi

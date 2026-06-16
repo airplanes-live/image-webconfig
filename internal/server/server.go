@@ -118,6 +118,19 @@ type PrivilegedArgv struct {
 	AggregatorReset   []string
 	AggregatorExport  []string
 	AggregatorImport  []string
+	// SSH* target the apl-ssh helper that manages SSH access for the pi
+	// account only (a per-device password and a single managed authorized
+	// key). As with apl-wifi/apl-aggregator, one entry per verb keeps the
+	// sudoers grant pinned to a single subcommand so a compromised webconfig
+	// cannot drift between the read-only (status) and mutating (enable / set /
+	// disable / clear) surfaces via the same grant. The pi password value
+	// travels on the helper's stdin, never on argv.
+	SSHStatus          []string
+	SSHEnablePassword  []string
+	SSHSetPassword     []string
+	SSHDisablePassword []string
+	SSHSetKey          []string
+	SSHClearKey        []string
 }
 
 // DefaultPrivilegedArgv returns the production argv shapes for the
@@ -193,6 +206,18 @@ func DefaultPrivilegedArgv() PrivilegedArgv {
 		AggregatorReset:   sudo("/usr/local/bin/apl-aggregator", "reset", "--json"),
 		AggregatorExport:  sudo("/usr/local/bin/apl-aggregator", "export", "--json"),
 		AggregatorImport:  sudo("/usr/local/bin/apl-aggregator", "import", "--json"),
+		// apl-ssh manages SSH access for the pi account. One pinned argv per
+		// verb; the pi password (for enable/set) is read on stdin, not argv.
+		// enable-password and set-password are the same operation server-side —
+		// two verbs only so the grant + UI intent (enable vs rotate) read
+		// clearly. The helper is laid down in the rootfs payload alongside this
+		// argv contract so they version together.
+		SSHStatus:          sudo("/usr/local/bin/apl-ssh", "status", "--json"),
+		SSHEnablePassword:  sudo("/usr/local/bin/apl-ssh", "enable-password", "--json"),
+		SSHSetPassword:     sudo("/usr/local/bin/apl-ssh", "set-password", "--json"),
+		SSHDisablePassword: sudo("/usr/local/bin/apl-ssh", "disable-password", "--json"),
+		SSHSetKey:          sudo("/usr/local/bin/apl-ssh", "set-key", "--json"),
+		SSHClearKey:        sudo("/usr/local/bin/apl-ssh", "clear-key", "--json"),
 	}
 }
 
@@ -348,6 +373,20 @@ func New(d Deps) http.Handler {
 	mux.HandleFunc("POST /api/aggregators/{id}/disable", s.requireSession(s.handleAggregatorDisable))
 	mux.HandleFunc("POST /api/aggregators/{id}/set", s.requireSession(s.handleAggregatorSet))
 	mux.HandleFunc("POST /api/aggregators/{id}/reset", s.requireSession(s.handleAggregatorReset))
+
+	// SSH access for the pi account — privileged subcommands of
+	// /usr/local/bin/apl-ssh. The status read is GET; every mutating verb is a
+	// POST so it routes through requireOriginMatchesHost and carries a
+	// current_password the handler re-verifies (and strips) before forwarding
+	// to the helper. No Go-side mutex: the helper's flock at
+	// /run/airplanes/ssh.lock serializes across processes and returns a fast
+	// lock_timeout 503 to a second concurrent caller.
+	mux.HandleFunc("GET /api/ssh", s.requireSession(s.handleSSHStatus))
+	mux.HandleFunc("POST /api/ssh/enable-password", s.requireSession(s.handleSSHEnablePassword))
+	mux.HandleFunc("POST /api/ssh/set-password", s.requireSession(s.handleSSHSetPassword))
+	mux.HandleFunc("POST /api/ssh/disable-password", s.requireSession(s.handleSSHDisablePassword))
+	mux.HandleFunc("POST /api/ssh/set-key", s.requireSession(s.handleSSHSetKey))
+	mux.HandleFunc("POST /api/ssh/clear-key", s.requireSession(s.handleSSHClearKey))
 
 	// Static assets at /static/*; the SPA shell is served by the GET /
 	// handler below. no-store cache policy: assets are embedded in the
