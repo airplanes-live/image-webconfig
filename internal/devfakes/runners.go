@@ -85,6 +85,8 @@ func StubPrivilegedArgv() server.PrivilegedArgv {
 		WifiActivate:       []string{"dev-stub", "apl-wifi", "activate"},
 		WifiAdopt:          []string{"dev-stub", "apl-wifi", "adopt"},
 		WifiStatus:         []string{"dev-stub", "apl-wifi", "status"},
+		WifiExport:         []string{"dev-stub", "apl-wifi", "export"},
+		WifiImport:         []string{"dev-stub", "apl-wifi", "import"},
 		ExportIdentity:     []string{"dev-stub", "identity", "export"},
 		ImportIdentity:     []string{"dev-stub", "identity", "import"},
 		AggregatorStatus:   []string{"dev-stub", "apl-aggregator", "status"},
@@ -570,6 +572,10 @@ func wifiCmd(state *State, sub string, body []byte) (wexec.Result, error) {
 		return wifiActivate(state, body)
 	case "adopt":
 		return wifiAdopt(state, body)
+	case "export":
+		return wifiExport(state)
+	case "import":
+		return wifiImport(state, body)
 	}
 	env := map[string]any{"status": "usage_error", "message": "unknown subcommand " + sub}
 	b, _ := json.Marshal(env)
@@ -735,6 +741,101 @@ func wifiAdopt(state *State, body []byte) (wexec.Result, error) {
 		return wexec.Result{Stdout: b}, nil
 	}
 	env := map[string]any{"status": "applied", "id": newID, "adopted": true, "changed": []string{newID}}
+	b, _ := json.Marshal(env)
+	return wexec.Result{Stdout: b}, nil
+}
+
+// wifiExport mirrors `apl-wifi export --json`: every managed network with a
+// (synthetic) PSK. The fake never stores real PSKs, so it emits a placeholder
+// for password-protected networks — enough for the combined-backup round-trip
+// in the dev server.
+func wifiExport(state *State) (wexec.Result, error) {
+	type exportNet struct {
+		ID       string `json:"id"`
+		SSID     string `json:"ssid"`
+		PSK      string `json:"psk"`
+		Hidden   bool   `json:"hidden"`
+		Priority int    `json:"priority"`
+	}
+	nets := []exportNet{}
+	for _, n := range state.networksSnapshot() {
+		if !n.Managed {
+			continue
+		}
+		psk := ""
+		if n.HasPSK {
+			psk = "devfakepsk00"
+		}
+		nets = append(nets, exportNet{ID: n.ID, SSID: n.SSID, PSK: psk, Hidden: n.Hidden, Priority: n.Priority})
+	}
+	env := map[string]any{"status": "ok", "schema_version": 1, "networks": nets}
+	b, _ := json.Marshal(env)
+	return wexec.Result{Stdout: b}, nil
+}
+
+// wifiImport mirrors `apl-wifi import --json`: validate every entry first and
+// reject the whole payload on any invalid one (all-or-nothing, no mutation),
+// then apply non-disruptively — honour an explicit managed id, skip the active
+// connection, and report a per-network result.
+func wifiImport(state *State, body []byte) (wexec.Result, error) {
+	var req struct {
+		Networks []struct {
+			ID       string `json:"id"`
+			SSID     string `json:"ssid"`
+			PSK      string `json:"psk"`
+			Hidden   bool   `json:"hidden"`
+			Priority int    `json:"priority"`
+		} `json:"networks"`
+	}
+	if len(body) > 0 {
+		if err := json.Unmarshal(body, &req); err != nil {
+			env := map[string]any{"status": "parse_error", "message": err.Error()}
+			b, _ := json.Marshal(env)
+			return wexec.Result{Stdout: b}, nil
+		}
+	}
+
+	// Pass 1 — validate all; any invalid entry rejects the payload without
+	// touching state (mirrors the real helper's all-or-nothing contract).
+	for _, n := range req.Networks {
+		if n.SSID == "" {
+			env := map[string]any{"status": "rejected", "reason": "invalid_networks"}
+			b, _ := json.Marshal(env)
+			return wexec.Result{Stdout: b}, nil
+		}
+	}
+
+	// Pass 2 — apply, honouring managed ids and skipping the active link.
+	existing := map[string]WifiNetwork{}
+	for _, n := range state.networksSnapshot() {
+		existing[n.ID] = n
+	}
+	type result struct {
+		ID     string `json:"id"`
+		SSID   string `json:"ssid"`
+		Status string `json:"status"`
+		Reason string `json:"reason,omitempty"`
+	}
+	results := []result{}
+	imported := 0
+	for _, n := range req.Networks {
+		if n.ID != "" {
+			if cur, ok := existing[n.ID]; ok {
+				if cur.Active {
+					results = append(results, result{ID: n.ID, SSID: n.SSID, Status: "skipped", Reason: "active"})
+					continue
+				}
+				state.WifiUpdate(n.ID, n.SSID, n.PSK, "", n.Hidden, n.Priority)
+				imported++
+				results = append(results, result{ID: n.ID, SSID: n.SSID, Status: "applied"})
+				continue
+			}
+		}
+		id, _ := state.WifiAdd(n.SSID, n.PSK, "", n.Hidden, n.Priority)
+		imported++
+		results = append(results, result{ID: id, SSID: n.SSID, Status: "applied"})
+	}
+	env := map[string]any{"status": "applied", "schema_version": 1, "imported": imported, "results": results}
 	b, _ := json.Marshal(env)
 	return wexec.Result{Stdout: b}, nil
 }
