@@ -233,6 +233,77 @@ func TestBackupExport_FailsLoudlyOnSectionError(t *testing.T) {
 	}
 }
 
+func TestBackupExport_SelectionNarrowsSections(t *testing.T) {
+	h := newWriteHarness(t)
+	h.stdinResultFor = okStdin // wifi export
+	// identity-export runner is deliberately NOT stubbed: selecting only
+	// settings + wifi must never invoke it (a deselected secret isn't read).
+	h.runnerResultFor = func(argv []string) wexec.Result {
+		if argvHas(argv, "identity-export") {
+			t.Errorf("identity export ran for a settings+wifi selection: %v", argv)
+		}
+		return wexec.Result{}
+	}
+
+	r := postJSON(t, h.client, h.ts.URL+"/api/backup/export", map[string]any{"sections": []string{"settings", "wifi"}})
+	defer r.Body.Close()
+	if r.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", r.StatusCode)
+	}
+	var env combinedBackupEnvelope
+	if err := json.Unmarshal(readBody(t, r), &env); err != nil {
+		t.Fatalf("decode envelope: %v", err)
+	}
+	for _, want := range []string{"settings", "wifi"} {
+		if _, ok := env.Sections[want]; !ok {
+			t.Errorf("selected section %q missing", want)
+		}
+	}
+	for _, omit := range []string{"identity", "aggregators", "password"} {
+		if _, ok := env.Sections[omit]; ok {
+			t.Errorf("deselected section %q present", omit)
+		}
+	}
+}
+
+func TestBackupExport_UnknownOnlySelectionRejected(t *testing.T) {
+	h := newWriteHarness(t)
+	r := postJSON(t, h.client, h.ts.URL+"/api/backup/export", map[string]any{"sections": []string{"bogus"}})
+	defer r.Body.Close()
+	if r.StatusCode != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400", r.StatusCode)
+	}
+}
+
+func TestBackupExport_MalformedSelectionFallsBackToAll(t *testing.T) {
+	// A wrong-typed selection element makes the decoder error after partially
+	// populating the slice; the handler must discard that and export every
+	// section rather than a silently narrowed (or empty) one.
+	h := newWriteHarness(t)
+	h.runnerResultFor = func(argv []string) wexec.Result {
+		if argvHas(argv, "identity-export") {
+			return wexec.Result{Stdout: []byte(testIdentitySection)}
+		}
+		return wexec.Result{}
+	}
+	h.stdinResultFor = okStdin
+
+	r := postJSON(t, h.client, h.ts.URL+"/api/backup/export", map[string]any{"sections": []any{123}})
+	defer r.Body.Close()
+	if r.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", r.StatusCode)
+	}
+	var env combinedBackupEnvelope
+	if err := json.Unmarshal(readBody(t, r), &env); err != nil {
+		t.Fatalf("decode envelope: %v", err)
+	}
+	for _, name := range []string{"identity", "settings", "aggregators", "wifi", "password"} {
+		if _, ok := env.Sections[name]; !ok {
+			t.Errorf("malformed selection dropped section %q; want full backup", name)
+		}
+	}
+}
+
 // --- authed restore --------------------------------------------------------
 
 func TestBackupRestore_RequiresAuth(t *testing.T) {
