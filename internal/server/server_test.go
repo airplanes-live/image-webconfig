@@ -120,6 +120,7 @@ func newTestServer(t *testing.T) (*httptest.Server, *Server) {
 		Poweroff:           []string{"sudo-stub", "poweroff"},
 		StartOrchestrator:  []string{"sudo-stub", "orchestrator"},
 		RegisterClaim:      []string{"sudo-stub", "systemctl", "start", "--no-block", "airplanes-claim.service"},
+		RotateClaim:        []string{"sudo-stub", "claim-rotate"},
 		SyncConfig:         []string{"sudo-stub", "systemctl", "start", "--no-block", "airplanes-config-sync.service"},
 		WifiList:           []string{"sudo-stub", "apl-wifi", "list", "--json"},
 		WifiAdd:            []string{"sudo-stub", "apl-wifi", "add", "--json"},
@@ -216,8 +217,12 @@ type writeHarness struct {
 	runnerErr       error                            // returned by captureRunner; tests override
 	runnerErrFor    func(argv []string) error        // optional: per-argv error; falls back to runnerErr when nil
 	runnerResultFor func(argv []string) wexec.Result // optional: per-argv canned Result (stdout+stderr); falls back to zero value
-	stdinErr        error
-	stdinResult     wexec.Result
+	// runnerBlockUntilCtxDone makes captureRunner block until the handler's
+	// context is cancelled, then return ctx.Err() — simulating a privileged
+	// child killed by CommandContext on timeout (the rotate unknown-state path).
+	runnerBlockUntilCtxDone bool
+	stdinErr                error
+	stdinResult             wexec.Result
 	// stdinResultFor, when non-nil, returns a per-argv canned Result for the
 	// stdin runner (falls back to stdinResult). Needed when one request fans
 	// out to several distinct stdin shell-outs (e.g. combined backup/restore).
@@ -298,9 +303,10 @@ func newWriteHarness(t *testing.T, opts ...harnessOption) *writeHarness {
 	for _, o := range opts {
 		o(h)
 	}
-	captureRunner := func(_ context.Context, argv []string) (wexec.Result, error) {
+	captureRunner := func(ctx context.Context, argv []string) (wexec.Result, error) {
 		h.mu.Lock()
 		h.calls = append(h.calls, append([]string(nil), argv...))
+		block := h.runnerBlockUntilCtxDone
 		var err error
 		if h.runnerErrFor != nil {
 			err = h.runnerErrFor(argv)
@@ -312,6 +318,14 @@ func newWriteHarness(t *testing.T, opts ...harnessOption) *writeHarness {
 			res = h.runnerResultFor(argv)
 		}
 		h.mu.Unlock()
+		// Simulate a privileged child that outlives the handler's context:
+		// block until cancellation, then report it the way RealRunner's
+		// CommandContext would (ctx error, no stdout). Drives the rotate
+		// handler's timeout / unknown-state branch deterministically.
+		if block {
+			<-ctx.Done()
+			return wexec.Result{}, ctx.Err()
+		}
 		return res, err
 	}
 	captureStdinRunner := func(_ context.Context, argv []string, stdin io.Reader) (wexec.Result, error) {
@@ -335,6 +349,7 @@ func newWriteHarness(t *testing.T, opts ...harnessOption) *writeHarness {
 		Poweroff:           []string{"sudo-stub", "poweroff"},
 		StartOrchestrator:  []string{"sudo-stub", "orchestrator"},
 		RegisterClaim:      []string{"sudo-stub", "systemctl", "start", "--no-block", "airplanes-claim.service"},
+		RotateClaim:        []string{"sudo-stub", "claim-rotate"},
 		SyncConfig:         []string{"sudo-stub", "systemctl", "start", "--no-block", "airplanes-config-sync.service"},
 		WifiList:           []string{"sudo-stub", "apl-wifi", "list", "--json"},
 		WifiAdd:            []string{"sudo-stub", "apl-wifi", "add", "--json"},

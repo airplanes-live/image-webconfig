@@ -637,6 +637,30 @@ func (s *State) RegisterClaim() error {
 	return s.syncClaimSecretLocked()
 }
 
+// RotateClaim mints a fresh secret and bumps the claim version, mirroring
+// what apl-feed claim rotate does once the server accepts the new secret.
+// Rewriting the secret file changes its mtime, which is what invalidates
+// the server-side claim-status cache (keyed on the identity fingerprint).
+// Returns the new version. Errors when there is no secret to rotate — the
+// same precondition the real helper enforces.
+func (s *State) RotateClaim() (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.claim == "" {
+		return 0, fmt.Errorf("no active claim secret to rotate")
+	}
+	s.claim = randomClaimSecret()
+	next := 1
+	if s.version != nil {
+		next = *s.version + 1
+	}
+	s.version = &next
+	if err := s.syncClaimSecretLocked(); err != nil {
+		return 0, err
+	}
+	return next, nil
+}
+
 // ClaimRegisteredAt returns when RegisterClaim minted the secret (zero
 // for imported/pre-seeded identities). claimStatusFeed uses it to fake
 // the server-side "waiting for first data" window after registration.

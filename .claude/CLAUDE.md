@@ -57,7 +57,7 @@ web/
 files/                          rootfs payload installed by install.sh (tarred at release time)
   etc/sudoers.d/                010 (base privilege)
   etc/systemd/system/           airplanes-webconfig.service + reset oneshot
-  usr/local/lib/airplanes-webconfig/  reset, identity-export.sh, identity-import.sh
+  usr/local/lib/airplanes-webconfig/  reset, identity-export.sh, identity-import.sh, claim-rotate.sh
   usr/local/lib/airplanes/      wifi-validators.sh, wifi-keyfile.sh (sourced by apl-wifi + airplanes-first-run)
   usr/local/bin/apl-wifi        privileged Wi-Fi management helper
 install.sh                      build-mode entrypoint (image build only)
