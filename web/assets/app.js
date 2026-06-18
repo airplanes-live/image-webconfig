@@ -3885,12 +3885,50 @@
         { key: "password", label: "Admin password" },
     ];
 
-    // buildRestoreChecklist renders one row per section and returns a setStatus
-    // updater so the live NDJSON stream can tick each row as it lands.
-    function buildRestoreChecklist() {
+    // buildSectionCheckboxes renders a vertical checkbox group, one per entry in
+    // `sections` (a subset of BACKUP_SECTIONS). opts.checked(key) sets the
+    // initial state (default checked); opts.locked(key) forces a box checked +
+    // disabled (e.g. the password section on first-run restore, where it is
+    // mandatory); opts.onChange fires after any toggle. selected() returns the
+    // checked keys in BACKUP_SECTIONS order.
+    function buildSectionCheckboxes(sections, opts) {
+        opts = opts || {};
+        const boxes = {};
+        const node = el("div", { class: "wc-backup-sections" });
+        for (const s of sections) {
+            const locked = opts.locked ? !!opts.locked(s.key) : false;
+            const input = el("input", { type: "checkbox", name: "section-" + s.key });
+            input.checked = locked || (opts.checked ? !!opts.checked(s.key) : true);
+            input.disabled = locked;
+            if (opts.onChange) input.onchange = opts.onChange;
+            boxes[s.key] = input;
+            node.appendChild(el("label", { class: "wc-checkbox" }, input, el("span", {}, s.label)));
+        }
+        const selected = () => sections.map((s) => s.key).filter((k) => boxes[k].checked);
+        return { node, selected };
+    }
+
+    // restrictSections returns a shallow clone of a parsed backup envelope whose
+    // `sections` map is narrowed to `keys` — what the user ticked. The server
+    // restore loop already skips absent sections, so sending only the selected
+    // ones is all that "restore just these" needs.
+    function restrictSections(env, keys) {
+        const want = new Set(keys);
+        const sections = {};
+        for (const k of Object.keys(env.sections || {})) {
+            if (want.has(k)) sections[k] = env.sections[k];
+        }
+        return Object.assign({}, env, { sections: sections });
+    }
+
+    // buildRestoreChecklist renders one live status row per section. Pass the
+    // subset actually being restored so deselected sections don't sit stuck on
+    // "waiting…"; defaults to every section for callers that restore all.
+    function buildRestoreChecklist(sections) {
+        sections = sections || BACKUP_SECTIONS;
         const rows = {};
         const container = el("div", { class: "wc-agg-status", role: "status", "aria-live": "polite" });
-        for (const s of BACKUP_SECTIONS) {
+        for (const s of sections) {
             const dot = el("span", { class: "wc-tile__dot wc-tile__dot--na" });
             const state = el("span", { class: "wc-agg-status__value" }, "waiting…");
             rows[s.key] = { dot, state };
@@ -3995,11 +4033,23 @@
     function buildBackupExportCard() {
         const msg = el("div", {});
         const setMsg = (text, kind) => msg.replaceChildren(text ? el("div", { class: "wc-flash wc-flash--" + (kind || "ok") }, text) : el("span"));
+        const sections = buildSectionCheckboxes(BACKUP_SECTIONS, { onChange: refresh });
+        const pwNote = el("p", { class: "muted", hidden: true },
+            "A backup without the admin password can't set up a freshly-flashed feeder — it can only be restored onto one that's already set up.");
         const exportBtn = el("button", { type: "button", class: "wc-btn-ghost" }, "Download backup");
+
+        function refresh() {
+            const sel = sections.selected();
+            exportBtn.disabled = sel.length === 0;
+            pwNote.hidden = sel.indexOf("password") !== -1;
+        }
+
         exportBtn.onclick = async () => {
+            const sel = sections.selected();
+            if (sel.length === 0) return;
             setMsg("");
             exportBtn.disabled = true;
-            const r = await postJSON("/api/backup/export", {});
+            const r = await postJSON("/api/backup/export", { sections: sel });
             exportBtn.disabled = false;
             if (handleAuthFailure(r)) return;
             if (!r.ok) { setMsg((r.payload && r.payload.error) || "Backup failed.", "warn"); return; }
@@ -4012,10 +4062,13 @@
                 setMsg("Backup downloaded — keep it private.", "ok");
             } catch (_) { setMsg("Could not start the download.", "warn"); }
         };
+        refresh();
         return el("section", { class: "wc-card" },
             el("h2", {}, "Back up this feeder"),
             el("p", { class: "muted" },
-                "Download one file with this feeder's identity, settings, third-party aggregator sign-ins, saved Wi-Fi networks (including passwords), and the admin password. Use it to restore the feeder after reflashing. The file holds every secret this feeder stores — keep it private."),
+                "Download a file with the parts of this feeder you choose — identity, settings, third-party aggregator sign-ins, saved Wi-Fi networks (including passwords), and the admin password. Use it to restore the feeder after reflashing. The file holds every secret it contains — keep it private."),
+            sections.node,
+            pwNote,
             el("div", { class: "wc-agg-row__actions" }, exportBtn),
             msg,
         );
@@ -4024,50 +4077,83 @@
     function buildBackupRestoreCard() {
         const msg = el("div", {});
         const setMsg = (text, kind) => msg.replaceChildren(text ? el("div", { class: "wc-flash wc-flash--" + (kind || "ok") }, text) : el("span"));
-        const progress = el("div", {});
+        const area = el("div", {});
         const fileInput = el("input", { type: "file", accept: "application/json,.json", hidden: true });
         const importBtn = el("button", { type: "button", class: "wc-btn-ghost" }, "Restore from backup");
         importBtn.onclick = () => fileInput.click();
         fileInput.onchange = async () => {
             const file = fileInput.files && fileInput.files[0];
             fileInput.value = "";
-            progress.replaceChildren();
+            area.replaceChildren();
+            setMsg("");
             const parsed = await parseBackupFile(file);
             if (!parsed.ok) { if (parsed.error) setMsg(parsed.error, "warn"); return; }
-            if (!confirm("Restore this backup? It overwrites this feeder's settings, identity, aggregators, and Wi-Fi, and replaces the admin password — you'll be logged out and must log in with the password from the backup.")) return;
-            setMsg("");
-            importBtn.disabled = true;
-            const checklist = buildRestoreChecklist();
-            progress.replaceChildren(el("h3", {}, "Restoring…"), checklist.node);
-            let failed = 0;
-            let res;
-            try {
-                res = await streamRestore("/api/backup/restore", parsed.value, (ev) => {
-                    if (ev.type === "section") {
-                        checklist.setStatus(ev.section, ev.status, ev.reason);
-                        if (ev.status === "failed") failed++;
-                    }
-                });
-            } finally {
-                importBtn.disabled = false;
-            }
-            if (handleAuthFailure(res)) return;
-            if (!res.ok) { setMsg(res.error || "Restore failed.", "warn"); return; }
-            if (res.summary && res.summary.password_changed) {
-                navigate(() => loginPanel(failed > 0
-                    ? "Password restored, but some items couldn't be restored — log in and re-check Backup & restore."
-                    : "Password restored — log in with the password from your backup."), {});
-                return;
-            }
-            if (failed > 0) { setMsg("Restore finished, but some items couldn't be restored — see above.", "warn"); return; }
-            setMsg("Restore complete.", "ok");
+            const present = BACKUP_SECTIONS.filter((s) => parsed.value.sections && parsed.value.sections[s.key]);
+            if (present.length === 0) { setMsg("That backup has nothing in it to restore.", "warn"); return; }
+            showSelection(parsed.value, present);
         };
+
+        // showSelection lets the user pick which of the sections present in the
+        // file to apply. The admin password defaults OFF so a routine restore
+        // doesn't replace the login or log the user out unless they ask for it.
+        function showSelection(env, present) {
+            const sections = buildSectionCheckboxes(present, {
+                checked: (k) => k !== "password",
+                onChange: refresh,
+            });
+            const restoreBtn = el("button", { type: "button", class: "wc-btn-primary" }, "Restore selected");
+            function refresh() { restoreBtn.disabled = sections.selected().length === 0; }
+
+            restoreBtn.onclick = async () => {
+                const sel = sections.selected();
+                if (sel.length === 0) return;
+                const withPassword = sel.indexOf("password") !== -1;
+                const prompt = withPassword
+                    ? "Restore the selected items? This includes the admin password, so you'll be logged out and must log in with the password from the backup."
+                    : "Restore the selected items onto this feeder?";
+                if (!confirm(prompt)) return;
+
+                const chosen = present.filter((s) => sel.indexOf(s.key) !== -1);
+                const checklist = buildRestoreChecklist(chosen);
+                area.replaceChildren(el("h3", {}, "Restoring…"), checklist.node);
+                importBtn.disabled = true;
+                let failed = 0;
+                let res;
+                try {
+                    res = await streamRestore("/api/backup/restore", restrictSections(env, sel), (ev) => {
+                        if (ev.type === "section") {
+                            checklist.setStatus(ev.section, ev.status, ev.reason);
+                            if (ev.status === "failed") failed++;
+                        }
+                    });
+                } finally {
+                    importBtn.disabled = false;
+                }
+                if (handleAuthFailure(res)) return;
+                if (!res.ok) { setMsg(res.error || "Restore failed.", "warn"); return; }
+                if (res.summary && res.summary.password_changed) {
+                    navigate(() => loginPanel(failed > 0
+                        ? "Password restored, but some items couldn't be restored — log in and re-check Backup & restore."
+                        : "Password restored — log in with the password from your backup."), {});
+                    return;
+                }
+                if (failed > 0) { setMsg("Restore finished, but some items couldn't be restored — see above.", "warn"); return; }
+                setMsg("Restore complete.", "ok");
+            };
+            refresh();
+            area.replaceChildren(
+                el("p", { class: "muted" }, "Choose what to restore from this backup:"),
+                sections.node,
+                el("div", { class: "wc-agg-row__actions" }, restoreBtn),
+            );
+        }
+
         return el("section", { class: "wc-card" },
             el("h2", {}, "Restore from a backup"),
             el("p", { class: "muted" },
-                "Upload a backup file to restore it onto this feeder. Saved Wi-Fi networks are added without disturbing the connection you're using now."),
+                "Upload a backup file, then choose what to restore. Saved Wi-Fi networks are added without disturbing the connection you're using now."),
             el("div", { class: "wc-agg-row__actions" }, importBtn, fileInput),
-            progress,
+            area,
             msg,
         );
     }
@@ -4079,50 +4165,77 @@
     function setupRestorePanel() {
         const msg = el("div", {});
         const setMsg = (text, kind) => msg.replaceChildren(text ? el("div", { class: "wc-flash wc-flash--" + (kind || "ok") }, text) : el("span"));
-        const progress = el("div", {});
+        const area = el("div", {});
         const fileInput = el("input", { type: "file", accept: "application/json,.json", hidden: true });
         const importBtn = el("button", { type: "button", class: "wc-btn-primary" }, "Choose backup file");
         importBtn.onclick = () => fileInput.click();
         fileInput.onchange = async () => {
             const file = fileInput.files && fileInput.files[0];
             fileInput.value = "";
-            progress.replaceChildren();
+            area.replaceChildren();
+            setMsg("");
             const parsed = await parseBackupFile(file);
             if (!parsed.ok) { if (parsed.error) setMsg(parsed.error, "warn"); return; }
             if (!(parsed.value.sections && parsed.value.sections.password)) {
                 setMsg("This backup has no saved admin password, so it can't complete setup. Use “Set a password instead”.", "warn");
                 return;
             }
-            setMsg("");
-            importBtn.disabled = true;
-            const checklist = buildRestoreChecklist();
-            progress.replaceChildren(el("h3", {}, "Restoring…"), checklist.node);
-            let failed = 0;
-            let res;
-            try {
-                res = await streamRestore("/api/backup/restore-setup", parsed.value, (ev) => {
-                    if (ev.type === "section") {
-                        checklist.setStatus(ev.section, ev.status, ev.reason);
-                        if (ev.status === "failed") failed++;
-                    }
-                });
-            } finally {
-                importBtn.disabled = false;
-            }
-            if (!res.ok) { setMsg(res.error || "Restore failed.", "warn"); return; }
-            // The device is initialized and we're auto-logged-in; carry a warning
-            // to the dashboard if any section failed, then boot() routes there.
-            if (failed > 0) {
-                pendingFlash = { text: "Signed in. Some items couldn't be restored — check Backup & restore.", level: "warn" };
-            }
-            await boot();
+            const present = BACKUP_SECTIONS.filter((s) => parsed.value.sections[s.key]);
+            showSelection(parsed.value, present);
         };
+
+        // showSelection lets the user pick what to restore onto the fresh flash.
+        // The admin password is mandatory here — it completes setup and signs
+        // the user in — so its box is checked and locked.
+        function showSelection(env, present) {
+            const sections = buildSectionCheckboxes(present, {
+                locked: (k) => k === "password",
+                onChange: refresh,
+            });
+            const restoreBtn = el("button", { type: "button", class: "wc-btn-primary" }, "Restore selected");
+            function refresh() { restoreBtn.disabled = sections.selected().length === 0; }
+
+            restoreBtn.onclick = async () => {
+                const sel = sections.selected();
+                if (sel.length === 0) return;
+                const chosen = present.filter((s) => sel.indexOf(s.key) !== -1);
+                const checklist = buildRestoreChecklist(chosen);
+                area.replaceChildren(el("h3", {}, "Restoring…"), checklist.node);
+                importBtn.disabled = true;
+                let failed = 0;
+                let res;
+                try {
+                    res = await streamRestore("/api/backup/restore-setup", restrictSections(env, sel), (ev) => {
+                        if (ev.type === "section") {
+                            checklist.setStatus(ev.section, ev.status, ev.reason);
+                            if (ev.status === "failed") failed++;
+                        }
+                    });
+                } finally {
+                    importBtn.disabled = false;
+                }
+                if (!res.ok) { setMsg(res.error || "Restore failed.", "warn"); return; }
+                // The device is initialized and we're auto-logged-in; carry a warning
+                // to the dashboard if any section failed, then boot() routes there.
+                if (failed > 0) {
+                    pendingFlash = { text: "Signed in. Some items couldn't be restored — check Backup & restore.", level: "warn" };
+                }
+                await boot();
+            };
+            refresh();
+            area.replaceChildren(
+                el("p", { class: "muted" }, "Choose what to restore. The admin password is always restored so you can sign in."),
+                sections.node,
+                el("div", { class: "wc-agg-row__actions" }, restoreBtn),
+            );
+        }
+
         render(el("section", { class: "wc-card" },
             el("h2", {}, "Restore from backup"),
             el("p", {},
-                "Upload a backup from another airplanes.live feeder (or an earlier flash of this one) to restore its identity, settings, and admin password. You'll be signed in automatically."),
+                "Upload a backup from another airplanes.live feeder (or an earlier flash of this one), then choose what to restore. You'll be signed in automatically."),
             el("div", { class: "wc-agg-row__actions" }, importBtn, fileInput),
-            progress,
+            area,
             msg,
             el("div", { class: "wc-setup-alt" },
                 el("button", { type: "button", class: "wc-btn-ghost", onclick: () => navigate(setupPanel, { title: "First-time setup", showBack: false }) }, "Set a password instead")),

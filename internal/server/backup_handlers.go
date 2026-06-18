@@ -92,21 +92,62 @@ type restoreEvent struct {
 // errors (as opposed to being legitimately empty), the whole export fails with
 // a 500 naming the section — a half-captured file must never masquerade as a
 // complete backup.
+//
+// An optional {"sections":[...]} body narrows the export to the named sections
+// so a secret a user doesn't want in the file is never even read. An absent,
+// empty, or unparseable body means "every section" — preserving the original
+// POST {} behavior — so an older client still gets a full backup.
 func (s *Server) handleBackupExport(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), backupExportTimeout)
 	defer cancel()
 
-	sections := make(map[string]json.RawMessage, 5)
-	for _, sec := range []struct {
+	var req struct {
+		Sections []string `json:"sections"`
+	}
+	// Tolerant decode: the selection is optional and tiny. Any decode error
+	// (no body, oversized body, or a wrong-typed element that would leave the
+	// slice partially populated) resets the selection to nil → all sections,
+	// so a malformed request yields a full backup rather than a silently
+	// narrowed or empty one.
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4096)).Decode(&req); err != nil {
+		req.Sections = nil
+	}
+
+	type exportSection struct {
 		name string
 		fn   func(context.Context) (json.RawMessage, error)
-	}{
+	}
+	all := []exportSection{
 		{"identity", s.exportIdentitySection},
 		{"settings", s.exportSettingsSection},
 		{"aggregators", s.exportAggregatorsSection},
 		{"wifi", s.exportWifiSection},
 		{"password", func(context.Context) (json.RawMessage, error) { return s.exportPasswordSection() }},
-	} {
+	}
+	// nil/empty selection → every section. A non-empty selection narrows to
+	// the named known sections (unknown names ignored); a selection that
+	// matches nothing known is a 400 rather than a silently empty backup.
+	chosen := all
+	if len(req.Sections) > 0 {
+		want := make(map[string]bool, len(req.Sections))
+		for _, n := range req.Sections {
+			want[n] = true
+		}
+		var sel []exportSection
+		for _, sec := range all {
+			if want[sec.name] {
+				sel = append(sel, sec)
+			}
+		}
+		if len(sel) == 0 {
+			writeJSONError(w, http.StatusBadRequest, "select at least one section to back up")
+			return
+		}
+		chosen = sel
+	}
+
+	sections := make(map[string]json.RawMessage, len(chosen))
+	for _, sec := range chosen {
 		raw, err := sec.fn(ctx)
 		if err != nil {
 			log.Printf("backup export: %s section: %v", sec.name, err)
