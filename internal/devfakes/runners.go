@@ -76,6 +76,7 @@ func StubPrivilegedArgv() server.PrivilegedArgv {
 		Poweroff:           []string{"dev-stub", "systemctl", "poweroff"},
 		StartOrchestrator:  []string{"dev-stub", "systemd-run", "airplanes-update-orchestrator"},
 		RegisterClaim:      []string{"dev-stub", "systemctl", "claim-register"},
+		RotateClaim:        []string{"dev-stub", "apl-feed", "claim", "rotate"},
 		SyncConfig:         []string{"dev-stub", "systemctl", "config-sync"},
 		WifiList:           []string{"dev-stub", "apl-wifi", "list"},
 		WifiAdd:            []string{"dev-stub", "apl-wifi", "add"},
@@ -218,6 +219,9 @@ func dispatchStub(state *State, priv server.PrivilegedArgv, argv []string, body 
 				return configShowFeed(state)
 			}
 		case "claim":
+			if len(argv) >= 4 && argv[3] == "rotate" {
+				return claimRotateFeed(state)
+			}
 			return claimStatusFeed(state, argv)
 		}
 	case "identity":
@@ -455,6 +459,26 @@ func identityImport(state *State, body []byte) (wexec.Result, error) {
 		return wexec.Result{ExitCode: 1, Stderr: []byte(err.Error())}, err
 	}
 	return wexec.Result{Stdout: []byte("Restored feeder config for Feeder ID " + env.FeederUUID + "\n")}, nil
+}
+
+// claimRotateFeed fakes `apl-feed claim rotate --json`: it mints a fresh
+// secret + bumps the version via the State helper and emits the schema-v1
+// result object on stdout. A missing secret mirrors the real helper's
+// precondition die — non-zero exit, reason on stderr, no JSON — so the
+// handler's no-payload fallback is exercised through the dev path too.
+func claimRotateFeed(state *State) (wexec.Result, error) {
+	version, err := state.RotateClaim()
+	if err != nil {
+		return wexec.Result{ExitCode: 1, Stderr: []byte(err.Error() + "\n")}, err
+	}
+	out, _ := json.Marshal(map[string]any{
+		"schema_version": 1,
+		"result":         "rotated",
+		"version":        version,
+		"error":          nil,
+		"detail":         nil,
+	})
+	return wexec.Result{Stdout: append(out, '\n')}, nil
 }
 
 // SchemaWritableKeys / SchemaReadableKeys mirror feed's

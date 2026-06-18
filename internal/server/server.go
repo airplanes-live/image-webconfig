@@ -93,6 +93,7 @@ type PrivilegedArgv struct {
 	Poweroff          []string // sudo -n /usr/bin/systemctl poweroff
 	StartOrchestrator []string // sudo systemd-run --unit=airplanes-update-orchestrator ...
 	RegisterClaim     []string // sudo systemctl start --no-block airplanes-claim.service
+	RotateClaim       []string // sudo -n /usr/local/lib/airplanes-webconfig/claim-rotate.sh
 	SyncConfig        []string // sudo systemctl start --no-block airplanes-config-sync.service
 	WifiList          []string
 	WifiAdd           []string
@@ -175,6 +176,12 @@ func DefaultPrivilegedArgv() PrivilegedArgv {
 		// immediately. Progress and failures show up in the claim activity
 		// log via the SSE stream the SPA opens after this returns.
 		RegisterClaim: sudo("/usr/bin/systemctl", "start", "--no-block", "airplanes-claim.service"),
+		// RotateClaim calls a wrapper script (not bare apl-feed) so the
+		// sudoers grant is a single fixed argv that cannot drift to
+		// `apl-feed claim rotate --abort` or other subcommands. The wrapper
+		// pins `--json --max-retry-time 20`; claimRotateTimeout below adds
+		// the headroom over that 20s budget.
+		RotateClaim: sudo("/usr/local/lib/airplanes-webconfig/claim-rotate.sh"),
 		// Fired after a successful config save so a change reaches the server
 		// on the next sync instead of the ~60s timer tick. --no-block: the
 		// unit is Type=oneshot and `apl-feed config sync` does a network
@@ -336,8 +343,6 @@ func New(d Deps) http.Handler {
 	mux.HandleFunc("GET /api/auth/whoami", s.requireSession(s.handleWhoami))
 	mux.HandleFunc("GET /api/identity", s.requireSession(s.handleIdentity))
 	mux.HandleFunc("POST /api/identity/secret", s.requireSession(s.handleIdentitySecret))
-	mux.HandleFunc("POST /api/identity/export", s.requireSession(s.handleIdentityExport))
-	mux.HandleFunc("POST /api/identity/import", s.requireSession(s.handleIdentityImport))
 	// Combined device backup / restore. export + the configured-device restore
 	// require a session; restore-setup is public but gated on the uninitialized
 	// state (the same trust window as POST /api/setup) so a fresh flash can be
@@ -356,6 +361,7 @@ func New(d Deps) http.Handler {
 	mux.HandleFunc("POST /api/reboot", s.requireSession(s.handleReboot))
 	mux.HandleFunc("POST /api/poweroff", s.requireSession(s.handlePoweroff))
 	mux.HandleFunc("POST /api/claim/register", s.requireSession(s.handleClaimRegister))
+	mux.HandleFunc("POST /api/claim/rotate", s.requireSession(s.handleClaimRotate))
 	mux.HandleFunc("GET /api/claim/status", s.requireSession(s.handleClaimStatus))
 
 	// Wi-Fi network management — privileged subcommands of /usr/local/bin/apl-wifi.

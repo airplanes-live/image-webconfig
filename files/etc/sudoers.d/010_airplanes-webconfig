@@ -63,6 +63,11 @@ airplanes-webconfig ALL=(root) NOPASSWD: /usr/bin/systemd-run --unit=airplanes-u
 airplanes-webconfig ALL=(root) NOPASSWD: /usr/local/lib/airplanes-webconfig/identity-export.sh
 airplanes-webconfig ALL=(root) NOPASSWD: /usr/local/lib/airplanes-webconfig/identity-import.sh
 
+# Claim-secret rotation. The wrapper calls `apl-feed claim rotate --json
+# --max-retry-time 20`; it takes no arguments and never forwards "$@", so
+# the grant cannot drift to rotate --abort or other apl-feed subcommands.
+airplanes-webconfig ALL=(root) NOPASSWD: /usr/local/lib/airplanes-webconfig/claim-rotate.sh
+
 # /usr/local/bin/apl-aggregator manages optional third-party feed aggregators
 # (FlightRadar24, ...). Each verb is its own pinned argv so a compromised
 # webconfig cannot drift between the read-only (status, detail, export) and mutating
