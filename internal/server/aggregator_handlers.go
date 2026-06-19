@@ -30,10 +30,6 @@ const (
 	// aggregatorBodyLimit caps the enable/set request bodies (lat/lon/alt plus
 	// a small fields object). 4 KiB is far above any realistic payload.
 	aggregatorBodyLimit = 4096
-
-	// aggregatorImportBodyLimit caps the import backup blob, matching the
-	// helper's own input cap (AGG_STATE_MAX_BYTES = 65536).
-	aggregatorImportBodyLimit = 65536
 )
 
 // invokeAggregator pipes body through the sudoers-pinned argv, verifies the
@@ -132,51 +128,6 @@ func (s *Server) handleAggregatorDetail(w http.ResponseWriter, r *http.Request) 
 	if ierr != nil {
 		log.Printf("aggregator detail %q: %v", id, ierr)
 		writeJSONError(w, http.StatusInternalServerError, "aggregator detail failed")
-		return
-	}
-	s.writeAggregatorResponse(w, resp, httpStatus)
-}
-
-// handleAggregatorExport (POST /api/aggregators/export) returns the
-// recoverable identities INCLUDING secret values as a backup blob. POST (not
-// GET) so it routes through the origin check and never lands in browser
-// history — the same posture as the feeder-identity export. no-store plus an
-// attachment disposition keep a proxy/browser from caching the secret-bearing
-// body. The helper takes no stdin.
-func (s *Server) handleAggregatorExport(w http.ResponseWriter, r *http.Request) {
-	body, httpStatus, err := s.invokeAggregator(r.Context(), s.priv.AggregatorExport, nil, aggregatorHelperTimeout)
-	if err != nil {
-		log.Printf("aggregator export: %v", err)
-		writeJSONError(w, http.StatusInternalServerError, "aggregator export failed")
-		return
-	}
-	w.Header().Set("Content-Disposition", `attachment; filename="airplanes-aggregators-backup.json"`)
-	s.writeAggregatorResponse(w, body, httpStatus)
-}
-
-// handleAggregatorImport (POST /api/aggregators/import) seeds identities from a
-// backup blob. The helper does the full structural validation (kind / schema /
-// key-format) and refuses an enabled adapter; the Go side only enforces the
-// Content-Type and the size cap before piping the body through.
-func (s *Server) handleAggregatorImport(w http.ResponseWriter, r *http.Request) {
-	if !isJSONContentType(r.Header.Get("Content-Type")) {
-		writeJSONError(w, http.StatusBadRequest, errBadContentType.Error())
-		return
-	}
-	r.Body = http.MaxBytesReader(w, r.Body, aggregatorImportBodyLimit)
-	body, err := io.ReadAll(r.Body)
-	if err != nil {
-		writeJSONError(w, http.StatusBadRequest, "backup body too large or unreadable")
-		return
-	}
-	if len(body) == 0 {
-		writeJSONError(w, http.StatusBadRequest, "empty backup body")
-		return
-	}
-	resp, httpStatus, ierr := s.invokeAggregator(r.Context(), s.priv.AggregatorImport, body, aggregatorHelperTimeout)
-	if ierr != nil {
-		log.Printf("aggregator import: %v", ierr)
-		writeJSONError(w, http.StatusInternalServerError, "aggregator import failed")
 		return
 	}
 	s.writeAggregatorResponse(w, resp, httpStatus)

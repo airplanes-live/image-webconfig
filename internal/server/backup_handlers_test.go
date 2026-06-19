@@ -388,6 +388,37 @@ func TestBackupRestore_AggregatorEnabledIsSkippedNotFailed(t *testing.T) {
 	}
 }
 
+// The aggregators section is handed to the import helper byte-for-byte: the Go
+// side owns no structural validation, so a transform here would silently corrupt
+// a restore. (This is the verbatim-pipe guarantee the now-removed standalone
+// /api/aggregators/import route used to pin.)
+func TestBackupRestore_AggregatorsSectionPipedVerbatim(t *testing.T) {
+	h := newWriteHarness(t)
+	h.stdinResultFor = okStdin
+	r := postJSON(t, h.client, h.ts.URL+"/api/backup/restore", combinedBody(fullRestoreSections(t)))
+	defer r.Body.Close()
+	if r.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", r.StatusCode)
+	}
+	statuses, _ := parseRestoreStream(t, readBody(t, r))
+	if statuses["aggregators"] != "applied" {
+		t.Fatalf("aggregators status = %q, want applied", statuses["aggregators"])
+	}
+	var got []byte
+	for _, c := range h.stdinCallsCopy() {
+		if argvHas(c.argv, "apl-aggregator", "import") {
+			got = c.stdin
+			break
+		}
+	}
+	if got == nil {
+		t.Fatal("apl-aggregator import was never invoked")
+	}
+	if string(got) != testAggImportPopulated {
+		t.Errorf("import stdin = %s\nwant verbatim section = %s", got, testAggImportPopulated)
+	}
+}
+
 // Only a well-formed, genuinely-empty aggregator-backup short-circuits to a
 // skip; everything else (populated, null, absent, array, wrong kind/schema)
 // must still reach the import helper, which owns structural validation. The
