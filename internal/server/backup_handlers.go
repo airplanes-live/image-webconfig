@@ -238,7 +238,21 @@ func (s *Server) exportAggregatorsSection(ctx context.Context) (json.RawMessage,
 		probe.Kind != "aggregator-backup" || probe.SchemaVersion != 1 || len(probe.Aggregators) == 0 {
 		return nil, fmt.Errorf("aggregator export: not a valid backup payload (kind=%q schema=%d)", probe.Kind, probe.SchemaVersion)
 	}
-	return json.RawMessage(body), nil
+	// Reshape to just the fields the section needs: {kind, schema_version,
+	// aggregators}. The helper's reply also carries the generic RPC envelope
+	// fields (result, protocol_version), which mean nothing once the payload is
+	// at rest in a backup file. Trimming mirrors exportWifiSection; the importer
+	// is lenient about extra keys, so this is backward-compatible with older
+	// backups that still embed the full envelope.
+	clean, err := json.Marshal(struct {
+		Kind          string          `json:"kind"`
+		SchemaVersion int             `json:"schema_version"`
+		Aggregators   json.RawMessage `json:"aggregators"`
+	}{probe.Kind, probe.SchemaVersion, probe.Aggregators})
+	if err != nil {
+		return nil, fmt.Errorf("aggregator export: reshape: %w", err)
+	}
+	return json.RawMessage(clean), nil
 }
 
 // exportWifiSection reshapes the helper's export envelope into the section the
@@ -555,7 +569,11 @@ func (s *Server) restoreAggregators(ctx context.Context, env combinedBackupEnvel
 		return "failed", "import error"
 	}
 	if status == http.StatusOK || status == http.StatusAccepted {
-		return "applied", ""
+		// Import seeds each identity disabled; the operator re-enables to resume
+		// feeding (and trigger the vendor install). The checklist renders this as
+		// "restored — <reason>", so a restore that leaves adapters showing
+		// "Ready to enable" doesn't look like a no-op.
+		return "applied", "enable each adapter to resume feeding"
 	}
 	// The helper returns the same `rejected` code for an empty backup, an
 	// unknown adapter, AND an adapter that is currently enabled. Only the last

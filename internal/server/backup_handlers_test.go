@@ -187,6 +187,16 @@ func TestBackupExport_AssemblesAllSections(t *testing.T) {
 	if strings.Contains(string(env.Sections["wifi"]), "status") {
 		t.Errorf("wifi section should not carry status: %s", env.Sections["wifi"])
 	}
+	// Aggregators section reshaped to {kind, schema_version, aggregators} — the
+	// helper's RPC envelope fields (result, protocol_version) mean nothing at
+	// rest and must be stripped, mirroring the Wi-Fi reshape above.
+	agg := string(env.Sections["aggregators"])
+	if strings.Contains(agg, "protocol_version") || strings.Contains(agg, `"result"`) {
+		t.Errorf("aggregators section should not carry RPC envelope fields: %s", agg)
+	}
+	if !strings.Contains(agg, "aggregator-backup") {
+		t.Errorf("aggregators section missing kind: %s", agg)
+	}
 }
 
 func TestBackupExport_OmitsIdentityWhenUnclaimed(t *testing.T) {
@@ -437,8 +447,13 @@ func TestBackupRestore_EmptyAggregatorsSkippedNotFailed(t *testing.T) {
 	}{
 		// The real empty export — must skip without touching the helper.
 		{"valid empty set", testAggExportEnvelope, rejectEmpty, "skipped", false},
+		// The reshaped export drops result/protocol_version; a trimmed empty set
+		// must still short-circuit to a skip exactly like the full envelope.
+		{"trimmed empty set", `{"kind":"aggregator-backup","schema_version":1,"aggregators":{}}`, rejectEmpty, "skipped", false},
 		// A populated backup goes through the helper and applies.
 		{"populated", testAggImportPopulated, ok, "applied", true},
+		// A trimmed populated export (new shape) must apply just the same.
+		{"trimmed populated", `{"kind":"aggregator-backup","schema_version":1,"aggregators":{"fr24":{"mlat_enabled":false,"fields":{"sharing_key":"deadbeef"}}}}`, ok, "applied", true},
 		// Malformed / ambiguous shapes must NOT be mistaken for empty: they
 		// reach the helper rather than being silently skipped.
 		{"aggregators null", `{"kind":"aggregator-backup","schema_version":1,"aggregators":null}`, rejectEmpty, "failed", true},
@@ -469,6 +484,43 @@ func TestBackupRestore_EmptyAggregatorsSkippedNotFailed(t *testing.T) {
 				t.Errorf("import invoked = %v, want %v", importCalled, tc.wantImport)
 			}
 		})
+	}
+}
+
+// A successful aggregator restore seeds identities disabled, so the checklist
+// must carry a non-empty reason telling the operator to re-enable them —
+// otherwise the row reads a bare "restored" and the restore looks like a no-op.
+func TestBackupRestore_AggregatorsAppliedReasonGuidesEnable(t *testing.T) {
+	h := newWriteHarness(t)
+	h.stdinResultFor = func(argv []string) wexec.Result {
+		if argvHas(argv, "apl-aggregator", "import") {
+			return wexec.Result{Stdout: []byte(`{"protocol_version":1,"result":"ok"}`)}
+		}
+		return okStdin(argv)
+	}
+	sections := fullRestoreSections(t)
+	r := postJSON(t, h.client, h.ts.URL+"/api/backup/restore", combinedBody(sections))
+	defer r.Body.Close()
+
+	var reason string
+	found := false
+	for _, line := range bytes.Split(bytes.TrimSpace(readBody(t, r)), []byte("\n")) {
+		if len(bytes.TrimSpace(line)) == 0 {
+			continue
+		}
+		var ev restoreEvent
+		if err := json.Unmarshal(line, &ev); err != nil {
+			t.Fatalf("bad ndjson line %q: %v", line, err)
+		}
+		if ev.Type == "section" && ev.Section == "aggregators" {
+			reason, found = ev.Reason, true
+		}
+	}
+	if !found {
+		t.Fatal("no aggregators section event in restore stream")
+	}
+	if reason == "" {
+		t.Error("aggregators applied reason is empty; operator gets no enable guidance")
 	}
 }
 
