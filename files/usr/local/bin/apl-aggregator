@@ -35,6 +35,7 @@
 #   AGG_DESC_DIR       descriptor directory
 #   AGG_SYSTEMCTL      systemctl binary
 #   AGG_DECODER_ADDR   local readsb BEAST endpoint
+#   AGG_NC             netcat binary for the decoder reachability probe
 #   AGG_DECODER_STATE  "up"/"down" to bypass the TCP probe in tests
 #   AGG_STATE_HOME     vendor runtime/config home (e.g. fr24feed.ini)
 #   AGG_FR24_BIN / AGG_FR24_INI         installed-binary / ini paths (enable)
@@ -54,6 +55,7 @@ AGG_INSTALL_ROOT="${AGG_INSTALL_ROOT:-/opt/airplanes-aggregators}"
 AGG_DESC_DIR="${AGG_DESC_DIR:-/usr/local/lib/airplanes-webconfig/aggregators}"
 AGG_SYSTEMCTL="${AGG_SYSTEMCTL:-systemctl}"
 AGG_DECODER_ADDR="${AGG_DECODER_ADDR:-127.0.0.1:30005}"
+AGG_NC="${AGG_NC:-nc}"
 AGG_LOCK="${AGG_LOCK:-/run/airplanes/aggregator.lock}"
 AGG_LOCK_TIMEOUT="${AGG_LOCK_TIMEOUT:-5}"
 AGG_STATE_HOME="${AGG_STATE_HOME:-/var/lib/airplanes-aggregators}"
@@ -260,9 +262,28 @@ _enable_overlay() {
 
 # --- probes ----------------------------------------------------------------
 
-# _decoder_reachable: does the local readsb BEAST endpoint accept a connection?
-# host/port are passed as positional args to a single-quoted inner script so a
-# malformed AGG_DECODER_ADDR can never inject into the root shell.
+# _nc_supports_shutdown: true when $AGG_NC exists and advertises -N (graceful
+# shutdown-after-EOF), i.e. OpenBSD netcat. `nc -h` exits non-zero and prints
+# its usage to stderr, so its status is masked and grep alone decides.
+_nc_supports_shutdown() {
+	command -v "$AGG_NC" >/dev/null 2>&1 || return 1
+	{ "$AGG_NC" -h 2>&1 || true; } | grep -q -- '-N'
+}
+
+# _decoder_reachable: does the local readsb BEAST endpoint (AGG_DECODER_ADDR)
+# accept a connection? Used both as an advisory signal in `status`/`detail` and
+# as a hard gate before enabling/reconfiguring an adapter, so it verifies the
+# actual TCP endpoint the vendor feeders connect to — not merely that readsb is
+# "running".
+#
+# The probe closes gracefully (shutdown-write + drain, via `nc -N`) rather than
+# with a bare connect+abort. A bare connect that closes while readsb's queued
+# BEAST bytes are still unread makes the kernel send RST, which readsb logs as
+# "Beast TCP output: Send Error: Broken pipe" — once per probe, and `status` is
+# polled by the dashboard, so the bare probe spams the journal. `nc -N` sends
+# FIN on stdin EOF and drains until readsb closes its side, so the close is
+# clean and silent. If this nc lacks -N (or nc is absent) we fall back to the
+# bare connect: reachability stays correct, only the cosmetic log line returns.
 _decoder_reachable() {
 	case "${AGG_DECODER_STATE:-}" in
 		up) return 0 ;;
@@ -270,10 +291,15 @@ _decoder_reachable() {
 	esac
 	local host="${AGG_DECODER_ADDR%%:*}" port="${AGG_DECODER_ADDR##*:}"
 	[[ -n "$host" && "$port" =~ ^[0-9]+$ ]] || return 1
-	# $1/$2 are the inner bash's positional args (host/port), expanded at its
-	# runtime — deliberately single-quoted so the outer shell does not interpolate.
-	# shellcheck disable=SC2016
-	timeout 1 bash -c 'exec 3<>/dev/tcp/"$1"/"$2"' _ "$host" "$port" 2>/dev/null
+	if _nc_supports_shutdown; then
+		timeout 2 "$AGG_NC" -N "$host" "$port" </dev/null >/dev/null 2>&1
+	else
+		# Fallback only — emits one cosmetic readsb broken-pipe line per probe.
+		# $1/$2 are the inner bash's positional args (host/port), expanded at its
+		# runtime — single-quoted so the outer shell does not interpolate them.
+		# shellcheck disable=SC2016
+		timeout 1 bash -c 'exec 3<>/dev/tcp/"$1"/"$2"' _ "$host" "$port" 2>/dev/null
+	fi
 }
 
 # _service_state: the trimmed `systemctl is-active` word for a unit. is-active

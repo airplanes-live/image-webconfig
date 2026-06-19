@@ -264,3 +264,46 @@ EOF
     [ "$status" -eq 0 ]
     echo "$output" | jq -e '.aggregators[0] | has("reconcile_error") | not'
 }
+
+# --- real decoder probe (AGG_DECODER_STATE unset) ---------------------------
+# The cases above bypass the probe via AGG_DECODER_STATE. These exercise the
+# actual probe path through an AGG_NC stub, so we cover the graceful `nc -N`
+# invocation without needing a live readsb on the build host. The stub
+# advertises -N on `-h` (so _nc_supports_shutdown selects the graceful path)
+# and records its argv; NC_RESULT picks connect success/failure.
+_install_fake_nc() {
+    export NC_ARGV_LOG="$WORK/nc.argv"; : >"$NC_ARGV_LOG"
+    local nc="$WORK/fake-nc"
+    cat > "$nc" <<'EOF'
+#!/usr/bin/env bash
+if [[ "$1" == "-h" ]]; then
+    # Mimic OpenBSD netcat: usage line plus a command-summary line for -N.
+    printf 'usage: nc [-46CDdFhklNnrStUuvZz] ...\n\t-N\tshutdown(2) after EOF on stdin\n' >&2
+    exit 1
+fi
+printf '%s\n' "$*" >>"$NC_ARGV_LOG"
+[[ "${NC_RESULT:-0}" == "0" ]] && exit 0 || exit 1
+EOF
+    chmod +x "$nc"
+    export AGG_NC="$nc"
+}
+
+@test "decoder probe: graceful nc -N reports reachable when connect succeeds" {
+    _install_fake_nc
+    export NC_RESULT=0          # connect ok
+    unset AGG_DECODER_STATE     # exercise the real probe
+    run "$APLAGG" status --json
+    [ "$status" -eq 0 ]
+    echo "$output" | jq -e '.aggregators[0].decoder_reachable == true'
+    # Probe used graceful shutdown against the configured endpoint.
+    grep -q -- '-N 127.0.0.1 30005' "$NC_ARGV_LOG"
+}
+
+@test "decoder probe: reports not reachable when connect fails" {
+    _install_fake_nc
+    export NC_RESULT=1          # connect refused / timed out
+    unset AGG_DECODER_STATE
+    run "$APLAGG" status --json
+    [ "$status" -eq 0 ]
+    echo "$output" | jq -e '.aggregators[0].decoder_reachable == false'
+}
