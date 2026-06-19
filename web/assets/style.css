@@ -49,6 +49,13 @@
      tiles, the gap between stacked tile rows, and the hero-to-grid gap
      all resolve to this so the whole dashboard reads as one even grid. */
   --wc-tile-gap: 0.75rem;
+
+  /* The gap between full-size cards — horizontally (the two columns of
+     .wc-split) and vertically (stacked cards in .wc-stack, and between
+     the split block and what follows it). One value so card spacing is
+     uniform in both axes. Matches --wc-tile-gap so cards and tiles read
+     as the same grid. */
+  --wc-card-gap: 0.75rem;
 }
 
 /* User-chosen dark — overrides OS preference */
@@ -999,8 +1006,8 @@ textarea:focus {
 
 .wc-split {
   display: grid;
-  gap: 1rem;
-  margin-bottom: 1.25rem;
+  gap: var(--wc-card-gap);
+  margin-bottom: var(--wc-card-gap);
   grid-template-columns: 1fr;
   /* Don't stretch a short left column to match a tall right column —
      Identity + Privacy stack only as tall as their content while
@@ -1011,13 +1018,14 @@ textarea:focus {
   .wc-split { grid-template-columns: 1fr 1fr; }
 }
 
-/* Vertical stack of cards within one grid cell. Used to put Identity
-   and Privacy in the left column of .wc-split, gap-matched to the
-   grid's own gap. */
+/* Vertical stack of full-size cards: the Identity + Privacy column of
+   .wc-split, and any page that stacks two top-level cards (Backup &
+   restore, Claim activity). Gap-matched to .wc-split so vertical and
+   horizontal card spacing are the same. */
 .wc-stack {
   display: flex;
   flex-direction: column;
-  gap: 1rem;
+  gap: var(--wc-card-gap);
 }
 
 /* ========== Wi-Fi panel ========== */

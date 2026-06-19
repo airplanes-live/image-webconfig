@@ -4027,7 +4027,7 @@
     }
 
     function backupPanel() {
-        render(buildBackupExportCard(), buildBackupRestoreCard());
+        render(el("div", { class: "wc-stack" }, buildBackupExportCard(), buildBackupRestoreCard()));
     }
 
     function buildBackupExportCard() {
@@ -5612,7 +5612,7 @@
 
         const logPre = streamLog("claim");
         render(
-            el("div", {},
+            el("div", { class: "wc-stack" },
                 statusCard,
                 el("section", { class: "wc-card" },
                     el("h2", {}, "journalctl -u airplanes-claim.service"),
