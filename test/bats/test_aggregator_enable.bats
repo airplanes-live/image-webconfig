@@ -294,6 +294,17 @@ EOF
     grep -q 'fr24key="KEYONLY1234"' "$AGG_FR24_INI"
 }
 
+@test "fr24 ini feeds from the configured decoder address" {
+    # AGG_DECODER_STATE=up (setup) bypasses the live probe; a non-default
+    # AGG_DECODER_ADDR must still flow into fr24feed.ini so fr24 feeds from
+    # exactly the decoder the reachability probe checks.
+    export AGG_DECODER_ADDR="10.9.8.7:31005"
+    agg enable '{"id":"fr24","lat":47.0,"lon":8.0,"alt":400,"fields":{"email":"a@b.c","sharing_key":"PROVIDEDKEY1"}}'
+    [ "$status" -eq 0 ]
+    grep -q 'host="10.9.8.7:31005"' "$AGG_FR24_INI"
+    ! grep -q 'host="127.0.0.1:30005"' "$AGG_FR24_INI"
+}
+
 @test "enable fails cleanly when the local decoder is unreachable" {
     export AGG_DECODER_STATE=down
     agg enable '{"id":"fr24","lat":47.0,"lon":8.0,"alt":400,"fields":{"email":"a@b.c","sharing_key":"VALIDKEY12"}}'
