@@ -1148,7 +1148,7 @@ _enable_fr24() {
 		_valid_geo "$lat" "$lon" "$alt" || { _emit_error rejected "valid latitude, longitude and altitude are required"; exit 2; }
 	fi
 	[[ -z "$key" ]] || _valid_fr24_key "$key" || { _emit_error rejected "invalid sharing key format"; exit 2; }
-	_decoder_reachable || { _emit_error decoder_unavailable "local decoder 127.0.0.1:30005 is not reachable"; exit 2; }
+	_decoder_reachable || { _emit_error decoder_unavailable "local decoder ${AGG_DECODER_ADDR} is not reachable"; exit 2; }
 
 	# Pinned vendor URL + checksum from the (trusted) descriptor, captured in a
 	# subshell so descriptor sourcing cannot clobber locals or write to stdout.
@@ -1236,7 +1236,7 @@ _fr24_validate_sync() {
 		_valid_geo "$lat" "$lon" "$alt" || { _emit_error rejected "valid latitude, longitude and altitude are required"; exit 2; }
 	fi
 	[[ -z "$key" ]] || _valid_fr24_key "$key" || { _emit_error rejected "invalid sharing key format"; exit 2; }
-	_decoder_reachable || { _emit_error decoder_unavailable "local decoder 127.0.0.1:30005 is not reachable"; exit 2; }
+	_decoder_reachable || { _emit_error decoder_unavailable "local decoder ${AGG_DECODER_ADDR} is not reachable"; exit 2; }
 }
 
 # --- piaware (pinned-deb) --------------------------------------------------
