@@ -1052,15 +1052,17 @@ _fr24_acquire_binary() {
 	rm -rf "$tmp"
 }
 
-# _fr24_write_ini <ini> <key>: configure fr24feed as a BEAST-TCP consumer of
-# the local decoder with the operator's sharing key (MLAT off, per the
-# adapter's FR24-MLAT-default-off contract).
+# _fr24_write_ini <ini> <key> <decoder-addr>: configure fr24feed as a BEAST-TCP
+# consumer of the local decoder at <decoder-addr> with the operator's sharing
+# key (MLAT off, per the adapter's FR24-MLAT-default-off contract). The address
+# is the same AGG_DECODER_ADDR the reachability probe checks, so fr24feed feeds
+# from exactly what was verified rather than a separately hardcoded endpoint.
 _fr24_write_ini() {
-	local ini="$1" key="$2" tmp
+	local ini="$1" key="$2" addr="$3" tmp
 	tmp="$(mktemp "${ini}.XXXXXX")" || return 1
 	if ! cat >"$tmp" <<EOF
 receiver="beast-tcp"
-host="127.0.0.1:30005"
+host="$addr"
 fr24key="$key"
 bs="no"
 raw="no"
@@ -1175,7 +1177,7 @@ _enable_fr24() {
 	_worker_progress configuring
 	install -d -m 0750 "$(dirname "$ini")" 2>/dev/null || true
 	if [[ -n "$key" ]]; then
-		_fr24_write_ini "$ini" "$key" || { _emit_error state_error "failed to write fr24feed.ini"; exit 3; }
+		_fr24_write_ini "$ini" "$key" "$AGG_DECODER_ADDR" || { _emit_error state_error "failed to write fr24feed.ini"; exit 3; }
 	else
 		if ! _fr24_signup "$bin" "$ini" "$email" "$lat" "$lon" "$alt"; then
 			_emit_error signup_failed "fr24 signup did not return a sharing key"; exit 2
@@ -1185,7 +1187,7 @@ _enable_fr24() {
 		# The wizard writes its own receiver config (dvbt/auto); overwrite it so the
 		# signup and keyed paths produce identical BEAST-TCP-to-local config. Only
 		# the minted key is kept from the wizard's run.
-		_fr24_write_ini "$ini" "$key" || { _emit_error state_error "failed to write fr24feed.ini"; exit 3; }
+		_fr24_write_ini "$ini" "$key" "$AGG_DECODER_ADDR" || { _emit_error state_error "failed to write fr24feed.ini"; exit 3; }
 	fi
 	_fr24_finalize_perms "$ini"
 
