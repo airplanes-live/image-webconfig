@@ -30,6 +30,26 @@ printf '%s\n' "${SVC_STATE-inactive}"
 EOF
     chmod +x "$SYSTEMCTL"
     export AGG_SYSTEMCTL="$SYSTEMCTL"
+
+    # dpkg-query stub: a package reads installed iff $AGG_TEST_DPKG_DIR/<pkg>
+    # exists. Default-clean so fr24's external-install package probe is
+    # deterministic on any host (the build box may or may not have fr24feed).
+    export AGG_TEST_DPKG_DIR="$WORK/dpkg"; mkdir -p "$AGG_TEST_DPKG_DIR"
+    DQ="$WORK/fake-dpkg-query"
+    cat > "$DQ" <<'EOF'
+#!/usr/bin/env bash
+pkg="${@: -1}"
+[ -f "$AGG_TEST_DPKG_DIR/$pkg" ] || exit 1
+printf 'ii '
+exit 0
+EOF
+    chmod +x "$DQ"; export AGG_DPKG_QUERY="$DQ"
+
+    # Point fr24's external-install signals at temp paths so a real vendor
+    # fr24feed on the build host can't leak into these tests; default-absent.
+    mkdir -p "$WORK/fr24"
+    export AGG_FR24_SYSTEM_BIN="$WORK/fr24/usr-bin-fr24feed"
+    export AGG_FR24_SYSTEM_UNIT_PATHS="$WORK/fr24/fr24feed.service"
 }
 
 teardown() {
@@ -52,6 +72,43 @@ teardown() {
     echo "$output" | jq -e '.aggregators[0].decoder_reachable == true'
     echo "$output" | jq -e '.aggregators[0].secret_fields_present == []'
     echo "$output" | jq -e '.aggregators[0].fields | length == 2'
+}
+
+@test "status on a fresh device reports fr24 neither external nor managed" {
+    run "$APLAGG" status --json
+    [ "$status" -eq 0 ]
+    echo "$output" | jq -e '.aggregators[] | select(.id=="fr24")
+        | .external_install==false and .managed_install==false'
+}
+
+@test "status flags a manually-installed fr24 binary as external_install" {
+    : > "$AGG_FR24_SYSTEM_BIN"; chmod +x "$AGG_FR24_SYSTEM_BIN"
+    run "$APLAGG" status --json
+    [ "$status" -eq 0 ]
+    echo "$output" | jq -e '.aggregators[] | select(.id=="fr24")
+        | .external_install==true and .managed_install==false'
+}
+
+@test "status flags a vendor fr24feed.service unit as external_install" {
+    : > "$AGG_FR24_SYSTEM_UNIT_PATHS"
+    run "$APLAGG" status --json
+    [ "$status" -eq 0 ]
+    echo "$output" | jq -e '.aggregators[] | select(.id=="fr24") | .external_install==true'
+}
+
+@test "status flags an apt-installed fr24feed package as external_install" {
+    : > "$AGG_TEST_DPKG_DIR/fr24feed"
+    run "$APLAGG" status --json
+    [ "$status" -eq 0 ]
+    echo "$output" | jq -e '.aggregators[] | select(.id=="fr24") | .external_install==true'
+}
+
+@test "status reports our own fr24 install as managed_install, not external" {
+    install -D -m 0755 /dev/null "$AGG_INSTALL_ROOT/fr24/fr24feed"
+    run "$APLAGG" status --json
+    [ "$status" -eq 0 ]
+    echo "$output" | jq -e '.aggregators[] | select(.id=="fr24")
+        | .managed_install==true and .external_install==false'
 }
 
 @test "list is an alias for status" {
@@ -206,4 +263,47 @@ EOF
     run "$APLAGG" status --json
     [ "$status" -eq 0 ]
     echo "$output" | jq -e '.aggregators[0] | has("reconcile_error") | not'
+}
+
+# --- real decoder probe (AGG_DECODER_STATE unset) ---------------------------
+# The cases above bypass the probe via AGG_DECODER_STATE. These exercise the
+# actual probe path through an AGG_NC stub, so we cover the graceful `nc -N`
+# invocation without needing a live readsb on the build host. The stub
+# advertises -N on `-h` (so _nc_supports_shutdown selects the graceful path)
+# and records its argv; NC_RESULT picks connect success/failure.
+_install_fake_nc() {
+    export NC_ARGV_LOG="$WORK/nc.argv"; : >"$NC_ARGV_LOG"
+    local nc="$WORK/fake-nc"
+    cat > "$nc" <<'EOF'
+#!/usr/bin/env bash
+if [[ "$1" == "-h" ]]; then
+    # Mimic OpenBSD netcat: usage line plus a command-summary line for -N.
+    printf 'usage: nc [-46CDdFhklNnrStUuvZz] ...\n\t-N\tshutdown(2) after EOF on stdin\n' >&2
+    exit 1
+fi
+printf '%s\n' "$*" >>"$NC_ARGV_LOG"
+[[ "${NC_RESULT:-0}" == "0" ]] && exit 0 || exit 1
+EOF
+    chmod +x "$nc"
+    export AGG_NC="$nc"
+}
+
+@test "decoder probe: graceful nc -N reports reachable when connect succeeds" {
+    _install_fake_nc
+    export NC_RESULT=0          # connect ok
+    unset AGG_DECODER_STATE     # exercise the real probe
+    run "$APLAGG" status --json
+    [ "$status" -eq 0 ]
+    echo "$output" | jq -e '.aggregators[0].decoder_reachable == true'
+    # Probe used graceful shutdown against the configured endpoint.
+    grep -q -- '-N 127.0.0.1 30005' "$NC_ARGV_LOG"
+}
+
+@test "decoder probe: reports not reachable when connect fails" {
+    _install_fake_nc
+    export NC_RESULT=1          # connect refused / timed out
+    unset AGG_DECODER_STATE
+    run "$APLAGG" status --json
+    [ "$status" -eq 0 ]
+    echo "$output" | jq -e '.aggregators[0].decoder_reachable == false'
 }

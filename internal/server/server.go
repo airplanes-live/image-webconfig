@@ -93,6 +93,7 @@ type PrivilegedArgv struct {
 	Poweroff          []string // sudo -n /usr/bin/systemctl poweroff
 	StartOrchestrator []string // sudo systemd-run --unit=airplanes-update-orchestrator ...
 	RegisterClaim     []string // sudo systemctl start --no-block airplanes-claim.service
+	RotateClaim       []string // sudo -n /usr/local/lib/airplanes-webconfig/claim-rotate.sh
 	SyncConfig        []string // sudo systemctl start --no-block airplanes-config-sync.service
 	WifiList          []string
 	WifiAdd           []string
@@ -102,6 +103,8 @@ type PrivilegedArgv struct {
 	WifiActivate      []string
 	WifiAdopt         []string
 	WifiStatus        []string
+	WifiExport        []string // sudo -n /usr/local/bin/apl-wifi export --json (PSK-bearing; backup only)
+	WifiImport        []string // sudo -n /usr/local/bin/apl-wifi import --json (non-disruptive restore)
 	ExportIdentity    []string // sudo -n /usr/local/lib/airplanes-webconfig/identity-export.sh
 	ImportIdentity    []string // sudo -n /usr/local/lib/airplanes-webconfig/identity-import.sh
 	// Aggregator* target the apl-aggregator helper installed by the runtime
@@ -118,6 +121,19 @@ type PrivilegedArgv struct {
 	AggregatorReset   []string
 	AggregatorExport  []string
 	AggregatorImport  []string
+	// SSH* target the apl-ssh helper that manages SSH access for the pi
+	// account only (a per-device password and a single managed authorized
+	// key). As with apl-wifi/apl-aggregator, one entry per verb keeps the
+	// sudoers grant pinned to a single subcommand so a compromised webconfig
+	// cannot drift between the read-only (status) and mutating (enable / set /
+	// disable / clear) surfaces via the same grant. The pi password value
+	// travels on the helper's stdin, never on argv.
+	SSHStatus          []string
+	SSHEnablePassword  []string
+	SSHSetPassword     []string
+	SSHDisablePassword []string
+	SSHSetKey          []string
+	SSHClearKey        []string
 }
 
 // DefaultPrivilegedArgv returns the production argv shapes for the
@@ -160,6 +176,12 @@ func DefaultPrivilegedArgv() PrivilegedArgv {
 		// immediately. Progress and failures show up in the claim activity
 		// log via the SSE stream the SPA opens after this returns.
 		RegisterClaim: sudo("/usr/bin/systemctl", "start", "--no-block", "airplanes-claim.service"),
+		// RotateClaim calls a wrapper script (not bare apl-feed) so the
+		// sudoers grant is a single fixed argv that cannot drift to
+		// `apl-feed claim rotate --abort` or other subcommands. The wrapper
+		// pins `--json --max-retry-time 20`; claimRotateTimeout below adds
+		// the headroom over that 20s budget.
+		RotateClaim: sudo("/usr/local/lib/airplanes-webconfig/claim-rotate.sh"),
 		// Fired after a successful config save so a change reaches the server
 		// on the next sync instead of the ~60s timer tick. --no-block: the
 		// unit is Type=oneshot and `apl-feed config sync` does a network
@@ -175,6 +197,10 @@ func DefaultPrivilegedArgv() PrivilegedArgv {
 		WifiActivate: sudo("/usr/local/bin/apl-wifi", "activate", "--json"),
 		WifiAdopt:    sudo("/usr/local/bin/apl-wifi", "adopt", "--json"),
 		WifiStatus:   sudo("/usr/local/bin/apl-wifi", "status", "--json"),
+		// export reads PSKs from root-only keyfiles for the combined backup;
+		// import writes keyfiles non-disruptively. One pinned argv per verb.
+		WifiExport: sudo("/usr/local/bin/apl-wifi", "export", "--json"),
+		WifiImport: sudo("/usr/local/bin/apl-wifi", "import", "--json"),
 		// Identity export/import call wrapper scripts (not bare apl-feed)
 		// so each surface is its own fixed argv in sudoers. The wrappers
 		// invoke `apl-feed backup -` and `apl-feed restore /dev/stdin
@@ -193,6 +219,18 @@ func DefaultPrivilegedArgv() PrivilegedArgv {
 		AggregatorReset:   sudo("/usr/local/bin/apl-aggregator", "reset", "--json"),
 		AggregatorExport:  sudo("/usr/local/bin/apl-aggregator", "export", "--json"),
 		AggregatorImport:  sudo("/usr/local/bin/apl-aggregator", "import", "--json"),
+		// apl-ssh manages SSH access for the pi account. One pinned argv per
+		// verb; the pi password (for enable/set) is read on stdin, not argv.
+		// enable-password and set-password are the same operation server-side —
+		// two verbs only so the grant + UI intent (enable vs rotate) read
+		// clearly. The helper is laid down in the rootfs payload alongside this
+		// argv contract so they version together.
+		SSHStatus:          sudo("/usr/local/bin/apl-ssh", "status", "--json"),
+		SSHEnablePassword:  sudo("/usr/local/bin/apl-ssh", "enable-password", "--json"),
+		SSHSetPassword:     sudo("/usr/local/bin/apl-ssh", "set-password", "--json"),
+		SSHDisablePassword: sudo("/usr/local/bin/apl-ssh", "disable-password", "--json"),
+		SSHSetKey:          sudo("/usr/local/bin/apl-ssh", "set-key", "--json"),
+		SSHClearKey:        sudo("/usr/local/bin/apl-ssh", "clear-key", "--json"),
 	}
 }
 
@@ -305,8 +343,13 @@ func New(d Deps) http.Handler {
 	mux.HandleFunc("GET /api/auth/whoami", s.requireSession(s.handleWhoami))
 	mux.HandleFunc("GET /api/identity", s.requireSession(s.handleIdentity))
 	mux.HandleFunc("POST /api/identity/secret", s.requireSession(s.handleIdentitySecret))
-	mux.HandleFunc("POST /api/identity/export", s.requireSession(s.handleIdentityExport))
-	mux.HandleFunc("POST /api/identity/import", s.requireSession(s.handleIdentityImport))
+	// Combined device backup / restore. export + the configured-device restore
+	// require a session; restore-setup is public but gated on the uninitialized
+	// state (the same trust window as POST /api/setup) so a fresh flash can be
+	// restored before a password exists. Restore streams NDJSON progress.
+	mux.HandleFunc("POST /api/backup/export", s.requireSession(s.handleBackupExport))
+	mux.HandleFunc("POST /api/backup/restore", s.requireSession(s.handleBackupRestore))
+	mux.HandleFunc("POST /api/backup/restore-setup", s.handleBackupRestoreSetup)
 	mux.HandleFunc("GET /api/config", s.requireSession(s.handleConfigGet))
 	mux.HandleFunc("GET /api/sdr", s.requireSession(s.handleSDRList))
 	mux.HandleFunc("GET /api/status", s.requireSession(s.handleStatus))
@@ -318,6 +361,7 @@ func New(d Deps) http.Handler {
 	mux.HandleFunc("POST /api/reboot", s.requireSession(s.handleReboot))
 	mux.HandleFunc("POST /api/poweroff", s.requireSession(s.handlePoweroff))
 	mux.HandleFunc("POST /api/claim/register", s.requireSession(s.handleClaimRegister))
+	mux.HandleFunc("POST /api/claim/rotate", s.requireSession(s.handleClaimRotate))
 	mux.HandleFunc("GET /api/claim/status", s.requireSession(s.handleClaimStatus))
 
 	// Wi-Fi network management — privileged subcommands of /usr/local/bin/apl-wifi.
@@ -338,16 +382,29 @@ func New(d Deps) http.Handler {
 	// /usr/local/bin/apl-aggregator. As with Wi-Fi, no Go-side mutex: the
 	// helper's flock at /run/airplanes/aggregator.lock serializes across
 	// processes (and a webconfig restart racing the CLI) and returns a fast
-	// lock_timeout 503 to the second caller. export/import are POST so they
-	// route through the origin check; export is the one secret-bearing read.
+	// lock_timeout 503 to the second caller. The aggregator sign-in details
+	// (including sharing keys) are backed up and restored through the combined
+	// device backup (/api/backup/*), which reuses the export/import helper verbs.
 	mux.HandleFunc("GET /api/aggregators", s.requireSession(s.handleAggregatorList))
 	mux.HandleFunc("GET /api/aggregators/{id}", s.requireSession(s.handleAggregatorDetail))
-	mux.HandleFunc("POST /api/aggregators/export", s.requireSession(s.handleAggregatorExport))
-	mux.HandleFunc("POST /api/aggregators/import", s.requireSession(s.handleAggregatorImport))
 	mux.HandleFunc("POST /api/aggregators/{id}/enable", s.requireSession(s.handleAggregatorEnable))
 	mux.HandleFunc("POST /api/aggregators/{id}/disable", s.requireSession(s.handleAggregatorDisable))
 	mux.HandleFunc("POST /api/aggregators/{id}/set", s.requireSession(s.handleAggregatorSet))
 	mux.HandleFunc("POST /api/aggregators/{id}/reset", s.requireSession(s.handleAggregatorReset))
+
+	// SSH access for the pi account — privileged subcommands of
+	// /usr/local/bin/apl-ssh. The status read is GET; every mutating verb is a
+	// POST so it routes through requireOriginMatchesHost and carries a
+	// current_password the handler re-verifies (and strips) before forwarding
+	// to the helper. No Go-side mutex: the helper's flock at
+	// /run/airplanes/ssh.lock serializes across processes and returns a fast
+	// lock_timeout 503 to a second concurrent caller.
+	mux.HandleFunc("GET /api/ssh", s.requireSession(s.handleSSHStatus))
+	mux.HandleFunc("POST /api/ssh/enable-password", s.requireSession(s.handleSSHEnablePassword))
+	mux.HandleFunc("POST /api/ssh/set-password", s.requireSession(s.handleSSHSetPassword))
+	mux.HandleFunc("POST /api/ssh/disable-password", s.requireSession(s.handleSSHDisablePassword))
+	mux.HandleFunc("POST /api/ssh/set-key", s.requireSession(s.handleSSHSetKey))
+	mux.HandleFunc("POST /api/ssh/clear-key", s.requireSession(s.handleSSHClearKey))
 
 	// Static assets at /static/*; the SPA shell is served by the GET /
 	// handler below. no-store cache policy: assets are embedded in the

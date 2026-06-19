@@ -184,6 +184,7 @@ func aggLifecycle(installing, enabled, configured bool) string {
 func aggAdapterFR24(state *State) map[string]any {
 	enabled, mlat, fields := state.AggregatorRecord("fr24")
 	installing := state.AggregatorInstalling("fr24")
+	external := state.AggregatorExternal("fr24")
 	secretsPresent := []string{}
 	if fields["sharing_key"] != "" {
 		secretsPresent = append(secretsPresent, "sharing_key")
@@ -197,6 +198,8 @@ func aggAdapterFR24(state *State) map[string]any {
 		"state":                   aggLifecycle(installing, enabled, configured),
 		"enabled":                 enabled,
 		"configured":              configured,
+		"external_install":        external,
+		"managed_install":         configured,
 		"available":               true,
 		"mlat_capable":            false,
 		"mlat_default":            false,
@@ -228,6 +231,7 @@ func aggAdapterFR24(state *State) map[string]any {
 func aggAdapterPiaware(state *State) map[string]any {
 	enabled, mlat, fields := state.AggregatorRecord("piaware")
 	installing := state.AggregatorInstalling("piaware")
+	external := state.AggregatorExternal("piaware")
 	secretsPresent := []string{}
 	if fields["feeder_id"] != "" {
 		secretsPresent = append(secretsPresent, "feeder_id")
@@ -241,6 +245,8 @@ func aggAdapterPiaware(state *State) map[string]any {
 		"state":                   aggLifecycle(installing, enabled, configured),
 		"enabled":                 enabled,
 		"configured":              configured,
+		"external_install":        external,
+		"managed_install":         configured,
 		"available":               true,
 		"mlat_capable":            true,
 		"mlat_default":            true,

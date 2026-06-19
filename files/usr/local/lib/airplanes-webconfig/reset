@@ -13,3 +13,20 @@ rm -f /boot/firmware/airplanes-reset-password
 # after the reboot that triggers this unit, but a password reset must
 # never leave pre-reset sessions behind.
 rm -f /run/airplanes-webconfig/sessions.json
+
+# Revoke webconfig-managed SSH access for the pi account too. A password reset
+# returns the device to "unconfigured webconfig", so it must not silently leave
+# a root-equivalent pi login (password or managed key) that was set up through
+# the now-cleared webconfig. Each step is guarded so a device that never enabled
+# SSH (missing user, missing files) isn't a fatal reset failure.
+logger -t airplanes-webconfig-reset "revoking webconfig-managed pi SSH access"
+if getent passwd pi >/dev/null 2>&1; then
+    passwd -l pi >/dev/null 2>&1 || \
+        logger -t airplanes-webconfig-reset "warning: could not lock the pi password"
+fi
+rm -f /etc/ssh/authorized_keys.d/pi
+rm -f /etc/ssh/sshd_config.d/99-airplanes-ssh-pi.conf
+# Reload sshd so the revocation takes effect without a reboot dependency.
+# Best-effort: if ssh isn't running yet (early boot) the reload is a no-op and
+# the new config is read when sshd starts.
+systemctl reload ssh >/dev/null 2>&1 || true

@@ -57,7 +57,7 @@ web/
 files/                          rootfs payload installed by install.sh (tarred at release time)
   etc/sudoers.d/                010 (base privilege)
   etc/systemd/system/           airplanes-webconfig.service + reset oneshot
-  usr/local/lib/airplanes-webconfig/  reset, identity-export.sh, identity-import.sh
+  usr/local/lib/airplanes-webconfig/  reset, identity-export.sh, identity-import.sh, claim-rotate.sh
   usr/local/lib/airplanes/      wifi-validators.sh, wifi-keyfile.sh (sourced by apl-wifi + airplanes-first-run)
   usr/local/bin/apl-wifi        privileged Wi-Fi management helper
 install.sh                      build-mode entrypoint (image build only)
@@ -67,6 +67,8 @@ scripts/lib/install-common.sh   shared resolution + download + verify helpers
 ### Sudoers / argv parity invariant
 
 `internal/server/server.go`'s `DefaultPrivilegedArgv()` hard-codes the `/usr/bin/sudo -n …` argv shapes that the binary uses. Each shape must appear verbatim in `files/etc/sudoers.d/010_airplanes-webconfig`. The Go test `TestDefaultPrivilegedArgv_SudoersParity` enforces this from the Go side; the `visudo` CI job enforces parseability from the policy side. Both must travel together in the release — that's why sudoers ships in the rootfs payload rather than being owned by `airplanes-live/image`.
+
+> **Cross-repo gotcha — new privileged helper scripts.** When you add (or remove) a wrapper under `files/usr/local/lib/airplanes-webconfig/` that a sudoers grant invokes (e.g. `claim-rotate.sh`, `identity-import.sh`), you must also add (or remove) a matching `managed_paths` entry in **`airplanes-live/image`** (`runtime-overlay/manifest-inputs/managed_paths.json`). The grant ships here, but what an *in-place overlay update* lays down is decided there. Miss it and the helper works on a freshly flashed image (the rootfs carries it) but breaks on an updated feeder (the grant points at a script that was never linked into place). The image repo's `sudoers-managed-check.sh` release gate enforces this, but it runs over *there* — so a new helper here is only half the change.
 
 ### Release manifest
 

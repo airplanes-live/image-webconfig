@@ -31,6 +31,11 @@ airplanes-webconfig ALL=(root) NOPASSWD: /usr/local/bin/apl-wifi test --json
 airplanes-webconfig ALL=(root) NOPASSWD: /usr/local/bin/apl-wifi activate --json
 airplanes-webconfig ALL=(root) NOPASSWD: /usr/local/bin/apl-wifi adopt --json
 airplanes-webconfig ALL=(root) NOPASSWD: /usr/local/bin/apl-wifi status --json
+# export emits saved networks INCLUDING the PSK (root-only keyfile read) for the
+# combined backup; import writes keyfiles non-disruptively (never touches the
+# active link). Both pinned to their own verb, --json mandatory.
+airplanes-webconfig ALL=(root) NOPASSWD: /usr/local/bin/apl-wifi export --json
+airplanes-webconfig ALL=(root) NOPASSWD: /usr/local/bin/apl-wifi import --json
 
 airplanes-webconfig ALL=(root) NOPASSWD: /usr/bin/systemctl reboot
 airplanes-webconfig ALL=(root) NOPASSWD: /usr/bin/systemctl poweroff
@@ -58,6 +63,11 @@ airplanes-webconfig ALL=(root) NOPASSWD: /usr/bin/systemd-run --unit=airplanes-u
 airplanes-webconfig ALL=(root) NOPASSWD: /usr/local/lib/airplanes-webconfig/identity-export.sh
 airplanes-webconfig ALL=(root) NOPASSWD: /usr/local/lib/airplanes-webconfig/identity-import.sh
 
+# Claim-secret rotation. The wrapper calls `apl-feed claim rotate --json
+# --max-retry-time 20`; it takes no arguments and never forwards "$@", so
+# the grant cannot drift to rotate --abort or other apl-feed subcommands.
+airplanes-webconfig ALL=(root) NOPASSWD: /usr/local/lib/airplanes-webconfig/claim-rotate.sh
+
 # /usr/local/bin/apl-aggregator manages optional third-party feed aggregators
 # (FlightRadar24, ...). Each verb is its own pinned argv so a compromised
 # webconfig cannot drift between the read-only (status, detail, export) and mutating
@@ -73,3 +83,17 @@ airplanes-webconfig ALL=(root) NOPASSWD: /usr/local/bin/apl-aggregator set --jso
 airplanes-webconfig ALL=(root) NOPASSWD: /usr/local/bin/apl-aggregator reset --json
 airplanes-webconfig ALL=(root) NOPASSWD: /usr/local/bin/apl-aggregator export --json
 airplanes-webconfig ALL=(root) NOPASSWD: /usr/local/bin/apl-aggregator import --json
+
+# /usr/local/bin/apl-ssh manages SSH access for the pi account only: a
+# per-device password (enable/rotate/disable) and a single webconfig-managed
+# authorized key (set/clear). Each verb is its own pinned argv so a compromised
+# webconfig cannot drift between the read-only (status) and mutating
+# (enable/set/disable/clear) surfaces via one grant. `--json` is mandatory in
+# argv. The pi password value is read on the helper's stdin, never passed on
+# argv (which /proc/<pid>/cmdline would expose).
+airplanes-webconfig ALL=(root) NOPASSWD: /usr/local/bin/apl-ssh status --json
+airplanes-webconfig ALL=(root) NOPASSWD: /usr/local/bin/apl-ssh enable-password --json
+airplanes-webconfig ALL=(root) NOPASSWD: /usr/local/bin/apl-ssh set-password --json
+airplanes-webconfig ALL=(root) NOPASSWD: /usr/local/bin/apl-ssh disable-password --json
+airplanes-webconfig ALL=(root) NOPASSWD: /usr/local/bin/apl-ssh set-key --json
+airplanes-webconfig ALL=(root) NOPASSWD: /usr/local/bin/apl-ssh clear-key --json

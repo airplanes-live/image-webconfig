@@ -109,6 +109,8 @@
     const refreshBtn = document.getElementById("wc-refresh-btn");
     const userMenu = document.getElementById("wc-user-menu");
     const userMenuAggregators = document.getElementById("wc-user-aggregators");
+    const userMenuBackup = document.getElementById("wc-user-backup");
+    const userMenuSSH = document.getElementById("wc-user-ssh");
     const userMenuChangePw = document.getElementById("wc-user-change-pw");
     const userMenuLogout = document.getElementById("wc-user-logout");
     const userMenuReboot = document.getElementById("wc-user-reboot");
@@ -344,6 +346,29 @@
             }
         }
         return node;
+    }
+
+    // Wrap a password <input> with a Show/Hide reveal toggle and return the
+    // wrapping element (the input itself is unchanged, so callers keep their
+    // reference for .value/.focus()). The toggle flips input.type between
+    // password and text. aria-pressed is set as a string because el() drops
+    // falsey attrs. type="button" so it never submits the enclosing form.
+    // Named pwReveal (not pwField) to avoid colliding with the local pwField
+    // identifiers in the SSH forms.
+    function pwReveal(input) {
+        input.classList.add("wc-pw-input");
+        const toggle = el("button", {
+            type: "button", class: "wc-pw-toggle",
+            "aria-label": "Show password", "aria-pressed": "false",
+        }, "Show");
+        toggle.onclick = () => {
+            const reveal = input.type === "password";
+            input.type = reveal ? "text" : "password";
+            toggle.textContent = reveal ? "Hide" : "Show";
+            toggle.setAttribute("aria-pressed", reveal ? "true" : "false");
+            toggle.setAttribute("aria-label", reveal ? "Hide password" : "Show password");
+        };
+        return el("div", { class: "wc-pw-field" }, input, toggle);
     }
 
     function clear() { app.replaceChildren(); }
@@ -806,9 +831,9 @@
     // hook, group visibility toggle, programmatic value write) keeps the
     // error UI consistent with the actual Save gate. Caller controls
     // empty-handling semantics via shouldShowError: empty-valid fields
-    // (MLAT_USER, DUMP978_SDR_SERIAL, identity-import UUID/secret) hide
-    // their error on empty input; empty-invalid fields (GAIN, DUMP978_GAIN)
-    // surface the error even on empty.
+    // (MLAT_USER, DUMP978_SDR_SERIAL) hide their error on empty input;
+    // empty-invalid fields (GAIN, DUMP978_GAIN) surface the error even on
+    // empty.
     function refreshFieldError(inputEl, errorEl, shouldShowError) {
         const invalid = shouldShowError(inputEl.value);
         errorEl.hidden = !invalid;
@@ -1450,11 +1475,15 @@
         const id = resp.payload || {};
         if (!id.feeder_id) {
             parent.appendChild(el("p", { class: "muted" }, "Feeder ID will be assigned on first run."));
-            // Allow restore from a backup before first-run assigns a
-            // UUID: a freshly-flashed replacement device with a saved
-            // backup file should be able to recover its identity here.
+            // Before first-run assigns a UUID, a freshly-flashed
+            // replacement device recovers its identity from a saved backup
+            // via the combined Backup & restore page.
             parent.appendChild(el("div", { class: "wc-action-grid" },
-                buildImportIdentityNavBtn(null),
+                el("button", {
+                    class: "wc-btn-ghost",
+                    type: "button",
+                    onclick: () => navigate(backupPanel, { title: "Backup & restore", showBack: true }),
+                }, "Backup & restore"),
                 el("span", { class: "wc-action-grid__spacer", "aria-hidden": "true" }),
             ));
             return;
@@ -1486,417 +1515,133 @@
                     navigate(() => claimActivityPanel(), { title: "Claim activity", showBack: true });
                 },
             }, "Register now");
-            // Row 1: Register now + Claim activity. Row 2: Import (col 1
-            // only; col 2 stays empty so column alignment matches the
-            // secret-present view).
+            // Row 1: Register now + Claim activity. Row 2: a recovery path
+            // to the combined Backup & restore page (col 2 stays empty so
+            // column alignment matches the secret-present view).
             parent.appendChild(el("div", { class: "wc-action-grid" },
                 registerBtn, claimLog,
-                buildImportIdentityNavBtn(id.feeder_id),
+                el("button", {
+                    class: "wc-btn-ghost",
+                    type: "button",
+                    onclick: () => navigate(backupPanel, { title: "Backup & restore", showBack: true }),
+                }, "Backup & restore"),
                 el("span", { class: "wc-action-grid__spacer", "aria-hidden": "true" }),
             ));
             parent.appendChild(registerErr);
             return;
         }
 
+        // doReveal fetches the full secret and renders the revealed view via
+        // showRevealed (optionally with a status note, e.g. after a
+        // rotation). Factored out so "Rotate secret" can re-render with the
+        // freshly-rotated secret in place. doReveal/showRevealed/rotateSecret
+        // are function declarations so they hoist above reveal's onclick.
         const reveal = el("button", {
             class: "wc-btn-ghost",
             type: "button",
             onclick: async () => {
                 reveal.disabled = true;
-                const r = await postJSON("/api/identity/secret", {});
+                await doReveal();
                 reveal.disabled = false;
-                if (handleAuthFailure(r)) return;
-                if (!r.ok) {
-                    parent.replaceChildren(el("p", { class: "error", role: "alert" },
-                        (r.payload && r.payload.error) || "reveal failed"));
-                    return;
-                }
-                if (!r.payload.feeder_id || !r.payload.claim_secret) {
-                    parent.replaceChildren(el("p", { class: "error", role: "alert" },
-                        "reveal returned incomplete data"));
-                    return;
-                }
-                const safe = claimHrefWithFeederId(r.payload.claim_page, r.payload.feeder_id);
-                const linkOrText = safe
-                    ? el("a", { href: safe, target: "_blank", rel: "noopener noreferrer" }, "Claim this feeder")
-                    : el("span", { class: "muted" }, r.payload.claim_page || "");
-                parent.replaceChildren(
-                    el("p", { class: "wc-copy-row" },
-                        el("strong", {}, "Feeder ID: "),
-                        el("span", { class: "wc-copy-val" }, r.payload.feeder_id),
-                        copyButton(r.payload.feeder_id, "feeder ID")),
-                    el("p", { class: "wc-copy-row" },
-                        el("strong", {}, "Claim secret: "),
-                        el("code", { class: "wc-copy-val" }, r.payload.claim_secret),
-                        copyButton(r.payload.claim_secret, "claim secret")),
-                    el("p", {}, linkOrText),
-                    el("div", { class: "wc-action-grid" }, claimLog),
-                );
             },
         }, "Show claim secret");
 
-        const exportBtn = el("button", {
-            class: "wc-btn-ghost",
-            type: "button",
-            onclick: async () => {
-                exportBtn.disabled = true;
-                try {
-                    const resp = await fetch("/api/identity/export", {
-                        method: "POST",
-                        credentials: "same-origin",
-                        headers: { "Content-Type": "application/json" },
-                    });
-                    if (resp.status === 401) {
-                        navigate(() => loginPanel("Session expired — log in again."), {});
-                        return;
-                    }
-                    if (!resp.ok) {
-                        let msg = "export failed";
-                        try { const j = await resp.json(); if (j && j.error) msg = j.error; } catch (_) {}
-                        alert(msg);
-                        return;
-                    }
-                    const text = await resp.text();
-                    let env;
-                    try { env = JSON.parse(text); } catch (_) {
-                        alert("export produced invalid JSON");
-                        return;
-                    }
-                    const fid = (env && env.feeder_uuid) || "feeder";
-                    const stamp = new Date().toISOString().slice(0, 10);
-                    const filename = "airplanes-live-feeder-" + String(fid).slice(0, 8) + "-" + stamp + ".json";
-                    const blob = new Blob([text], { type: "application/json" });
-                    const url = URL.createObjectURL(blob);
-                    const a = document.createElement("a");
-                    a.href = url;
-                    a.download = filename;
-                    document.body.appendChild(a);
-                    a.click();
-                    document.body.removeChild(a);
-                    setTimeout(() => URL.revokeObjectURL(url), 0);
-                } finally {
-                    exportBtn.disabled = false;
-                }
-            },
-        }, "Export identity");
+        async function doReveal(note) {
+            const r = await postJSON("/api/identity/secret", {});
+            if (handleAuthFailure(r)) return;
+            if (!r.ok) {
+                parent.replaceChildren(el("p", { class: "error", role: "alert" },
+                    (r.payload && r.payload.error) || "reveal failed"));
+                return;
+            }
+            if (!r.payload.feeder_id || !r.payload.claim_secret) {
+                parent.replaceChildren(el("p", { class: "error", role: "alert" },
+                    "reveal returned incomplete data"));
+                return;
+            }
+            showRevealed(r.payload, note);
+        }
 
-        // Row 1: Show claim secret + Claim activity.
-        // Row 2: Export identity + Import identity.
+        function showRevealed(payload, note) {
+            const safe = claimHrefWithFeederId(payload.claim_page, payload.feeder_id);
+            const linkOrText = safe
+                ? el("a", { href: safe, target: "_blank", rel: "noopener noreferrer" }, "Claim this feeder")
+                : el("span", { class: "muted" }, payload.claim_page || "");
+            const rotateMsg = el("p", { class: "muted", role: "status" }, note || "");
+            const rotateBtn = el("button", {
+                class: "wc-btn-ghost",
+                type: "button",
+                onclick: () => rotateSecret(rotateBtn, rotateMsg),
+            }, "Rotate secret");
+            parent.replaceChildren(
+                el("p", { class: "wc-copy-row" },
+                    el("strong", {}, "Feeder ID: "),
+                    el("span", { class: "wc-copy-val" }, payload.feeder_id),
+                    copyButton(payload.feeder_id, "feeder ID")),
+                el("p", { class: "wc-copy-row" },
+                    el("strong", {}, "Claim secret: "),
+                    el("code", { class: "wc-copy-val" }, payload.claim_secret),
+                    copyButton(payload.claim_secret, "claim secret")),
+                el("p", {}, linkOrText),
+                el("div", { class: "wc-action-grid" }, claimLog, rotateBtn),
+                rotateMsg,
+            );
+        }
+
+        // rotateSecret drives POST /api/claim/rotate. Confirm-only — the
+        // reveal already exposed the secret to this session. On success it
+        // re-reveals the new secret and repaints the claim dot. "pending"
+        // (the feed helper kept an interrupted rotation, which a retry
+        // resumes) and "unknown" (the call couldn't be confirmed) both leave
+        // the button enabled so the user can try again.
+        async function rotateSecret(btn, msgEl) {
+            if (!confirm("Rotate the claim secret? This replaces it with a new one. "
+                + "The old secret stops working immediately, including any backup that holds it.")) {
+                return;
+            }
+            btn.disabled = true;
+            msgEl.className = "muted";
+            msgEl.textContent = "Rotating…";
+            const r = await postJSON("/api/claim/rotate", {});
+            if (handleAuthFailure(r)) return;
+            const status = r.payload && r.payload.status;
+            if (r.ok && status === "rotated") {
+                refreshClaimDot(dashboardCtx);
+                await doReveal("Claim secret rotated.");
+                return;
+            }
+            btn.disabled = false;
+            msgEl.className = "error";
+            if (status === "pending") {
+                msgEl.textContent = (r.payload && r.payload.message)
+                    || "Rotation didn’t finish — try again to resume it.";
+            } else if (status === "unknown") {
+                msgEl.textContent = (r.payload && r.payload.message)
+                    || "Couldn’t confirm the rotation — check the claim status, then try again.";
+            } else {
+                msgEl.textContent = (r.payload && (r.payload.message || r.payload.error)) || "Rotation failed.";
+            }
+        }
+
+        // Show claim secret + Claim activity. Identity backup/restore now
+        // lives in the combined Backup & restore page; "Rotate secret"
+        // appears in the revealed view above.
         parent.appendChild(el("div", { class: "wc-action-grid" },
             reveal, claimLog,
-            exportBtn, buildImportIdentityNavBtn(id.feeder_id),
         ));
     }
 
-    // feederUUIDRE mirrors isCanonicalUUID in
-    // internal/server/handlers.go: 8-4-4-4-12 lowercase hex. The server
-    // rejects uppercase, so the UUID input lowercases on every keystroke
-    // (matches apl-feed's canonicalize_uuid) and the payload is always
-    // normalized before send.
+    // feederUUIDRE matches a canonical feeder ID: 8-4-4-4-12 lowercase hex
+    // (mirrors isCanonicalUUID in internal/server/handlers.go). Used by the
+    // MLAT anonymous-username placeholder to decide whether a real feeder ID
+    // is available to derive the fallback name from.
     const feederUUIDRE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
-
-    // claimSecretStripRE mirrors isCanonicalClaimSecret in
-    // internal/server/handlers.go — strip hyphen, ASCII space, tab, LF,
-    // CR. Deliberately NOT JS \s: \s also matches NBSP, form-feed,
-    // vertical-tab, and U+2028 / U+2029 which the Go validator does NOT
-    // strip, so using \s would let invalid input pass client-side and
-    // fail server-side with the button green.
-    const claimSecretStripRE = /[- \t\n\r]/g;
 
     function normalizedFeederUUID(v) {
         return String(v == null ? "" : v).trim().toLowerCase();
     }
     function isCanonicalFeederUUID(v) {
         return feederUUIDRE.test(normalizedFeederUUID(v));
-    }
-    function isCanonicalClaimSecret(v) {
-        const s = String(v == null ? "" : v).replace(claimSecretStripRE, "");
-        return s.length === 16 && /^[A-Za-z0-9]+$/.test(s);
-    }
-
-    // buildImportIdentityNavBtn returns the ghost button shown in the
-    // identity card that navigates to the dedicated import sub-page.
-    // currentFeederId is forwarded so the panel can show what's about to
-    // be replaced; pass null in the "no identity yet" branch.
-    function buildImportIdentityNavBtn(currentFeederId) {
-        return el("button", {
-            class: "wc-btn-ghost",
-            type: "button",
-            onclick: () => navigate(
-                () => importIdentityPanel(currentFeederId),
-                { title: "Import identity", showBack: true },
-            ),
-        }, "Import identity");
-    }
-
-    // Maximum size for an uploaded backup file. apl-feed's export
-    // envelope is well under 1 KiB; 8 KiB is comfortable headroom for
-    // any reasonable JSON formatting / future sidecar fields without
-    // handing the FileReader a multi-megabyte file by accident.
-    const IDENTITY_BACKUP_MAX_BYTES = 8192;
-
-    // validateBackupEnvelope checks an uploaded JSON value against the
-    // apl-feed backup envelope shape AND the per-field validators the
-    // server applies. Returns { error } or normalized fields ready to
-    // drop into the form inputs. Permissive on unknown keys so a future
-    // export adding a sidecar field doesn't break today's UI.
-    function validateBackupEnvelope(obj) {
-        if (obj === null || typeof obj !== "object" || Array.isArray(obj)) {
-            return { error: "File doesn't contain a JSON object." };
-        }
-        if (obj.schema_version !== 1) {
-            return { error: "Unsupported backup schema (expected schema_version 1)." };
-        }
-        if (typeof obj.feeder_uuid !== "string") {
-            return { error: "Backup is missing feeder_uuid." };
-        }
-        if (obj.claim === null || typeof obj.claim !== "object" || Array.isArray(obj.claim)) {
-            return { error: "Backup is missing claim." };
-        }
-        if (typeof obj.claim.secret !== "string") {
-            return { error: "Backup is missing claim.secret." };
-        }
-        const feederUUID = normalizedFeederUUID(obj.feeder_uuid);
-        if (!isCanonicalFeederUUID(feederUUID)) {
-            return { error: "Backup feeder_uuid is not a valid feeder ID." };
-        }
-        if (!isCanonicalClaimSecret(obj.claim.secret)) {
-            return { error: "Backup claim.secret is not a valid claim secret." };
-        }
-        let claimVersion = null;
-        if (obj.claim.version !== undefined && obj.claim.version !== null) {
-            if (!Number.isSafeInteger(obj.claim.version)) {
-                return { error: "Backup claim.version is not an integer." };
-            }
-            claimVersion = obj.claim.version;
-        }
-        return { feederUUID: feederUUID, claimSecret: obj.claim.secret, claimVersion: claimVersion };
-    }
-
-    // importIdentityPanel: full-page identity restore. Accepts an
-    // uploaded backup JSON file (apl-feed backup export shape) OR direct
-    // UUID + claim-secret input; runs the same validators the Go side
-    // enforces in /api/identity/import before allowing submit, and
-    // POSTs the canonical envelope.
-    //
-    // currentFeederId is the feeder_id currently on disk (or null when
-    // no identity exists yet) — used in the page banner and the confirm
-    // dialog so the user sees what they're about to replace.
-    function importIdentityPanel(currentFeederId) {
-        const err = errorEl();
-        const fileInput = el("input", {
-            id: "import-identity-file",
-            type: "file", accept: ".json,application/json", autocomplete: "off",
-        });
-        const fileStatus = el("p", { class: "muted" });
-        const uuidIn = el("input", {
-            id: "import-identity-uuid",
-            type: "text",
-            autocomplete: "off",
-            autocapitalize: "none",
-            autocorrect: "off",
-            spellcheck: "false",
-            // Soft guard, not a hard limit: the canonical UUID is 36
-            // chars but pasted clipboard text can have leading or
-            // trailing whitespace/newlines. The input event handler
-            // trims those before validating; the validator regex is
-            // the authoritative length gate.
-            maxlength: "64",
-            placeholder: "11111111-2222-3333-4444-555555555555",
-        });
-        const secretIn = el("input", {
-            id: "import-identity-secret",
-            type: "text",
-            autocomplete: "off",
-            autocapitalize: "characters",
-            autocorrect: "off",
-            spellcheck: "false",
-            maxlength: "32",
-            placeholder: "ABCD-EFGH-IJKL-MNOP",
-        });
-        const submit = el("button", { type: "submit", class: "wc-btn-primary", disabled: true }, "Import");
-        const cancel = el("button", {
-            type: "button", class: "wc-btn-ghost",
-            onclick: () => navigateDashboard(),
-        }, "Cancel");
-
-        // storedVersion: the claim.version pulled from the most recent
-        // uploaded JSON, if any. Cleared on any manual edit of UUID /
-        // secret so we never submit fileA's version with fileB's (or
-        // hand-typed) credentials.
-        let storedVersion = null;
-        // busy gates submit during the POST so completion routes through
-        // updateSubmitState() rather than blindly re-enabling on now-
-        // invalid input.
-        let busy = false;
-
-        // Per-field inline errors — mirror the config-tile pattern so the
-        // user knows WHY submit is disabled, not just that it is.
-        const uuidError = el("p", { class: "field-help wc-field-error", hidden: true, role: "alert" },
-            "Format: 8-4-4-4-12 hex digits (UUID).");
-        const secretError = el("p", { class: "field-help wc-field-error", hidden: true, role: "alert" },
-            "16 letters/digits; dashes or spaces are ignored.");
-        // Predicates trim because isCanonical* both normalise via stripRE
-        // / trim+lowercase before testing; the surfaced error matches the
-        // validator. Empty stays clean (the disabled button already
-        // communicates "you haven't filled this in").
-        const uuidShouldShowError = (v) => v.trim() !== "" && !isCanonicalFeederUUID(v);
-        const secretShouldShowError = (v) => v.trim() !== "" && !isCanonicalClaimSecret(v);
-        function refreshIdentityErrors() {
-            refreshFieldError(uuidIn, uuidError, uuidShouldShowError);
-            refreshFieldError(secretIn, secretError, secretShouldShowError);
-        }
-
-        function updateSubmitState() {
-            submit.disabled = busy
-                || !isCanonicalFeederUUID(uuidIn.value)
-                || !isCanonicalClaimSecret(secretIn.value);
-        }
-
-        uuidIn.addEventListener("input", () => {
-            // Silent normalize on input: trim + lowercase, matching
-            // apl-feed's canonicalize_uuid. A clipboard paste often
-            // carries leading/trailing whitespace that would otherwise
-            // sit in the field invisibly and keep submit disabled with
-            // no obvious reason. Caret tracking is best-effort —
-            // clamping to the new length is correct for the typical
-            // paste-at-end case.
-            const before = uuidIn.value;
-            const after = before.trim().toLowerCase();
-            if (after !== before) {
-                const start = uuidIn.selectionStart;
-                const end = uuidIn.selectionEnd;
-                uuidIn.value = after;
-                const n = after.length;
-                try { uuidIn.setSelectionRange(Math.min(start, n), Math.min(end, n)); }
-                catch (_) { /* not focusable */ }
-            }
-            storedVersion = null;
-            refreshFieldError(uuidIn, uuidError, uuidShouldShowError);
-            updateSubmitState();
-        });
-        secretIn.addEventListener("input", () => {
-            storedVersion = null;
-            refreshFieldError(secretIn, secretError, secretShouldShowError);
-            updateSubmitState();
-        });
-
-        fileInput.addEventListener("change", () => {
-            // Capture the File reference, then clear the input so
-            // picking the same filename twice in a row still fires change.
-            const file = fileInput.files && fileInput.files[0];
-            fileInput.value = "";
-            if (!file) return;
-            err.textContent = "";
-            if (file.size === 0) {
-                fileStatus.textContent = "";
-                err.textContent = "Selected file is empty.";
-                return;
-            }
-            if (file.size > IDENTITY_BACKUP_MAX_BYTES) {
-                fileStatus.textContent = "";
-                err.textContent = "Identity backup files are under 1 KB; selected file is too large.";
-                return;
-            }
-            const reader = new FileReader();
-            reader.onerror = () => {
-                fileStatus.textContent = "";
-                err.textContent = "Could not read the selected file.";
-            };
-            reader.onabort = () => {
-                fileStatus.textContent = "";
-                err.textContent = "Reading the selected file was cancelled.";
-            };
-            reader.onload = () => {
-                const text = typeof reader.result === "string" ? reader.result : "";
-                let parsed;
-                try { parsed = JSON.parse(text); }
-                catch (_) {
-                    fileStatus.textContent = "";
-                    err.textContent = "Not a valid JSON file.";
-                    return;
-                }
-                const v = validateBackupEnvelope(parsed);
-                if (v.error) {
-                    fileStatus.textContent = "";
-                    err.textContent = v.error;
-                    return;
-                }
-                // Atomic prefill: only after every check passes. Manual
-                // .value writes don't fire input events, so refresh the
-                // inline field-errors and submit state explicitly (a
-                // valid backup must clear any stale errors from a prior
-                // manual edit).
-                uuidIn.value = v.feederUUID;
-                secretIn.value = v.claimSecret;
-                storedVersion = v.claimVersion;
-                fileStatus.textContent = "Loaded from " + file.name;
-                refreshIdentityErrors();
-                updateSubmitState();
-            };
-            reader.readAsText(file);
-        });
-
-        const form = el("form", {
-            class: "wc-card",
-            onsubmit: async (e) => {
-                e.preventDefault();
-                err.textContent = "";
-                if (!isCanonicalFeederUUID(uuidIn.value)
-                    || !isCanonicalClaimSecret(secretIn.value)) {
-                    err.textContent = "Feeder ID and claim secret must be valid.";
-                    return;
-                }
-                const targetUUID = normalizedFeederUUID(uuidIn.value);
-                const currentLine = currentFeederId
-                    ? "Current feeder ID: " + currentFeederId + "\n"
-                    : "This feeder has no identity yet.\n";
-                const prompt = currentLine
-                    + "New feeder ID: " + targetUUID + "\n\n"
-                    + "Importing replaces this feeder's identity with the supplied "
-                    + "UUID and claim secret. Continue?";
-                if (!confirm(prompt)) return;
-                busy = true;
-                updateSubmitState();
-                cancel.disabled = true;
-                submit.textContent = "Importing…";
-                const body = {
-                    schema_version: 1,
-                    feeder_uuid: targetUUID,
-                    claim: { secret: secretIn.value, version: storedVersion },
-                };
-                const r = await postJSON("/api/identity/import", body);
-                busy = false;
-                cancel.disabled = false;
-                submit.textContent = "Import";
-                updateSubmitState();
-                if (handleAuthFailure(r)) return;
-                if (!r.ok) {
-                    err.textContent = (r.payload && r.payload.error) || "import failed";
-                    return;
-                }
-                navigateDashboard({ flash: { text: "Identity imported.", level: "ok" } });
-            },
-        },
-            el("h2", {}, "Import identity"),
-            el("p", {},
-                "Restore this feeder's identity from a JSON backup you exported earlier, "
-                + "or enter the feeder ID and claim secret by hand."),
-            currentFeederId
-                ? el("p", {}, el("strong", {}, "Current feeder ID: "), currentFeederId)
-                : el("p", { class: "muted" }, "This feeder has no identity yet."),
-            el("div", { class: "field" },
-                el("label", { for: "import-identity-file" }, "Identity backup (optional)"),
-                fileInput,
-                fileStatus,
-            ),
-            el("div", { class: "field" }, el("label", { for: "import-identity-uuid" }, "Feeder ID"), uuidIn, uuidError),
-            el("div", { class: "field" }, el("label", { for: "import-identity-secret" }, "Claim secret"), secretIn, secretError),
-            el("div", { class: "actions" }, cancel, submit),
-            err,
-        );
-        render(form);
-        uuidIn.focus();
     }
 
     function identityChanged(prev, next) {
@@ -3589,24 +3334,10 @@
             const ssid = el("input", { id: "wifi-ssid", name: "ssid", type: "text", value: existing ? (existing.ssid || "") : "" });
             const psk = el("input", {
                 id: "wifi-psk", name: "psk",
-                type: "password", autocomplete: "new-password", class: "wifi-pw-input",
+                type: "password", autocomplete: "new-password",
                 placeholder: isEdit && existing.has_psk ? "(unchanged — leave blank to keep)" : "8-63 chars or 64-hex",
             });
-            // Reveal toggle. aria-pressed is set as a string both here and in
-            // the handler because el() drops falsey attrs (a boolean false
-            // would never reach the DOM).
-            const pwToggle = el("button", {
-                type: "button", class: "wifi-pw-toggle",
-                "aria-label": "Show password", "aria-pressed": "false",
-            }, "Show");
-            pwToggle.onclick = () => {
-                const reveal = psk.type === "password";
-                psk.type = reveal ? "text" : "password";
-                pwToggle.textContent = reveal ? "Hide" : "Show";
-                pwToggle.setAttribute("aria-pressed", reveal ? "true" : "false");
-                pwToggle.setAttribute("aria-label", reveal ? "Hide password" : "Show password");
-            };
-            const pwField = el("div", { class: "wifi-pw-field" }, psk, pwToggle);
+            const pwField = pwReveal(psk);
             const hidden = el("input", { id: "wifi-hidden", name: "hidden", type: "checkbox" });
             if (existing && existing.hidden) hidden.checked = true;
             const priority = el("input", {
@@ -3946,20 +3677,39 @@
         installing:          ["Installing…",        "warn"],
         stopped:             ["Off",                "na"],
         not_installed:       ["Not set up",         "na"],
+        configured_off:      ["Ready to enable",    "na"],
         failed:              ["Setup failed",       "err"],
         decoder_unavailable: ["Decoder not ready",  "warn"],
         network_unavailable: ["Network unavailable", "warn"],
         unavailable:         ["Unavailable",        "na"],
+        unmanaged:           ["Unmanaged",          "na"],
     };
     function aggStateBadge(state) {
         const pair = AGG_STATE_BADGE[state] || [state || "—", "na"];
         return el("span", { class: "wc-agg-badge wc-agg-badge--" + pair[1] }, pair[0]);
     }
 
+    // aggDisplayState collapses an adapter to the state its badge should show. An
+    // externally-installed (unmanaged) adapter reads "unmanaged" — EXCEPT while one
+    // of our own mutations is in flight or has just failed, which stays visible so a
+    // conflicting managed copy can still be cleaned up.
+    function aggDisplayState(a) {
+        const s = a.state;
+        if (s === "installing" || s === "removing" || s === "applying" || s === "failed") return s;
+        if (a.external_install) return "unmanaged";
+        // A restored (or otherwise saved-but-disabled) identity reports
+        // not_installed with configured=true: credentials are on disk, the vendor
+        // binary just isn't enabled yet. Distinguish it from a never-touched
+        // adapter so a restore doesn't read as "Not set up" / a no-op.
+        if (s === "not_installed" && a.configured) return "configured_off";
+        return s;
+    }
+
     // buildAdapterTile renders one configured/active adapter as a nav tile that
     // opens its manage page. The state label + dot come from AGG_STATE_BADGE.
     function buildAdapterTile(a) {
-        const pair = AGG_STATE_BADGE[a.state] || [a.state || "—", "na"];
+        const ds = aggDisplayState(a);
+        const pair = AGG_STATE_BADGE[ds] || [ds || "—", "na"];
         const iconNode = el("span", { class: "wc-tile__icon" }, svgIcon(AGGREGATOR_ICON));
         const titleEl  = el("span", { class: "wc-tile__title" }, a.display_name || a.id);
         const metaEl   = el("span", { class: "wc-tile__meta" }, a.reconcile_error ? pair[0] + " · Update failed" : pair[0]);
@@ -3986,12 +3736,13 @@
         if (!container) return;
         const all = (resp && resp.ok && resp.payload && resp.payload.aggregators) || [];
         const adapters = all.filter(a =>
-            a.configured || a.enabled ||
+            a.configured || a.enabled || a.external_install ||
             a.state === "installing" || a.state === "removing" || a.state === "failed");
         // Signature covers everything a tile renders + membership flags, so a
         // change to any of them re-renders rather than going stale behind state.
         const sig = adapters.map(a =>
             [a.id, a.state || "", a.display_name || "", a.configured ? 1 : 0, a.enabled ? 1 : 0,
+             a.external_install ? 1 : 0,
              (a.reconcile_error && a.reconcile_error.error_code) || ""].join(":")
         ).join("|");
         if (container.__sig === sig) return;
@@ -4043,13 +3794,13 @@
             el("p", { class: "wc-agg-caveat" }, AGG_CAVEAT_TEXT),
             flashEl,
             list,
-            buildAggregatorBackupCard(),
         ));
     }
 
     function buildAggregatorRow(a) {
         const manageable = adapterManageable(a.id);
-        const pair = AGG_STATE_BADGE[a.state] || [a.state || "—", "na"];
+        const ds = aggDisplayState(a);
+        const pair = AGG_STATE_BADGE[ds] || [ds || "—", "na"];
         // A failed auto-update is sticky and easy to miss on the manage page, so
         // surface it on the row too; a pending (self-healing) drift is not noisy here.
         let status = a.version ? pair[0] + " · v" + a.version : pair[0];
@@ -4073,58 +3824,374 @@
         return el("div", { class: "wc-agg-row" }, icon, body, dot);
     }
 
-    function buildAggregatorBackupCard() {
+    // ===== Combined device backup / restore =====
+
+    // The five sections a combined backup carries, in display order. Restore
+    // applies them in a slightly different order server-side, but the checklist
+    // is keyed by section so arrival order doesn't matter.
+    const BACKUP_SECTIONS = [
+        { key: "settings", label: "Feeder settings" },
+        { key: "identity", label: "Feeder identity" },
+        { key: "aggregators", label: "Third-party aggregators" },
+        { key: "wifi", label: "Saved Wi-Fi networks" },
+        { key: "password", label: "Admin password" },
+    ];
+
+    // buildSectionCheckboxes renders a vertical checkbox group, one per entry in
+    // `sections` (a subset of BACKUP_SECTIONS). opts.checked(key) sets the
+    // initial state (default checked); opts.locked(key) forces a box checked +
+    // disabled (e.g. the password section on first-run restore, where it is
+    // mandatory); opts.onChange fires after any toggle. selected() returns the
+    // checked keys in BACKUP_SECTIONS order.
+    function buildSectionCheckboxes(sections, opts) {
+        opts = opts || {};
+        const boxes = {};
+        const node = el("div", { class: "wc-backup-sections" });
+        for (const s of sections) {
+            const locked = opts.locked ? !!opts.locked(s.key) : false;
+            const input = el("input", { type: "checkbox", name: "section-" + s.key });
+            input.checked = locked || (opts.checked ? !!opts.checked(s.key) : true);
+            input.disabled = locked;
+            if (opts.onChange) input.onchange = opts.onChange;
+            boxes[s.key] = input;
+            node.appendChild(el("label", { class: "wc-checkbox" }, input, el("span", {}, s.label)));
+        }
+        const selected = () => sections.map((s) => s.key).filter((k) => boxes[k].checked);
+        return { node, selected };
+    }
+
+    // restrictSections returns a shallow clone of a parsed backup envelope whose
+    // `sections` map is narrowed to `keys` — what the user ticked. The server
+    // restore loop already skips absent sections, so sending only the selected
+    // ones is all that "restore just these" needs.
+    function restrictSections(env, keys) {
+        const want = new Set(keys);
+        const sections = {};
+        for (const k of Object.keys(env.sections || {})) {
+            if (want.has(k)) sections[k] = env.sections[k];
+        }
+        return Object.assign({}, env, { sections: sections });
+    }
+
+    // buildRestoreChecklist renders one live status row per section. Pass the
+    // subset actually being restored so deselected sections don't sit stuck on
+    // "waiting…"; defaults to every section for callers that restore all.
+    function buildRestoreChecklist(sections) {
+        sections = sections || BACKUP_SECTIONS;
+        const rows = {};
+        const container = el("div", { class: "wc-agg-status", role: "status", "aria-live": "polite" });
+        for (const s of sections) {
+            const dot = el("span", { class: "wc-tile__dot wc-tile__dot--na" });
+            const state = el("span", { class: "wc-agg-status__value" }, "waiting…");
+            rows[s.key] = { dot, state };
+            container.appendChild(el("div", { class: "wc-agg-status__row" },
+                dot, el("span", { class: "wc-agg-status__label" }, s.label), state));
+        }
+        const setStatus = (key, status, reason) => {
+            const r = rows[key];
+            if (!r) return;
+            let sev = "na", text = status;
+            if (status === "applied") { sev = "ok"; text = "restored" + (reason ? " — " + reason : ""); }
+            else if (status === "skipped") { sev = "na"; text = "skipped" + (reason ? " — " + reason : ""); }
+            else if (status === "failed") { sev = "err"; text = "failed" + (reason ? " — " + reason : ""); }
+            r.dot.className = "wc-tile__dot wc-tile__dot--" + sev;
+            r.state.textContent = text;
+        };
+        return { node: container, setStatus };
+    }
+
+    // streamRestore POSTs a backup envelope and reads the NDJSON restore stream,
+    // calling onEvent(ev) per event so the checklist updates live. A pre-stream
+    // rejection (4xx) is a normal JSON error body, not NDJSON. Returns
+    // {ok, status, summary, error}. Deliberately uses its own fetch (not
+    // sendJSON, which buffers + parses one JSON value) and does NOT register an
+    // AbortController: the server finishes the restore under its own background
+    // context regardless, so navigating away must not interrupt a write in
+    // flight.
+    async function streamRestore(path, body, onEvent) {
+        let resp;
+        try {
+            resp = await fetch(path, {
+                method: "POST",
+                credentials: "same-origin",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify(body),
+            });
+        } catch (_) {
+            return { ok: false, status: 0, error: "network error" };
+        }
+        if (!resp.ok) {
+            let payload = null;
+            try { payload = await resp.json(); } catch (_) {}
+            return { ok: false, status: resp.status, error: (payload && payload.error) || "Restore failed." };
+        }
+        if (!resp.body || typeof resp.body.getReader !== "function") {
+            return { ok: false, status: resp.status, error: "restore stream unavailable" };
+        }
+        let summary = null;
+        const handleLine = (line) => {
+            line = line.trim();
+            if (!line) return;
+            let ev;
+            try { ev = JSON.parse(line); } catch (_) { return; }
+            if (ev.type === "summary") summary = ev;
+            onEvent(ev);
+        };
+        const reader = resp.body.getReader();
+        const decoder = new TextDecoder();
+        let buf = "";
+        for (;;) {
+            let chunk;
+            try { chunk = await reader.read(); }
+            catch (_) { return { ok: false, status: resp.status, error: "connection lost during restore" }; }
+            if (chunk.done) break;
+            buf += decoder.decode(chunk.value, { stream: true });
+            let nl;
+            while ((nl = buf.indexOf("\n")) >= 0) {
+                handleLine(buf.slice(0, nl));
+                buf = buf.slice(nl + 1);
+            }
+        }
+        buf += decoder.decode(); // flush any trailing multi-byte sequence
+        handleLine(buf);
+        // A stream that ends without the terminal summary line was truncated
+        // (dropped connection, killed server) — report it as a failure rather
+        // than letting the caller treat a partial restore as complete.
+        if (!summary) {
+            return { ok: false, status: resp.status, error: "restore ended unexpectedly — it may be incomplete" };
+        }
+        return { ok: true, status: resp.status, summary };
+    }
+
+    // parseBackupFile reads + validates an uploaded file client-side: size cap
+    // (mirrors the server's 128 KiB), JSON parse, and the combined-backup kind.
+    // Returns {ok, value, error}.
+    async function parseBackupFile(file) {
+        if (!file) return { ok: false, error: "" };
+        if (file.size > 131072) return { ok: false, error: "That file is too large to be a valid backup." };
+        let parsed;
+        try { parsed = JSON.parse(await file.text()); }
+        catch (_) { return { ok: false, error: "That file isn't a valid backup." }; }
+        if (!parsed || parsed.kind !== "airplanes-combined-backup") {
+            return { ok: false, error: "That file isn't an airplanes.live feeder backup." };
+        }
+        return { ok: true, value: parsed };
+    }
+
+    function backupPanel() {
+        render(el("div", { class: "wc-stack" }, buildBackupExportCard(), buildBackupRestoreCard()));
+    }
+
+    function buildBackupExportCard() {
         const msg = el("div", {});
         const setMsg = (text, kind) => msg.replaceChildren(text ? el("div", { class: "wc-flash wc-flash--" + (kind || "ok") }, text) : el("span"));
-
+        const sections = buildSectionCheckboxes(BACKUP_SECTIONS, { onChange: refresh });
+        const pwNote = el("p", { class: "muted", hidden: true },
+            "A backup without the admin password can't set up a freshly-flashed feeder — it can only be restored onto one that's already set up.");
         const exportBtn = el("button", { type: "button", class: "wc-btn-ghost" }, "Download backup");
+
+        function refresh() {
+            const sel = sections.selected();
+            exportBtn.disabled = sel.length === 0;
+            pwNote.hidden = sel.indexOf("password") !== -1;
+        }
+
         exportBtn.onclick = async () => {
+            const sel = sections.selected();
+            if (sel.length === 0) return;
             setMsg("");
-            const r = await postJSON("/api/aggregators/export", {});
+            exportBtn.disabled = true;
+            const r = await postJSON("/api/backup/export", { sections: sel });
+            exportBtn.disabled = false;
             if (handleAuthFailure(r)) return;
-            if (!r.ok) { setMsg((r.payload && (r.payload.message || r.payload.error)) || "Backup failed.", "warn"); return; }
+            if (!r.ok) { setMsg((r.payload && r.payload.error) || "Backup failed.", "warn"); return; }
             try {
                 const blob = new Blob([JSON.stringify(r.payload, null, 2)], { type: "application/json" });
                 const url = URL.createObjectURL(blob);
-                const a = el("a", { href: url, download: "airplanes-aggregators-backup.json" });
+                const a = el("a", { href: url, download: "airplanes-feeder-backup.json" });
                 document.body.appendChild(a); a.click(); a.remove();
                 setTimeout(() => URL.revokeObjectURL(url), 1000);
                 setMsg("Backup downloaded — keep it private.", "ok");
             } catch (_) { setMsg("Could not start the download.", "warn"); }
         };
+        refresh();
+        return el("section", { class: "wc-card" },
+            el("h2", {}, "Back up this feeder"),
+            el("p", { class: "muted" },
+                "Download a file with the parts of this feeder you choose — identity, settings, third-party aggregator sign-ins, saved Wi-Fi networks (including passwords), and the admin password. Use it to restore the feeder after reflashing. The file holds every secret it contains — keep it private."),
+            sections.node,
+            pwNote,
+            el("div", { class: "wc-agg-row__actions" }, exportBtn),
+            msg,
+        );
+    }
 
+    function buildBackupRestoreCard() {
+        const msg = el("div", {});
+        const setMsg = (text, kind) => msg.replaceChildren(text ? el("div", { class: "wc-flash wc-flash--" + (kind || "ok") }, text) : el("span"));
+        const area = el("div", {});
         const fileInput = el("input", { type: "file", accept: "application/json,.json", hidden: true });
         const importBtn = el("button", { type: "button", class: "wc-btn-ghost" }, "Restore from backup");
         importBtn.onclick = () => fileInput.click();
         fileInput.onchange = async () => {
             const file = fileInput.files && fileInput.files[0];
             fileInput.value = "";
-            if (!file) return;
-            // Guard before reading/parsing so a huge file can't freeze the
-            // browser (the server caps the import body at 64 KiB anyway).
-            if (file.size > 65536) { setMsg("That backup file is too large to be a valid aggregator backup.", "warn"); return; }
-            setMsg("Restoring…");
-            let parsed;
-            try { parsed = JSON.parse(await file.text()); }
-            catch (_) { setMsg("That file isn't a valid backup.", "warn"); return; }
-            const r = await postJSON("/api/aggregators/import", parsed);
-            if (handleAuthFailure(r)) return;
-            if (!r.ok) {
-                setMsg((r.payload && (r.payload.message || r.payload.error)) ||
-                    "Restore failed. Stop an enabled adapter before restoring.", "warn");
-                return;
-            }
-            pendingFlash = { text: "Identities restored. Set up an adapter to start feeding.", level: "ok" };
-            await aggregatorsPanel();
+            area.replaceChildren();
+            setMsg("");
+            const parsed = await parseBackupFile(file);
+            if (!parsed.ok) { if (parsed.error) setMsg(parsed.error, "warn"); return; }
+            const present = BACKUP_SECTIONS.filter((s) => parsed.value.sections && parsed.value.sections[s.key]);
+            if (present.length === 0) { setMsg("That backup has nothing in it to restore.", "warn"); return; }
+            showSelection(parsed.value, present);
         };
 
-        return el("section", { class: "wc-card wc-agg-backup" },
-            el("h3", {}, "Back up & restore"),
+        // showSelection lets the user pick which of the sections present in the
+        // file to apply. The admin password defaults OFF so a routine restore
+        // doesn't replace the login or log the user out unless they ask for it.
+        function showSelection(env, present) {
+            const sections = buildSectionCheckboxes(present, {
+                checked: (k) => k !== "password",
+                onChange: refresh,
+            });
+            const restoreBtn = el("button", { type: "button", class: "wc-btn-primary" }, "Restore selected");
+            function refresh() { restoreBtn.disabled = sections.selected().length === 0; }
+
+            restoreBtn.onclick = async () => {
+                const sel = sections.selected();
+                if (sel.length === 0) return;
+                const withPassword = sel.indexOf("password") !== -1;
+                const prompt = withPassword
+                    ? "Restore the selected items? This includes the admin password, so you'll be logged out and must log in with the password from the backup."
+                    : "Restore the selected items onto this feeder?";
+                if (!confirm(prompt)) return;
+
+                const chosen = present.filter((s) => sel.indexOf(s.key) !== -1);
+                const checklist = buildRestoreChecklist(chosen);
+                area.replaceChildren(el("h3", {}, "Restoring…"), checklist.node);
+                importBtn.disabled = true;
+                let failed = 0;
+                let res;
+                try {
+                    res = await streamRestore("/api/backup/restore", restrictSections(env, sel), (ev) => {
+                        if (ev.type === "section") {
+                            checklist.setStatus(ev.section, ev.status, ev.reason);
+                            if (ev.status === "failed") failed++;
+                        }
+                    });
+                } finally {
+                    importBtn.disabled = false;
+                }
+                if (handleAuthFailure(res)) return;
+                if (!res.ok) { setMsg(res.error || "Restore failed.", "warn"); return; }
+                if (res.summary && res.summary.password_changed) {
+                    navigate(() => loginPanel(failed > 0
+                        ? "Password restored, but some items couldn't be restored — log in and re-check Backup & restore."
+                        : "Password restored — log in with the password from your backup."), {});
+                    return;
+                }
+                if (failed > 0) { setMsg("Restore finished, but some items couldn't be restored — see above.", "warn"); return; }
+                setMsg("Restore complete.", "ok");
+            };
+            refresh();
+            area.replaceChildren(
+                el("p", { class: "muted" }, "Choose what to restore from this backup:"),
+                sections.node,
+                el("div", { class: "wc-agg-row__actions" }, restoreBtn),
+            );
+        }
+
+        return el("section", { class: "wc-card" },
+            el("h2", {}, "Restore from a backup"),
             el("p", { class: "muted" },
-                "Download your aggregator sign-in details (including sharing keys) so you can restore them after a reflash. The file is sensitive — keep it private."),
-            el("div", { class: "wc-agg-row__actions" }, exportBtn, importBtn, fileInput),
+                "Upload a backup file, then choose what to restore. Saved Wi-Fi networks are added without disturbing the connection you're using now."),
+            el("div", { class: "wc-agg-row__actions" }, importBtn, fileInput),
+            area,
             msg,
         );
+    }
+
+    // setupRestorePanel is the first-run counterpart reached from the password
+    // setup screen: it restores a backup onto a freshly-flashed feeder (no
+    // password set yet) and auto-logs-in. The backup MUST carry a password
+    // section — that's what completes setup.
+    function setupRestorePanel() {
+        const msg = el("div", {});
+        const setMsg = (text, kind) => msg.replaceChildren(text ? el("div", { class: "wc-flash wc-flash--" + (kind || "ok") }, text) : el("span"));
+        const area = el("div", {});
+        const fileInput = el("input", { type: "file", accept: "application/json,.json", hidden: true });
+        const importBtn = el("button", { type: "button", class: "wc-btn-primary" }, "Choose backup file");
+        importBtn.onclick = () => fileInput.click();
+        fileInput.onchange = async () => {
+            const file = fileInput.files && fileInput.files[0];
+            fileInput.value = "";
+            area.replaceChildren();
+            setMsg("");
+            const parsed = await parseBackupFile(file);
+            if (!parsed.ok) { if (parsed.error) setMsg(parsed.error, "warn"); return; }
+            if (!(parsed.value.sections && parsed.value.sections.password)) {
+                setMsg("This backup has no saved admin password, so it can't complete setup. Use “Set a password instead”.", "warn");
+                return;
+            }
+            const present = BACKUP_SECTIONS.filter((s) => parsed.value.sections[s.key]);
+            showSelection(parsed.value, present);
+        };
+
+        // showSelection lets the user pick what to restore onto the fresh flash.
+        // The admin password is mandatory here — it completes setup and signs
+        // the user in — so its box is checked and locked.
+        function showSelection(env, present) {
+            const sections = buildSectionCheckboxes(present, {
+                locked: (k) => k === "password",
+                onChange: refresh,
+            });
+            const restoreBtn = el("button", { type: "button", class: "wc-btn-primary" }, "Restore selected");
+            function refresh() { restoreBtn.disabled = sections.selected().length === 0; }
+
+            restoreBtn.onclick = async () => {
+                const sel = sections.selected();
+                if (sel.length === 0) return;
+                const chosen = present.filter((s) => sel.indexOf(s.key) !== -1);
+                const checklist = buildRestoreChecklist(chosen);
+                area.replaceChildren(el("h3", {}, "Restoring…"), checklist.node);
+                importBtn.disabled = true;
+                let failed = 0;
+                let res;
+                try {
+                    res = await streamRestore("/api/backup/restore-setup", restrictSections(env, sel), (ev) => {
+                        if (ev.type === "section") {
+                            checklist.setStatus(ev.section, ev.status, ev.reason);
+                            if (ev.status === "failed") failed++;
+                        }
+                    });
+                } finally {
+                    importBtn.disabled = false;
+                }
+                if (!res.ok) { setMsg(res.error || "Restore failed.", "warn"); return; }
+                // The device is initialized and we're auto-logged-in; carry a warning
+                // to the dashboard if any section failed, then boot() routes there.
+                if (failed > 0) {
+                    pendingFlash = { text: "Signed in. Some items couldn't be restored — check Backup & restore.", level: "warn" };
+                }
+                await boot();
+            };
+            refresh();
+            area.replaceChildren(
+                el("p", { class: "muted" }, "Choose what to restore. The admin password is always restored so you can sign in."),
+                sections.node,
+                el("div", { class: "wc-agg-row__actions" }, restoreBtn),
+            );
+        }
+
+        render(el("section", { class: "wc-card" },
+            el("h2", {}, "Restore from backup"),
+            el("p", {},
+                "Upload a backup from another airplanes.live feeder (or an earlier flash of this one), then choose what to restore. You'll be signed in automatically."),
+            el("div", { class: "wc-agg-row__actions" }, importBtn, fileInput),
+            area,
+            msg,
+            el("div", { class: "wc-setup-alt" },
+                el("button", { type: "button", class: "wc-btn-ghost", onclick: () => navigate(setupPanel, { title: "First-time setup", showBack: false }) }, "Set a password instead")),
+        ));
     }
 
     // aggEnableErrorMessage turns a failed enable/disable/reset response (or a
@@ -4223,7 +4290,67 @@
         return el("section", { class: "wc-card wc-agg-status-card" }, el("h3", {}, "Status"), rows);
     }
 
+    // renderAggExternalManaged: read-only view for an adapter installed OUTSIDE
+    // airplanes.live (external_install). The vendor/admin tool owns it, so our
+    // enable/disable/logs verbs can't act on it — show what we can read and present
+    // the actions disabled rather than letting a click error. Remove stays enabled
+    // only when WE also have a copy here (managed_install): the conflict case where
+    // reset usefully clears our duplicate and leaves the external install alone.
+    function renderAggExternalManaged(a, name) {
+        const inlineErr = el("p", { class: "error", role: "alert" });
+        const tip = name + " is managed by another tool on this device, not by airplanes.live.";
+        // A failed managed mutation (e.g. a Remove of our conflicting copy) lands
+        // here once it leaves the in-flight states — surface it instead of swallowing.
+        if (a.enable && (a.enable.error_code || a.enable.status === "failed")) {
+            inlineErr.textContent = aggEnableErrorMessage({ payload: a.enable });
+        }
+
+        const note = a.managed_install
+            ? name + " is installed on this device by another tool. An airplanes.live-managed copy " +
+              "was also set up but can't run alongside it. Use Remove to clear the airplanes.live copy " +
+              "— the other install is left untouched."
+            : name + " is already installed on this device by another tool, so airplanes.live can't " +
+              "start, stop, or remove it here. To let airplanes.live manage " + name + " instead, remove " +
+              "the existing install over SSH, then set it up here.";
+
+        const start = el("button", { type: "button", class: "wc-btn-primary", disabled: "", title: tip }, "Start feeding");
+
+        // Label the button by what it actually deletes: in the conflict case it
+        // clears ONLY our managed copy (never the external install), so spell that
+        // out rather than a bare "Remove" that reads like it removes their feeder.
+        const remove = el("button", { type: "button", class: "wc-btn-danger" },
+            a.managed_install ? "Remove airplanes.live copy" : "Remove");
+        if (a.managed_install) {
+            remove.onclick = async () => {
+                if (!confirm("Remove the airplanes.live-managed " + name + " copy? This stops and deletes " +
+                    "only the airplanes.live copy; the install added by the other tool is left as-is.")) return;
+                remove.disabled = true;
+                const r = await postJSON("/api/aggregators/" + a.id + "/reset", {});
+                if (handleAuthFailure(r)) return;
+                if (r.status === 202) {
+                    navigate(() => aggregatorMutationProgress(a.id, r.payload && r.payload.request_id, "reset"),
+                        { title: "Removing " + name, showBack: true });
+                    return;
+                }
+                remove.disabled = false; inlineErr.textContent = aggEnableErrorMessage(r);
+            };
+        } else {
+            remove.disabled = true;
+            remove.title = tip;
+        }
+
+        render(el("section", { class: "wc-card" },
+            aggDetailHead(name, aggDisplayState(a)),
+            el("p", { class: "muted" }, "Installed on this device by another tool."),
+            buildAggStatusBlock(a),
+            el("p", { class: "wc-agg-caveat" }, note),
+            inlineErr,
+            el("div", { class: "wc-agg-row__actions" }, start, remove),
+        ));
+    }
+
     function renderFr24Form(a, cfg) {
+        if (a.external_install) return renderAggExternalManaged(a, "Flightradar24");
         cfg = cfg || {};
         const configured = !!(a.configured || a.enabled);
         const inlineErr = el("p", { class: "error", role: "alert" });
@@ -4277,7 +4404,7 @@
             actions.appendChild(viewLogs);
 
             render(el("section", { class: "wc-card" },
-                aggDetailHead("Flightradar24", a.state),
+                aggDetailHead("Flightradar24", aggDisplayState(a)),
                 el("p", { class: "muted" }, a.enabled ? "Feeding Flightradar24." : "Set up but not feeding right now."),
                 buildAggStatusBlock(a),
                 inlineErr,
@@ -4366,7 +4493,7 @@
         recheck();
 
         render(el("section", { class: "wc-card" },
-            aggDetailHead("Flightradar24", a.state),
+            aggDetailHead("Flightradar24", aggDisplayState(a)),
             el("p", { class: "muted" }, "Send your receiver's data to Flightradar24."),
             buildAggStatusBlock(a),
             form,
@@ -4397,6 +4524,7 @@
     }
 
     function renderPiawareForm(a) {
+        if (a.external_install) return renderAggExternalManaged(a, "FlightAware");
         const configured = !!(a.configured || a.enabled);
         const inlineErr = el("p", { class: "error", role: "alert" });
         const mlatOn = a.configured_mlat_enabled != null ? !!a.configured_mlat_enabled : !!a.mlat_default;
@@ -4450,7 +4578,7 @@
             actions.appendChild(viewLogs);
 
             render(el("section", { class: "wc-card" },
-                aggDetailHead("FlightAware", a.state),
+                aggDetailHead("FlightAware", aggDisplayState(a)),
                 el("p", { class: "muted" }, a.enabled ? "Feeding FlightAware." : "Set up but not feeding right now."),
                 buildAggStatusBlock(a),
                 inlineErr,
@@ -4508,7 +4636,7 @@
         recheck();
 
         render(el("section", { class: "wc-card" },
-            aggDetailHead("FlightAware", a.state),
+            aggDetailHead("FlightAware", aggDisplayState(a)),
             el("p", { class: "muted" }, "Send your receiver's data to FlightAware."),
             buildAggStatusBlock(a),
             form,
@@ -4878,9 +5006,14 @@
             el("h2", {}, "Set webconfig password"),
             el("p", {}, "Choose the password used to administer this feeder. Minimum 12 characters."),
             username,
-            el("div", { class: "field" }, el("label", { for: "setup-pw" }, "Password"), pw),
-            el("div", { class: "field" }, el("label", { for: "setup-pw-confirm" }, "Confirm password"), confirmInput),
+            el("div", { class: "field" }, el("label", { for: "setup-pw" }, "Password"), pwReveal(pw)),
+            el("div", { class: "field" }, el("label", { for: "setup-pw-confirm" }, "Confirm password"), pwReveal(confirmInput)),
             submit,
+            el("div", { class: "wc-setup-alt" },
+                el("button", {
+                    type: "button", class: "wc-btn-ghost",
+                    onclick: () => navigate(setupRestorePanel, { title: "Restore from backup", showBack: false }),
+                }, "Restore from backup instead")),
             err,
         );
         render(form);
@@ -4917,12 +5050,184 @@
         },
             el("h2", {}, "Log in"),
             username,
-            el("div", { class: "field" }, el("label", { for: "login-pw" }, "Password"), pw),
+            el("div", { class: "field" }, el("label", { for: "login-pw" }, "Password"), pwReveal(pw)),
             submit,
             err,
         );
         render(form);
         pw.focus();
+    }
+
+    // ===== SSH access (pi account) =====
+
+    // The SSH card manages ONLY the pi account: a per-device password
+    // (enable / rotate / disable) and a single webconfig-managed authorized
+    // key (set / clear). Every mutating action re-authenticates with the
+    // webconfig password, which the server re-verifies against a fresh hash and
+    // strips before forwarding to the privileged apl-ssh helper.
+    const SSH_IMAGER_NOTE =
+        "Set up SSH in Raspberry Pi Imager? Manage that login from your own session.";
+
+    async function sshPanel() {
+        render(el("div", { class: "wc-card" }, el("p", { class: "muted" }, "loading SSH access…")));
+        const resp = await getJSON("/api/ssh");
+        if (handleAuthFailure(resp)) return;
+        const pf = consumePendingFlash();
+        if (!resp.ok) {
+            render(el("section", { class: "wc-card" },
+                el("h2", {}, "SSH access"),
+                pf && pf.text ? el("div", { class: "wc-flash wc-flash--" + (pf.level || "ok") }, pf.text) : null,
+                el("p", { class: "error", role: "alert" }, "Could not load SSH status."),
+                el("button", { type: "button", class: "wc-btn-primary", onclick: () => sshPanel() }, "Retry"),
+            ));
+            return;
+        }
+        const st = resp.payload || {};
+        // password_auth_allowed / password_hash_unlocked may be null (helper
+        // couldn't determine). Treat "password enabled" as both being true; any
+        // null/false falls back to the enable affordance.
+        const passwordOn = st.password_auth_allowed === true && st.password_hash_unlocked === true;
+        const keyOn = st.managed_key_present === true;
+        const piPresent = st.pi_present === true;
+
+        const flashEl = el("div", {});
+        if (pf && pf.text) flashEl.appendChild(el("div", { class: "wc-flash wc-flash--" + (pf.level || "ok") }, pf.text));
+
+        const sections = [];
+        if (!piPresent) {
+            sections.push(el("p", { class: "error", role: "alert" },
+                "The pi account does not exist on this device, so webconfig can't manage SSH access for it."));
+        } else {
+            sections.push(buildSSHPasswordSection(passwordOn));
+            sections.push(buildSSHKeySection(keyOn));
+        }
+
+        render(el("section", { class: "wc-card" },
+            el("h2", {}, "SSH access"),
+            el("p", { class: "muted" },
+                "Manage SSH login for the ", el("code", {}, "pi"), " account: a per-device password and a single public key. ",
+                "Other accounts are unaffected."),
+            el("p", { class: "muted" }, SSH_IMAGER_NOTE),
+            flashEl,
+            ...sections,
+        ));
+    }
+
+    // sshReauthForm builds a small inline form: a webconfig-password field, any
+    // extra fields (e.g. the new SSH password or the public key), and a submit
+    // button that re-auths + POSTs to path. body() returns the request body
+    // EXCLUDING current_password (added here). On success it sets a pending
+    // flash and re-renders the SSH panel.
+    function sshReauthForm(opts) {
+        const err = errorEl();
+        const pwField = el("input", {
+            type: "password", name: "current-password", autocomplete: "current-password",
+            required: true, placeholder: "Your webconfig password",
+        });
+        const username = hiddenUsernameField();
+        const submit = el("button", { type: "submit", class: opts.danger ? "wc-btn-danger" : "wc-btn-primary" }, opts.submitLabel);
+
+        const form = el("form", { class: "wc-ssh-action" },
+            username,
+            ...(opts.extraFields || []),
+            el("div", { class: "field" },
+                el("label", {}, "Confirm with your webconfig password"), pwReveal(pwField)),
+            el("div", { class: "actions" }, submit),
+            err,
+        );
+        form.addEventListener("submit", async (e) => {
+            e.preventDefault();
+            err.textContent = "";
+            if (opts.validate) {
+                const v = opts.validate();
+                if (v) { err.textContent = v; return; }
+            }
+            submit.disabled = true;
+            const prevLabel = submit.textContent;
+            submit.textContent = "Working…";
+            const body = Object.assign({ current_password: pwField.value }, opts.body ? opts.body() : {});
+            const r = await postJSON(opts.path, body);
+            submit.disabled = false;
+            submit.textContent = prevLabel;
+            if (handleAuthFailure(r)) return;
+            if (!r.ok) {
+                err.textContent = (r.payload && (r.payload.message || r.payload.error)) || "Operation failed.";
+                return;
+            }
+            pendingFlash = { text: opts.successText, level: "ok" };
+            await sshPanel();
+        });
+        return form;
+    }
+
+    function buildSSHPasswordSection(passwordOn) {
+        const wrap = el("div", { class: "wc-ssh-section" },
+            el("h3", {}, "Password login"),
+        );
+        const dot = el("span", { class: "wc-tile__dot wc-tile__dot--" + (passwordOn ? "ok" : "na") });
+        wrap.appendChild(el("p", { class: "wc-ssh-state" }, dot,
+            passwordOn ? " Password login is enabled for pi." : " Password login is disabled."));
+
+        const newPw = el("input", {
+            type: "password", name: "new-ssh-password", autocomplete: "new-password",
+            required: true, minlength: "12", placeholder: "New pi password (≥12 characters)",
+        });
+        const pwField = () => el("div", { class: "field" },
+            el("label", {}, passwordOn ? "New password for pi" : "Password for pi"), pwReveal(newPw));
+
+        wrap.appendChild(sshReauthForm({
+            path: passwordOn ? "/api/ssh/set-password" : "/api/ssh/enable-password",
+            submitLabel: passwordOn ? "Rotate password" : "Enable password",
+            extraFields: [pwField()],
+            validate: () => (newPw.value.length < 12 ? "The pi password must be at least 12 characters." : ""),
+            body: () => ({ password: newPw.value }),
+            successText: passwordOn ? "pi password rotated." : "Password login enabled for pi.",
+        }));
+
+        if (passwordOn) {
+            wrap.appendChild(sshReauthForm({
+                path: "/api/ssh/disable-password",
+                submitLabel: "Disable password login",
+                danger: true,
+                successText: "Password login disabled for pi.",
+            }));
+        }
+        return wrap;
+    }
+
+    function buildSSHKeySection(keyOn) {
+        const wrap = el("div", { class: "wc-ssh-section" },
+            el("h3", {}, "Public key"),
+        );
+        const dot = el("span", { class: "wc-tile__dot wc-tile__dot--" + (keyOn ? "ok" : "na") });
+        wrap.appendChild(el("p", { class: "wc-ssh-state" }, dot,
+            keyOn ? " A webconfig-managed key is set for pi." : " No webconfig-managed key is set."));
+
+        const keyInput = el("textarea", {
+            name: "ssh-public-key", rows: "3", autocomplete: "off", spellcheck: "false",
+            placeholder: "ssh-ed25519 AAAA… comment",
+        });
+        const keyField = el("div", { class: "field" },
+            el("label", {}, keyOn ? "Replace the managed key" : "Public key"), keyInput);
+
+        wrap.appendChild(sshReauthForm({
+            path: "/api/ssh/set-key",
+            submitLabel: keyOn ? "Replace key" : "Set key",
+            extraFields: [keyField],
+            validate: () => (keyInput.value.trim() === "" ? "Paste a public key." : ""),
+            body: () => ({ key: keyInput.value.trim() }),
+            successText: keyOn ? "Managed key replaced." : "Managed key set for pi.",
+        }));
+
+        if (keyOn) {
+            wrap.appendChild(sshReauthForm({
+                path: "/api/ssh/clear-key",
+                submitLabel: "Clear key",
+                danger: true,
+                successText: "Managed key cleared.",
+            }));
+        }
+        return wrap;
     }
 
     function changePasswordPanel() {
@@ -4964,9 +5269,9 @@
         },
             el("h2", {}, "Change webconfig password"),
             username,
-            el("div", { class: "field" }, el("label", { for: "change-pw-old" }, "Current password"), oldPw),
-            el("div", { class: "field" }, el("label", { for: "change-pw-new" }, "New password"), newPw),
-            el("div", { class: "field" }, el("label", { for: "change-pw-confirm" }, "Confirm new password"), confirmInput),
+            el("div", { class: "field" }, el("label", { for: "change-pw-old" }, "Current password"), pwReveal(oldPw)),
+            el("div", { class: "field" }, el("label", { for: "change-pw-new" }, "New password"), pwReveal(newPw)),
+            el("div", { class: "field" }, el("label", { for: "change-pw-confirm" }, "Confirm new password"), pwReveal(confirmInput)),
             el("div", { class: "actions" }, cancel, submit),
             err,
         );
@@ -5259,7 +5564,7 @@
 
         const logPre = streamLog("claim");
         render(
-            el("div", {},
+            el("div", { class: "wc-stack" },
                 statusCard,
                 el("section", { class: "wc-card" },
                     el("h2", {}, "journalctl -u airplanes-claim.service"),
@@ -5342,6 +5647,14 @@
     if (userMenuAggregators) userMenuAggregators.addEventListener("click", () => {
         closeUserMenu();
         navigate(aggregatorsPanel, { title: "Third-party aggregators", showBack: true });
+    });
+    if (userMenuBackup) userMenuBackup.addEventListener("click", () => {
+        closeUserMenu();
+        navigate(backupPanel, { title: "Backup & restore", showBack: true });
+    });
+    if (userMenuSSH) userMenuSSH.addEventListener("click", () => {
+        closeUserMenu();
+        navigate(sshPanel, { title: "SSH access", showBack: true });
     });
     if (userMenuChangePw) userMenuChangePw.addEventListener("click", () => {
         closeUserMenu();

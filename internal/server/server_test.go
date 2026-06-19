@@ -114,31 +114,40 @@ func newTestServer(t *testing.T) (*httptest.Server, *Server) {
 	}
 
 	priv := PrivilegedArgv{
-		ApplyFeed:         []string{"sudo-stub", "apl-feed", "apply", "--json", "--lock-timeout", "5"},
-		SchemaFeed:        []string{"apl-feed", "schema", "--json"},
-		Reboot:            []string{"sudo-stub", "reboot"},
-		Poweroff:          []string{"sudo-stub", "poweroff"},
-		StartOrchestrator: []string{"sudo-stub", "orchestrator"},
-		RegisterClaim:     []string{"sudo-stub", "systemctl", "start", "--no-block", "airplanes-claim.service"},
-		SyncConfig:        []string{"sudo-stub", "systemctl", "start", "--no-block", "airplanes-config-sync.service"},
-		WifiList:          []string{"sudo-stub", "apl-wifi", "list", "--json"},
-		WifiAdd:           []string{"sudo-stub", "apl-wifi", "add", "--json"},
-		WifiUpdate:        []string{"sudo-stub", "apl-wifi", "update", "--json"},
-		WifiDelete:        []string{"sudo-stub", "apl-wifi", "delete", "--json"},
-		WifiTest:          []string{"sudo-stub", "apl-wifi", "test", "--json"},
-		WifiActivate:      []string{"sudo-stub", "apl-wifi", "activate", "--json"},
-		WifiAdopt:         []string{"sudo-stub", "apl-wifi", "adopt", "--json"},
-		WifiStatus:        []string{"sudo-stub", "apl-wifi", "status", "--json"},
-		ExportIdentity:    []string{"sudo-stub", "identity-export"},
-		ImportIdentity:    []string{"sudo-stub", "identity-import"},
-		AggregatorStatus:  []string{"sudo-stub", "apl-aggregator", "status", "--json"},
-		AggregatorDetail:  []string{"sudo-stub", "apl-aggregator", "detail", "--json"},
-		AggregatorEnable:  []string{"sudo-stub", "apl-aggregator", "enable", "--json"},
-		AggregatorDisable: []string{"sudo-stub", "apl-aggregator", "disable", "--json"},
-		AggregatorSet:     []string{"sudo-stub", "apl-aggregator", "set", "--json"},
-		AggregatorReset:   []string{"sudo-stub", "apl-aggregator", "reset", "--json"},
-		AggregatorExport:  []string{"sudo-stub", "apl-aggregator", "export", "--json"},
-		AggregatorImport:  []string{"sudo-stub", "apl-aggregator", "import", "--json"},
+		ApplyFeed:          []string{"sudo-stub", "apl-feed", "apply", "--json", "--lock-timeout", "5"},
+		SchemaFeed:         []string{"apl-feed", "schema", "--json"},
+		Reboot:             []string{"sudo-stub", "reboot"},
+		Poweroff:           []string{"sudo-stub", "poweroff"},
+		StartOrchestrator:  []string{"sudo-stub", "orchestrator"},
+		RegisterClaim:      []string{"sudo-stub", "systemctl", "start", "--no-block", "airplanes-claim.service"},
+		RotateClaim:        []string{"sudo-stub", "claim-rotate"},
+		SyncConfig:         []string{"sudo-stub", "systemctl", "start", "--no-block", "airplanes-config-sync.service"},
+		WifiList:           []string{"sudo-stub", "apl-wifi", "list", "--json"},
+		WifiAdd:            []string{"sudo-stub", "apl-wifi", "add", "--json"},
+		WifiUpdate:         []string{"sudo-stub", "apl-wifi", "update", "--json"},
+		WifiDelete:         []string{"sudo-stub", "apl-wifi", "delete", "--json"},
+		WifiTest:           []string{"sudo-stub", "apl-wifi", "test", "--json"},
+		WifiActivate:       []string{"sudo-stub", "apl-wifi", "activate", "--json"},
+		WifiAdopt:          []string{"sudo-stub", "apl-wifi", "adopt", "--json"},
+		WifiStatus:         []string{"sudo-stub", "apl-wifi", "status", "--json"},
+		WifiExport:         []string{"sudo-stub", "apl-wifi", "export", "--json"},
+		WifiImport:         []string{"sudo-stub", "apl-wifi", "import", "--json"},
+		ExportIdentity:     []string{"sudo-stub", "identity-export"},
+		ImportIdentity:     []string{"sudo-stub", "identity-import"},
+		AggregatorStatus:   []string{"sudo-stub", "apl-aggregator", "status", "--json"},
+		AggregatorDetail:   []string{"sudo-stub", "apl-aggregator", "detail", "--json"},
+		AggregatorEnable:   []string{"sudo-stub", "apl-aggregator", "enable", "--json"},
+		AggregatorDisable:  []string{"sudo-stub", "apl-aggregator", "disable", "--json"},
+		AggregatorSet:      []string{"sudo-stub", "apl-aggregator", "set", "--json"},
+		AggregatorReset:    []string{"sudo-stub", "apl-aggregator", "reset", "--json"},
+		AggregatorExport:   []string{"sudo-stub", "apl-aggregator", "export", "--json"},
+		AggregatorImport:   []string{"sudo-stub", "apl-aggregator", "import", "--json"},
+		SSHStatus:          []string{"sudo-stub", "apl-ssh", "status", "--json"},
+		SSHEnablePassword:  []string{"sudo-stub", "apl-ssh", "enable-password", "--json"},
+		SSHSetPassword:     []string{"sudo-stub", "apl-ssh", "set-password", "--json"},
+		SSHDisablePassword: []string{"sudo-stub", "apl-ssh", "disable-password", "--json"},
+		SSHSetKey:          []string{"sudo-stub", "apl-ssh", "set-key", "--json"},
+		SSHClearKey:        []string{"sudo-stub", "apl-ssh", "clear-key", "--json"},
 	}
 
 	deps := Deps{
@@ -208,8 +217,26 @@ type writeHarness struct {
 	runnerErr       error                            // returned by captureRunner; tests override
 	runnerErrFor    func(argv []string) error        // optional: per-argv error; falls back to runnerErr when nil
 	runnerResultFor func(argv []string) wexec.Result // optional: per-argv canned Result (stdout+stderr); falls back to zero value
-	stdinErr        error
-	stdinResult     wexec.Result
+	// runnerBlockUntilCtxDone makes captureRunner block until the handler's
+	// context is cancelled, then return ctx.Err() — simulating a privileged
+	// child killed by CommandContext on timeout (the rotate unknown-state path).
+	runnerBlockUntilCtxDone bool
+	stdinErr                error
+	stdinResult             wexec.Result
+	// stdinResultFor, when non-nil, returns a per-argv canned Result for the
+	// stdin runner (falls back to stdinResult). Needed when one request fans
+	// out to several distinct stdin shell-outs (e.g. combined backup/restore).
+	stdinResultFor func(argv []string) wexec.Result
+	// skipSetup, when true, leaves the device uninitialized (no password) so
+	// the public first-run paths can be exercised. Set via withoutSetup().
+	skipSetup bool
+	// unclaimedIdentity, when true, leaves the feeder without a claim secret so
+	// the identity-omitted export path can be exercised. Set via withoutIdentity().
+	unclaimedIdentity bool
+	// corruptIdentity, when true, writes a feeder-id plus a non-canonical claim
+	// secret so the fail-loud-on-corruption export path can be exercised. Set
+	// via withCorruptIdentity().
+	corruptIdentity bool
 	// upgradeStatePath is wired into Deps.UpgradeStatePath. Set via
 	// withUpgradeStatePath() before harness construction; defaults to
 	// the production path (which doesn't exist in tests, surfacing
@@ -276,9 +303,10 @@ func newWriteHarness(t *testing.T, opts ...harnessOption) *writeHarness {
 	for _, o := range opts {
 		o(h)
 	}
-	captureRunner := func(_ context.Context, argv []string) (wexec.Result, error) {
+	captureRunner := func(ctx context.Context, argv []string) (wexec.Result, error) {
 		h.mu.Lock()
 		h.calls = append(h.calls, append([]string(nil), argv...))
+		block := h.runnerBlockUntilCtxDone
 		var err error
 		if h.runnerErrFor != nil {
 			err = h.runnerErrFor(argv)
@@ -290,6 +318,14 @@ func newWriteHarness(t *testing.T, opts ...harnessOption) *writeHarness {
 			res = h.runnerResultFor(argv)
 		}
 		h.mu.Unlock()
+		// Simulate a privileged child that outlives the handler's context:
+		// block until cancellation, then report it the way RealRunner's
+		// CommandContext would (ctx error, no stdout). Drives the rotate
+		// handler's timeout / unknown-state branch deterministically.
+		if block {
+			<-ctx.Done()
+			return wexec.Result{}, ctx.Err()
+		}
 		return res, err
 	}
 	captureStdinRunner := func(_ context.Context, argv []string, stdin io.Reader) (wexec.Result, error) {
@@ -298,36 +334,66 @@ func newWriteHarness(t *testing.T, opts ...harnessOption) *writeHarness {
 		h.stdinCalls = append(h.stdinCalls, stdinCall{argv: append([]string(nil), argv...), stdin: body})
 		err := h.stdinErr
 		res := h.stdinResult
+		fn := h.stdinResultFor
 		h.mu.Unlock()
+		if fn != nil {
+			res = fn(argv)
+		}
 		return res, err
 	}
 
 	priv := PrivilegedArgv{
-		ApplyFeed:         []string{"sudo-stub", "apl-feed", "apply", "--json", "--lock-timeout", "5"},
-		SchemaFeed:        []string{"apl-feed", "schema", "--json"},
-		Reboot:            []string{"sudo-stub", "reboot"},
-		Poweroff:          []string{"sudo-stub", "poweroff"},
-		StartOrchestrator: []string{"sudo-stub", "orchestrator"},
-		RegisterClaim:     []string{"sudo-stub", "systemctl", "start", "--no-block", "airplanes-claim.service"},
-		SyncConfig:        []string{"sudo-stub", "systemctl", "start", "--no-block", "airplanes-config-sync.service"},
-		WifiList:          []string{"sudo-stub", "apl-wifi", "list", "--json"},
-		WifiAdd:           []string{"sudo-stub", "apl-wifi", "add", "--json"},
-		WifiUpdate:        []string{"sudo-stub", "apl-wifi", "update", "--json"},
-		WifiDelete:        []string{"sudo-stub", "apl-wifi", "delete", "--json"},
-		WifiTest:          []string{"sudo-stub", "apl-wifi", "test", "--json"},
-		WifiActivate:      []string{"sudo-stub", "apl-wifi", "activate", "--json"},
-		WifiAdopt:         []string{"sudo-stub", "apl-wifi", "adopt", "--json"},
-		WifiStatus:        []string{"sudo-stub", "apl-wifi", "status", "--json"},
-		ExportIdentity:    []string{"sudo-stub", "identity-export"},
-		ImportIdentity:    []string{"sudo-stub", "identity-import"},
-		AggregatorStatus:  []string{"sudo-stub", "apl-aggregator", "status", "--json"},
-		AggregatorDetail:  []string{"sudo-stub", "apl-aggregator", "detail", "--json"},
-		AggregatorEnable:  []string{"sudo-stub", "apl-aggregator", "enable", "--json"},
-		AggregatorDisable: []string{"sudo-stub", "apl-aggregator", "disable", "--json"},
-		AggregatorSet:     []string{"sudo-stub", "apl-aggregator", "set", "--json"},
-		AggregatorReset:   []string{"sudo-stub", "apl-aggregator", "reset", "--json"},
-		AggregatorExport:  []string{"sudo-stub", "apl-aggregator", "export", "--json"},
-		AggregatorImport:  []string{"sudo-stub", "apl-aggregator", "import", "--json"},
+		ApplyFeed:          []string{"sudo-stub", "apl-feed", "apply", "--json", "--lock-timeout", "5"},
+		SchemaFeed:         []string{"apl-feed", "schema", "--json"},
+		Reboot:             []string{"sudo-stub", "reboot"},
+		Poweroff:           []string{"sudo-stub", "poweroff"},
+		StartOrchestrator:  []string{"sudo-stub", "orchestrator"},
+		RegisterClaim:      []string{"sudo-stub", "systemctl", "start", "--no-block", "airplanes-claim.service"},
+		RotateClaim:        []string{"sudo-stub", "claim-rotate"},
+		SyncConfig:         []string{"sudo-stub", "systemctl", "start", "--no-block", "airplanes-config-sync.service"},
+		WifiList:           []string{"sudo-stub", "apl-wifi", "list", "--json"},
+		WifiAdd:            []string{"sudo-stub", "apl-wifi", "add", "--json"},
+		WifiUpdate:         []string{"sudo-stub", "apl-wifi", "update", "--json"},
+		WifiDelete:         []string{"sudo-stub", "apl-wifi", "delete", "--json"},
+		WifiTest:           []string{"sudo-stub", "apl-wifi", "test", "--json"},
+		WifiActivate:       []string{"sudo-stub", "apl-wifi", "activate", "--json"},
+		WifiAdopt:          []string{"sudo-stub", "apl-wifi", "adopt", "--json"},
+		WifiStatus:         []string{"sudo-stub", "apl-wifi", "status", "--json"},
+		WifiExport:         []string{"sudo-stub", "apl-wifi", "export", "--json"},
+		WifiImport:         []string{"sudo-stub", "apl-wifi", "import", "--json"},
+		ExportIdentity:     []string{"sudo-stub", "identity-export"},
+		ImportIdentity:     []string{"sudo-stub", "identity-import"},
+		AggregatorStatus:   []string{"sudo-stub", "apl-aggregator", "status", "--json"},
+		AggregatorDetail:   []string{"sudo-stub", "apl-aggregator", "detail", "--json"},
+		AggregatorEnable:   []string{"sudo-stub", "apl-aggregator", "enable", "--json"},
+		AggregatorDisable:  []string{"sudo-stub", "apl-aggregator", "disable", "--json"},
+		AggregatorSet:      []string{"sudo-stub", "apl-aggregator", "set", "--json"},
+		AggregatorReset:    []string{"sudo-stub", "apl-aggregator", "reset", "--json"},
+		AggregatorExport:   []string{"sudo-stub", "apl-aggregator", "export", "--json"},
+		AggregatorImport:   []string{"sudo-stub", "apl-aggregator", "import", "--json"},
+		SSHStatus:          []string{"sudo-stub", "apl-ssh", "status", "--json"},
+		SSHEnablePassword:  []string{"sudo-stub", "apl-ssh", "enable-password", "--json"},
+		SSHSetPassword:     []string{"sudo-stub", "apl-ssh", "set-password", "--json"},
+		SSHDisablePassword: []string{"sudo-stub", "apl-ssh", "disable-password", "--json"},
+		SSHSetKey:          []string{"sudo-stub", "apl-ssh", "set-key", "--json"},
+		SSHClearKey:        []string{"sudo-stub", "apl-ssh", "clear-key", "--json"},
+	}
+
+	idPaths := identity.Paths{
+		FeederIDFile:     filepath.Join(dir, "feeder-id"),
+		ClaimSecretFile:  filepath.Join(dir, "feeder-claim-secret"),
+		ClaimVersionFile: filepath.Join(dir, "feeder-claim-secret.version"),
+	}
+	switch {
+	case h.corruptIdentity:
+		// feeder-id present but a non-canonical claim secret on disk — real
+		// corruption, which the export must surface rather than silently omit.
+		_ = os.WriteFile(idPaths.FeederIDFile, []byte("11111111-2222-3333-4444-555555555555\n"), 0o644)
+		_ = os.WriteFile(idPaths.ClaimSecretFile, []byte("tooshort\n"), 0o640)
+	case !h.unclaimedIdentity:
+		_ = os.WriteFile(idPaths.FeederIDFile, []byte("11111111-2222-3333-4444-555555555555\n"), 0o644)
+		_ = os.WriteFile(idPaths.ClaimSecretFile, []byte("ABCDEFGHIJKLMNOP\n"), 0o640)
+		_ = os.WriteFile(idPaths.ClaimVersionFile, []byte("1\n"), 0o640)
 	}
 
 	deps := Deps{
@@ -337,7 +403,7 @@ func newWriteHarness(t *testing.T, opts ...harnessOption) *writeHarness {
 		Lockout:      auth.NewLockout(5, time.Minute, 15*time.Minute),
 		Guard:        guard,
 		Argon2Params: fastTestParams,
-		Identity:     identity.NewReader(identity.Paths{FeederIDFile: filepath.Join(dir, "feeder-id")}, feedEnv),
+		Identity:     identity.NewReader(idPaths, feedEnv),
 		FeedEnv:      feedEnv,
 		Status: status.NewReader("test-sha", status.Paths{
 			SystemctlBinary: "/bin/true", IsActiveTimeout: time.Second,
@@ -357,12 +423,35 @@ func newWriteHarness(t *testing.T, opts ...harnessOption) *writeHarness {
 	h.ts = httptest.NewServer(New(deps))
 	t.Cleanup(h.ts.Close)
 	h.client = httpClient(t)
+	if h.skipSetup {
+		// Leave the device uninitialized for first-run-path tests; the client
+		// has no session.
+		return h
+	}
 	r := postJSON(t, h.client, h.ts.URL+"/api/setup", map[string]string{"password": testPassword})
 	r.Body.Close()
 	if r.StatusCode != http.StatusOK {
 		t.Fatalf("setup status = %d", r.StatusCode)
 	}
 	return h
+}
+
+// withoutSetup leaves the harness device uninitialized (no password set), so
+// the public first-run restore path can be exercised.
+func withoutSetup() harnessOption {
+	return func(h *writeHarness) { h.skipSetup = true }
+}
+
+// withoutIdentity leaves the feeder unclaimed (no claim secret), so the
+// identity section is legitimately omitted from an export.
+func withoutIdentity() harnessOption {
+	return func(h *writeHarness) { h.unclaimedIdentity = true }
+}
+
+// withCorruptIdentity writes a feeder-id plus a non-canonical claim secret, so
+// the export's fail-loud-on-corruption path can be exercised.
+func withCorruptIdentity() harnessOption {
+	return func(h *writeHarness) { h.corruptIdentity = true }
 }
 
 // setFeedEnv replaces the value set the fake `apl-feed config show`

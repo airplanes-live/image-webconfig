@@ -79,6 +79,46 @@ func Verify(password, phc string) (bool, error) {
 	return subtle.ConstantTimeCompare(got, want) == 1, nil
 }
 
+// MaxStoredParams bounds the argon2 cost an externally-supplied PHC (e.g. one
+// carried in a device backup) may declare. parsePHC already enforces the
+// format and the lower bounds; these caps guard the OTHER direction: a hostile
+// or corrupt backup could otherwise set m/t/p so high that every subsequent
+// login exhausts CPU/RAM on a 512 MiB Pi. The caps are generous over
+// DefaultParams (m=64 MiB, t=2, p=2) so any hash a real airplanes device
+// produced is accepted, while a degenerate one is refused.
+var MaxStoredParams = Params{
+	TimeCost: 10,
+	MemoryKB: 256 * 1024, // 256 MiB
+	Threads:  8,
+	KeyLen:   128,
+	SaltLen:  64,
+}
+
+// ValidateStoredPHC reports whether phc is a well-formed argon2id PHC string
+// whose cost parameters are within MaxStoredParams. Use this to vet a password
+// hash from an untrusted source (backup import) BEFORE writing it to the store:
+// parsePHC alone accepts arbitrarily large m/t/p (it only enforces lower
+// bounds), which would let an imported hash turn login into a DoS.
+func ValidateStoredPHC(phc string) error {
+	p, _, _, err := parsePHC(phc)
+	if err != nil {
+		return err
+	}
+	switch {
+	case p.MemoryKB > MaxStoredParams.MemoryKB:
+		return fmt.Errorf("phc: memory %d KiB exceeds max %d KiB", p.MemoryKB, MaxStoredParams.MemoryKB)
+	case p.TimeCost > MaxStoredParams.TimeCost:
+		return fmt.Errorf("phc: time-cost %d exceeds max %d", p.TimeCost, MaxStoredParams.TimeCost)
+	case p.Threads > MaxStoredParams.Threads:
+		return fmt.Errorf("phc: threads %d exceeds max %d", p.Threads, MaxStoredParams.Threads)
+	case p.KeyLen > MaxStoredParams.KeyLen:
+		return fmt.Errorf("phc: key length %d exceeds max %d", p.KeyLen, MaxStoredParams.KeyLen)
+	case p.SaltLen > MaxStoredParams.SaltLen:
+		return fmt.Errorf("phc: salt length %d exceeds max %d", p.SaltLen, MaxStoredParams.SaltLen)
+	}
+	return nil
+}
+
 func formatPHC(p Params, salt, hash []byte) string {
 	enc := base64.RawStdEncoding
 	return fmt.Sprintf(

@@ -86,6 +86,16 @@ INI
 EOF
     chmod +x "$SIGN"
     export AGG_FR24_SIGNUP_OVERRIDE="$SIGN"
+
+    # Keep the fr24 external-install probe negative by default (the build host may
+    # have a real fr24feed): clean dpkg + temp, absent system paths. The
+    # unmanaged-refusal test below opts in by creating one of these.
+    DQ="$WORK/fake-dpkg-query"
+    printf '#!/usr/bin/env bash\nexit 1\n' > "$DQ"; chmod +x "$DQ"
+    export AGG_DPKG_QUERY="$DQ"
+    export AGG_FR24_SYSTEM_BIN="$WORK/sys/fr24feed"
+    export AGG_FR24_SYSTEM_UNIT_PATHS="$WORK/sys/fr24feed.service"
+    mkdir -p "$WORK/sys"
 }
 
 teardown() {
@@ -234,6 +244,17 @@ EOF
     [ ! -f "$AGG_ENABLE_STATE" ]   # no overlay, no worker
 }
 
+@test "enable refuses fr24 when a vendor fr24feed is already installed (before field validation)" {
+    : > "$AGG_FR24_SYSTEM_BIN"; chmod +x "$AGG_FR24_SYSTEM_BIN"
+    # Empty fields would normally fail on "email required" first; the ownership
+    # guard must win, proving it runs before field validation.
+    agg enable '{"id":"fr24","fields":{}}'
+    [ "$status" -eq 3 ]
+    echo "$output" | jq -e '.error_code == "state_error"'
+    echo "$output" | jq -e '.message | test("not managed by airplanes.live")'
+    [ ! -f "$AGG_ENABLE_STATE" ]   # refused synchronously, no worker
+}
+
 @test "enable rejects a malformed sharing key synchronously" {
     agg enable '{"id":"fr24","lat":47.0,"lon":8.0,"alt":400,"fields":{"email":"a@b.c","sharing_key":"bad key!"}}'
     [ "$status" -eq 2 ]
@@ -271,6 +292,17 @@ EOF
     [ "$status" -eq 0 ]
     echo "$output" | jq -e '.result == "accepted"'
     grep -q 'fr24key="KEYONLY1234"' "$AGG_FR24_INI"
+}
+
+@test "fr24 ini feeds from the configured decoder address" {
+    # AGG_DECODER_STATE=up (setup) bypasses the live probe; a non-default
+    # AGG_DECODER_ADDR must still flow into fr24feed.ini so fr24 feeds from
+    # exactly the decoder the reachability probe checks.
+    export AGG_DECODER_ADDR="10.9.8.7:31005"
+    agg enable '{"id":"fr24","lat":47.0,"lon":8.0,"alt":400,"fields":{"email":"a@b.c","sharing_key":"PROVIDEDKEY1"}}'
+    [ "$status" -eq 0 ]
+    grep -q 'host="10.9.8.7:31005"' "$AGG_FR24_INI"
+    ! grep -q 'host="127.0.0.1:30005"' "$AGG_FR24_INI"
 }
 
 @test "enable fails cleanly when the local decoder is unreachable" {

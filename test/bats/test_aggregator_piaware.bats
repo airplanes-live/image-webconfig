@@ -217,6 +217,40 @@ seed_managed() {
         | .version=="10.0" and .desired_version=="11.0" and .version_drift==true'
 }
 
+@test "status flags a pre-existing unmanaged piaware as external_install" {
+    : > "$PKG_MARK"          # package present, but no piaware.managed.json marker
+    run "$APLAGG" status --json
+    [ "$status" -eq 0 ]
+    echo "$output" | jq -e '.aggregators[] | select(.id=="piaware")
+        | .external_install==true and .managed_install==false'
+}
+
+@test "status treats a bare /etc/piaware.conf (no package) as an unmanaged install" {
+    printf 'feeder-id deadbeef\n' > "$AGG_PIAWARE_CONF"
+    run "$APLAGG" status --json
+    [ "$status" -eq 0 ]
+    echo "$output" | jq -e '.aggregators[] | select(.id=="piaware") | .external_install==true'
+}
+
+@test "status reports a managed piaware as managed_install, not external" {
+    seed_managed "11.0" true
+    run "$APLAGG" status --json
+    [ "$status" -eq 0 ]
+    echo "$output" | jq -e '.aggregators[] | select(.id=="piaware")
+        | .managed_install==true and .external_install==false'
+}
+
+@test "status: an unmanaged package plus our own state reports both external and managed" {
+    : > "$PKG_MARK"          # admin package present, no we_installed marker
+    # Our own state (e.g. an imported identity) — reset can safely clear just this.
+    printf '{"schema_version":1,"enabled":false,"mlat_enabled":false,"fields":{"feeder_id":"aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"}}' \
+        > "$AGG_STATE_DIR/piaware.json"
+    run "$APLAGG" status --json
+    [ "$status" -eq 0 ]
+    echo "$output" | jq -e '.aggregators[] | select(.id=="piaware")
+        | .external_install==true and .managed_install==true'
+}
+
 # --- enable (worker run inline by the systemd-run stub) --------------------
 
 @test "enable fetches+installs the pinned .deb, holds it, configures + starts, persists feeder-id" {

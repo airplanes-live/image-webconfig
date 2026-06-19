@@ -63,6 +63,7 @@ func privilegedArgvCases(priv PrivilegedArgv) []privilegedArgvCase {
 		{"Poweroff", priv.Poweroff},
 		{"StartOrchestrator", priv.StartOrchestrator},
 		{"RegisterClaim", priv.RegisterClaim},
+		{"RotateClaim", priv.RotateClaim},
 		{"SyncConfig", priv.SyncConfig},
 		{"WifiList", priv.WifiList},
 		{"WifiAdd", priv.WifiAdd},
@@ -72,6 +73,8 @@ func privilegedArgvCases(priv PrivilegedArgv) []privilegedArgvCase {
 		{"WifiActivate", priv.WifiActivate},
 		{"WifiAdopt", priv.WifiAdopt},
 		{"WifiStatus", priv.WifiStatus},
+		{"WifiExport", priv.WifiExport},
+		{"WifiImport", priv.WifiImport},
 		{"ExportIdentity", priv.ExportIdentity},
 		{"ImportIdentity", priv.ImportIdentity},
 		{"AggregatorStatus", priv.AggregatorStatus},
@@ -82,6 +85,12 @@ func privilegedArgvCases(priv PrivilegedArgv) []privilegedArgvCase {
 		{"AggregatorReset", priv.AggregatorReset},
 		{"AggregatorExport", priv.AggregatorExport},
 		{"AggregatorImport", priv.AggregatorImport},
+		{"SSHStatus", priv.SSHStatus},
+		{"SSHEnablePassword", priv.SSHEnablePassword},
+		{"SSHSetPassword", priv.SSHSetPassword},
+		{"SSHDisablePassword", priv.SSHDisablePassword},
+		{"SSHSetKey", priv.SSHSetKey},
+		{"SSHClearKey", priv.SSHClearKey},
 	}
 }
 
