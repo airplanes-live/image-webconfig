@@ -382,12 +382,11 @@ func New(d Deps) http.Handler {
 	// /usr/local/bin/apl-aggregator. As with Wi-Fi, no Go-side mutex: the
 	// helper's flock at /run/airplanes/aggregator.lock serializes across
 	// processes (and a webconfig restart racing the CLI) and returns a fast
-	// lock_timeout 503 to the second caller. export/import are POST so they
-	// route through the origin check; export is the one secret-bearing read.
+	// lock_timeout 503 to the second caller. The aggregator sign-in details
+	// (including sharing keys) are backed up and restored through the combined
+	// device backup (/api/backup/*), which reuses the export/import helper verbs.
 	mux.HandleFunc("GET /api/aggregators", s.requireSession(s.handleAggregatorList))
 	mux.HandleFunc("GET /api/aggregators/{id}", s.requireSession(s.handleAggregatorDetail))
-	mux.HandleFunc("POST /api/aggregators/export", s.requireSession(s.handleAggregatorExport))
-	mux.HandleFunc("POST /api/aggregators/import", s.requireSession(s.handleAggregatorImport))
 	mux.HandleFunc("POST /api/aggregators/{id}/enable", s.requireSession(s.handleAggregatorEnable))
 	mux.HandleFunc("POST /api/aggregators/{id}/disable", s.requireSession(s.handleAggregatorDisable))
 	mux.HandleFunc("POST /api/aggregators/{id}/set", s.requireSession(s.handleAggregatorSet))

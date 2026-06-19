@@ -567,7 +567,7 @@ func (s *Server) restoreAggregators(ctx context.Context, env combinedBackupEnvel
 	}
 	_ = json.Unmarshal(resp, &msg)
 	if strings.Contains(msg.Message, "is enabled") {
-		return "skipped", "an aggregator is currently enabled — disable it, then import aggregators separately"
+		return "skipped", "an aggregator is currently enabled — disable it, then restore again"
 	}
 	if msg.Message != "" {
 		return "failed", msg.Message

@@ -1469,7 +1469,6 @@ input[aria-invalid="true"] {
 .wc-agg-badge--err  { background: color-mix(in srgb, var(--wc-status-err) 20%, var(--wc-surface-1)); color: var(--wc-ink-1); }
 
 .wc-agg-form { margin-top: 0.5rem; }
-.wc-agg-backup { margin-top: 1rem; }
 
 /* SSH access card sections (password login + public key). Each section groups
    a state line and one or two inline re-auth forms. */

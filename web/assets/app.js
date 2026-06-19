@@ -3787,7 +3787,6 @@
             el("p", { class: "wc-agg-caveat" }, AGG_CAVEAT_TEXT),
             flashEl,
             list,
-            buildAggregatorBackupCard(),
         ));
     }
 
@@ -3816,60 +3815,6 @@
             }, icon, body, dot, chev);
         }
         return el("div", { class: "wc-agg-row" }, icon, body, dot);
-    }
-
-    function buildAggregatorBackupCard() {
-        const msg = el("div", {});
-        const setMsg = (text, kind) => msg.replaceChildren(text ? el("div", { class: "wc-flash wc-flash--" + (kind || "ok") }, text) : el("span"));
-
-        const exportBtn = el("button", { type: "button", class: "wc-btn-ghost" }, "Download backup");
-        exportBtn.onclick = async () => {
-            setMsg("");
-            const r = await postJSON("/api/aggregators/export", {});
-            if (handleAuthFailure(r)) return;
-            if (!r.ok) { setMsg((r.payload && (r.payload.message || r.payload.error)) || "Backup failed.", "warn"); return; }
-            try {
-                const blob = new Blob([JSON.stringify(r.payload, null, 2)], { type: "application/json" });
-                const url = URL.createObjectURL(blob);
-                const a = el("a", { href: url, download: "airplanes-aggregators-backup.json" });
-                document.body.appendChild(a); a.click(); a.remove();
-                setTimeout(() => URL.revokeObjectURL(url), 1000);
-                setMsg("Backup downloaded — keep it private.", "ok");
-            } catch (_) { setMsg("Could not start the download.", "warn"); }
-        };
-
-        const fileInput = el("input", { type: "file", accept: "application/json,.json", hidden: true });
-        const importBtn = el("button", { type: "button", class: "wc-btn-ghost" }, "Restore from backup");
-        importBtn.onclick = () => fileInput.click();
-        fileInput.onchange = async () => {
-            const file = fileInput.files && fileInput.files[0];
-            fileInput.value = "";
-            if (!file) return;
-            // Guard before reading/parsing so a huge file can't freeze the
-            // browser (the server caps the import body at 64 KiB anyway).
-            if (file.size > 65536) { setMsg("That backup file is too large to be a valid aggregator backup.", "warn"); return; }
-            setMsg("Restoring…");
-            let parsed;
-            try { parsed = JSON.parse(await file.text()); }
-            catch (_) { setMsg("That file isn't a valid backup.", "warn"); return; }
-            const r = await postJSON("/api/aggregators/import", parsed);
-            if (handleAuthFailure(r)) return;
-            if (!r.ok) {
-                setMsg((r.payload && (r.payload.message || r.payload.error)) ||
-                    "Restore failed. Stop an enabled adapter before restoring.", "warn");
-                return;
-            }
-            pendingFlash = { text: "Identities restored. Set up an adapter to start feeding.", level: "ok" };
-            await aggregatorsPanel();
-        };
-
-        return el("section", { class: "wc-card wc-agg-backup" },
-            el("h3", {}, "Back up & restore"),
-            el("p", { class: "muted" },
-                "Download your aggregator sign-in details (including sharing keys) so you can restore them after a reflash. The file is sensitive — keep it private."),
-            el("div", { class: "wc-agg-row__actions" }, exportBtn, importBtn, fileInput),
-            msg,
-        );
     }
 
     // ===== Combined device backup / restore =====
