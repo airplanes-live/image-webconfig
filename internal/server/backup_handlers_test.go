@@ -16,7 +16,17 @@ import (
 
 const testIdentitySection = `{"schema_version":1,"feeder_uuid":"11111111-2222-3333-4444-555555555555","claim":{"secret":"ABCDEFGHIJKLMNOP","version":null}}`
 
+// testAggExportEnvelope is the no-aggregators-configured case (empty set), as
+// produced by `apl-aggregator export` on a feeder with nothing set up. Restore
+// must treat it as a skip, not a failure (TestBackupRestore_EmptyAggregatorsSkippedNotFailed).
 const testAggExportEnvelope = `{"protocol_version":1,"result":"ok","kind":"aggregator-backup","schema_version":1,"aggregators":{}}`
+
+// testAggImportPopulated carries one adapter, so a restore exercises the real
+// import-helper path rather than the empty-set short-circuit. Export-shaped
+// (protocol_version + result) to match the envelope a real combined backup
+// embeds. Used by fullRestoreSections so the happy-path and enabled-adapter
+// tests are meaningful.
+const testAggImportPopulated = `{"protocol_version":1,"result":"ok","kind":"aggregator-backup","schema_version":1,"aggregators":{"fr24":{"mlat_enabled":false,"fields":{"sharing_key":"deadbeef"}}}}`
 
 func validPHC(t *testing.T) string {
 	t.Helper()
@@ -77,7 +87,7 @@ func fullRestoreSections(t *testing.T) map[string]any {
 	return map[string]any{
 		"identity":    json.RawMessage(testIdentitySection),
 		"settings":    map[string]any{"schema_version": 1, "values": map[string]string{"LATITUDE": "51.5"}},
-		"aggregators": json.RawMessage(testAggExportEnvelope),
+		"aggregators": json.RawMessage(testAggImportPopulated),
 		"wifi":        map[string]any{"schema_version": 1, "networks": []any{}},
 		"password":    map[string]any{"schema_version": 1, "phc": validPHC(t)},
 	}
@@ -375,6 +385,59 @@ func TestBackupRestore_AggregatorEnabledIsSkippedNotFailed(t *testing.T) {
 	statuses, _ := parseRestoreStream(t, readBody(t, r))
 	if statuses["aggregators"] != "skipped" {
 		t.Errorf("aggregators status = %q, want skipped (enabled adapter)", statuses["aggregators"])
+	}
+}
+
+// Only a well-formed, genuinely-empty aggregator-backup short-circuits to a
+// skip; everything else (populated, null, absent, array, wrong kind/schema)
+// must still reach the import helper, which owns structural validation. The
+// fake records whether import ran and returns a response per case, so the test
+// pins both the resulting status AND the short-circuit boundary — removing the
+// short-circuit flips the empty case to importCalled=true and "failed".
+func TestBackupRestore_EmptyAggregatorsSkippedNotFailed(t *testing.T) {
+	const rejectEmpty = `{"protocol_version":1,"result":"error","error_code":"rejected","message":"backup contains no aggregators"}`
+	const ok = `{"protocol_version":1,"result":"ok"}`
+	cases := []struct {
+		name       string
+		section    string
+		importResp string
+		wantStatus string
+		wantImport bool
+	}{
+		// The real empty export — must skip without touching the helper.
+		{"valid empty set", testAggExportEnvelope, rejectEmpty, "skipped", false},
+		// A populated backup goes through the helper and applies.
+		{"populated", testAggImportPopulated, ok, "applied", true},
+		// Malformed / ambiguous shapes must NOT be mistaken for empty: they
+		// reach the helper rather than being silently skipped.
+		{"aggregators null", `{"kind":"aggregator-backup","schema_version":1,"aggregators":null}`, rejectEmpty, "failed", true},
+		{"aggregators absent", `{"kind":"aggregator-backup","schema_version":1}`, rejectEmpty, "failed", true},
+		{"aggregators array", `{"kind":"aggregator-backup","schema_version":1,"aggregators":[]}`, rejectEmpty, "failed", true},
+		{"wrong kind empty obj", `{"kind":"nope","schema_version":1,"aggregators":{}}`, rejectEmpty, "failed", true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			h := newWriteHarness(t)
+			importCalled := false
+			h.stdinResultFor = func(argv []string) wexec.Result {
+				if argvHas(argv, "apl-aggregator", "import") {
+					importCalled = true
+					return wexec.Result{Stdout: []byte(tc.importResp)}
+				}
+				return okStdin(argv)
+			}
+			sections := fullRestoreSections(t)
+			sections["aggregators"] = json.RawMessage(tc.section)
+			r := postJSON(t, h.client, h.ts.URL+"/api/backup/restore", combinedBody(sections))
+			defer r.Body.Close()
+			statuses, _ := parseRestoreStream(t, readBody(t, r))
+			if statuses["aggregators"] != tc.wantStatus {
+				t.Errorf("aggregators status = %q, want %q", statuses["aggregators"], tc.wantStatus)
+			}
+			if importCalled != tc.wantImport {
+				t.Errorf("import invoked = %v, want %v", importCalled, tc.wantImport)
+			}
+		})
 	}
 }
 

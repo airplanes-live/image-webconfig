@@ -525,6 +525,28 @@ func (s *Server) restoreAggregators(ctx context.Context, env combinedBackupEnvel
 	if !ok {
 		return "skipped", "absent"
 	}
+	// A backup taken on a feeder with no third-party aggregators carries a valid
+	// envelope with an empty set — the common case. The import helper rejects an
+	// empty set with the same `rejected` code it uses for genuine errors, so
+	// handing it {} would surface a spurious "failed" (and the alarming "some
+	// items couldn't be restored" banner) for a restore that actually succeeded.
+	// Short-circuit only a well-formed, genuinely-empty aggregator-backup — same
+	// kind/schema gate the export uses; anything malformed, null, or non-empty
+	// still goes to the helper, which owns structural validation. Mirrors the
+	// absent-section case above and empty Wi-Fi (a no-op the wifi helper accepts).
+	var probe struct {
+		Kind          string          `json:"kind"`
+		SchemaVersion int             `json:"schema_version"`
+		Aggregators   json.RawMessage `json:"aggregators"`
+	}
+	if json.Unmarshal(raw, &probe) == nil &&
+		probe.Kind == "aggregator-backup" && probe.SchemaVersion == 1 &&
+		len(probe.Aggregators) > 0 {
+		var aggs map[string]json.RawMessage
+		if json.Unmarshal(probe.Aggregators, &aggs) == nil && aggs != nil && len(aggs) == 0 {
+			return "skipped", "no third-party aggregators in backup"
+		}
+	}
 	cctx, cancel := context.WithTimeout(ctx, backupSectionTimeout)
 	defer cancel()
 	resp, status, err := s.invokeAggregator(cctx, s.priv.AggregatorImport, raw, backupSectionTimeout)
