@@ -3677,6 +3677,7 @@
         installing:          ["Installing…",        "warn"],
         stopped:             ["Off",                "na"],
         not_installed:       ["Not set up",         "na"],
+        configured_off:      ["Ready to enable",    "na"],
         failed:              ["Setup failed",       "err"],
         decoder_unavailable: ["Decoder not ready",  "warn"],
         network_unavailable: ["Network unavailable", "warn"],
@@ -3695,7 +3696,13 @@
     function aggDisplayState(a) {
         const s = a.state;
         if (s === "installing" || s === "removing" || s === "applying" || s === "failed") return s;
-        return a.external_install ? "unmanaged" : s;
+        if (a.external_install) return "unmanaged";
+        // A restored (or otherwise saved-but-disabled) identity reports
+        // not_installed with configured=true: credentials are on disk, the vendor
+        // binary just isn't enabled yet. Distinguish it from a never-touched
+        // adapter so a restore doesn't read as "Not set up" / a no-op.
+        if (s === "not_installed" && a.configured) return "configured_off";
+        return s;
     }
 
     // buildAdapterTile renders one configured/active adapter as a nav tile that
@@ -3884,7 +3891,7 @@
             const r = rows[key];
             if (!r) return;
             let sev = "na", text = status;
-            if (status === "applied") { sev = "ok"; text = "restored"; }
+            if (status === "applied") { sev = "ok"; text = "restored" + (reason ? " — " + reason : ""); }
             else if (status === "skipped") { sev = "na"; text = "skipped" + (reason ? " — " + reason : ""); }
             else if (status === "failed") { sev = "err"; text = "failed" + (reason ? " — " + reason : ""); }
             r.dot.className = "wc-tile__dot wc-tile__dot--" + sev;
@@ -4397,7 +4404,7 @@
             actions.appendChild(viewLogs);
 
             render(el("section", { class: "wc-card" },
-                aggDetailHead("Flightradar24", a.state),
+                aggDetailHead("Flightradar24", aggDisplayState(a)),
                 el("p", { class: "muted" }, a.enabled ? "Feeding Flightradar24." : "Set up but not feeding right now."),
                 buildAggStatusBlock(a),
                 inlineErr,
@@ -4486,7 +4493,7 @@
         recheck();
 
         render(el("section", { class: "wc-card" },
-            aggDetailHead("Flightradar24", a.state),
+            aggDetailHead("Flightradar24", aggDisplayState(a)),
             el("p", { class: "muted" }, "Send your receiver's data to Flightradar24."),
             buildAggStatusBlock(a),
             form,
@@ -4571,7 +4578,7 @@
             actions.appendChild(viewLogs);
 
             render(el("section", { class: "wc-card" },
-                aggDetailHead("FlightAware", a.state),
+                aggDetailHead("FlightAware", aggDisplayState(a)),
                 el("p", { class: "muted" }, a.enabled ? "Feeding FlightAware." : "Set up but not feeding right now."),
                 buildAggStatusBlock(a),
                 inlineErr,
@@ -4629,7 +4636,7 @@
         recheck();
 
         render(el("section", { class: "wc-card" },
-            aggDetailHead("FlightAware", a.state),
+            aggDetailHead("FlightAware", aggDisplayState(a)),
             el("p", { class: "muted" }, "Send your receiver's data to FlightAware."),
             buildAggStatusBlock(a),
             form,
