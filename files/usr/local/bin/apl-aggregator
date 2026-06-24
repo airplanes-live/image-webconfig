@@ -51,14 +51,14 @@
 set -Eeuo pipefail
 
 AGG_STATE_DIR="${AGG_STATE_DIR:-/etc/airplanes/aggregators}"
-AGG_INSTALL_ROOT="${AGG_INSTALL_ROOT:-/opt/airplanes-aggregators}"
-AGG_DESC_DIR="${AGG_DESC_DIR:-/usr/local/lib/airplanes-webconfig/aggregators}"
+AGG_INSTALL_ROOT="${AGG_INSTALL_ROOT:-/var/lib/airplanes/aggregators/bin}"
+AGG_DESC_DIR="${AGG_DESC_DIR:-/opt/airplanes/current/lib/airplanes-webconfig/aggregators}"
 AGG_SYSTEMCTL="${AGG_SYSTEMCTL:-systemctl}"
 AGG_DECODER_ADDR="${AGG_DECODER_ADDR:-127.0.0.1:30005}"
 AGG_NC="${AGG_NC:-nc}"
 AGG_LOCK="${AGG_LOCK:-/run/airplanes/aggregator.lock}"
 AGG_LOCK_TIMEOUT="${AGG_LOCK_TIMEOUT:-5}"
-AGG_STATE_HOME="${AGG_STATE_HOME:-/var/lib/airplanes-aggregators}"
+AGG_STATE_HOME="${AGG_STATE_HOME:-/var/lib/airplanes/aggregators/state}"
 
 # --- pinned-deb / system seams (piaware) -----------------------------------
 # All system mutations route through these so bats can stub apt/dpkg/apt-mark/

@@ -74,7 +74,7 @@ var AllowedReasons978 = map[string]bool{
 }
 
 // AllowedReasonsDump978FA mirrors dump978-fa.sh's classifier. dump978-fa
-// has its own state file at /run/dump978-fa/state; the additional
+// has its own state file at /run/airplanes/dump978-fa/state; the additional
 // no_hardware reason captures the wrapper's hardware-probe self-disable.
 var AllowedReasonsDump978FA = map[string]bool{
 	"ok":                true,

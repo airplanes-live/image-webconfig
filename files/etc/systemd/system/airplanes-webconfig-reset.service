@@ -8,7 +8,7 @@ Before=airplanes-webconfig.service
 
 [Service]
 Type=oneshot
-ExecStart=/usr/local/lib/airplanes-webconfig/reset
+ExecStart=/opt/airplanes/current/lib/airplanes-webconfig/reset
 RemainAfterExit=no
 
 [Install]
