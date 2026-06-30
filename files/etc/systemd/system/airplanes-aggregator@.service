@@ -6,7 +6,7 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart=/usr/local/lib/airplanes-webconfig/aggregator-run %i
+ExecStart=/opt/airplanes/current/lib/airplanes-webconfig/aggregator-run %i
 Restart=always
 RestartSec=10
 
@@ -14,7 +14,11 @@ RestartSec=10
 # account + state dir are provisioned by the image build (airplanes-live/image).
 User=airplanes-aggregator
 Group=airplanes-aggregator
-StateDirectory=airplanes-aggregators
+# Only the writable state subtree is account-owned. The fetched vendor binary
+# lives under the root-owned /var/lib/airplanes/aggregators/bin (read-only in
+# this ProtectSystem=strict namespace), so the running account cannot replace
+# the executable it runs.
+StateDirectory=airplanes/aggregators/state
 NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=true

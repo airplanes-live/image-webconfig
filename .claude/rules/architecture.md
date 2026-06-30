@@ -82,9 +82,9 @@ Webconfig has no in-product self-update path. Updates ship as part of the runtim
 
 ### Upgrade-state file ownership
 
-Parent dir `/var/lib/airplanes-webconfig-upgrade/` is `0755 root:root`. File `/var/lib/airplanes-webconfig-upgrade/upgrade-state` is `0644 root:root`. The unprivileged `airplanes-webconfig` service account can read but cannot unlink/replace — intentionally NOT `/var/lib/airplanes-webconfig/`, which is `0700 airplanes-webconfig:airplanes-webconfig` and would let the account replace the marker regardless of file ownership.
+Parent dir `/var/lib/airplanes/webconfig-upgrade/` is `0755 root:root`. File `/var/lib/airplanes/webconfig-upgrade/upgrade-state` is `0644 root:root`. The unprivileged `airplanes-webconfig` service account can read but cannot unlink/replace — intentionally NOT `/var/lib/airplanes/webconfig/`, which is `0700 airplanes-webconfig:airplanes-webconfig` and would let the account replace the marker regardless of file ownership.
 
-The directory is provisioned two ways (idempotent): `install.sh --build-mode` calls `airplanes_webconfig_ensure_upgrade_state_dir` (mode 0755), and the rootfs tarball ships `files/var/lib/airplanes-webconfig-upgrade/.gitkeep` so `tar --owner=0 --group=0` lays the dir down as `root:root` during extract.
+The directory is provisioned two ways (idempotent): `install.sh --build-mode` calls `airplanes_webconfig_ensure_upgrade_state_dir` (mode 0755), and the rootfs tarball ships `files/var/lib/airplanes/webconfig-upgrade/.gitkeep` so `tar --owner=0 --group=0` lays the dir down as `root:root` during extract.
 
 ## Accepted v1 limitations
 

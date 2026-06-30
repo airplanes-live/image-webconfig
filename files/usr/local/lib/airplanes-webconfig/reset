@@ -12,7 +12,7 @@ rm -f /boot/firmware/airplanes-reset-password
 # Belt-and-braces: persisted sessions live on tmpfs and are already gone
 # after the reboot that triggers this unit, but a password reset must
 # never leave pre-reset sessions behind.
-rm -f /run/airplanes-webconfig/sessions.json
+rm -f /run/airplanes/webconfig/sessions.json
 
 # Revoke webconfig-managed SSH access for the pi account too. A password reset
 # returns the device to "unconfigured webconfig", so it must not silently leave

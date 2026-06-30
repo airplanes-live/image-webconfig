@@ -7,9 +7,9 @@
 # data, never command strings.
 set -Eeuo pipefail
 
-AGG_INSTALL_ROOT="${AGG_INSTALL_ROOT:-/opt/airplanes-aggregators}"
-AGG_DESC_DIR="${AGG_DESC_DIR:-/usr/local/lib/airplanes-webconfig/aggregators}"
-AGG_STATE_HOME="${AGG_STATE_HOME:-/var/lib/airplanes-aggregators}"
+AGG_INSTALL_ROOT="${AGG_INSTALL_ROOT:-/var/lib/airplanes/aggregators/bin}"
+AGG_DESC_DIR="${AGG_DESC_DIR:-/opt/airplanes/current/lib/airplanes-webconfig/aggregators}"
+AGG_STATE_HOME="${AGG_STATE_HOME:-/var/lib/airplanes/aggregators/state}"
 
 id="${1:-}"
 [[ "$id" =~ ^[a-z0-9][a-z0-9_-]*$ ]] || { echo "aggregator-run: invalid id '$id'" >&2; exit 64; }

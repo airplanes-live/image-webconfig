@@ -8,11 +8,11 @@ import (
 )
 
 // DefaultUpgradeStatePath is where the runtime overlay's update path
-// writes the upgrade-state marker. /var/lib/airplanes-webconfig-upgrade/
-// is a root-owned parent — intentionally NOT /var/lib/airplanes-webconfig/,
+// writes the upgrade-state marker. /var/lib/airplanes/webconfig-upgrade/
+// is a root-owned parent — intentionally NOT /var/lib/airplanes/webconfig/,
 // which is mode 0700 owned by the unprivileged service account and would
 // let the account unlink files there regardless of file ownership.
-const DefaultUpgradeStatePath = "/var/lib/airplanes-webconfig-upgrade/upgrade-state"
+const DefaultUpgradeStatePath = "/var/lib/airplanes/webconfig-upgrade/upgrade-state"
 
 // readUpgradeState returns one of "clean", "in-progress", "failed",
 // "unknown". "unknown" covers every non-success case the caller cannot

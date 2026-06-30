@@ -22,11 +22,11 @@ const (
 	// that the sudoers grant pins to. The trampoline execs into the
 	// orchestrator binary inside the currently-active runtime release,
 	// so the absolute path here doesn't change when the overlay flips.
-	orchestratorTrampolinePath = "/usr/local/lib/airplanes-webconfig/start-orchestrator.sh"
+	orchestratorTrampolinePath = "/opt/airplanes/libexec/start-orchestrator.sh"
 	// orchestratorTargetPath is the overlay-owned binary the trampoline
-	// will exec. The path resolves through /opt/airplanes-runtime/current,
+	// will exec. The path resolves through /opt/airplanes/current,
 	// so an overlay flip is observed atomically.
-	orchestratorTargetPath = "/opt/airplanes-runtime/current/lib/airplanes-update-orchestrator"
+	orchestratorTargetPath = "/opt/airplanes/current/lib/airplanes-update-orchestrator"
 )
 
 // DefaultOrchestratorStatePath is where the orchestrator atomically
