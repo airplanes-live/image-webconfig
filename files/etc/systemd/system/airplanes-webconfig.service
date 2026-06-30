@@ -25,6 +25,12 @@ SupplementaryGroups=airplanes-feed video
 RuntimeDirectory=airplanes/webconfig
 RuntimeDirectoryMode=0700
 RuntimeDirectoryPreserve=yes
+# /var/lib/airplanes/webconfig is also provisioned by image stage 05, but
+# StateDirectory makes the daemon self-sufficient: systemd guarantees the dir
+# exists, owned by the service account at mode 0700, on every start. The
+# root-owned webconfig-upgrade marker dir is deliberately NOT a StateDirectory.
+StateDirectory=airplanes/webconfig
+StateDirectoryMode=0700
 ExecStart=/opt/airplanes/current/bin/airplanes-webconfig --listen 127.0.0.1:8080 --sessions-path /run/airplanes/webconfig/sessions.json
 Restart=on-failure
 RestartSec=5s
