@@ -8,6 +8,10 @@ AGG_ACQUIRE_METHOD="pinned-deb"
 # piaware runs as its own apt-installed unit (root), not the airplanes-aggregator@
 # template — it spawns faup1090 to consume the local readsb Beast feed.
 AGG_SERVICE_UNIT="piaware.service"
+# Tile feed-health probe: read piaware's status.json adept (the FlightAware
+# uplink) on each status poll, so a running-but-disconnected feed reads degraded
+# instead of green.
+AGG_HEALTH_PROBE="piaware_status"
 # piaware does MLAT; the receiver LOCATION is set on the FlightAware website
 # after claiming (there is no lat/lon in piaware-config), so allow-mlat is the
 # only local knob and MLAT only activates once the feeder is claimed + located.

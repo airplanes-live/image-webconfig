@@ -6,6 +6,9 @@ AGG_ID="fr24"
 AGG_DISPLAY_NAME="Flightradar24"
 AGG_ACQUIRE_METHOD="vendor-installer"
 AGG_SERVICE_UNIT="airplanes-aggregator@fr24.service"
+# Tile feed-health probe: query fr24feed's monitor.json feed_status on each
+# status poll, so a running-but-rejected feed reads degraded instead of green.
+AGG_HEALTH_PROBE="fr24_monitor"
 AGG_MLAT_CAPABLE="false"
 AGG_MLAT_DEFAULT="false"
 AGG_CLAIM_URL="https://www.flightradar24.com/account/data-sharing"
@@ -18,9 +21,9 @@ AGG_FIELDS_JSON='[{"id":"email","label":"Email address","required":true,"secret"
 # Pinned fr24feed: static_arm64 build, validated on Debian 13 (trixie) aarch64.
 # Bump deliberately after re-validating the signup wizard prompt sequence on a
 # feeder (NOT always-latest — a vendor update could shift the prompts).
-AGG_FR24_DEB_URL="https://repo-feed.flightradar24.com/rpi_binaries/fr24feed_1.0.48-0_arm64.deb"
-AGG_FR24_VERSION="1.0.48-0"
+AGG_FR24_DEB_URL="https://repo-feed.flightradar24.com/rpi_binaries/fr24feed_1.0.53-0_arm64.deb"
+AGG_FR24_VERSION="1.0.53-0"
 # sha256 of the pinned .deb (a root-executed binary — verified before extract).
-AGG_FR24_DEB_SHA256="1a440dc7c4f9d4f675d9990f4858259a1d93d65302402cab2dc67478af56d0f9"
+AGG_FR24_DEB_SHA256="50dcb3ba74f9adc1387505ab94af30e69aef1fb5029e90fed76fc53f8559baf2"
 # Receiver fr24feed consumes: the overlay's local readsb BEAST output.
 AGG_BEAST_INPUT="127.0.0.1:30005"

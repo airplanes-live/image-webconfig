@@ -64,10 +64,12 @@ EOF
 }
 
 # fr24 monitor.json fixture, served to the producer via a file:// URL.
-# $1 = rx_connected (default 1), $2 = feed_num_ac_tracked (default 7).
+# $1 = rx_connected (default 1), $2 = feed_num_ac_tracked (default 7),
+# $3 = feed_status (default connected). feed_last_config_result stays "error" on
+# purpose: the verdict must key on feed_status, never on that stale config field.
 stub_fr24_json() {
     cat > "$WORK/monitor.json" <<EOF
-{"rx_connected":"${1:-1}","feed_num_ac_tracked":"${2:-7}","feed_last_config_result":"error","fr24key":"KEY123"}
+{"rx_connected":"${1:-1}","feed_num_ac_tracked":"${2:-7}","feed_status":"${3:-connected}","feed_last_config_result":"error","fr24key":"KEY123"}
 EOF
     export AGG_FR24_MONITOR_URL="file://$WORK/monitor.json"
 }
@@ -134,6 +136,46 @@ EOF
     [ "$status" -eq 0 ]
     echo "$output" | jq -e '.aggregators[0].status_detail[] | select(.label=="Receiver") | .value=="Not connected" and .severity=="err"'
     echo "$output" | jq -e '.aggregators[0].status_detail[] | select(.label=="Aircraft tracked") | .value=="0" and .severity=="na"'
+}
+
+@test "fr24 feed_status=connected surfaces a Feed Connected row despite a stale config error" {
+    seed_fr24_enabled; stub_fr24_json 1 7 connected; export SVC_STATE=active
+    run detail fr24
+    [ "$status" -eq 0 ]
+    echo "$output" | jq -e '.aggregators[0].status_detail[] | select(.label=="Feed") | .value=="Connected" and .severity=="ok"'
+}
+
+@test "fr24 feed_status=disconnected surfaces a Feed Not feeding err row (receiver stays ok)" {
+    seed_fr24_enabled; stub_fr24_json 1 7 disconnected; export SVC_STATE=active
+    run detail fr24
+    [ "$status" -eq 0 ]
+    echo "$output" | jq -e '.aggregators[0].status_detail[] | select(.label=="Feed") | .value=="Not feeding" and .severity=="err"'
+    # The LOCAL receiver row stays healthy — proving Feed reflects the upstream link.
+    echo "$output" | jq -e '.aggregators[0].status_detail[] | select(.label=="Receiver") | .value=="Connected" and .severity=="ok"'
+}
+
+@test "fr24 monitor without feed_status omits the Feed row" {
+    seed_fr24_enabled; export SVC_STATE=active
+    cat > "$WORK/monitor.json" <<'EOF'
+{"rx_connected":"1","feed_num_ac_tracked":"7"}
+EOF
+    export AGG_FR24_MONITOR_URL="file://$WORK/monitor.json"
+    run detail fr24
+    [ "$status" -eq 0 ]
+    echo "$output" | jq -e '.aggregators[0].status_detail | all(.label != "Feed")'
+    echo "$output" | jq -e '.aggregators[0].status_detail[] | select(.label=="Receiver") | .value=="Connected"'
+}
+
+@test "fr24 detail never surfaces the raw feed_status_message" {
+    seed_fr24_enabled; export SVC_STATE=active
+    cat > "$WORK/monitor.json" <<'EOF'
+{"rx_connected":"1","feed_num_ac_tracked":"7","feed_status":"disconnected","feed_status_message":"acct-98765 near 51.5,-0.12"}
+EOF
+    export AGG_FR24_MONITOR_URL="file://$WORK/monitor.json"
+    run detail fr24
+    [ "$status" -eq 0 ]
+    echo "$output" | jq -e '.aggregators[0].status_detail[] | select(.label=="Feed") | .value=="Not feeding"'
+    if echo "$output" | grep -qE 'acct-98765|51\.5'; then echo "raw feed_status_message leaked" >&2; return 1; fi
 }
 
 @test "an inactive service yields only a Service: Stopped row (no status source read)" {
