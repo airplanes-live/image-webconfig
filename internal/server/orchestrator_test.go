@@ -346,7 +346,7 @@ func TestDefaultPrivilegedArgv_SudoersParity_CoversOrchestrator(t *testing.T) {
 		"--unit=airplanes-update-orchestrator.service",
 		"--collect",
 		"--property=ExecStopPost=/usr/bin/systemctl kill -s HUP airplanes-webconfig.service",
-		"/usr/local/lib/airplanes-webconfig/start-orchestrator.sh",
+		"/opt/airplanes/libexec/start-orchestrator.sh",
 	}
 	got := DefaultPrivilegedArgv().StartOrchestrator
 	if !reflect.DeepEqual(got, want) {

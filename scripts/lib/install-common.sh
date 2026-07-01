@@ -215,7 +215,7 @@ airplanes_webconfig_extract_rootfs() {
     local tarball="$1" target_root="$2"
     # --no-overwrite-dir preserves directory permissions on existing dirs
     # like /etc/airplanes/webconfig (0700 airplanes-webconfig) and
-    # /var/lib/airplanes-webconfig (0700 airplanes-webconfig). The tarball
+    # /var/lib/airplanes/webconfig (0700 airplanes-webconfig). The tarball
     # ships files inside those dirs; tar would otherwise reset the dir mode.
     if ! tar -C "$target_root" --no-overwrite-dir -xzf "$tarball"; then
         echo "ERROR: rootfs extraction failed" >&2
@@ -244,11 +244,11 @@ airplanes_webconfig_install_manifest() {
 # the unprivileged service account cannot forge the marker.
 #
 # Idempotent: the rootfs tarball also ships this directory via
-# files/var/lib/airplanes-webconfig-upgrade/.gitkeep, so this call is
+# files/var/lib/airplanes/webconfig-upgrade/.gitkeep, so this call is
 # usually a no-op after extract_rootfs.
 airplanes_webconfig_ensure_upgrade_state_dir() {
     local target_root="$1"
-    local dir="${target_root}/var/lib/airplanes-webconfig-upgrade"
+    local dir="${target_root}/var/lib/airplanes/webconfig-upgrade"
     # No explicit -o/-g: install.sh runs as root in production
     # (pi-gen chroot), so the dir is root:root by virtue of the caller's
     # identity — same

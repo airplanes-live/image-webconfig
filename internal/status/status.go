@@ -76,10 +76,10 @@ type Paths struct {
 	RuntimeManifestFile string   // /etc/airplanes/runtime-manifest.json (live overlay, advances on update)
 	AircraftJSONFile    string   // /run/readsb/aircraft.json
 	ReadsbStatsFile     string   // /run/readsb/stats.json (effective gain_db)
-	MlatStateFile       string   // /run/airplanes-mlat/state
-	FeedStateFile       string   // /run/airplanes-feed/state
-	UAT978StateFile     string   // /run/airplanes-978/state
-	Dump978FAStateFile  string   // /run/dump978-fa/state
+	MlatStateFile       string   // /run/airplanes/mlat/state
+	FeedStateFile       string   // /run/airplanes/feed/state
+	UAT978StateFile     string   // /run/airplanes/978/state
+	Dump978FAStateFile  string   // /run/airplanes/dump978-fa/state
 	ReadsbStateFile     string   // /run/readsb/state
 	RebootRequiredFile  string   // /var/run/reboot-required (written by needrestart after kernel/libc upgrades)
 	SystemctlSudoArgv0  []string // [sudo, -n, ...] OR [systemctl] (no sudo: is-active is read-only)
@@ -93,10 +93,10 @@ func DefaultPaths() Paths {
 		RuntimeManifestFile: "/etc/airplanes/runtime-manifest.json",
 		AircraftJSONFile:    "/run/readsb/aircraft.json",
 		ReadsbStatsFile:     "/run/readsb/stats.json",
-		MlatStateFile:       "/run/airplanes-mlat/state",
-		FeedStateFile:       "/run/airplanes-feed/state",
-		UAT978StateFile:     "/run/airplanes-978/state",
-		Dump978FAStateFile:  "/run/dump978-fa/state",
+		MlatStateFile:       "/run/airplanes/mlat/state",
+		FeedStateFile:       "/run/airplanes/feed/state",
+		UAT978StateFile:     "/run/airplanes/978/state",
+		Dump978FAStateFile:  "/run/airplanes/dump978-fa/state",
 		ReadsbStateFile:     "/run/readsb/state",
 		RebootRequiredFile:  "/var/run/reboot-required",
 		SystemctlBinary:     "/usr/bin/systemctl",

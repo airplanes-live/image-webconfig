@@ -93,7 +93,7 @@ type PrivilegedArgv struct {
 	Poweroff          []string // sudo -n /usr/bin/systemctl poweroff
 	StartOrchestrator []string // sudo systemd-run --unit=airplanes-update-orchestrator ...
 	RegisterClaim     []string // sudo systemctl start --no-block airplanes-claim.service
-	RotateClaim       []string // sudo -n /usr/local/lib/airplanes-webconfig/claim-rotate.sh
+	RotateClaim       []string // sudo -n /opt/airplanes/current/lib/airplanes-webconfig/claim-rotate.sh
 	SyncConfig        []string // sudo systemctl start --no-block airplanes-config-sync.service
 	WifiList          []string
 	WifiAdd           []string
@@ -105,8 +105,8 @@ type PrivilegedArgv struct {
 	WifiStatus        []string
 	WifiExport        []string // sudo -n /usr/local/bin/apl-wifi export --json (PSK-bearing; backup only)
 	WifiImport        []string // sudo -n /usr/local/bin/apl-wifi import --json (non-disruptive restore)
-	ExportIdentity    []string // sudo -n /usr/local/lib/airplanes-webconfig/identity-export.sh
-	ImportIdentity    []string // sudo -n /usr/local/lib/airplanes-webconfig/identity-import.sh
+	ExportIdentity    []string // sudo -n /opt/airplanes/current/lib/airplanes-webconfig/identity-export.sh
+	ImportIdentity    []string // sudo -n /opt/airplanes/current/lib/airplanes-webconfig/identity-import.sh
 	// Aggregator* target the apl-aggregator helper installed by the runtime
 	// overlay. As with apl-wifi, one entry per verb keeps the sudoers grant
 	// pinned to a single subcommand so a compromised webconfig cannot drift
@@ -160,7 +160,7 @@ func DefaultPrivilegedArgv() PrivilegedArgv {
 		// on a stale unit name. The ExecStopPost HUPs this service so the
 		// schema cache reloads after the overlay leg potentially rewrote
 		// /etc/airplanes/*.
-		// Trampoline at /usr/local/lib/airplanes-webconfig/ is owned by
+		// Trampoline at /opt/airplanes/libexec/ is owned by
 		// the image's pi-gen stage 06d; it execs into the orchestrator
 		// binary inside the active runtime release.
 		StartOrchestrator: sudo(
@@ -168,7 +168,7 @@ func DefaultPrivilegedArgv() PrivilegedArgv {
 			"--unit=airplanes-update-orchestrator.service",
 			"--collect",
 			"--property=ExecStopPost=/usr/bin/systemctl kill -s HUP airplanes-webconfig.service",
-			"/usr/local/lib/airplanes-webconfig/start-orchestrator.sh",
+			"/opt/airplanes/libexec/start-orchestrator.sh",
 		),
 		// --no-block: the unit is Type=oneshot and apl-feed claim register
 		// retries on network failure for up to ~15s. A blocking start could
@@ -181,7 +181,7 @@ func DefaultPrivilegedArgv() PrivilegedArgv {
 		// `apl-feed claim rotate --abort` or other subcommands. The wrapper
 		// pins `--json --max-retry-time 20`; claimRotateTimeout below adds
 		// the headroom over that 20s budget.
-		RotateClaim: sudo("/usr/local/lib/airplanes-webconfig/claim-rotate.sh"),
+		RotateClaim: sudo("/opt/airplanes/current/lib/airplanes-webconfig/claim-rotate.sh"),
 		// Fired after a successful config save so a change reaches the server
 		// on the next sync instead of the ~60s timer tick. --no-block: the
 		// unit is Type=oneshot and `apl-feed config sync` does a network
@@ -205,8 +205,8 @@ func DefaultPrivilegedArgv() PrivilegedArgv {
 		// so each surface is its own fixed argv in sudoers. The wrappers
 		// invoke `apl-feed backup -` and `apl-feed restore /dev/stdin
 		// --force` internally.
-		ExportIdentity: sudo("/usr/local/lib/airplanes-webconfig/identity-export.sh"),
-		ImportIdentity: sudo("/usr/local/lib/airplanes-webconfig/identity-import.sh"),
+		ExportIdentity: sudo("/opt/airplanes/current/lib/airplanes-webconfig/identity-export.sh"),
+		ImportIdentity: sudo("/opt/airplanes/current/lib/airplanes-webconfig/identity-import.sh"),
 		// apl-aggregator manages optional third-party feed aggregators. One
 		// pinned argv per verb; the JSON request (and any secret field) is
 		// read on stdin, not argv. The helper is laid down by the runtime
