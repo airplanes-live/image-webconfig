@@ -50,6 +50,11 @@ EOF
     mkdir -p "$WORK/fr24"
     export AGG_FR24_SYSTEM_BIN="$WORK/fr24/usr-bin-fr24feed"
     export AGG_FR24_SYSTEM_UNIT_PATHS="$WORK/fr24/fr24feed.service"
+
+    # Feed-health probe seams default to absent files, so every test is hermetic
+    # (no network to :8754) and a non-overridden probe reads "unknown" fast.
+    export AGG_FR24_MONITOR_URL="file://$WORK/fr24-monitor.json"
+    export AGG_PIAWARE_STATUS_JSON="$WORK/piaware-status.json"
 }
 
 teardown() {
@@ -211,6 +216,157 @@ EOF
     [ "$status" -eq 0 ]
     echo "$output" | jq -e '.aggregators[0].reconcile_error.error_code == "acquire_failed"'
     echo "$output" | jq -e '.aggregators[0].reconcile_error.message == "could not download or verify fr24feed"'
+}
+
+# --- feed health (tile verdict) --------------------------------------------
+# feed_health is present ONLY for a running adapter whose descriptor declares a
+# probe. It is the tile's real "is it feeding?" signal, orthogonal to `state`
+# (which is systemd liveness and stays "running" through a rejected feed).
+
+seed_fr24_running() {
+    export AGG_DECODER_STATE=up SVC_STATE=active
+    cat > "$AGG_STATE_DIR/fr24.json" <<'EOF'
+{"schema_version":1,"enabled":true,"mlat_enabled":false,"fields":{"email":"a@b.c","sharing_key":"K"}}
+EOF
+}
+# $1 = feed_status (omit for a monitor payload without the field).
+stub_fr24_monitor() {
+    if [ "$#" -gt 0 ]; then
+        printf '{"feed_status":"%s","rx_connected":"1","feed_num_ac_tracked":"7"}\n' "$1" > "$WORK/fr24-monitor.json"
+    else
+        printf '{"rx_connected":"1","feed_num_ac_tracked":"7"}\n' > "$WORK/fr24-monitor.json"
+    fi
+}
+
+seed_piaware_running() {
+    export AGG_DECODER_STATE=up SVC_STATE=active
+    # piaware availability is arch/codename gated; force a supported host so the
+    # adapter reaches state=running (fr24 is unconditionally available).
+    export AGG_DPKG_ARCH=arm64
+    printf 'VERSION_ID="13"\nVERSION_CODENAME=trixie\n' > "$WORK/os-release"
+    export AGG_OS_RELEASE="$WORK/os-release"
+    cat > "$AGG_STATE_DIR/piaware.json" <<'EOF'
+{"schema_version":1,"enabled":true,"mlat_enabled":false,"fields":{"feeder_id":"8bb46ddf-d507-4c18-9724-0b5f94cba900"}}
+EOF
+}
+# $1 = adept status (omit for a status payload without adept).
+stub_piaware_status() {
+    if [ "$#" -gt 0 ]; then
+        printf '{"expiry":99999999999999,"adept":{"status":"%s"},"radio":{"status":"green"}}\n' "$1" > "$WORK/piaware-status.json"
+    else
+        printf '{"expiry":99999999999999,"radio":{"status":"green"}}\n' > "$WORK/piaware-status.json"
+    fi
+}
+
+@test "fr24 feed_status=connected -> feed_health feeding" {
+    seed_fr24_running; stub_fr24_monitor connected
+    run "$APLAGG" status --json
+    [ "$status" -eq 0 ]
+    echo "$output" | jq -e '.aggregators[] | select(.id=="fr24") | .state=="running" and .feed_health=="feeding"'
+}
+
+@test "fr24 feed_status=disconnected -> feed_health not_feeding while state stays running" {
+    seed_fr24_running; stub_fr24_monitor disconnected
+    run "$APLAGG" status --json
+    [ "$status" -eq 0 ]
+    echo "$output" | jq -e '.aggregators[] | select(.id=="fr24") | .state=="running" and .feed_health=="not_feeding"'
+}
+
+@test "fr24 non-disconnected feed_status (error) -> feed_health unknown, never red" {
+    # Only "disconnected" is a confirmed rejection; any other non-connected value
+    # (the exact 1.0.53 vocabulary is unvalidated) must stay neutral, not red.
+    seed_fr24_running; stub_fr24_monitor error
+    run "$APLAGG" status --json
+    [ "$status" -eq 0 ]
+    echo "$output" | jq -e '.aggregators[] | select(.id=="fr24") | .feed_health=="unknown"'
+}
+
+@test "fr24 oversized monitor payload is capped and reads unknown" {
+    # A valid prefix + >16KiB padding: head -c truncates the read mid-document, so
+    # the object guard rejects it instead of trusting a partial/huge response.
+    seed_fr24_running
+    { printf '{"feed_status":"connected","pad":"'; head -c 20000 /dev/zero | tr '\0' x; printf '"}'; } > "$WORK/fr24-monitor.json"
+    run "$APLAGG" status --json
+    [ "$status" -eq 0 ]
+    echo "$output" | jq -e '.aggregators[] | select(.id=="fr24") | .feed_health=="unknown"'
+}
+
+@test "fr24 transient feed_status (connecting) -> feed_health unknown" {
+    seed_fr24_running; stub_fr24_monitor connecting
+    run "$APLAGG" status --json
+    [ "$status" -eq 0 ]
+    echo "$output" | jq -e '.aggregators[] | select(.id=="fr24") | .feed_health=="unknown"'
+}
+
+@test "fr24 monitor unreachable -> feed_health unknown (never green)" {
+    seed_fr24_running
+    export AGG_FR24_MONITOR_URL="file://$WORK/does-not-exist.json"
+    run "$APLAGG" status --json
+    [ "$status" -eq 0 ]
+    echo "$output" | jq -e '.aggregators[] | select(.id=="fr24") | .feed_health=="unknown"'
+}
+
+@test "fr24 malformed monitor json -> feed_health unknown" {
+    seed_fr24_running
+    printf 'not json at all' > "$WORK/fr24-monitor.json"
+    run "$APLAGG" status --json
+    [ "$status" -eq 0 ]
+    echo "$output" | jq -e '.aggregators[] | select(.id=="fr24") | .feed_health=="unknown"'
+}
+
+@test "fr24 monitor without a feed_status field -> feed_health unknown" {
+    seed_fr24_running; stub_fr24_monitor
+    run "$APLAGG" status --json
+    [ "$status" -eq 0 ]
+    echo "$output" | jq -e '.aggregators[] | select(.id=="fr24") | .feed_health=="unknown"'
+}
+
+@test "a stopped adapter is not probed and carries no feed_health" {
+    export AGG_DECODER_STATE=up SVC_STATE=inactive
+    mkdir -p "$AGG_INSTALL_ROOT/fr24"; : > "$AGG_INSTALL_ROOT/fr24/fr24feed"
+    stub_fr24_monitor connected   # a healthy monitor is present, but...
+    run "$APLAGG" status --json
+    [ "$status" -eq 0 ]
+    # ...a non-running service must not be probed, so the field is absent.
+    echo "$output" | jq -e '.aggregators[] | select(.id=="fr24") | .state=="stopped" and (has("feed_health")|not)'
+}
+
+@test "piaware adept green -> feed_health feeding" {
+    seed_piaware_running; stub_piaware_status green
+    run "$APLAGG" status --json
+    [ "$status" -eq 0 ]
+    echo "$output" | jq -e '.aggregators[] | select(.id=="piaware") | .state=="running" and .feed_health=="feeding"'
+}
+
+@test "piaware adept red -> feed_health not_feeding" {
+    seed_piaware_running; stub_piaware_status red
+    run "$APLAGG" status --json
+    [ "$status" -eq 0 ]
+    echo "$output" | jq -e '.aggregators[] | select(.id=="piaware") | .feed_health=="not_feeding"'
+}
+
+@test "piaware adept amber (starting) -> feed_health unknown" {
+    seed_piaware_running; stub_piaware_status amber
+    run "$APLAGG" status --json
+    [ "$status" -eq 0 ]
+    echo "$output" | jq -e '.aggregators[] | select(.id=="piaware") | .feed_health=="unknown"'
+}
+
+@test "piaware missing status.json -> feed_health unknown" {
+    seed_piaware_running
+    export AGG_PIAWARE_STATUS_JSON="$WORK/no-such-piaware.json"
+    run "$APLAGG" status --json
+    [ "$status" -eq 0 ]
+    echo "$output" | jq -e '.aggregators[] | select(.id=="piaware") | .feed_health=="unknown"'
+}
+
+@test "piaware stale status.json (expiry past) -> feed_health unknown" {
+    date +%s%3N | grep -qE '^[0-9]+$' || skip "staleness check needs GNU date (%3N)"
+    seed_piaware_running
+    printf '{"expiry":1,"adept":{"status":"green"}}\n' > "$WORK/piaware-status.json"
+    run "$APLAGG" status --json
+    [ "$status" -eq 0 ]
+    echo "$output" | jq -e '.aggregators[] | select(.id=="piaware") | .feed_health=="unknown"'
 }
 
 @test "no reconcile_error key when state has none (e.g. after an ok reconcile)" {

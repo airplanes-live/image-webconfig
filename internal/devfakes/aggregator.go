@@ -213,17 +213,20 @@ func aggAdapterFR24(state *State) map[string]any {
 		"secret_fields_present": secretsPresent,
 		"decoder_reachable":     true,
 		"claim_url":             "https://www.flightradar24.com/account/data-sharing",
-		"desired_version":       "1.0.48-0",
+		"desired_version":       "1.0.53-0",
 		"version_drift":         false,
 	}
 	if configured {
-		fr24["version"] = "1.0.48-0"
+		fr24["version"] = "1.0.53-0"
 	}
 	if installing {
 		fr24["enable"] = map[string]any{"status": "running", "step": "acquiring", "request_id": "dev-fr24"}
 	}
 	if re := state.AggregatorReconcileError("fr24"); re != nil {
 		fr24["reconcile_error"] = re
+	}
+	if fr24["state"] == "running" {
+		fr24["feed_health"] = "feeding"
 	}
 	return fr24
 }
@@ -270,6 +273,9 @@ func aggAdapterPiaware(state *State) map[string]any {
 	}
 	if re := state.AggregatorReconcileError("piaware"); re != nil {
 		pw["reconcile_error"] = re
+	}
+	if pw["state"] == "running" {
+		pw["feed_health"] = "feeding"
 	}
 	return pw
 }

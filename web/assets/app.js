@@ -3674,6 +3674,8 @@
     // AGG_STATE_BADGE maps an adapter `state` to [label, severity-suffix].
     const AGG_STATE_BADGE = {
         running:             ["Feeding",            "ok"],
+        not_feeding:         ["Not feeding",        "err"],
+        checking:            ["Checking…",          "warn"],
         installing:          ["Installing…",        "warn"],
         stopped:             ["Off",                "na"],
         not_installed:       ["Not set up",         "na"],
@@ -3702,6 +3704,16 @@
         // binary just isn't enabled yet. Distinguish it from a never-touched
         // adapter so a restore doesn't read as "Not set up" / a no-op.
         if (s === "not_installed" && a.configured) return "configured_off";
+        // A running service is only truly "Feeding" if the vendor's own feed-health
+        // probe confirms it. `state` is process lifecycle (systemd-active), which
+        // stays "running" even when the upstream feed is rejected — so a not_feeding
+        // verdict shows red and an unknown/unconfirmed one shows amber, never green.
+        // Absent feed_health (adapter without a probe, or an older release) keeps
+        // "running", so those tiles are unchanged.
+        if (s === "running") {
+            if (a.feed_health === "not_feeding") return "not_feeding";
+            if (a.feed_health === "unknown") return "checking";
+        }
         return s;
     }
 
@@ -3742,7 +3754,7 @@
         // change to any of them re-renders rather than going stale behind state.
         const sig = adapters.map(a =>
             [a.id, a.state || "", a.display_name || "", a.configured ? 1 : 0, a.enabled ? 1 : 0,
-             a.external_install ? 1 : 0,
+             a.external_install ? 1 : 0, a.feed_health || "",
              (a.reconcile_error && a.reconcile_error.error_code) || ""].join(":")
         ).join("|");
         if (container.__sig === sig) return;

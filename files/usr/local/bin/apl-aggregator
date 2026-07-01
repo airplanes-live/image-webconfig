@@ -353,6 +353,7 @@ _adapter_json() {
 		AGG_ID=""; AGG_DISPLAY_NAME=""; AGG_ACQUIRE_METHOD=""
 		AGG_SERVICE_UNIT=""; AGG_MLAT_CAPABLE="false"; AGG_MLAT_DEFAULT="false"
 		AGG_CLAIM_URL=""; AGG_SECRET_FIELDS=""; AGG_FIELDS_JSON="[]"
+		AGG_HEALTH_PROBE=""                                                # tile feed-health probe id
 		AGG_FR24_VERSION=""                                                # vendor-installer pin
 		AGG_PIAWARE_PACKAGE=""; AGG_PIAWARE_VERSION=""                     # pinned-deb pin
 		AGG_PIAWARE_SUPPORTED_ARCHES=""; AGG_PIAWARE_SUPPORTED_CODENAMES=""
@@ -507,6 +508,16 @@ _adapter_json() {
 			esac
 		fi
 
+		# Tile-level feed health: state above is process lifecycle (systemd stays
+		# "running" even when the upstream feed link is rejected). Probe the
+		# vendor's own status for adapters that declare a probe, once the FINAL
+		# (post-overlay) state is running. Absent/failed probe -> "unknown", which
+		# the UI keeps neutral (never green).
+		local feed_health=""
+		if [[ "$state" == "running" && -n "$AGG_HEALTH_PROBE" ]]; then
+			feed_health="$(_feed_health)"
+		fi
+
 		# Secret-field presence is derived from state on jq STDIN — the secret
 		# VALUES never travel via argv (where /proc/<pid>/cmdline would expose
 		# them). Only the non-secret field NAMES go through --arg.
@@ -553,6 +564,7 @@ _adapter_json() {
 			--argjson external_install "$external_install" \
 			--argjson managed_install "$managed_install" \
 			--argjson overlay "$ov_json" \
+			--arg feed_health "$feed_health" \
 			'{
 				id: $id, display_name: $name, acquire_method: $acquire, service_unit: $unit,
 				state: $state, enabled: $enabled, configured: $configured,
@@ -563,13 +575,14 @@ _adapter_json() {
 				decoder_reachable: $decoder, claim_url: $claim,
 				version: $version, desired_version: $desired_version, version_drift: $version_drift,
 				external_install: $external_install, managed_install: $managed_install,
-				reconcile_error: $reconcile_error
+				reconcile_error: $reconcile_error, feed_health: $feed_health
 			 }
 			 | (if .unavailable_reason == "" then del(.unavailable_reason) else . end)
 			 | (if .claim_url == "" then del(.claim_url) else . end)
 			 | (if .version == "" then del(.version) else . end)
 			 | (if .desired_version == "" then del(.desired_version) else . end)
 			 | (if .reconcile_error == null then del(.reconcile_error) else . end)
+			 | (if .feed_health == "" then del(.feed_health) else . end)
 			 | (if $overlay != null
 			    then .enable = ($overlay | {status, step, request_id, op}
 			         + (if .error_code then {error_code} else {} end)
@@ -615,6 +628,91 @@ _sd_array() {
 # timeout / missing binary never looks like a healthy adapter with no detail.
 _sd_unavailable() { _sd_array "$(_sd_obj "Status" "Status unavailable" warn)"; }
 
+# --- feed health (tile verdict) --------------------------------------------
+# The tile `state` is process lifecycle only: a running vendor whose UPSTREAM
+# feed is rejected still reads active/running. _feed_health probes the vendor's
+# own status and returns feeding | not_feeding | unknown. "unknown" is the safe
+# default — probe failed, still connecting, or the field is absent — and the UI
+# must never paint it green. Dispatch is by the descriptor's AGG_HEALTH_PROBE, so
+# the probe is declared per-adapter, not inferred from install mechanics.
+_feed_health() {
+	case "${AGG_HEALTH_PROBE:-}" in
+		fr24_monitor)   _fr24_feed_health ;;
+		piaware_status) _piaware_feed_health ;;
+		*)              printf 'unknown' ;;
+	esac
+}
+
+# _fr24_monitor_raw <timeout_s>: fr24feed's monitor.json (or the file:// test
+# seam), byte-capped DURING read via head -c so a wedged/huge response can't
+# stall or blow up the poll, and empty on any curl failure. `|| true` swallows
+# the SIGPIPE that head raises (under pipefail) once the cap is hit.
+_fr24_monitor_raw() {
+	local timeout="${1:-5}" url raw
+	url="${AGG_FR24_MONITOR_URL:-http://127.0.0.1:8754/monitor.json}"
+	raw="$(curl -fsS --connect-timeout "$timeout" --max-time "$timeout" "$url" 2>/dev/null \
+		| head -c "${AGG_STATUS_MAX_BYTES:-16384}")" || true
+	printf '%s' "$raw"
+}
+
+# _fr24_feed_status_word <raw>: normalized lowercase .feed_status ("" when absent
+# or non-string) so the tile verdict and the detail "Feed" row can't disagree.
+_fr24_feed_status_word() {
+	jq -r '(.feed_status // "") | if type == "string" then ascii_downcase else "" end' \
+		<<<"$1" 2>/dev/null
+}
+
+# _fr24_feed_health: verdict from monitor.json .feed_status, on a SHORT timeout —
+# this runs on every status poll, unlike the 5s detail probe.
+_fr24_feed_health() {
+	local raw fs
+	raw="$(_fr24_monitor_raw "${AGG_FEED_HEALTH_TIMEOUT:-1}")"
+	{ [[ -n "$raw" ]] && jq -e 'type == "object"' >/dev/null 2>&1 <<<"$raw"; } \
+		|| { printf 'unknown'; return; }
+	fs="$(_fr24_feed_status_word "$raw")"
+	# Only an explicit "disconnected" is a confirmed rejection -> red. Every other
+	# non-connected value (connecting/sleeping/error/absent/…) is unknown, so a
+	# transient or unrecognized state never false-alarms as down. The exact non-
+	# connected vocabulary is not validated against 1.0.53 yet, hence the caution.
+	case "$fs" in
+		connected)    printf 'feeding' ;;
+		disconnected) printf 'not_feeding' ;;
+		*)            printf 'unknown' ;;
+	esac
+}
+
+# _piaware_status_raw: piaware's /run/piaware/status.json (or the seam),
+# byte-capped, object-checked, and rejected once its `expiry` stamp has passed so
+# a wedged-but-active piaware can't report stale health. Empty stdout on any of
+# those. Shared by the detail rows and the tile verdict.
+_piaware_status_raw() {
+	local sj raw expiry now_ms
+	sj="${AGG_PIAWARE_STATUS_JSON:-/run/piaware/status.json}"
+	raw="$(head -c "${AGG_STATUS_MAX_BYTES:-16384}" "$sj" 2>/dev/null)"
+	jq -e 'type == "object"' >/dev/null 2>&1 <<<"$raw" || return 0
+	expiry="$(jq -r '.expiry // ""' <<<"$raw" 2>/dev/null)"
+	if [[ "$expiry" =~ ^[0-9]+$ ]]; then
+		now_ms="$(date +%s%3N 2>/dev/null || echo 0)"
+		[[ "$now_ms" =~ ^[0-9]+$ ]] && (( now_ms > expiry )) && return 0
+	fi
+	printf '%s' "$raw"
+}
+
+# _piaware_feed_health: verdict from status.json .adept.status — the FlightAware
+# uplink. radio is LOCAL reception and mlat is pre-claim-normal, so neither gates
+# the feed verdict.
+_piaware_feed_health() {
+	local raw st
+	raw="$(_piaware_status_raw)"
+	[[ -n "$raw" ]] || { printf 'unknown'; return; }
+	st="$(jq -r '.adept.status // ""' <<<"$raw" 2>/dev/null)"
+	case "$st" in
+		green) printf 'feeding' ;;
+		red)   printf 'not_feeding' ;;
+		*)     printf 'unknown' ;;   # amber/yellow (starting), absent
+	esac
+}
+
 # _status_detail_piaware: read piaware's machine-readable status file
 # (/run/piaware/status.json, rewritten every few seconds while piaware runs) and
 # map its per-component status code into rows. Far more robust than scraping
@@ -625,19 +723,9 @@ _sd_unavailable() { _sd_array "$(_sd_obj "Status" "Status unavailable" warn)"; }
 # and controlled — the vendor `message` is never surfaced, so a future message
 # wording (or an identifier inside it) can neither leak nor break the UI.
 _status_detail_piaware() {
-	local sj raw rows=() comp
-	sj="${AGG_PIAWARE_STATUS_JSON:-/run/piaware/status.json}"
-	raw="$(head -c "${AGG_STATUS_MAX_BYTES:-16384}" "$sj" 2>/dev/null)"
-	jq -e 'type == "object"' >/dev/null 2>&1 <<<"$raw" || { _sd_unavailable; return 0; }
-	# Reject a stale snapshot: piaware stamps `expiry` (ms epoch) on each write, so
-	# a wedged-but-still-active piaware can't show stale green. Missing/non-numeric
-	# expiry (or a clock that can't be read) is tolerated for compatibility.
-	local expiry now_ms
-	expiry="$(jq -r '.expiry // ""' <<<"$raw" 2>/dev/null)"
-	if [[ "$expiry" =~ ^[0-9]+$ ]]; then
-		now_ms="$(date +%s%3N 2>/dev/null || echo 0)"
-		[[ "$now_ms" =~ ^[0-9]+$ ]] && (( now_ms > expiry )) && { _sd_unavailable; return 0; }
-	fi
+	local raw rows=() comp
+	raw="$(_piaware_status_raw)"
+	[[ -n "$raw" ]] || { _sd_unavailable; return 0; }
 	# "<json-key>:<label>". Fixed text per (component, status); mlat "red" means
 	# MLAT is off (normal pre-claim), which is informational, not a fault.
 	for comp in "adept:FlightAware" "radio:ADS-B" "mlat:MLAT"; do
@@ -661,21 +749,27 @@ _status_detail_piaware() {
 }
 
 # _status_detail_fr24: query fr24feed's local monitor API (monitor.json on
-# 127.0.0.1:8754, served by default) and surface the real signals it exposes. The
-# vendor `fr24feed-status` tool is NOT used: it hard-codes a `systemctl status
-# fr24feed` check, so it always reports "failed" for our airplanes-aggregator@fr24
-# unit. monitor.json (1.0.48) has no explicit feed-server-link field, so we report
-# what it does expose — the receiver connection and the tracked-aircraft count.
+# 127.0.0.1:8754, served by default) and surface the real signals it exposes: the
+# upstream feed link (feed_status), the local receiver connection, and the
+# tracked-aircraft count. The vendor `fr24feed-status` tool is NOT used: it
+# hard-codes a `systemctl status fr24feed` check, so it always reports "failed"
+# for our airplanes-aggregator@fr24 unit. Row text is fixed — the vendor's
+# feed_status_message is never surfaced (it could carry account/location text).
 _status_detail_fr24() {
-	local url raw rows=() rx ac
-	url="${AGG_FR24_MONITOR_URL:-http://127.0.0.1:8754/monitor.json}"
-	# `if !` (not `; rc=$?`) so a curl failure is handled even under set -e.
-	if ! raw="$(curl -fsS --max-time "${AGG_STATUS_TIMEOUT:-5}" "$url" 2>/dev/null)"; then
-		_sd_unavailable; return 0
-	fi
-	raw="${raw:0:${AGG_STATUS_MAX_BYTES:-16384}}"
+	local raw rows=() fs rx ac
+	raw="$(_fr24_monitor_raw "${AGG_STATUS_TIMEOUT:-5}")"
+	[[ -n "$raw" ]] || { _sd_unavailable; return 0; }
 	jq -e 'type == "object"' >/dev/null 2>&1 <<<"$raw" || { _sd_unavailable; return 0; }
 
+	# Upstream feed link — the signal a rejected feed actually moves (rx + aircraft
+	# below are LOCAL and stay healthy while the feed is refused). Fixed text only.
+	fs="$(_fr24_feed_status_word "$raw")"
+	case "$fs" in
+		connected)    rows+=("$(_sd_obj "Feed" "Connected" ok)") ;;
+		disconnected) rows+=("$(_sd_obj "Feed" "Not feeding" err)") ;;
+		"")           : ;;  # field absent (older fr24feed) — no Feed row
+		*)            rows+=("$(_sd_obj "Feed" "Starting" warn)") ;;  # connecting/error/…
+	esac
 	rx="$(jq -r '.rx_connected // ""' <<<"$raw" 2>/dev/null)"
 	case "$rx" in
 		1) rows+=("$(_sd_obj "Receiver" "Connected" ok)") ;;
