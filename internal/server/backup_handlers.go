@@ -33,9 +33,11 @@ const (
 	combinedBackupVersion = 1
 
 	// combinedBackupBodyLimit caps an uploaded backup. The largest contributor
-	// is the aggregator section (helper cap 64 KiB); 128 KiB is comfortable
-	// headroom for every section combined. NOT readJSON's 1 KiB cap.
-	combinedBackupBodyLimit = 128 * 1024
+	// is the aggregator section (helper cap 64 KiB), and the export is written
+	// indented, which roughly doubles dense JSON; 256 KiB is comfortable
+	// headroom for every section combined after indentation. Mirrored by the
+	// SPA's client-side size check in parseBackupFile. NOT readJSON's 1 KiB cap.
+	combinedBackupBodyLimit = 256 * 1024
 
 	// backupExportTimeout bounds the whole export (five privileged reads).
 	backupExportTimeout = 60 * time.Second
@@ -163,24 +165,72 @@ func (s *Server) handleBackupExport(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// One clock read for both the envelope stamp and the filename, so a
+	// midnight boundary can't produce a file whose name and created_at
+	// disagree about the day.
+	now := s.now().UTC()
 	env := combinedBackupEnvelope{
 		SchemaVersion: combinedBackupVersion,
 		Kind:          combinedBackupKind,
-		CreatedAt:     s.now().UTC().Format(time.RFC3339),
+		CreatedAt:     now.Format(time.RFC3339),
 		Sections:      sections,
 	}
-	body, err := json.Marshal(env)
+	// Indented: the SPA downloads these bytes verbatim, and the file is a
+	// user-facing artifact people open to see what it holds.
+	body, err := json.MarshalIndent(env, "", "  ")
 	if err != nil {
 		log.Printf("backup export: marshal: %v", err)
 		writeJSONError(w, http.StatusInternalServerError, "backup export failed")
 		return
 	}
-	filename := fmt.Sprintf("airplanes-feeder-backup-%s.json", s.now().UTC().Format("2006-01-02"))
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-store")
-	w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=%q", filename))
+	w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=%q", s.backupExportFilename(now)))
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write(body)
+}
+
+// backupExportFilename names the exported file so downloads from different
+// feeders (hostname) and different days (date) don't collide in a downloads
+// folder. The SPA saves the file under exactly this name (read from the
+// Content-Disposition header). The hostname segment is dropped when the
+// lookup fails or nothing filename-safe survives sanitizing.
+func (s *Server) backupExportFilename(now time.Time) string {
+	name := "airplanes-feeder-backup"
+	if host, err := s.hostnameFunc(); err == nil {
+		if host = sanitizeHostToken(host); host != "" {
+			name += "-" + host
+		}
+	}
+	return name + "-" + now.Format("2006-01-02") + ".json"
+}
+
+// sanitizeHostToken reduces a hostname to a filename- and header-safe token:
+// ASCII letters, digits, dots and hyphens pass through; every other run of
+// characters collapses to a single hyphen. Capped at 63 characters (the DNS
+// label limit), then re-trimmed so neither the cap nor the input can leave a
+// leading/trailing "." or "-". Returns "" when nothing survives.
+func sanitizeHostToken(host string) string {
+	var b strings.Builder
+	pendingSep := false
+	for _, r := range host {
+		ok := (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') ||
+			(r >= '0' && r <= '9') || r == '.' || r == '-'
+		if !ok {
+			pendingSep = b.Len() > 0
+			continue
+		}
+		if pendingSep {
+			b.WriteByte('-')
+			pendingSep = false
+		}
+		b.WriteRune(r)
+	}
+	token := b.String()
+	if len(token) > 63 {
+		token = token[:63]
+	}
+	return strings.Trim(token, ".-")
 }
 
 func (s *Server) exportIdentitySection(ctx context.Context) (json.RawMessage, error) {

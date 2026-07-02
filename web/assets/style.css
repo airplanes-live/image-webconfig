@@ -893,7 +893,7 @@ textarea:focus {
    clean/disabled group (e.g. MLAT off) from reserving dead space below its
    content. Reappears the instant a Save/Cancel, pending notice, or error
    shows. */
-.config-fieldset__footer:not(:has(button:not([hidden]))):not(:has(.config-fieldset__pending:not([hidden]))):not(:has(.error:not(:empty))) {
+.config-fieldset__footer:not(:has(button:not([hidden]))):not(:has(.config-fieldset__pending:not([hidden]))):not(:has(.config-fieldset__saved:not([hidden]))):not(:has(.error:not(:empty))) {
   display: none;
 }
 /* Error sits first and grows, pushing the action buttons to the right
@@ -904,6 +904,11 @@ textarea:focus {
   margin: 0;
   flex-basis: 100%;
   color: var(--wc-warn, var(--wc-ink-2));
+  font-size: 0.85rem;
+}
+.config-fieldset__footer .config-fieldset__saved {
+  margin: 0;
+  color: var(--wc-status-ok, var(--wc-ink-2));
   font-size: 0.85rem;
 }
 .config-fieldset__footer .wc-btn-primary,
@@ -1497,6 +1502,12 @@ input[aria-invalid="true"] {
 /* Vertical group of section checkboxes (backup/restore "choose what to
    include / restore"). */
 .wc-backup-sections { display: flex; flex-direction: column; gap: 0.4rem; margin: 0.5rem 0; }
+
+/* Backup-restore flow: the dynamic block below the upload button — first the
+   "choose what to restore" section picker, then the live "Restoring…"
+   checklist. It's an empty div until a file is chosen, so the separating
+   margin applies only while it holds content. */
+.wc-restore-area:not(:empty) { margin-top: 1rem; }
 
 /* Manage-page title: name + status chip sit together, left-aligned, rather
    than pushing the chip to the far edge (overrides .wc-card-head). */

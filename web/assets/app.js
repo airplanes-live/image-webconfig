@@ -1718,9 +1718,16 @@
         const err = errorEl();
         const pending = el("p", { class: "config-fieldset__pending" });
         pending.hidden = true;
+        // Success confirmation. The Save button is dirty-state (it vanishes
+        // the moment a save lands), so without this a clean save is silent —
+        // indistinguishable from nothing having happened. role="status" makes
+        // it a polite live region; it stays until the group is edited again.
+        const saved = el("p", { class: "config-fieldset__saved", role: "status" });
+        saved.hidden = true;
         footerEl.appendChild(btn);
         footerEl.appendChild(err);
         footerEl.appendChild(pending);
+        footerEl.appendChild(saved);
 
         const isDirty = () => {
             const cur = readInputs();
@@ -1735,6 +1742,8 @@
         const recheck = () => {
             if (isDirty()) {
                 configState.dirtyGroups.add(name);
+                saved.hidden = true;
+                saved.textContent = "";
             } else {
                 configState.dirtyGroups.delete(name);
             }
@@ -1770,6 +1779,8 @@
             err.textContent = "";
             pending.hidden = true;
             pending.textContent = "";
+            saved.hidden = true;
+            saved.textContent = "";
             state.inFlight = name;
             btn.disabled = true;
             btn.textContent = "Saving…";
@@ -1827,7 +1838,8 @@
                 state.inFlight = null;
                 return;
             }
-            if (refreshed.ok) {
+            const refreshOk = refreshed.ok;
+            if (refreshOk) {
                 state.savedValues = normaliseSavedValues((refreshed.payload && refreshed.payload.values) || {});
                 if (dashboardCtx) dashboardCtx.configValues = state.savedValues;
             }
@@ -1844,6 +1856,14 @@
             }
             if (onSavedHook) {
                 try { onSavedHook(); } catch (_) {}
+            }
+            // Only claim success when the authoritative refresh also landed:
+            // a failed refresh leaves savedValues stale, so the group can
+            // still read dirty — "Saved." next to a re-shown Save button
+            // would contradict itself.
+            if (pendingRestart.length === 0 && refreshOk) {
+                saved.hidden = false;
+                saved.textContent = "Saved.";
             }
         });
 
@@ -3674,6 +3694,8 @@
     // AGG_STATE_BADGE maps an adapter `state` to [label, severity-suffix].
     const AGG_STATE_BADGE = {
         running:             ["Feeding",            "ok"],
+        not_feeding:         ["Not feeding",        "err"],
+        checking:            ["Checking…",          "warn"],
         installing:          ["Installing…",        "warn"],
         stopped:             ["Off",                "na"],
         not_installed:       ["Not set up",         "na"],
@@ -3702,6 +3724,16 @@
         // binary just isn't enabled yet. Distinguish it from a never-touched
         // adapter so a restore doesn't read as "Not set up" / a no-op.
         if (s === "not_installed" && a.configured) return "configured_off";
+        // A running service is only truly "Feeding" if the vendor's own feed-health
+        // probe confirms it. `state` is process lifecycle (systemd-active), which
+        // stays "running" even when the upstream feed is rejected — so a not_feeding
+        // verdict shows red and an unknown/unconfirmed one shows amber, never green.
+        // Absent feed_health (adapter without a probe, or an older release) keeps
+        // "running", so those tiles are unchanged.
+        if (s === "running") {
+            if (a.feed_health === "not_feeding") return "not_feeding";
+            if (a.feed_health === "unknown") return "checking";
+        }
         return s;
     }
 
@@ -3742,7 +3774,7 @@
         // change to any of them re-renders rather than going stale behind state.
         const sig = adapters.map(a =>
             [a.id, a.state || "", a.display_name || "", a.configured ? 1 : 0, a.enabled ? 1 : 0,
-             a.external_install ? 1 : 0,
+             a.external_install ? 1 : 0, a.feed_health || "",
              (a.reconcile_error && a.reconcile_error.error_code) || ""].join(":")
         ).join("|");
         if (container.__sig === sig) return;
@@ -3963,12 +3995,58 @@
         return { ok: true, status: resp.status, summary };
     }
 
+    // contentDispositionFilename extracts the quoted filename from a
+    // Content-Disposition header. It only needs to understand what our own
+    // server emits — `attachment; filename="…"` with sanitized ASCII — and
+    // returns null for anything else.
+    function contentDispositionFilename(header) {
+        const m = /(?:^|;)\s*filename="([^"]*)"/i.exec(header || "");
+        return (m && m[1]) || null;
+    }
+
+    // fetchBackupExport POSTs the export request and hands back the server's
+    // exact bytes as a Blob plus the filename the server chose (from
+    // Content-Disposition), so the saved file is byte-identical to what the
+    // server produced. Deliberately bypasses sendJSON, which JSON-parses the
+    // body — re-serializing client-side would make the file a reconstruction
+    // rather than the server's own bytes. A failed export is a normal JSON
+    // error body, parsed so callers can show the message.
+    async function fetchBackupExport(sectionKeys) {
+        const ctrl = new AbortController();
+        activeAbort = ctrl;
+        let resp;
+        try {
+            resp = await fetch("/api/backup/export", {
+                method: "POST",
+                credentials: "same-origin",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ sections: sectionKeys }),
+                signal: ctrl.signal,
+            });
+            if (!resp.ok) {
+                let payload = null;
+                try { payload = await resp.json(); } catch (_) {}
+                return { ok: false, status: resp.status, payload: payload || {} };
+            }
+            const blob = await resp.blob();
+            return {
+                ok: true, status: resp.status, blob,
+                filename: contentDispositionFilename(resp.headers.get("Content-Disposition")),
+            };
+        } catch (e) {
+            return {
+                ok: false, status: 0, payload: { error: "network error" },
+                aborted: e && e.name === "AbortError",
+            };
+        }
+    }
+
     // parseBackupFile reads + validates an uploaded file client-side: size cap
-    // (mirrors the server's 128 KiB), JSON parse, and the combined-backup kind.
-    // Returns {ok, value, error}.
+    // (mirrors the server's 256 KiB combinedBackupBodyLimit), JSON parse, and
+    // the combined-backup kind. Returns {ok, value, error}.
     async function parseBackupFile(file) {
         if (!file) return { ok: false, error: "" };
-        if (file.size > 131072) return { ok: false, error: "That file is too large to be a valid backup." };
+        if (file.size > 262144) return { ok: false, error: "That file is too large to be a valid backup." };
         let parsed;
         try { parsed = JSON.parse(await file.text()); }
         catch (_) { return { ok: false, error: "That file isn't a valid backup." }; }
@@ -4001,14 +4079,13 @@
             if (sel.length === 0) return;
             setMsg("");
             exportBtn.disabled = true;
-            const r = await postJSON("/api/backup/export", { sections: sel });
+            const r = await fetchBackupExport(sel);
             exportBtn.disabled = false;
             if (handleAuthFailure(r)) return;
             if (!r.ok) { setMsg((r.payload && r.payload.error) || "Backup failed.", "warn"); return; }
             try {
-                const blob = new Blob([JSON.stringify(r.payload, null, 2)], { type: "application/json" });
-                const url = URL.createObjectURL(blob);
-                const a = el("a", { href: url, download: "airplanes-feeder-backup.json" });
+                const url = URL.createObjectURL(r.blob);
+                const a = el("a", { href: url, download: r.filename || "airplanes-feeder-backup.json" });
                 document.body.appendChild(a); a.click(); a.remove();
                 setTimeout(() => URL.revokeObjectURL(url), 1000);
                 setMsg("Backup downloaded — keep it private.", "ok");
@@ -4029,7 +4106,7 @@
     function buildBackupRestoreCard() {
         const msg = el("div", {});
         const setMsg = (text, kind) => msg.replaceChildren(text ? el("div", { class: "wc-flash wc-flash--" + (kind || "ok") }, text) : el("span"));
-        const area = el("div", {});
+        const area = el("div", { class: "wc-restore-area" });
         const fileInput = el("input", { type: "file", accept: "application/json,.json", hidden: true });
         const importBtn = el("button", { type: "button", class: "wc-btn-ghost" }, "Restore from backup");
         importBtn.onclick = () => fileInput.click();
@@ -4117,7 +4194,7 @@
     function setupRestorePanel() {
         const msg = el("div", {});
         const setMsg = (text, kind) => msg.replaceChildren(text ? el("div", { class: "wc-flash wc-flash--" + (kind || "ok") }, text) : el("span"));
-        const area = el("div", {});
+        const area = el("div", { class: "wc-restore-area" });
         const fileInput = el("input", { type: "file", accept: "application/json,.json", hidden: true });
         const importBtn = el("button", { type: "button", class: "wc-btn-primary" }, "Choose backup file");
         importBtn.onclick = () => fileInput.click();
@@ -4255,6 +4332,20 @@
         return el("h2", { class: "wc-card-head wc-agg-detail-head" },
             el("span", { class: "wc-agg-detail-head__name" }, name),
             aggStateBadge(state));
+    }
+
+    // aggFeedLine: the one-line summary under the manage-page heading. Health-
+    // aware: "Feeding X." was previously shown for any enabled adapter, which
+    // read as success while the vendor was actively rejecting the feed (e.g. a
+    // bad FR24 sharing key). Only a confirmed feed_health=feeding says feeding;
+    // a confirmed rejection names the likely fix; anything else stays neutral.
+    function aggFeedLine(a, name, rejectedHint) {
+        if (!a.enabled) return "Set up but not feeding right now.";
+        if (a.feed_health === "feeding") return "Feeding " + name + ".";
+        if (a.feed_health === "not_feeding") {
+            return "Not feeding \u2014 " + name + " is rejecting the feed. " + rejectedHint;
+        }
+        return "Waiting for " + name + " to confirm the feed\u2026";
     }
 
     // buildAggStatusBlock: the "Status" card on a manage page — installed
@@ -4405,7 +4496,7 @@
 
             render(el("section", { class: "wc-card" },
                 aggDetailHead("Flightradar24", aggDisplayState(a)),
-                el("p", { class: "muted" }, a.enabled ? "Feeding Flightradar24." : "Set up but not feeding right now."),
+                el("p", { class: "muted" }, aggFeedLine(a, "Flightradar24", "Check your sharing key.")),
                 buildAggStatusBlock(a),
                 inlineErr,
                 actions,
@@ -4579,7 +4670,7 @@
 
             render(el("section", { class: "wc-card" },
                 aggDetailHead("FlightAware", aggDisplayState(a)),
-                el("p", { class: "muted" }, a.enabled ? "Feeding FlightAware." : "Set up but not feeding right now."),
+                el("p", { class: "muted" }, aggFeedLine(a, "FlightAware", "Check the service logs.")),
                 buildAggStatusBlock(a),
                 inlineErr,
                 actions,

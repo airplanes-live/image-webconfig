@@ -81,6 +81,72 @@ overlay_code() { jq -r '.error_code // ""' "$AGG_ENABLE_STATE" 2>/dev/null; }
     jq -e '.fields.email == "a@b.c" and .fields.sharing_key == "K"' "$AGG_STATE_DIR/fr24.json"
 }
 
+# A key change via set must reach the vendor daemon: fr24feed only reads
+# fr24key from its ini at startup, so set re-renders the ini and try-restarts
+# the instance. Without this, set on a running fr24 was a silent no-op (state
+# updated, daemon kept feeding with the old key).
+@test "set with a changed fr24 sharing key re-renders the ini and restarts" {
+    export AGG_FR24_INI="$WORK/fr24feed.ini"
+    printf 'receiver="beast-tcp"\nhost="127.0.0.1:30005"\nfr24key="OLDKEY"\n' > "$AGG_FR24_INI"
+    agg set '{"id":"fr24","fields":{"sharing_key":"NEWKEY"}}'
+    [ "$status" -eq 0 ]
+    [ "$(overlay_status)" = "done" ]
+    grep -q 'fr24key="NEWKEY"' "$AGG_FR24_INI"
+    grep -q 'try-restart airplanes-aggregator@fr24.service' "$WORK/systemctl.log"
+}
+
+@test "set with an unchanged fr24 sharing key leaves the ini and service alone" {
+    export AGG_FR24_INI="$WORK/fr24feed.ini"
+    printf 'receiver="beast-tcp"\nhost="127.0.0.1:30005"\nfr24key="SAMEKEY"\n' > "$AGG_FR24_INI"
+    agg set '{"id":"fr24","fields":{"sharing_key":"SAMEKEY"}}'
+    [ "$status" -eq 0 ]
+    [ "$(overlay_status)" = "done" ]
+    ! grep -q 'try-restart' "$WORK/systemctl.log"
+}
+
+@test "set on a never-rendered fr24 (no ini) stores fields without touching services" {
+    export AGG_FR24_INI="$WORK/fr24feed.ini"
+    agg set '{"id":"fr24","fields":{"sharing_key":"NEWKEY"}}'
+    [ "$status" -eq 0 ]
+    [ "$(overlay_status)" = "done" ]
+    [ ! -e "$AGG_FR24_INI" ]
+    ! grep -q 'try-restart' "$WORK/systemctl.log"
+    jq -e '.fields.sharing_key == "NEWKEY"' "$AGG_STATE_DIR/fr24.json"
+}
+
+# The reconcile interpolates the key into the privileged ini writer, so it
+# applies the same format gate enable uses; an injection-shaped key fails the
+# whole set rather than reaching the ini.
+@test "set with a malformed fr24 key on a rendered adapter fails without touching the ini" {
+    export AGG_FR24_INI="$WORK/fr24feed.ini"
+    printf 'receiver="beast-tcp"\nhost="127.0.0.1:30005"\nfr24key="OLDKEY"\n' > "$AGG_FR24_INI"
+    agg set '{"id":"fr24","fields":{"sharing_key":"bad\"key\nreceiver=evil"}}'
+    [ "$status" -eq 0 ]
+    [ "$(overlay_status)" = "failed" ]
+    grep -q 'fr24key="OLDKEY"' "$AGG_FR24_INI"
+    ! grep -q 'try-restart' "$WORK/systemctl.log"
+}
+
+# A failed restart rolls the ini back to the previous key, so a retried set
+# re-attempts the apply instead of matching the rewritten ini and silently
+# skipping the restart.
+@test "set rolls the fr24 ini back when the restart fails" {
+    export AGG_FR24_INI="$WORK/fr24feed.ini"
+    printf 'receiver="beast-tcp"\nhost="127.0.0.1:30005"\nfr24key="OLDKEY"\n' > "$AGG_FR24_INI"
+    cat > "$WORK/fake-systemctl" <<SH
+#!/bin/bash
+printf '%s\n' "\$*" >> "$WORK/systemctl.log"
+[[ "\$1" == "try-restart" ]] && exit 1
+exit 0
+SH
+    chmod +x "$WORK/fake-systemctl"
+    agg set '{"id":"fr24","fields":{"sharing_key":"NEWKEY"}}'
+    [ "$status" -eq 0 ]
+    [ "$(overlay_status)" = "failed" ]
+    grep -q 'fr24key="OLDKEY"' "$AGG_FR24_INI"
+    jq -e '(.fields.sharing_key // "") != "NEWKEY"' "$AGG_STATE_DIR/fr24.json" 2>/dev/null || [ ! -e "$AGG_STATE_DIR/fr24.json" ]
+}
+
 @test "set rejects a non-boolean mlat_enabled" {
     agg set '{"id":"fr24","mlat_enabled":"yes"}'
     [ "$status" -eq 2 ]
