@@ -154,6 +154,21 @@ EOF
     echo "$output" | jq -e '.aggregators[0].status_detail[] | select(.label=="Receiver") | .value=="Connected" and .severity=="ok"'
 }
 
+# Rejected sharing key (validated against 1.0.53): absent feed_status + config
+# error gets an actionable fixed-text Feed row; the vendor's own message stays
+# in the logs, never in a row value.
+@test "fr24 absent feed_status + config error surfaces a rejected Feed row" {
+    seed_fr24_enabled; export SVC_STATE=active
+    cat > "$WORK/monitor.json" <<'EOF'
+{"rx_connected":"1","feed_num_ac_tracked":"0","feed_last_config_result":"error","feed_last_config_info":"Not found, check your key!"}
+EOF
+    export AGG_FR24_MONITOR_URL="file://$WORK/monitor.json"
+    run detail fr24
+    [ "$status" -eq 0 ]
+    echo "$output" | jq -e '.aggregators[0].status_detail[] | select(.label=="Feed") | .value=="Rejected \u2014 check your sharing key" and .severity=="err"'
+    echo "$output" | jq -e '[.aggregators[0].status_detail[].value] | all(contains("Not found") | not)'
+}
+
 @test "fr24 monitor without feed_status omits the Feed row" {
     seed_fr24_enabled; export SVC_STATE=active
     cat > "$WORK/monitor.json" <<'EOF'

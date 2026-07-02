@@ -4269,6 +4269,20 @@
             aggStateBadge(state));
     }
 
+    // aggFeedLine: the one-line summary under the manage-page heading. Health-
+    // aware: "Feeding X." was previously shown for any enabled adapter, which
+    // read as success while the vendor was actively rejecting the feed (e.g. a
+    // bad FR24 sharing key). Only a confirmed feed_health=feeding says feeding;
+    // a confirmed rejection names the likely fix; anything else stays neutral.
+    function aggFeedLine(a, name, rejectedHint) {
+        if (!a.enabled) return "Set up but not feeding right now.";
+        if (a.feed_health === "feeding") return "Feeding " + name + ".";
+        if (a.feed_health === "not_feeding") {
+            return "Not feeding \u2014 " + name + " is rejecting the feed. " + rejectedHint;
+        }
+        return "Waiting for " + name + " to confirm the feed\u2026";
+    }
+
     // buildAggStatusBlock: the "Status" card on a manage page — installed
     // version plus the per-adapter status lines the helper surfaces from the
     // vendor status command (piaware-status / fr24feed). Null when empty.
@@ -4417,7 +4431,7 @@
 
             render(el("section", { class: "wc-card" },
                 aggDetailHead("Flightradar24", aggDisplayState(a)),
-                el("p", { class: "muted" }, a.enabled ? "Feeding Flightradar24." : "Set up but not feeding right now."),
+                el("p", { class: "muted" }, aggFeedLine(a, "Flightradar24", "Check your sharing key.")),
                 buildAggStatusBlock(a),
                 inlineErr,
                 actions,
@@ -4591,7 +4605,7 @@
 
             render(el("section", { class: "wc-card" },
                 aggDetailHead("FlightAware", aggDisplayState(a)),
-                el("p", { class: "muted" }, a.enabled ? "Feeding FlightAware." : "Set up but not feeding right now."),
+                el("p", { class: "muted" }, aggFeedLine(a, "FlightAware", "Check the service logs.")),
                 buildAggStatusBlock(a),
                 inlineErr,
                 actions,
