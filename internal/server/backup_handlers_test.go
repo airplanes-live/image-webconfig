@@ -4,9 +4,13 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
+	"mime"
 	"net/http"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/airplanes-live/image-webconfig/internal/auth"
 	wexec "github.com/airplanes-live/image-webconfig/internal/exec"
@@ -196,6 +200,150 @@ func TestBackupExport_AssemblesAllSections(t *testing.T) {
 	}
 	if !strings.Contains(agg, "aggregator-backup") {
 		t.Errorf("aggregators section missing kind: %s", agg)
+	}
+}
+
+// wireExportFakes points both fake runners at canned success outputs so a
+// full-section export succeeds (identity via the plain runner, wifi and
+// aggregators via the stdin runner).
+func wireExportFakes(h *writeHarness) {
+	h.runnerResultFor = func(argv []string) wexec.Result {
+		if argvHas(argv, "identity-export") {
+			return wexec.Result{Stdout: []byte(testIdentitySection)}
+		}
+		return wexec.Result{}
+	}
+	h.stdinResultFor = okStdin
+}
+
+// exportFilename POSTs an export and returns the Content-Disposition filename
+// parameter, asserting the disposition itself is a well-formed attachment.
+func exportFilename(t *testing.T, h *writeHarness) string {
+	t.Helper()
+	r := postJSON(t, h.client, h.ts.URL+"/api/backup/export", map[string]any{})
+	defer r.Body.Close()
+	if r.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", r.StatusCode)
+	}
+	disp, params, err := mime.ParseMediaType(r.Header.Get("Content-Disposition"))
+	if err != nil {
+		t.Fatalf("parse Content-Disposition %q: %v", r.Header.Get("Content-Disposition"), err)
+	}
+	if disp != "attachment" {
+		t.Errorf("disposition = %q, want attachment", disp)
+	}
+	return params["filename"]
+}
+
+func TestBackupExport_FilenameCarriesHostnameAndDate(t *testing.T) {
+	// 23:59 UTC: the handler reads the clock once, so the filename date and
+	// created_at can't disagree even at a midnight boundary.
+	h := newWriteHarness(t,
+		withNow(time.Date(2026, 7, 2, 23, 59, 59, 0, time.UTC)),
+		withHostname("feeder-attic", nil),
+	)
+	wireExportFakes(h)
+	if got, want := exportFilename(t, h), "airplanes-feeder-backup-feeder-attic-2026-07-02.json"; got != want {
+		t.Errorf("filename = %q, want %q", got, want)
+	}
+}
+
+func TestBackupExport_FilenameOmitsHostOnLookupFailure(t *testing.T) {
+	h := newWriteHarness(t,
+		withNow(time.Date(2026, 7, 2, 12, 0, 0, 0, time.UTC)),
+		withHostname("", errors.New("hostname unavailable")),
+	)
+	wireExportFakes(h)
+	if got, want := exportFilename(t, h), "airplanes-feeder-backup-2026-07-02.json"; got != want {
+		t.Errorf("filename = %q, want %q", got, want)
+	}
+}
+
+func TestBackupExport_FilenameSanitizesHostileHostname(t *testing.T) {
+	// A hostname with header-metacharacters must neither corrupt the header
+	// nor smuggle a second one; the sanitizer reduces it to safe ASCII.
+	h := newWriteHarness(t,
+		withNow(time.Date(2026, 7, 2, 12, 0, 0, 0, time.UTC)),
+		withHostname("evil\r\nX-Injected: 1", nil),
+	)
+	wireExportFakes(h)
+	r := postJSON(t, h.client, h.ts.URL+"/api/backup/export", map[string]any{})
+	defer r.Body.Close()
+	if got := r.Header.Get("X-Injected"); got != "" {
+		t.Errorf("X-Injected header smuggled through: %q", got)
+	}
+	disp, params, err := mime.ParseMediaType(r.Header.Get("Content-Disposition"))
+	if err != nil || disp != "attachment" {
+		t.Fatalf("Content-Disposition %q: disp=%q err=%v", r.Header.Get("Content-Disposition"), disp, err)
+	}
+	if got, want := params["filename"], "airplanes-feeder-backup-evil-X-Injected-1-2026-07-02.json"; got != want {
+		t.Errorf("filename = %q, want %q", got, want)
+	}
+}
+
+func TestBackupExport_FilenameDateMatchesCreatedAt(t *testing.T) {
+	// The handler must read the clock exactly once. The fake clock jumps a
+	// full day on every read, so a second read inside the handler would put
+	// the filename and created_at on different days.
+	var mu sync.Mutex
+	calls := 0
+	base := time.Date(2026, 7, 2, 23, 59, 59, 0, time.UTC)
+	h := newWriteHarness(t,
+		withNowFunc(func() time.Time {
+			mu.Lock()
+			defer mu.Unlock()
+			now := base.AddDate(0, 0, calls)
+			calls++
+			return now
+		}),
+		withHostname("feeder-attic", nil),
+	)
+	wireExportFakes(h)
+
+	r := postJSON(t, h.client, h.ts.URL+"/api/backup/export", map[string]any{})
+	defer r.Body.Close()
+	if r.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", r.StatusCode)
+	}
+	_, params, err := mime.ParseMediaType(r.Header.Get("Content-Disposition"))
+	if err != nil {
+		t.Fatalf("parse Content-Disposition: %v", err)
+	}
+	var env combinedBackupEnvelope
+	if err := json.Unmarshal(readBody(t, r), &env); err != nil {
+		t.Fatalf("decode envelope: %v", err)
+	}
+	if len(env.CreatedAt) < 10 {
+		t.Fatalf("created_at = %q", env.CreatedAt)
+	}
+	if day := env.CreatedAt[:10]; !strings.Contains(params["filename"], day) {
+		t.Errorf("filename %q does not carry created_at's date %q", params["filename"], day)
+	}
+}
+
+func TestSanitizeHostToken(t *testing.T) {
+	t.Parallel()
+	cases := []struct{ in, want string }{
+		{"feeder-attic", "feeder-attic"},
+		{"Feeder.Attic-2", "Feeder.Attic-2"},
+		{"", ""},
+		{"---", ""},
+		{"...", ""},
+		{"weird host!name", "weird-host-name"},
+		{"tab\there", "tab-here"},
+		{"\"quoted\\", "quoted"},
+		{"höstnäme", "h-stn-me"},
+		{"日本語", ""},
+		// Overlong input is capped at 63 chars.
+		{strings.Repeat("a", 80), strings.Repeat("a", 63)},
+		// A separator landing on the cap boundary is re-trimmed.
+		{strings.Repeat("a", 62) + "-b", strings.Repeat("a", 62)},
+		{strings.Repeat("a", 62) + ".b", strings.Repeat("a", 62)},
+	}
+	for _, c := range cases {
+		if got := sanitizeHostToken(c.in); got != c.want {
+			t.Errorf("sanitizeHostToken(%q) = %q, want %q", c.in, got, c.want)
+		}
 	}
 }
 

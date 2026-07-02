@@ -4,6 +4,7 @@ package server
 import (
 	"io/fs"
 	"net/http"
+	"os"
 	"sync"
 	"time"
 
@@ -36,7 +37,8 @@ type Server struct {
 	stdinRunner  wexec.CommandRunnerStdin
 	schema       *schemacache.Cache
 	priv         PrivilegedArgv
-	nowFunc      func() time.Time // injected for tests; defaults to time.Now
+	nowFunc      func() time.Time       // injected for tests; defaults to time.Now
+	hostnameFunc func() (string, error) // injected for tests; defaults to os.Hostname
 	// upgradeStatePath is the on-disk file the runtime overlay's update
 	// path writes with "clean" / "in-progress" / "failed". Defaults to
 	// DefaultUpgradeStatePath; tests override via Deps.UpgradeStatePath.
@@ -251,6 +253,7 @@ type Deps struct {
 	Runner       wexec.CommandRunner      // override for tests; nil → exec.RealRunner
 	StdinRunner  wexec.CommandRunnerStdin // ditto; piped variant for apl-feed apply
 	Now          func() time.Time         // override for tests; nil → time.Now
+	Hostname     func() (string, error)   // override for tests; nil → os.Hostname
 	Privileged   PrivilegedArgv
 	// UpgradeStatePath is the path the GET /api/status/upgrade handler
 	// reads. Defaults to DefaultUpgradeStatePath; tests inject a tempfile.
@@ -289,6 +292,10 @@ func New(d Deps) http.Handler {
 	if nowFunc == nil {
 		nowFunc = time.Now
 	}
+	hostnameFunc := d.Hostname
+	if hostnameFunc == nil {
+		hostnameFunc = os.Hostname
+	}
 	upgradeStatePath := d.UpgradeStatePath
 	if upgradeStatePath == "" {
 		upgradeStatePath = DefaultUpgradeStatePath
@@ -321,6 +328,7 @@ func New(d Deps) http.Handler {
 		stdinRunner:             stdinRunner,
 		schema:                  d.Schema,
 		nowFunc:                 nowFunc,
+		hostnameFunc:            hostnameFunc,
 		priv:                    d.Privileged,
 		upgradeStatePath:        upgradeStatePath,
 		orchestratorStatePath:   orchestratorStatePath,

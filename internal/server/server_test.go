@@ -252,6 +252,12 @@ type writeHarness struct {
 	// matching what an un-imaged feeder would report. Tests that need
 	// the capable path use withOrchestratorCapable(true) to flip it.
 	orchestratorCapable func() bool
+	// now is wired into Deps.Now. Set via withNow() before harness
+	// construction; nil keeps the real clock.
+	now func() time.Time
+	// hostname is wired into Deps.Hostname. Set via withHostname() before
+	// harness construction; nil keeps os.Hostname.
+	hostname func() (string, error)
 }
 
 // harnessOption mutates a writeHarness BEFORE Deps is constructed, so
@@ -270,6 +276,18 @@ func withOrchestratorCapable(capable bool) harnessOption {
 	return func(h *writeHarness) {
 		h.orchestratorCapable = func() bool { return capable }
 	}
+}
+
+func withNow(now time.Time) harnessOption {
+	return func(h *writeHarness) { h.now = func() time.Time { return now } }
+}
+
+func withNowFunc(fn func() time.Time) harnessOption {
+	return func(h *writeHarness) { h.now = fn }
+}
+
+func withHostname(name string, err error) harnessOption {
+	return func(h *writeHarness) { h.hostname = func() (string, error) { return name, err } }
 }
 
 func newWriteHarness(t *testing.T, opts ...harnessOption) *writeHarness {
@@ -415,6 +433,8 @@ func newWriteHarness(t *testing.T, opts ...harnessOption) *writeHarness {
 		),
 		Runner:                captureRunner,
 		StdinRunner:           captureStdinRunner,
+		Now:                   h.now,
+		Hostname:              h.hostname,
 		Privileged:            priv,
 		UpgradeStatePath:      h.upgradeStatePath,
 		OrchestratorStatePath: h.orchestratorStatePath,

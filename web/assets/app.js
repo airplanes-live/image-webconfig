@@ -3995,12 +3995,58 @@
         return { ok: true, status: resp.status, summary };
     }
 
+    // contentDispositionFilename extracts the quoted filename from a
+    // Content-Disposition header. It only needs to understand what our own
+    // server emits — `attachment; filename="…"` with sanitized ASCII — and
+    // returns null for anything else.
+    function contentDispositionFilename(header) {
+        const m = /(?:^|;)\s*filename="([^"]*)"/i.exec(header || "");
+        return (m && m[1]) || null;
+    }
+
+    // fetchBackupExport POSTs the export request and hands back the server's
+    // exact bytes as a Blob plus the filename the server chose (from
+    // Content-Disposition), so the saved file is byte-identical to what the
+    // server produced. Deliberately bypasses sendJSON, which JSON-parses the
+    // body — re-serializing client-side would make the file a reconstruction
+    // rather than the server's own bytes. A failed export is a normal JSON
+    // error body, parsed so callers can show the message.
+    async function fetchBackupExport(sectionKeys) {
+        const ctrl = new AbortController();
+        activeAbort = ctrl;
+        let resp;
+        try {
+            resp = await fetch("/api/backup/export", {
+                method: "POST",
+                credentials: "same-origin",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ sections: sectionKeys }),
+                signal: ctrl.signal,
+            });
+            if (!resp.ok) {
+                let payload = null;
+                try { payload = await resp.json(); } catch (_) {}
+                return { ok: false, status: resp.status, payload: payload || {} };
+            }
+            const blob = await resp.blob();
+            return {
+                ok: true, status: resp.status, blob,
+                filename: contentDispositionFilename(resp.headers.get("Content-Disposition")),
+            };
+        } catch (e) {
+            return {
+                ok: false, status: 0, payload: { error: "network error" },
+                aborted: e && e.name === "AbortError",
+            };
+        }
+    }
+
     // parseBackupFile reads + validates an uploaded file client-side: size cap
-    // (mirrors the server's 128 KiB), JSON parse, and the combined-backup kind.
-    // Returns {ok, value, error}.
+    // (mirrors the server's 256 KiB combinedBackupBodyLimit), JSON parse, and
+    // the combined-backup kind. Returns {ok, value, error}.
     async function parseBackupFile(file) {
         if (!file) return { ok: false, error: "" };
-        if (file.size > 131072) return { ok: false, error: "That file is too large to be a valid backup." };
+        if (file.size > 262144) return { ok: false, error: "That file is too large to be a valid backup." };
         let parsed;
         try { parsed = JSON.parse(await file.text()); }
         catch (_) { return { ok: false, error: "That file isn't a valid backup." }; }
@@ -4033,14 +4079,13 @@
             if (sel.length === 0) return;
             setMsg("");
             exportBtn.disabled = true;
-            const r = await postJSON("/api/backup/export", { sections: sel });
+            const r = await fetchBackupExport(sel);
             exportBtn.disabled = false;
             if (handleAuthFailure(r)) return;
             if (!r.ok) { setMsg((r.payload && r.payload.error) || "Backup failed.", "warn"); return; }
             try {
-                const blob = new Blob([JSON.stringify(r.payload, null, 2)], { type: "application/json" });
-                const url = URL.createObjectURL(blob);
-                const a = el("a", { href: url, download: "airplanes-feeder-backup.json" });
+                const url = URL.createObjectURL(r.blob);
+                const a = el("a", { href: url, download: r.filename || "airplanes-feeder-backup.json" });
                 document.body.appendChild(a); a.click(); a.remove();
                 setTimeout(() => URL.revokeObjectURL(url), 1000);
                 setMsg("Backup downloaded — keep it private.", "ok");
