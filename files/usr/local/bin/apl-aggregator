@@ -662,6 +662,14 @@ _fr24_feed_status_word() {
 		<<<"$1" 2>/dev/null
 }
 
+# _fr24_config_result_word <raw>: normalized lowercase .feed_last_config_result
+# ("" when absent or non-string). Consulted ONLY when feed_status is absent —
+# see _fr24_feed_health for why a present feed_status always wins.
+_fr24_config_result_word() {
+	jq -r '(.feed_last_config_result // "") | if type == "string" then ascii_downcase else "" end' \
+		<<<"$1" 2>/dev/null
+}
+
 # _fr24_feed_health: verdict from monitor.json .feed_status, on a SHORT timeout —
 # this runs on every status poll, unlike the 5s detail probe.
 _fr24_feed_health() {
@@ -670,13 +678,28 @@ _fr24_feed_health() {
 	{ [[ -n "$raw" ]] && jq -e 'type == "object"' >/dev/null 2>&1 <<<"$raw"; } \
 		|| { printf 'unknown'; return; }
 	fs="$(_fr24_feed_status_word "$raw")"
-	# Only an explicit "disconnected" is a confirmed rejection -> red. Every other
-	# non-connected value (connecting/sleeping/error/absent/…) is unknown, so a
-	# transient or unrecognized state never false-alarms as down. The exact non-
-	# connected vocabulary is not validated against 1.0.53 yet, hence the caution.
+	# A PRESENT feed_status is keyed on exclusively: only an explicit
+	# "disconnected" is a confirmed rejection -> red; other present values
+	# (connecting/sleeping/error/…) stay unknown so a transient or unrecognized
+	# state never false-alarms as down. feed_last_config_result is deliberately
+	# ignored when feed_status is present — it can hold a stale "error" from
+	# before a since-recovered feed.
+	#
+	# An ABSENT feed_status is different (validated against 1.0.53): while
+	# fr24feed's startup config fetch is failing — e.g. a rejected sharing key
+	# ("Not found, check your key!") — it serves monitor.json WITHOUT
+	# feed_status and with feed_last_config_result="error", looping with
+	# backoff. That is a confirmed not-feeding state, not a transient. Absent
+	# feed_status without the error marker (older fr24feed, or a startup race
+	# before the first config fetch) stays unknown.
 	case "$fs" in
 		connected)    printf 'feeding' ;;
 		disconnected) printf 'not_feeding' ;;
+		"")           if [[ "$(_fr24_config_result_word "$raw")" == "error" ]]; then
+			printf 'not_feeding'
+		else
+			printf 'unknown'
+		fi ;;
 		*)            printf 'unknown' ;;
 	esac
 }
@@ -767,7 +790,14 @@ _status_detail_fr24() {
 	case "$fs" in
 		connected)    rows+=("$(_sd_obj "Feed" "Connected" ok)") ;;
 		disconnected) rows+=("$(_sd_obj "Feed" "Not feeding" err)") ;;
-		"")           : ;;  # field absent (older fr24feed) — no Feed row
+		"")
+			# Absent feed_status + config error = fr24feed's startup config
+			# fetch is being rejected (typically a bad sharing key) — same
+			# signal _fr24_feed_health keys on. Fixed text only; the vendor's
+			# own message stays in the logs.
+			if [[ "$(_fr24_config_result_word "$raw")" == "error" ]]; then
+				rows+=("$(_sd_obj "Feed" "Rejected — check your sharing key" err)")
+			fi ;;  # absent without the error marker (older fr24feed) — no Feed row
 		*)            rows+=("$(_sd_obj "Feed" "Starting" warn)") ;;  # connecting/error/…
 	esac
 	rx="$(jq -r '.rx_connected // ""' <<<"$raw" 2>/dev/null)"

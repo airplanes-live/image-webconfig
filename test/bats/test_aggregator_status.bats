@@ -321,6 +321,30 @@ stub_piaware_status() {
     echo "$output" | jq -e '.aggregators[] | select(.id=="fr24") | .feed_health=="unknown"'
 }
 
+# The rejected-sharing-key shape, validated live against fr24feed 1.0.53: the
+# startup config fetch fails ("Not found, check your key!"), monitor.json is
+# served WITHOUT feed_status and WITH feed_last_config_result="error", and the
+# process loops with backoff. That must read red, not an eternal "unknown".
+@test "fr24 absent feed_status + config error -> feed_health not_feeding" {
+    seed_fr24_running
+    printf '{"rx_connected":"1","feed_num_ac_tracked":"0","feed_last_config_result":"error","feed_last_config_info":"Not found, check your key!"}\n' \
+        > "$WORK/fr24-monitor.json"
+    run "$APLAGG" status --json
+    [ "$status" -eq 0 ]
+    echo "$output" | jq -e '.aggregators[] | select(.id=="fr24") | .state=="running" and .feed_health=="not_feeding"'
+}
+
+# A PRESENT feed_status always wins over the config-result field, which can
+# hold a stale "error" from before a since-recovered feed.
+@test "fr24 feed_status=connected beats a stale config error -> feeding" {
+    seed_fr24_running
+    printf '{"feed_status":"connected","rx_connected":"1","feed_num_ac_tracked":"7","feed_last_config_result":"error"}\n' \
+        > "$WORK/fr24-monitor.json"
+    run "$APLAGG" status --json
+    [ "$status" -eq 0 ]
+    echo "$output" | jq -e '.aggregators[] | select(.id=="fr24") | .feed_health=="feeding"'
+}
+
 @test "a stopped adapter is not probed and carries no feed_health" {
     export AGG_DECODER_STATE=up SVC_STATE=inactive
     mkdir -p "$AGG_INSTALL_ROOT/fr24"; : > "$AGG_INSTALL_ROOT/fr24/fr24feed"
