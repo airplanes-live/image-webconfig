@@ -4041,7 +4041,7 @@
     function buildBackupRestoreCard() {
         const msg = el("div", {});
         const setMsg = (text, kind) => msg.replaceChildren(text ? el("div", { class: "wc-flash wc-flash--" + (kind || "ok") }, text) : el("span"));
-        const area = el("div", {});
+        const area = el("div", { class: "wc-restore-area" });
         const fileInput = el("input", { type: "file", accept: "application/json,.json", hidden: true });
         const importBtn = el("button", { type: "button", class: "wc-btn-ghost" }, "Restore from backup");
         importBtn.onclick = () => fileInput.click();
@@ -4129,7 +4129,7 @@
     function setupRestorePanel() {
         const msg = el("div", {});
         const setMsg = (text, kind) => msg.replaceChildren(text ? el("div", { class: "wc-flash wc-flash--" + (kind || "ok") }, text) : el("span"));
-        const area = el("div", {});
+        const area = el("div", { class: "wc-restore-area" });
         const fileInput = el("input", { type: "file", accept: "application/json,.json", hidden: true });
         const importBtn = el("button", { type: "button", class: "wc-btn-primary" }, "Choose backup file");
         importBtn.onclick = () => fileInput.click();
