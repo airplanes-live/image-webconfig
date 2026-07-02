@@ -2009,6 +2009,41 @@ cmd_enable_worker() {
 	esac
 }
 
+# _fr24_reconcile_key <merged-state-json>: apply a changed sharing key to the
+# live fr24feed instance. `set` merges fields into adapter state, but fr24feed
+# reads fr24key from its rendered ini at startup only — without a re-render and
+# restart, a key change via set would be a silent no-op on a running adapter
+# (state and vendor config diverge until some later enable re-renders). Mirrors
+# the piaware branch in cmd_set_worker: apply to the live daemon BEFORE state
+# persists. No-op when the adapter has never been rendered (no ini — the next
+# enable renders from state), when the merged key is empty (signup owns
+# minting), or when the key is unchanged. try-restart only bounces a running
+# instance; a stopped one reads the new ini on its next start.
+_fr24_reconcile_key() {
+	local merged="$1" ini key cur
+	ini="${AGG_FR24_INI:-$AGG_STATE_HOME/fr24/fr24feed.ini}"
+	[[ -f "$ini" ]] || return 0
+	key="$(jq -r '.fields.sharing_key // ""' <<<"$merged" 2>/dev/null)"
+	[[ -n "$key" ]] || return 0
+	# The key is interpolated into the ini; the same format gate enable
+	# applies keeps quotes/newlines/etc. out of the privileged writer.
+	_valid_fr24_key "$key" || return 1
+	cur="$(_fr24_read_key "$ini")"
+	[[ "$key" == "$cur" ]] && return 0
+	# Snapshot for rollback: if the restart fails after the rewrite, restore
+	# the previous ini so a retried set re-attempts the apply instead of
+	# matching the already-rewritten key and silently skipping the restart.
+	local prev
+	prev="$(cat "$ini" 2>/dev/null)" || return 1
+	_fr24_write_ini "$ini" "$key" "$AGG_DECODER_ADDR" || return 1
+	_fr24_finalize_perms "$ini"
+	if ! "$AGG_SYSTEMCTL" try-restart "airplanes-aggregator@fr24.service" >/dev/null 2>&1; then
+		printf '%s' "$prev" > "$ini" 2>/dev/null || true
+		return 1
+	fi
+	return 0
+}
+
 # cmd_reset_worker / cmd_set_worker are the detached workers for reset and set.
 # They run unsandboxed (a PID1-spawned transient unit) so their privileged
 # filesystem mutations — apt purge / rm under the install root / piaware-config
@@ -2066,6 +2101,12 @@ cmd_set_worker() {
 	if [[ "$id" == "piaware" ]]; then
 		_piaware_reconcile_mlat "$merged" \
 			|| { _emit_error state_error "failed to apply the MLAT setting to piaware"; exit 3; }
+	fi
+	# fr24 likewise applies before persist: re-render the ini + bounce the
+	# running instance so a sharing-key change actually reaches fr24feed.
+	if [[ "$id" == "fr24" ]]; then
+		_fr24_reconcile_key "$merged" \
+			|| { _emit_error state_error "failed to apply the sharing key to fr24feed"; exit 3; }
 	fi
 	_write_state "$id" "$merged"
 	_emit_ok "$id"
