@@ -28,7 +28,7 @@ set -Eeuo pipefail
 
 # --- paths + constants -----------------------------------------------------
 
-APL_SSH_LIB_DIR="${APL_SSH_LIB_DIR:-/usr/local/lib/airplanes}"
+APL_SSH_LIB_DIR="${APL_SSH_LIB_DIR:-/opt/airplanes/current/lib/airplanes}"
 APL_SSH_LOCK="${APL_SSH_LOCK:-/run/airplanes/ssh.lock}"
 APL_SSH_LOCK_TIMEOUT="${APL_SSH_LOCK_TIMEOUT:-5}"
 
