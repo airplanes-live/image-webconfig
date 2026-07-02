@@ -1498,6 +1498,12 @@ input[aria-invalid="true"] {
    include / restore"). */
 .wc-backup-sections { display: flex; flex-direction: column; gap: 0.4rem; margin: 0.5rem 0; }
 
+/* Backup-restore flow: the dynamic block below the upload button — first the
+   "choose what to restore" section picker, then the live "Restoring…"
+   checklist. It's an empty div until a file is chosen, so the separating
+   margin applies only while it holds content. */
+.wc-restore-area:not(:empty) { margin-top: 1rem; }
+
 /* Manage-page title: name + status chip sit together, left-aligned, rather
    than pushing the chip to the far edge (overrides .wc-card-head). */
 .wc-agg-detail-head { justify-content: flex-start; gap: 0.55rem; }
