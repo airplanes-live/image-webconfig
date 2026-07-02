@@ -23,7 +23,7 @@ set -Eeuo pipefail
 
 # --- paths + constants -----------------------------------------------------
 
-APL_WIFI_LIB_DIR="${APL_WIFI_LIB_DIR:-/usr/local/lib/airplanes}"
+APL_WIFI_LIB_DIR="${APL_WIFI_LIB_DIR:-/opt/airplanes/current/lib/airplanes}"
 APL_WIFI_KEYFILE_DIR="${APL_WIFI_KEYFILE_DIR:-/etc/NetworkManager/system-connections}"
 APL_WIFI_LOCK="${APL_WIFI_LOCK:-/run/airplanes/wifi.lock}"
 APL_WIFI_ROLLBACK_DIR="${APL_WIFI_ROLLBACK_DIR:-/run/airplanes/wifi-rollback}"
