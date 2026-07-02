@@ -1718,9 +1718,16 @@
         const err = errorEl();
         const pending = el("p", { class: "config-fieldset__pending" });
         pending.hidden = true;
+        // Success confirmation. The Save button is dirty-state (it vanishes
+        // the moment a save lands), so without this a clean save is silent —
+        // indistinguishable from nothing having happened. role="status" makes
+        // it a polite live region; it stays until the group is edited again.
+        const saved = el("p", { class: "config-fieldset__saved", role: "status" });
+        saved.hidden = true;
         footerEl.appendChild(btn);
         footerEl.appendChild(err);
         footerEl.appendChild(pending);
+        footerEl.appendChild(saved);
 
         const isDirty = () => {
             const cur = readInputs();
@@ -1735,6 +1742,8 @@
         const recheck = () => {
             if (isDirty()) {
                 configState.dirtyGroups.add(name);
+                saved.hidden = true;
+                saved.textContent = "";
             } else {
                 configState.dirtyGroups.delete(name);
             }
@@ -1770,6 +1779,8 @@
             err.textContent = "";
             pending.hidden = true;
             pending.textContent = "";
+            saved.hidden = true;
+            saved.textContent = "";
             state.inFlight = name;
             btn.disabled = true;
             btn.textContent = "Saving…";
@@ -1827,7 +1838,8 @@
                 state.inFlight = null;
                 return;
             }
-            if (refreshed.ok) {
+            const refreshOk = refreshed.ok;
+            if (refreshOk) {
                 state.savedValues = normaliseSavedValues((refreshed.payload && refreshed.payload.values) || {});
                 if (dashboardCtx) dashboardCtx.configValues = state.savedValues;
             }
@@ -1844,6 +1856,14 @@
             }
             if (onSavedHook) {
                 try { onSavedHook(); } catch (_) {}
+            }
+            // Only claim success when the authoritative refresh also landed:
+            // a failed refresh leaves savedValues stale, so the group can
+            // still read dirty — "Saved." next to a re-shown Save button
+            // would contradict itself.
+            if (pendingRestart.length === 0 && refreshOk) {
+                saved.hidden = false;
+                saved.textContent = "Saved.";
             }
         });
 
