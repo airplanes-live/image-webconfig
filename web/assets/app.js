@@ -1838,7 +1838,8 @@
                 state.inFlight = null;
                 return;
             }
-            if (refreshed.ok) {
+            const refreshOk = refreshed.ok;
+            if (refreshOk) {
                 state.savedValues = normaliseSavedValues((refreshed.payload && refreshed.payload.values) || {});
                 if (dashboardCtx) dashboardCtx.configValues = state.savedValues;
             }
@@ -1856,7 +1857,11 @@
             if (onSavedHook) {
                 try { onSavedHook(); } catch (_) {}
             }
-            if (pendingRestart.length === 0) {
+            // Only claim success when the authoritative refresh also landed:
+            // a failed refresh leaves savedValues stale, so the group can
+            // still read dirty — "Saved." next to a re-shown Save button
+            // would contradict itself.
+            if (pendingRestart.length === 0 && refreshOk) {
                 saved.hidden = false;
                 saved.textContent = "Saved.";
             }
