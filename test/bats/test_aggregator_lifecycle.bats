@@ -114,6 +114,39 @@ overlay_code() { jq -r '.error_code // ""' "$AGG_ENABLE_STATE" 2>/dev/null; }
     jq -e '.fields.sharing_key == "NEWKEY"' "$AGG_STATE_DIR/fr24.json"
 }
 
+# The reconcile interpolates the key into the privileged ini writer, so it
+# applies the same format gate enable uses; an injection-shaped key fails the
+# whole set rather than reaching the ini.
+@test "set with a malformed fr24 key on a rendered adapter fails without touching the ini" {
+    export AGG_FR24_INI="$WORK/fr24feed.ini"
+    printf 'receiver="beast-tcp"\nhost="127.0.0.1:30005"\nfr24key="OLDKEY"\n' > "$AGG_FR24_INI"
+    agg set '{"id":"fr24","fields":{"sharing_key":"bad\"key\nreceiver=evil"}}'
+    [ "$status" -eq 0 ]
+    [ "$(overlay_status)" = "failed" ]
+    grep -q 'fr24key="OLDKEY"' "$AGG_FR24_INI"
+    ! grep -q 'try-restart' "$WORK/systemctl.log"
+}
+
+# A failed restart rolls the ini back to the previous key, so a retried set
+# re-attempts the apply instead of matching the rewritten ini and silently
+# skipping the restart.
+@test "set rolls the fr24 ini back when the restart fails" {
+    export AGG_FR24_INI="$WORK/fr24feed.ini"
+    printf 'receiver="beast-tcp"\nhost="127.0.0.1:30005"\nfr24key="OLDKEY"\n' > "$AGG_FR24_INI"
+    cat > "$WORK/fake-systemctl" <<SH
+#!/bin/bash
+printf '%s\n' "\$*" >> "$WORK/systemctl.log"
+[[ "\$1" == "try-restart" ]] && exit 1
+exit 0
+SH
+    chmod +x "$WORK/fake-systemctl"
+    agg set '{"id":"fr24","fields":{"sharing_key":"NEWKEY"}}'
+    [ "$status" -eq 0 ]
+    [ "$(overlay_status)" = "failed" ]
+    grep -q 'fr24key="OLDKEY"' "$AGG_FR24_INI"
+    jq -e '(.fields.sharing_key // "") != "NEWKEY"' "$AGG_STATE_DIR/fr24.json" 2>/dev/null || [ ! -e "$AGG_STATE_DIR/fr24.json" ]
+}
+
 @test "set rejects a non-boolean mlat_enabled" {
     agg set '{"id":"fr24","mlat_enabled":"yes"}'
     [ "$status" -eq 2 ]

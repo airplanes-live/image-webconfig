@@ -1995,11 +1995,22 @@ _fr24_reconcile_key() {
 	[[ -f "$ini" ]] || return 0
 	key="$(jq -r '.fields.sharing_key // ""' <<<"$merged" 2>/dev/null)"
 	[[ -n "$key" ]] || return 0
+	# The key is interpolated into the ini; the same format gate enable
+	# applies keeps quotes/newlines/etc. out of the privileged writer.
+	_valid_fr24_key "$key" || return 1
 	cur="$(_fr24_read_key "$ini")"
 	[[ "$key" == "$cur" ]] && return 0
+	# Snapshot for rollback: if the restart fails after the rewrite, restore
+	# the previous ini so a retried set re-attempts the apply instead of
+	# matching the already-rewritten key and silently skipping the restart.
+	local prev
+	prev="$(cat "$ini" 2>/dev/null)" || return 1
 	_fr24_write_ini "$ini" "$key" "$AGG_DECODER_ADDR" || return 1
 	_fr24_finalize_perms "$ini"
-	"$AGG_SYSTEMCTL" try-restart "airplanes-aggregator@fr24.service" >/dev/null 2>&1 || return 1
+	if ! "$AGG_SYSTEMCTL" try-restart "airplanes-aggregator@fr24.service" >/dev/null 2>&1; then
+		printf '%s' "$prev" > "$ini" 2>/dev/null || true
+		return 1
+	fi
 	return 0
 }
 
